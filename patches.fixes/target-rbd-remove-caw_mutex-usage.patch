@@ -1,0 +1,179 @@
+From 9483a06e4f1ea4c715a3f3b917978ba97c174de6 Mon Sep 17 00:00:00 2001
+From: David Disseldorp <ddiss@suse.de>
+Date: Mon, 13 Jun 2016 11:01:07 +0200
+Subject: [PATCH 2/2] target/rbd: remove caw_mutex usage
+Patch-mainline: Not yet, SES clustered LIO/RBD
+References: bsc#981143
+
+The RBD backstore maps SCSI Compare And Write requests into cmpext+write
+compound OSD operations, which are handled by the OSDs in an atomic
+fashion. This means that SCSI Compare And Write request handling doesn't
+need to be serialised with caw_sem.
+
+Suggested-by: Mike Christie <mchristi@redhat.com>
+Signed-off-by: David Disseldorp <ddiss@suse.de>
+Reviewed-by: Jan Fajerski <jan.fajerski@suse.com>
+---
+ drivers/target/target_core_rbd.c | 66 ++++++++++++++++++++++++----------------
+ drivers/target/target_core_rbd.h |  6 ----
+ 2 files changed, 40 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/target/target_core_rbd.c b/drivers/target/target_core_rbd.c
+index 4d5c709..edcb4a1 100644
+--- a/drivers/target/target_core_rbd.c
++++ b/drivers/target/target_core_rbd.c
+@@ -414,16 +414,22 @@ static sense_reason_t tcm_rbd_execute_write_same(struct se_cmd *cmd)
+ 				   false);
+ }
+ 
++struct tcm_rbd_caw_state {
++	struct se_cmd *cmd;
++	struct scatterlist *cmp_and_write_sg;
++	struct page **cmp_and_write_pages;
++	u32 cmp_and_write_page_count;
++};
++
+ static void tcm_rbd_cmp_and_write_callback(struct rbd_img_request *img_request)
+ {
+-	struct se_cmd *cmd = img_request->lio_cmd_data;
+-	struct se_device *dev = cmd->se_dev;
+-	struct tcm_rbd_dev *tcm_rbd_dev = TCM_RBD_DEV(dev);
++	struct tcm_rbd_caw_state *caw_state = img_request->lio_cmd_data;
++	struct se_cmd *cmd = caw_state->cmd;
+ 	sense_reason_t sense_reason = TCM_NO_SENSE;
+ 	u64 miscompare_off;
+ 
+ 	if (img_request->result == -EILSEQ) {
+-		ceph_copy_from_page_vector(tcm_rbd_dev->cmp_and_write_pages,
++		ceph_copy_from_page_vector(caw_state->cmp_and_write_pages,
+ 					   &miscompare_off, 0,
+ 					   sizeof(miscompare_off));
+ 		cmd->sense_info = (u32)le64_to_cpu(miscompare_off);
+@@ -431,13 +437,10 @@ static void tcm_rbd_cmp_and_write_callback(struct rbd_img_request *img_request)
+ 			  (unsigned long long)cmd->bad_sector);
+ 		sense_reason = TCM_MISCOMPARE_VERIFY;
+ 	}
+-	kfree(tcm_rbd_dev->cmp_and_write_sg);
+-	tcm_rbd_dev->cmp_and_write_sg = NULL;
+-	ceph_release_page_vector(tcm_rbd_dev->cmp_and_write_pages,
+-				 tcm_rbd_dev->cmp_and_write_page_count);
+-	tcm_rbd_dev->cmp_and_write_pages = NULL;
+-	tcm_rbd_dev->cmp_and_write_page_count = 0;
+-	up(&dev->caw_sem);
++	kfree(caw_state->cmp_and_write_sg);
++	ceph_release_page_vector(caw_state->cmp_and_write_pages,
++				 caw_state->cmp_and_write_page_count);
++	kfree(caw_state);
+ 
+ 	if (sense_reason != TCM_NO_SENSE) {
+ 		/* TODO pass miscompare offset */
+@@ -455,6 +458,7 @@ static sense_reason_t tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 	struct se_device *dev = cmd->se_dev;
+ 	struct tcm_rbd_dev *tcm_rbd_dev = TCM_RBD_DEV(dev);
+ 	struct rbd_device *rbd_dev = tcm_rbd_dev->rbd_dev;
++	struct tcm_rbd_caw_state *caw_state = NULL;
+ 	struct rbd_img_request *img_request;
+ 	struct ceph_snap_context *snapc;
+ 	sense_reason_t sense = TCM_NO_SENSE;
+@@ -469,6 +473,11 @@ static sense_reason_t tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 	ceph_get_snap_context(snapc);
+ 	up_read(&rbd_dev->header_rwsem);
+ 
++	/*
++	 * No need to take dev->caw_sem here, as the IO is mapped to a compound
++	 * compare+write OSD request, which is handled atomically by the OSD.
++	 */
++
+ 	img_request = rbd_img_request_create(rbd_dev,
+ 					     rbd_lba_shift(dev, cmd->t_task_lba),
+ 					     len, OBJ_OP_CMP_AND_WRITE, snapc);
+@@ -478,26 +487,30 @@ static sense_reason_t tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 	}
+ 	snapc = NULL; /* img_request consumes a ref */
+ 
+-	ret = down_interruptible(&dev->caw_sem);
+-	if (ret != 0 || signal_pending(current)) {
+-		sense = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++	caw_state = kmalloc(sizeof(*caw_state), GFP_KERNEL);
++	if (caw_state == NULL) {
++		sense = TCM_OUT_OF_RESOURCES;
+ 		goto free_req;
+ 	}
+ 
+-	tcm_rbd_dev->cmp_and_write_sg = sbc_create_compare_and_write_sg(cmd);
+-	if (!tcm_rbd_dev->cmp_and_write_sg)
+-		goto rel_caw_sem;
++	caw_state->cmp_and_write_sg = sbc_create_compare_and_write_sg(cmd);
++	if (!caw_state->cmp_and_write_sg) {
++		sense = TCM_OUT_OF_RESOURCES;
++		goto free_caw_state;
++	}
+ 
+ 	page_count = (u32)calc_pages_for(0, len + sizeof(u64));
+ 	pages = ceph_alloc_page_vector(page_count, GFP_KERNEL);
+-	if (IS_ERR(pages))
++	if (IS_ERR(pages)) {
++		sense = TCM_OUT_OF_RESOURCES;
+ 		goto free_write_sg;
+-	tcm_rbd_dev->cmp_and_write_pages = pages;
+-	tcm_rbd_dev->cmp_and_write_page_count = page_count;
++	}
++	caw_state->cmp_and_write_pages = pages;
++	caw_state->cmp_and_write_page_count = page_count;
+ 
+ 	ret = rbd_img_cmp_and_write_request_fill(img_request, cmd->t_data_sg,
+ 						 len,
+-						 tcm_rbd_dev->cmp_and_write_sg,
++						 caw_state->cmp_and_write_sg,
+ 						 len, pages, response_len);
+ 	if (ret == -EOPNOTSUPP) {
+ 		sense = TCM_INVALID_CDB_FIELD;
+@@ -508,7 +521,8 @@ static sense_reason_t tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ 	}
+ 
+ 	cmd->priv = img_request;
+-	img_request->lio_cmd_data = cmd;
++	caw_state->cmd = cmd;
++	img_request->lio_cmd_data = caw_state;
+ 	img_request->callback = tcm_rbd_cmp_and_write_callback;
+ 
+ 	ret = rbd_img_request_submit(img_request);
+@@ -525,10 +539,10 @@ static sense_reason_t tcm_rbd_execute_cmp_and_write(struct se_cmd *cmd)
+ free_pages:
+ 	ceph_release_page_vector(pages, page_count);
+ free_write_sg:
+-	kfree(tcm_rbd_dev->cmp_and_write_sg);
+-	tcm_rbd_dev->cmp_and_write_sg = NULL;
+-rel_caw_sem:
+-	up(&dev->caw_sem);
++	kfree(caw_state->cmp_and_write_sg);
++	caw_state->cmp_and_write_sg = NULL;
++free_caw_state:
++	kfree(caw_state);
+ free_req:
+ 	rbd_img_request_put(img_request);
+ free_snapc:
+diff --git a/drivers/target/target_core_rbd.h b/drivers/target/target_core_rbd.h
+index f1525a8..956c5d1 100644
+--- a/drivers/target/target_core_rbd.h
++++ b/drivers/target/target_core_rbd.h
+@@ -5,16 +5,10 @@
+ 
+ #define TCM_RBD_HAS_UDEV_PATH		0x01
+ 
+-struct scatterlist;
+-
+ struct tcm_rbd_dev {
+ 	struct se_device dev;
+ 	struct rbd_device *rbd_dev;
+ 
+-	struct scatterlist *cmp_and_write_sg;
+-	struct page **cmp_and_write_pages;
+-	u32 cmp_and_write_page_count;
+-
+ 	unsigned char bd_udev_path[SE_UDEV_PATH_LEN];
+ 	u32 bd_flags;
+ 	struct block_device *bd;
+-- 
+2.6.6
+

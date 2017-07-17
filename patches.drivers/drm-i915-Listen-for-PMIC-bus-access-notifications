@@ -1,0 +1,179 @@
+From 9bb0260f84602995a02c5467dd081ba922154294 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Fri, 24 Feb 2017 10:29:12 +0100
+Subject: [PATCH 12/14] drm/i915: Listen for PMIC bus access notifications
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+References: bsc#1011913
+Patch-mainline: Submitted, intel-gfx ML
+
+Listen for PMIC bus access notifications and get FORCEWAKE_ALL while
+the bus is accessed to avoid needing to do any forcewakes, which need
+PMIC bus access, while the PMIC bus is busy:
+
+This fixes errors like these showing up in dmesg, usually followed
+by a gfx or system freeze:
+
+[drm:fw_domains_get [i915]] *ERROR* render: timed out waiting for forcewake ack request.
+[drm:fw_domains_get [i915]] *MEDIA* render: timed out waiting for forcewake ack request.
+i2c_designware 808622C1:06: punit semaphore timed out, resetting
+i2c_designware 808622C1:06: PUNIT SEM: 2
+i2c_designware 808622C1:06: couldn't acquire bus ownership
+
+Downside of this approach is that it causes wakeups whenever the PMIC
+bus is accessed. Unfortunately we cannot simply wait for the PMIC bus
+to go idle when we hit a race, as forcewakes may be done from interrupt
+handlers where we cannot sleep to wait for the i2c PMIC bus access to
+finish.
+
+Note that the notifications and thus the wakeups will only happen on
+baytrail / cherrytrail devices using PMICs with a shared i2c bus for
+P-Unit and host PMIC access (i2c busses with a _SEM method in their
+APCI node), e.g. an axp288 PMIC.
+
+I plan to write some patches for drivers accessing the PMIC bus to
+limit their bus accesses to a bare minimum (e.g. cache registers, do not
+update battery level more often then 4 times a minute), to limit the
+amount of wakeups.
+
+Buglink: https://bugzilla.kernel.org/show_bug.cgi?id=155241
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Tested-by: tagorereddy <tagore.chandan@gmail.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Acked-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/Kconfig        |    1 
+ drivers/gpu/drm/i915/i915_drv.c     |    1 
+ drivers/gpu/drm/i915/i915_drv.h     |    1 
+ drivers/gpu/drm/i915/intel_uncore.c |   46 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 49 insertions(+)
+
+--- a/drivers/gpu/drm/i915/Kconfig
++++ b/drivers/gpu/drm/i915/Kconfig
+@@ -20,6 +20,7 @@ config DRM_I915
+ 	select INPUT if ACPI
+ 	select ACPI_VIDEO if ACPI
+ 	select ACPI_BUTTON if ACPI
++	select IOSF_MBI
+ 	help
+ 	  Choose this option if you have a system that has "Intel Graphics
+ 	  Media Accelerator" or "HD Graphics" integrated graphics,
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -714,6 +714,7 @@ struct intel_uncore_funcs {
+ struct intel_uncore {
+ 	spinlock_t lock; /** lock is also taken in irq contexts. */
+ 
++	struct notifier_block pmic_bus_access_nb;
+ 	struct intel_uncore_funcs funcs;
+ 
+ 	unsigned fifo_count;
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -25,6 +25,7 @@
+ #include "intel_drv.h"
+ #include "i915_vgpu.h"
+ 
++#include <asm/iosf_mbi.h>
+ #include <linux/pm_runtime.h>
+ 
+ #define FORCEWAKE_ACK_TIMEOUT_MS 50
+@@ -372,12 +373,20 @@ static void __intel_uncore_early_sanitiz
+ 
+ void intel_uncore_suspend(struct drm_device *dev)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	iosf_mbi_unregister_pmic_bus_access_notifier(
++		&dev_priv->uncore.pmic_bus_access_nb);
+ 	intel_uncore_forcewake_reset(dev, false);
+ }
+ 
+ void intel_uncore_resume_early(struct drm_device *dev)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
+ 	__intel_uncore_early_sanitize(dev, true);
++	iosf_mbi_register_pmic_bus_access_notifier(
++		&dev_priv->uncore.pmic_bus_access_nb);
+ 	i915_check_and_clear_faults(dev);
+ }
+ 
+@@ -1199,6 +1208,32 @@ static void intel_uncore_fw_domains_init
+ 	WARN_ON(dev_priv->uncore.fw_domains == 0);
+ }
+ 
++static int i915_pmic_bus_access_notifier(struct notifier_block *nb,
++					 unsigned long action, void *data)
++{
++	struct drm_i915_private *dev_priv = container_of(nb,
++			struct drm_i915_private, uncore.pmic_bus_access_nb);
++
++	switch (action) {
++	case MBI_PMIC_BUS_ACCESS_BEGIN:
++		/*
++		 * forcewake all now to make sure that we don't need to do a
++		 * forcewake later which on systems where this notifier gets
++		 * called requires the punit to access to the shared pmic i2c
++		 * bus, which will be busy after this notification, leading to:
++		 * "render: timed out waiting for forcewake ack request."
++		 * errors.
++		 */
++		intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
++		break;
++	case MBI_PMIC_BUS_ACCESS_END:
++		intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
++		break;
++	}
++
++	return NOTIFY_OK;
++}
++
+ void intel_uncore_init(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1209,6 +1244,9 @@ void intel_uncore_init(struct drm_device
+ 	intel_uncore_fw_domains_init(dev);
+ 	__intel_uncore_early_sanitize(dev, false);
+ 
++	dev_priv->uncore.pmic_bus_access_nb.notifier_call =
++		i915_pmic_bus_access_notifier;
++
+ 	switch (INTEL_INFO(dev)->gen) {
+ 	default:
+ 	case 9:
+@@ -1256,6 +1294,9 @@ void intel_uncore_init(struct drm_device
+ 		ASSIGN_READ_MMIO_VFUNCS(vgpu);
+ 	}
+ 
++	iosf_mbi_register_pmic_bus_access_notifier(
++		&dev_priv->uncore.pmic_bus_access_nb);
++
+ 	i915_check_and_clear_faults(dev);
+ }
+ #undef ASSIGN_WRITE_MMIO_VFUNCS
+@@ -1263,6 +1304,11 @@ void intel_uncore_init(struct drm_device
+ 
+ void intel_uncore_fini(struct drm_device *dev)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	iosf_mbi_unregister_pmic_bus_access_notifier(
++		&dev_priv->uncore.pmic_bus_access_nb);
++
+ 	/* Paranoia: make sure we have disabled everything before we exit. */
+ 	intel_uncore_sanitize(dev);
+ 	intel_uncore_forcewake_reset(dev, false);
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -41,6 +41,7 @@
+ #include <linux/vga_switcheroo.h>
+ #include <drm/drm_crtc_helper.h>
+ 
++
+ static struct drm_driver driver;
+ 
+ #define GEN_DEFAULT_PIPEOFFSETS \

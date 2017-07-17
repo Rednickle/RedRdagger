@@ -1,0 +1,420 @@
+From: Stefan Haberland <sth@linux.vnet.ibm.com>
+Subject: dasd: add query host access to volume support
+Patch-mainline: not yet, in process
+References: FATE#319605, LTC#131276
+
+Summary:     dasd: add query host access to volume support
+Description: With this feature, applications can query if a DASD volume is
+             online to another operating system instances by checking the 
+             online status of all attached hosts from the storage server.
+
+
+Signed-off-by: Stefan Haberland <sth@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/dasd.c        |   56 +++++++++++++
+ drivers/s390/block/dasd_devmap.c |   27 ++++++
+ drivers/s390/block/dasd_eckd.c   |  166 +++++++++++++++++++++++++++++++++++++++
+ drivers/s390/block/dasd_eckd.h   |   33 +++++++
+ drivers/s390/block/dasd_int.h    |    3 
+ 5 files changed, 284 insertions(+), 1 deletion(-)
+
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -75,6 +75,8 @@ static void dasd_block_timeout(unsigned
+ static void __dasd_process_erp(struct dasd_device *, struct dasd_ccw_req *);
+ static void dasd_profile_init(struct dasd_profile *, struct dentry *);
+ static void dasd_profile_exit(struct dasd_profile *);
++static void dasd_hosts_init(struct dentry *, struct dasd_device *);
++static void dasd_hosts_exit(struct dasd_device *);
+ 
+ /*
+  * SECTION: Operations on the device structure.
+@@ -267,6 +269,7 @@ static int dasd_state_known_to_basic(str
+ 		dasd_debugfs_setup(dev_name(&device->cdev->dev),
+ 				   dasd_debugfs_root_entry);
+ 	dasd_profile_init(&device->profile, device->debugfs_dentry);
++	dasd_hosts_init(device->debugfs_dentry, device);
+ 
+ 	/* register 'device' debug area, used for all DBF_DEV_XXX calls */
+ 	device->debug_area = debug_register(dev_name(&device->cdev->dev), 4, 1,
+@@ -304,6 +307,7 @@ static int dasd_state_basic_to_known(str
+ 		return rc;
+ 	dasd_device_clear_timer(device);
+ 	dasd_profile_exit(&device->profile);
++	dasd_hosts_exit(device);
+ 	debugfs_remove(device->debugfs_dentry);
+ 	DBF_DEV_EVENT(DBF_EMERG, device, "%p debug area deleted", device);
+ 	if (device->debug_area != NULL) {
+@@ -1150,6 +1154,58 @@ int dasd_profile_on(struct dasd_profile
+ 
+ #endif				/* CONFIG_DASD_PROFILE */
+ 
++static int dasd_hosts_show(struct seq_file *m, void *v)
++{
++	struct dasd_device *device;
++	int rc = -EOPNOTSUPP;
++
++	device = m->private;
++	dasd_get_device(device);
++
++	if (device->discipline->hosts_print)
++		rc = device->discipline->hosts_print(device, m);
++
++	dasd_put_device(device);
++	return rc;
++}
++
++static int dasd_hosts_open(struct inode *inode, struct file *file)
++{
++	struct dasd_device *device = inode->i_private;
++
++	return single_open(file, dasd_hosts_show, device);
++}
++
++static const struct file_operations dasd_hosts_fops = {
++	.owner		= THIS_MODULE,
++	.open		= dasd_hosts_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++static void dasd_hosts_exit(struct dasd_device *device)
++{
++	debugfs_remove(device->hosts_dentry);
++	device->hosts_dentry = NULL;
++}
++
++static void dasd_hosts_init(struct dentry *base_dentry,
++			    struct dasd_device *device)
++{
++	struct dentry *pde;
++	umode_t mode;
++
++	if (!base_dentry)
++		return;
++
++	mode = S_IRUSR | S_IFREG;
++	pde = debugfs_create_file("host_access_list", mode, base_dentry,
++				  device, &dasd_hosts_fops);
++	if (pde && !IS_ERR(pde))
++		device->hosts_dentry = pde;
++}
++
+ /*
+  * Allocate memory for a channel program with 'cplength' channel
+  * command words and 'datasize' additional space. There are two
+--- a/drivers/s390/block/dasd_devmap.c
++++ b/drivers/s390/block/dasd_devmap.c
+@@ -984,6 +984,32 @@ out:
+ static DEVICE_ATTR(safe_offline, 0200, NULL, dasd_safe_offline_store);
+ 
+ static ssize_t
++dasd_access_show(struct device *dev, struct device_attribute *attr,
++		 char *buf)
++{
++	struct ccw_device *cdev = to_ccwdev(dev);
++	struct dasd_device *device;
++	int count;
++
++	device = dasd_device_from_cdev(cdev);
++	if (IS_ERR(device))
++		return PTR_ERR(device);
++
++	if (device->discipline->host_access_count)
++		count = device->discipline->host_access_count(device);
++	else
++		count = -EOPNOTSUPP;
++
++	dasd_put_device(device);
++	if (count < 0)
++		return count;
++
++	return sprintf(buf, "%d\n", count);
++}
++
++static DEVICE_ATTR(host_access_count, 0444, dasd_access_show, NULL);
++
++static ssize_t
+ dasd_discipline_show(struct device *dev, struct device_attribute *attr,
+ 		     char *buf)
+ {
+@@ -1473,6 +1499,7 @@ static struct attribute * dasd_attrs[] =
+ 	&dev_attr_reservation_policy.attr,
+ 	&dev_attr_last_known_reservation_state.attr,
+ 	&dev_attr_safe_offline.attr,
++	&dev_attr_host_access_count.attr,
+ 	&dev_attr_path_masks.attr,
+ 	NULL,
+ };
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -19,6 +19,7 @@
+ #include <linux/module.h>
+ #include <linux/compat.h>
+ #include <linux/init.h>
++#include <linux/seq_file.h>
+ 
+ #include <asm/css_chars.h>
+ #include <asm/debug.h>
+@@ -4624,6 +4625,169 @@ static int dasd_eckd_read_message_buffer
+ 	return rc;
+ }
+ 
++static int dasd_eckd_query_host_access(struct dasd_device *device,
++				       struct dasd_psf_query_host_access *data)
++{
++	struct dasd_psf_query_host_access *host_access;
++	struct dasd_psf_prssd_data *prssdp;
++	struct dasd_eckd_private *private;
++	struct dasd_ccw_req *cqr;
++	struct ccw1 *ccw;
++	int rc;
++
++	private = (struct dasd_eckd_private *) device->private;
++
++	/* not available for HYPER PAV alias devices */
++	if (!device->block && private->lcu->pav == HYPER_PAV)
++		return -EOPNOTSUPP;
++
++	cqr = dasd_smalloc_request(DASD_ECKD_MAGIC, 1 /* PSF */	+ 1 /* RSSD */,
++				   sizeof(struct dasd_psf_prssd_data) + 1,
++				   device);
++	if (IS_ERR(cqr)) {
++		DBF_EVENT_DEVID(DBF_WARNING, device->cdev, "%s",
++				"Could not allocate read message buffer request");
++		return PTR_ERR(cqr);
++	}
++	host_access = kzalloc(sizeof(*host_access), GFP_KERNEL | GFP_DMA);
++	if (!host_access) {
++		dasd_sfree_request(cqr, device);
++		DBF_EVENT_DEVID(DBF_WARNING, device->cdev, "%s",
++				"Could not allocate host_access buffer");
++		return -ENOMEM;
++	}
++	cqr->startdev = device;
++	cqr->memdev = device;
++	cqr->block = NULL;
++	cqr->retries = 256;
++	cqr->expires = 10 * HZ;
++
++	/* Prepare for Read Subsystem Data */
++	prssdp = (struct dasd_psf_prssd_data *) cqr->data;
++	memset(prssdp, 0, sizeof(struct dasd_psf_prssd_data));
++	prssdp->order = PSF_ORDER_PRSSD;
++	prssdp->suborder = PSF_SUBORDER_QHA;	/* query host access */
++	/* LSS and Volume that will be queried */
++	prssdp->lss = private->ned->ID;
++	prssdp->volume = private->ned->unit_addr;
++	/* all other bytes of prssdp must be zero */
++
++	ccw = cqr->cpaddr;
++	ccw->cmd_code = DASD_ECKD_CCW_PSF;
++	ccw->count = sizeof(struct dasd_psf_prssd_data);
++	ccw->flags |= CCW_FLAG_CC;
++	ccw->flags |= CCW_FLAG_SLI;
++	ccw->cda = (__u32)(addr_t) prssdp;
++
++	/* Read Subsystem Data - query host access */
++	ccw++;
++	ccw->cmd_code = DASD_ECKD_CCW_RSSD;
++	ccw->count = sizeof(struct dasd_psf_query_host_access);
++	ccw->flags |= CCW_FLAG_SLI;
++	ccw->cda = (__u32)(addr_t) host_access;
++
++	cqr->buildclk = get_tod_clock();
++	cqr->status = DASD_CQR_FILLED;
++	rc = dasd_sleep_on(cqr);
++	if (rc == 0) {
++		*data = *host_access;
++	} else {
++		DBF_EVENT_DEVID(DBF_WARNING, device->cdev,
++				"Reading host access data failed with rc=%d\n",
++				rc);
++		rc = -EOPNOTSUPP;
++	}
++
++	dasd_sfree_request(cqr, cqr->memdev);
++	kfree(host_access);
++	return rc;
++}
++/*
++ * return number of grouped devices
++ */
++static int dasd_eckd_host_access_count(struct dasd_device *device)
++{
++	struct dasd_psf_query_host_access *access;
++	struct dasd_ckd_path_group_entry *entry;
++	struct dasd_ckd_host_information *info;
++	int count = 0;
++	int rc, i;
++
++	access = kzalloc(sizeof(*access), GFP_NOIO);
++	if (!access) {
++		DBF_EVENT_DEVID(DBF_WARNING, device->cdev, "%s",
++				"Could not allocate access buffer");
++		return -ENOMEM;
++	}
++	rc = dasd_eckd_query_host_access(device, access);
++	if (rc) {
++		kfree(access);
++		return rc;
++	}
++
++	info = (struct dasd_ckd_host_information *)
++		access->host_access_information;
++	for (i = 0; i < info->entry_count; i++) {
++		entry = (struct dasd_ckd_path_group_entry *)
++			(info->entry + i * info->entry_size);
++		if (entry->status_flags & DASD_ECKD_PG_GROUPED)
++			count++;
++	}
++
++	kfree(access);
++	return count;
++}
++
++/*
++ * write host access information to a sequential file
++ */
++static int dasd_hosts_print(struct dasd_device *device, struct seq_file *m)
++{
++	struct dasd_psf_query_host_access *access;
++	struct dasd_ckd_path_group_entry *entry;
++	struct dasd_ckd_host_information *info;
++	char sysplex[9] = "";
++	int rc, i, j;
++
++	access = kzalloc(sizeof(*access), GFP_NOIO);
++	if (!access) {
++		DBF_EVENT_DEVID(DBF_WARNING, device->cdev, "%s",
++				"Could not allocate access buffer");
++		return -ENOMEM;
++	}
++	rc = dasd_eckd_query_host_access(device, access);
++	if (rc) {
++		kfree(access);
++		return rc;
++	}
++
++	info = (struct dasd_ckd_host_information *)
++		access->host_access_information;
++	for (i = 0; i < info->entry_count; i++) {
++		entry = (struct dasd_ckd_path_group_entry *)
++			(info->entry + i * info->entry_size);
++		/* PGID */
++		seq_puts(m, "pgid ");
++		for (j = 0; j < 11; j++)
++			seq_printf(m, "%02x", entry->pgid[j]);
++		seq_putc(m, '\n');
++		/* FLAGS */
++		seq_printf(m, "status_flags %02x\n", entry->status_flags);
++		/* SYSPLEX NAME */
++		memcpy(&sysplex, &entry->sysplex_name, sizeof(sysplex) - 1);
++		EBCASC(sysplex, sizeof(sysplex));
++		seq_printf(m, "sysplex_name %8s\n", sysplex);
++		/* SUPPORTED CYLINDER */
++		seq_printf(m, "supported_cylinder %d\n", entry->cylinder);
++		/* TIMESTAMP */
++		seq_printf(m, "timestamp %lu\n", (unsigned long)
++			   entry->timestamp);
++	}
++	kfree(access);
++
++	return 0;
++}
++
+ /*
+  * Perform Subsystem Function - CUIR response
+  */
+@@ -5100,6 +5264,8 @@ static struct dasd_discipline dasd_eckd_
+ 	.get_uid = dasd_eckd_get_uid,
+ 	.kick_validate = dasd_eckd_kick_validate_server,
+ 	.check_attention = dasd_eckd_check_attention,
++	.host_access_count = dasd_eckd_host_access_count,
++	.hosts_print = dasd_hosts_print,
+ };
+ 
+ static int __init
+--- a/drivers/s390/block/dasd_eckd.h
++++ b/drivers/s390/block/dasd_eckd.h
+@@ -53,6 +53,7 @@
+  */
+ #define PSF_ORDER_PRSSD			 0x18
+ #define PSF_ORDER_CUIR_RESPONSE		 0x1A
++#define PSF_SUBORDER_QHA		 0x1C
+ #define PSF_ORDER_SSC			 0x1D
+ 
+ /*
+@@ -81,6 +82,8 @@
+ #define ATTENTION_LENGTH_CUIR		 0x0e
+ #define ATTENTION_FORMAT_CUIR		 0x01
+ 
++#define DASD_ECKD_PG_GROUPED		 0x10
++
+ /*
+  * Size that is reportet for large volumes in the old 16-bit no_cyl field
+  */
+@@ -403,13 +406,41 @@ struct dasd_psf_cuir_response {
+ 	__u8 ssid;
+ } __packed;
+ 
++struct dasd_ckd_path_group_entry {
++	__u8 status_flags;
++	__u8 pgid[11];
++	__u8 sysplex_name[8];
++	__u32 timestamp;
++	__u32 cylinder;
++	__u8 reserved[4];
++} __packed;
++
++struct dasd_ckd_host_information {
++	__u8 access_flags;
++	__u8 entry_size;
++	__u16 entry_count;
++	__u8 entry[16390];
++} __packed;
++
++struct dasd_psf_query_host_access {
++	__u8 access_flag;
++	__u8 version;
++	__u16 CKD_length;
++	__u16 SCSI_length;
++	__u8 unused[10];
++	__u8 host_access_information[16394];
++} __packed;
++
+ /*
+  * Perform Subsystem Function - Prepare for Read Subsystem Data
+  */
+ struct dasd_psf_prssd_data {
+ 	unsigned char order;
+ 	unsigned char flags;
+-	unsigned char reserved[4];
++	unsigned char reserved1;
++	unsigned char reserved2;
++	unsigned char lss;
++	unsigned char volume;
+ 	unsigned char suborder;
+ 	unsigned char varies[5];
+ } __attribute__ ((packed));
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@ -358,6 +358,8 @@ struct dasd_discipline {
+ 	int (*get_uid) (struct dasd_device *, struct dasd_uid *);
+ 	void (*kick_validate) (struct dasd_device *);
+ 	int (*check_attention)(struct dasd_device *, __u8);
++	int (*host_access_count)(struct dasd_device *);
++	int (*hosts_print)(struct dasd_device *, struct seq_file *);
+ };
+ 
+ extern struct dasd_discipline *dasd_diag_discipline_pointer;
+@@ -479,6 +481,7 @@ struct dasd_device {
+ 	unsigned long blk_timeout;
+ 
+ 	struct dentry *debugfs_dentry;
++	struct dentry *hosts_dentry;
+ 	struct dasd_profile profile;
+ };
+ 

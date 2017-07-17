@@ -1,0 +1,161 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Sat, 13 May 2017 12:05:59 -0700
+Subject: nvme_fc: add uevent for auto-connect
+References: bsc#1037838
+Patch-Mainline: submitted to linux-scsi 2017/05/16
+
+To support auto-connecting to FC-NVME devices upon their dynamic
+appearance, add a uevent that can kick off connection scripts.
+uevent is posted against the nvme_fc transport device.
+
+Added checking to stop the "feature" of connecting to the same
+subsystem multiple times on FC devices.
+
+Added routine nvme_fc_rescan_remoteport() to allow lldd to request
+nvme scan. For example, lldd may invoke this after receiving an
+RSCN for a logged in device containing a discovery controller.
+
+Tested with the following rule to kick an nvme-cli connect-all for the
+FC initiator and FC target ports. This is just an example for testing
+and not intended for real life use.
+
+ACTION=="change", SUBSYSTEM=="fc", ENV{FC_EVENT}=="nvmediscovery", \
+        ENV{NVMEFC_HOST_TRADDR}=="*", ENV{NVMEFC_TRADDR}=="*", \
+	RUN+="/bin/sh -c '/usr/local/sbin/nvme connect-all --transport=fc --host-traddr=$env{NVMEFC_HOST_TRADDR} --traddr=$env{NVMEFC_TRADDR} >> /tmp/nvme_fc.log'"
+
+Signed-off-by: James Smart <james.smart@broadcom.com>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/nvme/host/fc.c         | 67 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/nvme-fc-driver.h |  2 ++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index fd360c0..bff3243 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -392,6 +392,26 @@ nvme_fc_unregister_localport(struct nvme_fc_local_port *portptr)
+ }
+ EXPORT_SYMBOL_GPL(nvme_fc_unregister_localport);
+ 
++static void
++nvme_fc_signal_discovery_scan(struct nvme_fc_lport *lport,
++		struct nvme_fc_rport *rport)
++{
++	char hostaddr[80];	/* NVMEFC_HOST_TRADDR=...*/
++	char tgtaddr[80];	/* NVMEFC_TRADDR=...*/
++	char *envp[4] = { "FC_EVENT=nvmediscovery", hostaddr, tgtaddr, NULL };
++
++	if (!(rport->remoteport.port_role & FC_PORT_ROLE_NVME_DISCOVERY))
++		return;
++
++	snprintf(hostaddr, sizeof(hostaddr),
++		"NVMEFC_HOST_TRADDR=nn-0x%016llx:pn-0x%016llx",
++		lport->localport.node_name, lport->localport.port_name);
++	snprintf(tgtaddr, sizeof(tgtaddr),
++		"NVMEFC_TRADDR=nn-0x%016llx:pn-0x%016llx",
++		rport->remoteport.node_name, rport->remoteport.port_name);
++	kobject_uevent_env(&nvmefc_device->kobj, KOBJ_CHANGE, envp);
++}
++
+ /**
+  * nvme_fc_register_remoteport - transport entry point called by an
+  *                              LLDD to register the existence of a NVME
+@@ -456,6 +476,8 @@ nvme_fc_register_remoteport(struct nvme_fc_local_port *localport,
+ 	list_add_tail(&newrec->endp_list, &lport->endp_list);
+ 	spin_unlock_irqrestore(&nvme_fc_lock, flags);
+ 
++	nvme_fc_signal_discovery_scan(lport, newrec);
++
+ 	*portptr = &newrec->remoteport;
+ 	return 0;
+ 
+@@ -574,6 +596,23 @@ nvme_fc_unregister_remoteport(struct nvme_fc_remote_port *portptr)
+ }
+ EXPORT_SYMBOL_GPL(nvme_fc_unregister_remoteport);
+ 
++/**
++ * nvme_fc_rescan_remoteport - transport entry point called by an
++ *                              LLDD to request a nvme device rescan.
++ * @remoteport: pointer to the (registered) remote port that is to be
++ *              rescanned.
++ *
++ * Returns: N/A
++ */
++void
++nvme_fc_rescan_remoteport(struct nvme_fc_remote_port *remoteport)
++{
++	struct nvme_fc_rport *rport = remoteport_to_rport(remoteport);
++
++	nvme_fc_signal_discovery_scan(rport->lport, rport);
++}
++EXPORT_SYMBOL_GPL(nvme_fc_rescan_remoteport);
++
+ 
+ /* *********************** FC-NVME DMA Handling **************************** */
+ 
+@@ -2701,6 +2740,19 @@ static const struct blk_mq_ops nvme_fc_admin_mq_ops = {
+ };
+ 
+ 
++static inline bool
++__nvme_fc_options_match(struct nvmf_ctrl_options *opts,
++			struct nvme_fc_ctrl *ctrl)
++{
++	if (strcmp(opts->subsysnqn, ctrl->ctrl.opts->subsysnqn) ||
++	    strcmp(opts->host->nqn, ctrl->ctrl.opts->host->nqn) ||
++	    memcmp(&opts->host->id, &ctrl->ctrl.opts->host->id,
++				sizeof(uuid_be)))
++		return false;
++
++	return true;
++}
++
+ static struct nvme_ctrl *
+ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 	struct nvme_fc_lport *lport, struct nvme_fc_rport *rport)
+@@ -2708,6 +2760,7 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 	struct nvme_fc_ctrl *ctrl;
+ 	unsigned long flags;
+ 	int ret, idx;
++	bool found = false;
+ 
+ 	if (!(rport->remoteport.port_role &
+ 	    (FC_PORT_ROLE_NVME_DISCOVERY | FC_PORT_ROLE_NVME_TARGET))) {
+@@ -2715,6 +2768,20 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 		goto out_fail;
+ 	}
+ 
++	spin_lock_irqsave(&rport->lock, flags);
++	list_for_each_entry(ctrl, &rport->ctrl_list, ctrl_list) {
++		if (__nvme_fc_options_match(opts, ctrl)) {
++			found = true;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&rport->lock, flags);
++
++	if (found) {
++		ret = -EALREADY;
++		goto out_fail;
++	}
++
+ 	ctrl = kzalloc(sizeof(*ctrl), GFP_KERNEL);
+ 	if (!ctrl) {
+ 		ret = -ENOMEM;
+diff --git a/include/linux/nvme-fc-driver.h b/include/linux/nvme-fc-driver.h
+index 492e9f40..c42313f 100644
+--- a/include/linux/nvme-fc-driver.h
++++ b/include/linux/nvme-fc-driver.h
+@@ -446,6 +446,8 @@ int nvme_fc_register_remoteport(struct nvme_fc_local_port *localport,
+ 
+ int nvme_fc_unregister_remoteport(struct nvme_fc_remote_port *remoteport);
+ 
++void nvme_fc_rescan_remoteport(struct nvme_fc_remote_port *remoteport);
++
+ 
+ 
+ /*
+-- 
+1.8.5.6
+

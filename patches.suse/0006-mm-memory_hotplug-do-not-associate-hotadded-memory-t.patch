@@ -1,0 +1,671 @@
+From 85520eb1e90e3817f6f24da61d969cbc7e88d89c Mon Sep 17 00:00:00 2001
+From: Michal Hocko <mhocko@suse.com>
+Date: Wed, 29 Mar 2017 16:07:00 +0200
+Subject: [PATCH 6/9] mm, memory_hotplug: do not associate hotadded memory to
+ zones until online
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: f1dd2cd13c4bbbc9a7c4617b3b034fa643de98fe
+Patch-mainline: 4.13-rc1
+References: bnc#1030659
+
+The current memory hotplug implementation relies on having all the
+struct pages associate with a zone/node during the physical hotplug phase
+(arch_add_memory->__add_pages->__add_section->__add_zone). In the vast
+majority of cases this means that they are added to ZONE_NORMAL. This
+has been so since 9d99aaa31f59 ("[PATCH] x86_64: Support memory hotadd
+without sparsemem") and it wasn't a big deal back then because movable
+onlining didn't exist yet.
+
+Much later memory hotplug wanted to (ab)use ZONE_MOVABLE for movable
+onlining 511c2aba8f07 ("mm, memory-hotplug: dynamic configure movable
+memory and portion memory") and then things got more complicated. Rather
+than reconsidering the zone association which was no longer needed
+(because the memory hotplug already depended on SPARSEMEM) a convoluted
+semantic of zone shifting has been developed. Only the currently last
+memblock or the one adjacent to the zone_movable can be onlined movable.
+This essentially means that the online type changes as the new memblocks
+are added.
+
+Let's simulate memory hot online manually
+Normal Movable
+
+/sys/devices/system/memory/memory32/valid_zones:Normal
+/sys/devices/system/memory/memory33/valid_zones:Normal Movable
+
+/sys/devices/system/memory/memory32/valid_zones:Normal
+/sys/devices/system/memory/memory33/valid_zones:Normal
+/sys/devices/system/memory/memory34/valid_zones:Normal Movable
+
+/sys/devices/system/memory/memory32/valid_zones:Normal
+/sys/devices/system/memory/memory33/valid_zones:Normal Movable
+/sys/devices/system/memory/memory34/valid_zones:Movable Normal
+
+This is an awkward semantic because an udev event is sent as soon as the
+block is onlined and an udev handler might want to online it based on
+some policy (e.g. association with a node) but it will inherently race
+with new blocks showing up.
+
+This patch changes the physical online phase to not associate pages
+with any zone at all. All the pages are just marked reserved and wait
+for the onlining phase to be associated with the zone as per the online
+request. There are only two requirements
+	- existing ZONE_NORMAL and ZONE_MOVABLE cannot overlap
+	- ZONE_NORMAL precedes ZONE_MOVABLE in physical addresses
+the later on is not an inherent requirement and can be changed in the
+future. It preserves the current behavior and made the code slightly
+simpler. This is subject to change in future.
+
+This means that the same physical online steps as above will lead to the
+following state:
+Normal Movable
+
+/sys/devices/system/memory/memory32/valid_zones:Normal Movable
+/sys/devices/system/memory/memory33/valid_zones:Normal Movable
+
+/sys/devices/system/memory/memory32/valid_zones:Normal Movable
+/sys/devices/system/memory/memory33/valid_zones:Normal Movable
+/sys/devices/system/memory/memory34/valid_zones:Normal Movable
+
+/sys/devices/system/memory/memory32/valid_zones:Normal Movable
+/sys/devices/system/memory/memory33/valid_zones:Normal Movable
+/sys/devices/system/memory/memory34/valid_zones:Movable
+
+Implementation: 
+The current move_pfn_range is reimplemented to check the above
+requirements (allow_online_pfn_range) and then updates the respective
+zone (move_pfn_range_to_zone), the pgdat and links all the pages in the
+pfn range with the zone/node. __add_pages is updated to not require the
+zone and only initializes sections in the range. This allowed to
+simplify the arch_add_memory code (s390 could get rid of quite some
+of code).
+
+devm_memremap_pages is the only user of arch_add_memory which relies
+on the zone association because it only hooks into the memory hotplug
+only half way. It uses it to associate the new memory with ZONE_DEVICE
+but doesn't allow it to be {on,off}lined via sysfs. This means that this
+particular code path has to call move_pfn_range_to_zone explicitly.
+
+The original zone shifting code is kept in place and will be removed in
+the follow up patch for an easier review.
+
+Changes since v1
+- we have to associate the page with the node early (in __add_section),
+  because pfn_to_node depends on struct page containing this
+  information - based on testing by Reza Arbab
+- resize_{zone,pgdat}_range has to check whether they are popoulated -
+  Reza Arbab
+- fix devm_memremap_pages to use pfn rather than physical address -
+  Jérôme Glisse
+- move_pfn_range has to check for intersection with zone_movable rather
+  than to rely on allow_online_pfn_range(MMOP_ONLINE_MOVABLE) for
+  MMOP_ONLINE_KEEP
+
+Cc: Lai Jiangshan <laijs@cn.fujitsu.com>
+Cc: Dan Williams <dan.j.williams@gmail.com>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: linux-arch@vger.kernel.org
+Acked-by: Heiko Carstens <heiko.carstens@de.ibm.com> # For s390 bits
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+
+---
+ arch/ia64/mm/init.c            |    8 -
+ arch/powerpc/mm/mem.c          |   10 --
+ arch/s390/mm/init.c            |   30 -------
+ arch/sh/mm/init.c              |    8 -
+ arch/x86/mm/init_32.c          |    5 -
+ arch/x86/mm/init_64.c          |    5 -
+ drivers/base/memory.c          |   53 +++++++-----
+ include/linux/memory_hotplug.h |   10 +-
+ include/linux/mmzone.h         |   16 +++
+ kernel/memremap.c              |    4 
+ mm/memory_hotplug.c            |  173 ++++++++++++++++++++++++++++++++---------
+ mm/sparse.c                    |    3 
+ 12 files changed, 204 insertions(+), 121 deletions(-)
+
+--- a/arch/ia64/mm/init.c
++++ b/arch/ia64/mm/init.c
+@@ -647,17 +647,11 @@ mem_init (void)
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ {
+-	pg_data_t *pgdat;
+-	struct zone *zone;
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	int ret;
+ 
+-	pgdat = NODE_DATA(nid);
+-
+-	zone = pgdat->node_zones +
+-		zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
+-	ret = __add_pages(nid, zone, start_pfn, nr_pages);
++	ret = __add_pages(nid, start_pfn, nr_pages);
+ 
+ 	if (ret)
+ 		printk("%s: Problem encountered in __add_pages() as ret=%d\n",
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@ -115,22 +115,14 @@ int memory_add_physaddr_to_nid(u64 start
+ 
+ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ {
+-	struct pglist_data *pgdata;
+-	struct zone *zone;
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 
+-	pgdata = NODE_DATA(nid);
+-
+ 	start = (unsigned long)__va(start);
+ 	if (create_section_mapping(start, start + size))
+ 		return -EINVAL;
+ 
+-	/* this should work for most non-highmem platforms */
+-	zone = pgdata->node_zones +
+-		zone_for_memory(nid, start, size, 0, for_device);
+-
+-	return __add_pages(nid, zone, start_pfn, nr_pages);
++	return __add_pages(nid, start_pfn, nr_pages);
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@ -148,41 +148,15 @@ void __init free_initrd_mem(unsigned lon
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ {
+-	unsigned long zone_start_pfn, zone_end_pfn, nr_pages;
+ 	unsigned long start_pfn = PFN_DOWN(start);
+ 	unsigned long size_pages = PFN_DOWN(size);
+-	pg_data_t *pgdat = NODE_DATA(nid);
+-	struct zone *zone;
+-	int rc, i;
++	int rc;
+ 
+ 	rc = vmem_add_mapping(start, size);
+ 	if (rc)
+ 		return rc;
+ 
+-	for (i = 0; i < MAX_NR_ZONES; i++) {
+-		zone = pgdat->node_zones + i;
+-		if (zone_idx(zone) != ZONE_MOVABLE) {
+-			/* Add range within existing zone limits, if possible */
+-			zone_start_pfn = zone->zone_start_pfn;
+-			zone_end_pfn = zone->zone_start_pfn +
+-				       zone->spanned_pages;
+-		} else {
+-			/* Add remaining range to ZONE_MOVABLE */
+-			zone_start_pfn = start_pfn;
+-			zone_end_pfn = start_pfn + size_pages;
+-		}
+-		if (start_pfn < zone_start_pfn || start_pfn >= zone_end_pfn)
+-			continue;
+-		nr_pages = (start_pfn + size_pages > zone_end_pfn) ?
+-			   zone_end_pfn - start_pfn : size_pages;
+-		rc = __add_pages(nid, zone, start_pfn, nr_pages);
+-		if (rc)
+-			break;
+-		start_pfn += nr_pages;
+-		size_pages -= nr_pages;
+-		if (!size_pages)
+-			break;
+-	}
++	rc = __add_pages(nid, start_pfn, size_pages);
+ 	if (rc)
+ 		vmem_remove_mapping(start, size);
+ 	return rc;
+--- a/arch/sh/mm/init.c
++++ b/arch/sh/mm/init.c
+@@ -487,18 +487,12 @@ void free_initrd_mem(unsigned long start
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ {
+-	pg_data_t *pgdat;
+ 	unsigned long start_pfn = PFN_DOWN(start);
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	int ret;
+ 
+-	pgdat = NODE_DATA(nid);
+-
+ 	/* We only have ZONE_NORMAL, so this is easy.. */
+-	ret = __add_pages(nid, pgdat->node_zones +
+-			zone_for_memory(nid, start, size, ZONE_NORMAL,
+-			for_device),
+-			start_pfn, nr_pages);
++	ret = __add_pages(nid, start_pfn, nr_pages);
+ 	if (unlikely(ret))
+ 		printk("%s: Failed, __add_pages() == %d\n", __func__, ret);
+ 
+--- a/arch/x86/mm/init_32.c
++++ b/arch/x86/mm/init_32.c
+@@ -825,13 +825,10 @@ void __init mem_init(void)
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ {
+-	struct pglist_data *pgdata = NODE_DATA(nid);
+-	struct zone *zone = pgdata->node_zones +
+-		zone_for_memory(nid, start, size, ZONE_HIGHMEM, for_device);
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 
+-	return __add_pages(nid, zone, start_pfn, nr_pages);
++	return __add_pages(nid, start_pfn, nr_pages);
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -689,16 +689,13 @@ static void  update_end_of_memory_vars(u
+  */
+ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ {
+-	struct pglist_data *pgdat = NODE_DATA(nid);
+-	struct zone *zone = pgdat->node_zones +
+-		zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	int ret;
+ 
+ 	init_memory_mapping(start, start + size);
+ 
+-	ret = __add_pages(nid, zone, start_pfn, nr_pages);
++	ret = __add_pages(nid, start_pfn, nr_pages);
+ 	WARN_ON_ONCE(ret);
+ 
+ 	/* update max_pfn, max_low_pfn and high_memory */
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -391,35 +391,46 @@ static ssize_t show_valid_zones(struct d
+ 				struct device_attribute *attr, char *buf)
+ {
+ 	struct memory_block *mem = to_memory_block(dev);
+-	unsigned long start_pfn, end_pfn;
+-	unsigned long valid_start, valid_end;
+ 	unsigned long nr_pages = PAGES_PER_SECTION * sections_per_block;
+-	struct zone *zone;
+-
+-	start_pfn = section_nr_to_pfn(mem->start_section_nr);
+-	end_pfn = start_pfn + nr_pages;
+-
+-	/* The block contains more than one zone can not be offlined. */
+-	if (!test_pages_in_a_zone(start_pfn, end_pfn, &valid_start, &valid_end))
++	unsigned long start_pfn = section_nr_to_pfn(mem->start_section_nr);
++	unsigned long valid_start_pfn, valid_end_pfn;
++	bool append = false;
++	int nid;
++
++	/*
++	 * The block contains more than one zone can not be offlined.
++	 * This can happen e.g. for ZONE_DMA and ZONE_DMA32
++	 */
++	if (!test_pages_in_a_zone(start_pfn, start_pfn + nr_pages, &valid_start_pfn, &valid_end_pfn))
+ 		return sprintf(buf, "none\n");
+ 
+-	zone = page_zone(pfn_to_page(valid_start));
++	start_pfn = valid_start_pfn;
++	nr_pages = valid_end_pfn - start_pfn;
++
++	/*
++	 * Check the existing zone. Make sure that we do that only on the
++	 * online nodes otherwise the page_zone is not reliable
++	 */
++	if (mem->state == MEM_ONLINE) {
++		strcat(buf, page_zone(pfn_to_page(start_pfn))->name);
++		goto out;
++	}
+ 
+-	if (zone_idx(zone) == ZONE_MOVABLE - 1) {
+-		/*The mem block is the last memoryblock of this zone.*/
+-		if (valid_end == zone_end_pfn(zone))
+-			return sprintf(buf, "%s %s\n",
+-					zone->name, (zone + 1)->name);
++	nid = pfn_to_nid(start_pfn);
++	if (allow_online_pfn_range(nid, start_pfn, nr_pages, MMOP_ONLINE_KERNEL)) {
++		strcat(buf, NODE_DATA(nid)->node_zones[ZONE_NORMAL].name);
++		append = true;
+ 	}
+ 
+-	if (zone_idx(zone) == ZONE_MOVABLE) {
+-		/*The mem block is the first memoryblock of ZONE_MOVABLE.*/
+-		if (valid_start == zone->zone_start_pfn)
+-			return sprintf(buf, "%s %s\n",
+-					zone->name, (zone - 1)->name);
++	if (allow_online_pfn_range(nid, start_pfn, nr_pages, MMOP_ONLINE_MOVABLE)) {
++		if (append)
++			strcat(buf, " ");
++		strcat(buf, NODE_DATA(nid)->node_zones[ZONE_MOVABLE].name);
+ 	}
++out:
++	strcat(buf, "\n");
+ 
+-	return sprintf(buf, "%s\n", zone->name);
++	return strlen(buf);
+ }
+ static DEVICE_ATTR(valid_zones, 0444, show_valid_zones, NULL);
+ #endif
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -107,8 +107,8 @@ extern int __remove_pages(struct zone *z
+ 	unsigned long nr_pages);
+ #endif /* CONFIG_MEMORY_HOTREMOVE */
+ 
+-/* reasonably generic interface to expand the physical pages in a zone  */
+-extern int __add_pages(int nid, struct zone *zone, unsigned long start_pfn,
++/* reasonably generic interface to expand the physical pages */
++extern int __add_pages(int nid, unsigned long start_pfn,
+ 	unsigned long nr_pages);
+ 
+ #ifdef CONFIG_NUMA
+@@ -275,12 +275,16 @@ extern int add_memory_resource(int nid,
+ extern int zone_for_memory(int nid, u64 start, u64 size, int zone_default,
+ 		bool for_device);
+ extern int arch_add_memory(int nid, u64 start, u64 size, bool for_device);
++extern void move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
++		unsigned long nr_pages);
+ extern int offline_pages(unsigned long start_pfn, unsigned long nr_pages);
+ extern bool is_memblock_offlined(struct memory_block *mem);
+ extern void remove_memory(int nid, u64 start, u64 size);
+-extern int sparse_add_one_section(struct zone *zone, unsigned long start_pfn);
++extern int sparse_add_one_section(struct pglist_data *pgdat, unsigned long start_pfn);
+ extern void sparse_remove_one_section(struct zone *zone, struct mem_section *ms);
+ extern struct page *sparse_decode_mem_map(unsigned long coded_mem_map,
+ 					  unsigned long pnum);
++extern bool allow_online_pfn_range(int nid, unsigned long pfn, unsigned long nr_pages,
++		int online_type);
+ 
+ #endif /* __LINUX_MEMORY_HOTPLUG_H */
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -550,6 +550,22 @@ static inline bool zone_is_empty(struct
+ }
+ 
+ /*
++ * Return true if [start_pfn, start_pfn + nr_pages) range has a non-mpty
++ * intersection with the given zone
++ */
++static inline bool zone_intersects(struct zone *zone,
++		unsigned long start_pfn, unsigned long nr_pages)
++{
++	if (zone_is_empty(zone))
++		return false;
++	if (zone->zone_start_pfn <= start_pfn && start_pfn < zone_end_pfn(zone))
++		return true;
++	if (start_pfn + nr_pages > zone->zone_start_pfn)
++		return true;
++	return false;
++}
++
++/*
+  * The "priority" of VM scanning is how much of the queues we will scan in one
+  * go. A value of 12 for DEF_PRIORITY implies that we will scan 1/4096th of the
+  * queues ("queue_length >> 12") during an aging round.
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@ -193,6 +193,10 @@ void *devm_memremap_pages(struct device
+ 
+ 	mem_hotplug_begin();
+ 	error = arch_add_memory(nid, res->start, resource_size(res), true);
++	if (!error)
++		move_pfn_range_to_zone(&NODE_DATA(nid)->node_zones[ZONE_DEVICE],
++					align_start >> PAGE_SHIFT,
++					align_size >> PAGE_SHIFT);
+ 	mem_hotplug_done();
+ 	if (error) {
+ 		devres_free(page_map);
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -459,23 +459,35 @@ static int __meminit __add_zone(struct z
+ 	return 0;
+ }
+ 
+-static int __meminit __add_section(int nid, struct zone *zone,
+-					unsigned long phys_start_pfn)
++static int __meminit __add_section(int nid, unsigned long phys_start_pfn)
+ {
+ 	int ret;
++	int i;
+ 
+ 	if (pfn_valid(phys_start_pfn))
+ 		return -EEXIST;
+ 
+-	ret = sparse_add_one_section(zone, phys_start_pfn);
++	ret = sparse_add_one_section(NODE_DATA(nid), phys_start_pfn);
+ 
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = __add_zone(zone, phys_start_pfn);
++	/*
++	 * Make all the pages reserved so that nobody will stumble over half
++	 * initialized state.
++	 * FIXME: We also have to associate it with a node because pfn_to_node
++	 * relies on having page with the proper node.
++	 */
++	for (i = 0; i < PAGES_PER_SECTION; i++) {
++		unsigned long pfn = phys_start_pfn + i;
++		struct page *page;
++		if (!pfn_valid(pfn))
++			continue;
+ 
+-	if (ret < 0)
+-		return ret;
++		page = pfn_to_page(pfn);
++		set_page_node(page, nid);
++		SetPageReserved(page);
++	}
+ 
+ 	return register_new_memory(nid, __pfn_to_section(phys_start_pfn));
+ }
+@@ -486,21 +498,19 @@ static int __meminit __add_section(int n
+  * call this function after deciding the zone to which to
+  * add the new pages.
+  */
+-int __ref __add_pages(int nid, struct zone *zone, unsigned long phys_start_pfn,
++int __ref __add_pages(int nid, unsigned long phys_start_pfn,
+ 			unsigned long nr_pages)
+ {
+ 	unsigned long i;
+ 	int err = 0;
+ 	int start_sec, end_sec;
+ 
+-	clear_zone_contiguous(zone);
+-
+ 	/* during initialize mem_map, align hot-added range to section */
+ 	start_sec = pfn_to_section_nr(phys_start_pfn);
+ 	end_sec = pfn_to_section_nr(phys_start_pfn + nr_pages - 1);
+ 
+ 	for (i = start_sec; i <= end_sec; i++) {
+-		err = __add_section(nid, zone, section_nr_to_pfn(i));
++		err = __add_section(nid, section_nr_to_pfn(i));
+ 
+ 		/*
+ 		 * EEXIST is finally dealt with by ioresource collision
+@@ -513,8 +523,6 @@ int __ref __add_pages(int nid, struct zo
+ 	}
+ 	vmemmap_populate_print_last();
+ 
+-	set_zone_contiguous(zone);
+-
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(__add_pages);
+@@ -967,6 +975,115 @@ static void node_states_set_node(int nod
+ 	node_set_state(node, N_MEMORY);
+ }
+ 
++bool allow_online_pfn_range(int nid, unsigned long pfn, unsigned long nr_pages, int online_type)
++{
++	struct pglist_data *pgdat = NODE_DATA(nid);
++	struct zone *movable_zone = &pgdat->node_zones[ZONE_MOVABLE];
++	struct zone *normal_zone =  &pgdat->node_zones[ZONE_NORMAL];
++
++	/*
++	 * TODO there shouldn't be any inherent reason to have ZONE_NORMAL
++	 * physically before ZONE_MOVABLE. All we need is they do not
++	 * overlap. Historically we didn't allow ZONE_NORMAL after ZONE_MOVABLE
++	 * though so let's stick with it for simplicity for now.
++	 * TODO make sure we do not overlap with ZONE_DEVICE
++	 */
++	if (online_type == MMOP_ONLINE_KERNEL) {
++		if (zone_is_empty(movable_zone))
++			return true;
++		return movable_zone->zone_start_pfn >= pfn + nr_pages;
++	} else if (online_type == MMOP_ONLINE_MOVABLE) {
++		return zone_end_pfn(normal_zone) <= pfn;
++	}
++
++	/* MMOP_ONLINE_KEEP will always succeed and inherits the current zone */
++	return online_type == MMOP_ONLINE_KEEP;
++}
++
++static void __meminit resize_zone_range(struct zone *zone, unsigned long start_pfn,
++		unsigned long nr_pages)
++{
++	unsigned long old_end_pfn = zone_end_pfn(zone);
++
++	if (zone_is_empty(zone) || start_pfn < zone->zone_start_pfn)
++		zone->zone_start_pfn = start_pfn;
++
++	zone->spanned_pages = max(start_pfn + nr_pages, old_end_pfn) - zone->zone_start_pfn;
++}
++
++static void __meminit resize_pgdat_range(struct pglist_data *pgdat, unsigned long start_pfn,
++                                     unsigned long nr_pages)
++{
++	unsigned long old_end_pfn = pgdat_end_pfn(pgdat);
++
++	if (!pgdat->node_spanned_pages || start_pfn < pgdat->node_start_pfn)
++		pgdat->node_start_pfn = start_pfn;
++
++	pgdat->node_spanned_pages = max(start_pfn + nr_pages, old_end_pfn) - pgdat->node_start_pfn;
++}
++
++void move_pfn_range_to_zone(struct zone *zone,
++		unsigned long start_pfn, unsigned long nr_pages)
++{
++	struct pglist_data *pgdat = zone->zone_pgdat;
++	int nid = pgdat->node_id;
++	unsigned long flags;
++	unsigned long i;
++
++	if (zone_is_empty(zone))
++		init_currently_empty_zone(zone, start_pfn, nr_pages);
++
++	clear_zone_contiguous(zone);
++
++	/* TODO Huh pgdat is irqsave while zone is not. It used to be like that before */
++	pgdat_resize_lock(pgdat, &flags);
++	zone_span_writelock(zone);
++	resize_zone_range(zone, start_pfn, nr_pages);
++	zone_span_writeunlock(zone);
++	resize_pgdat_range(pgdat, start_pfn, nr_pages);
++	pgdat_resize_unlock(pgdat, &flags);
++
++	/*
++	 * TODO now we have a visible range of pages which are not associated
++	 * with their zone properly. Not nice but set_pfnblock_flags_mask
++	 * expects the zone spans the pfn range. All the pages in the range
++	 * are reserved so nobody should be touching them so we should be safe
++	 */
++	memmap_init_zone(nr_pages, nid, zone_idx(zone), start_pfn, MEMMAP_HOTPLUG);
++	for (i = 0; i < nr_pages; i++) {
++		unsigned long pfn = start_pfn + i;
++		set_page_links(pfn_to_page(pfn), zone_idx(zone), nid, pfn);
++	}
++
++	set_zone_contiguous(zone);
++}
++
++/*
++ * Associates the given pfn range with the given node and the zone appropriate
++ * for the given online type.
++ */
++static struct zone * __meminit move_pfn_range(int online_type, int nid,
++		unsigned long start_pfn, unsigned long nr_pages)
++{
++	struct pglist_data *pgdat = NODE_DATA(nid);
++	struct zone *zone = &pgdat->node_zones[ZONE_NORMAL];
++
++	if (online_type == MMOP_ONLINE_KEEP) {
++		struct zone *movable_zone = &pgdat->node_zones[ZONE_MOVABLE];
++		/*
++		 * MMOP_ONLINE_KEEP inherits the current zone which is
++		 * ZONE_NORMAL by default but we might be within ZONE_MOVABLE
++		 * already.
++		 */
++		if (zone_intersects(movable_zone, start_pfn, nr_pages))
++			zone = movable_zone;
++	} else if (online_type == MMOP_ONLINE_MOVABLE) {
++		zone = &pgdat->node_zones[ZONE_MOVABLE];
++	}
++
++	move_pfn_range_to_zone(zone, start_pfn, nr_pages);
++	return zone;
++}
+ 
+ /* Must be protected by mem_hotplug_begin() */
+ int __ref online_pages(unsigned long pfn, unsigned long nr_pages, int online_type)
+@@ -979,38 +1096,22 @@ int __ref online_pages(unsigned long pfn
+ 	int ret;
+ 	struct memory_notify arg;
+ 
+-	/*
+-	 * This doesn't need a lock to do pfn_to_page().
+-	 * The section can't be removed here because of the
+-	 * memory_block->state_mutex.
+-	 */
+-	zone = page_zone(pfn_to_page(pfn));
+-
+-	if ((zone_idx(zone) > ZONE_NORMAL ||
+-	    online_type == MMOP_ONLINE_MOVABLE) &&
+-	    !can_online_high_movable(pfn_to_nid(pfn)))
++	nid = pfn_to_nid(pfn);
++	if (!allow_online_pfn_range(nid, pfn, nr_pages, online_type))
+ 		return -EINVAL;
+ 
+-	if (online_type == MMOP_ONLINE_KERNEL &&
+-	    zone_idx(zone) == ZONE_MOVABLE) {
+-		if (move_pfn_range_left(zone - 1, zone, pfn, pfn + nr_pages))
+-			return -EINVAL;
+-	}
+-	if (online_type == MMOP_ONLINE_MOVABLE &&
+-	    zone_idx(zone) == ZONE_MOVABLE - 1) {
+-		if (move_pfn_range_right(zone, zone + 1, pfn, pfn + nr_pages))
+-			return -EINVAL;
+-	}
++	if (online_type == MMOP_ONLINE_MOVABLE && !can_online_high_movable(nid))
++		return -EINVAL;
+ 
+-	/* Previous code may changed the zone of the pfn range */
+-	zone = page_zone(pfn_to_page(pfn));
++	/* associate pfn range with the zone */
++	zone = move_pfn_range(online_type, nid, pfn, nr_pages);
++	if (!zone)
++		return -EINVAL;
+ 
+ 	arg.start_pfn = pfn;
+ 	arg.nr_pages = nr_pages;
+ 	node_states_check_changes_online(nr_pages, zone, &arg);
+ 
+-	nid = zone_to_nid(zone);
+-
+ 	ret = memory_notify(MEM_GOING_ONLINE, &arg);
+ 	ret = notifier_to_errno(ret);
+ 	if (ret) {
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@ -690,10 +690,9 @@ static void free_map_bootmem(struct page
+  * set.  If this is <=0, then that means that the passed-in
+  * map was not consumed and must be freed.
+  */
+-int __meminit sparse_add_one_section(struct zone *zone, unsigned long start_pfn)
++int __meminit sparse_add_one_section(struct pglist_data *pgdat, unsigned long start_pfn)
+ {
+ 	unsigned long section_nr = pfn_to_section_nr(start_pfn);
+-	struct pglist_data *pgdat = zone->zone_pgdat;
+ 	struct mem_section *ms;
+ 	struct page *memmap;
+ 	unsigned long *usemap;
