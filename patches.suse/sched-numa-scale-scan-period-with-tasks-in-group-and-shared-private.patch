@@ -1,0 +1,195 @@
+From 011bab866a2e1debcc0d9cd772e833f04c9cd875 Mon Sep 17 00:00:00 2001
+From: Rik van Riel <riel@redhat.com>
+Date: Mon, 31 Jul 2017 15:28:47 -0400
+Subject: [PATCH] sched,numa: scale scan period with tasks in group and
+ shared/private
+
+References: Automatic NUMA Balancing (fate#315482)
+Patch-mainline: No, queued in subsystem maintainer tree
+
+Running 80 tasks in the same group, or as threads of the same process,
+results in the memory getting scanned 80x as fast as it would be if a
+single task was using the memory.
+
+This really hurts some workloads.
+
+Scale the scan period by the number of tasks in the numa group, and
+the shared / private ratio, so the average rate at which memory in
+the group is scanned corresponds roughly to the rate at which a single
+task would scan its memory.
+
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/fair.c | 111 ++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 86 insertions(+), 25 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 47ae2019e632..819b6a8ab92f 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -1070,6 +1070,29 @@ unsigned int sysctl_numa_balancing_scan_size = 256;
+ /* Scan @scan_size MB every @scan_period after an initial @scan_delay in ms */
+ unsigned int sysctl_numa_balancing_scan_delay = 1000;
+ 
++struct numa_group {
++	atomic_t refcount;
++
++	spinlock_t lock; /* nr_tasks, tasks */
++	int nr_tasks;
++	pid_t gid;
++	int active_nodes;
++
++	struct rcu_head rcu;
++	unsigned long total_faults;
++	unsigned long max_faults_cpu;
++	/*
++	 * Faults_cpu is used to decide whether memory should move
++	 * towards the CPU. As a consequence, these stats are weighted
++	 * more by CPU use than by memory faults.
++	 */
++	unsigned long *faults_cpu;
++	unsigned long faults[0];
++};
++
++static inline unsigned long group_faults_priv(struct numa_group *ng);
++static inline unsigned long group_faults_shared(struct numa_group *ng);
++
+ static unsigned int task_nr_scan_windows(struct task_struct *p)
+ {
+ 	unsigned long rss = 0;
+@@ -1106,13 +1129,47 @@ static unsigned int task_scan_min(struct task_struct *p)
+ 	return max_t(unsigned int, floor, scan);
+ }
+ 
++static unsigned int task_scan_start(struct task_struct *p)
++{
++	unsigned long smin = task_scan_min(p);
++	unsigned long period = smin;
++
++	/* Scale the maximum scan period with the amount of shared memory. */
++	if (p->numa_group) {
++		struct numa_group *ng = p->numa_group;
++		unsigned long shared = group_faults_shared(ng);
++		unsigned long private = group_faults_priv(ng);
++
++		period *= atomic_read(&ng->refcount);
++		period *= shared + 1;
++		period /= private + shared + 1;
++	}
++
++	return max(smin, period);
++}
++
+ static unsigned int task_scan_max(struct task_struct *p)
+ {
+-	unsigned int smin = task_scan_min(p);
+-	unsigned int smax;
++	unsigned long smin = task_scan_min(p);
++	unsigned long smax;
+ 
+ 	/* Watch for min being lower than max due to floor calculations */
+ 	smax = sysctl_numa_balancing_scan_period_max / task_nr_scan_windows(p);
++
++	/* Scale the maximum scan period with the amount of shared memory. */
++	if (p->numa_group) {
++		struct numa_group *ng = p->numa_group;
++		unsigned long shared = group_faults_shared(ng);
++		unsigned long private = group_faults_priv(ng);
++		unsigned long period = smax;
++
++		period *= atomic_read(&ng->refcount);
++		period *= shared + 1;
++		period /= private + shared + 1;
++
++		smax = max(smax, period);
++	}
++
+ 	return max(smin, smax);
+ }
+ 
+@@ -1128,26 +1185,6 @@ static void account_numa_dequeue(struct rq *rq, struct task_struct *p)
+ 	rq->nr_preferred_running -= (p->numa_preferred_nid == task_node(p));
+ }
+ 
+-struct numa_group {
+-	atomic_t refcount;
+-
+-	spinlock_t lock; /* nr_tasks, tasks */
+-	int nr_tasks;
+-	pid_t gid;
+-	int active_nodes;
+-
+-	struct rcu_head rcu;
+-	unsigned long total_faults;
+-	unsigned long max_faults_cpu;
+-	/*
+-	 * Faults_cpu is used to decide whether memory should move
+-	 * towards the CPU. As a consequence, these stats are weighted
+-	 * more by CPU use than by memory faults.
+-	 */
+-	unsigned long *faults_cpu;
+-	unsigned long faults[0];
+-};
+-
+ /* Shared or private faults. */
+ #define NR_NUMA_HINT_FAULT_TYPES 2
+ 
+@@ -1197,6 +1234,30 @@ static inline unsigned long group_faults_cpu(struct numa_group *group, int nid)
+ 		group->faults_cpu[task_faults_idx(NUMA_MEM, nid, 1)];
+ }
+ 
++static inline unsigned long group_faults_priv(struct numa_group *ng)
++{
++	unsigned long faults = 0;
++	int node;
++
++	for_each_online_node(node) {
++		faults += ng->faults[task_faults_idx(NUMA_MEM, node, 1)];
++	}
++
++	return faults;
++}
++
++static inline unsigned long group_faults_shared(struct numa_group *ng)
++{
++	unsigned long faults = 0;
++	int node;
++
++	for_each_online_node(node) {
++		faults += ng->faults[task_faults_idx(NUMA_MEM, node, 0)];
++	}
++
++	return faults;
++}
++
+ /*
+  * A node triggering more than 1/3 as many NUMA faults as the maximum is
+  * considered part of a numa group's pseudo-interleaving set. Migrations
+@@ -1807,7 +1868,7 @@ static int task_numa_migrate(struct task_struct *p)
+ 	 * Reset the scan period if the task is being rescheduled on an
+ 	 * alternative node to recheck if the tasks is now properly placed.
+ 	 */
+-	p->numa_scan_period = task_scan_min(p);
++	p->numa_scan_period = task_scan_start(p);
+ 
+ 	if (env.best_task == NULL) {
+ 		ret = migrate_task_to(p, env.best_cpu);
+@@ -2458,7 +2519,7 @@ void task_numa_work(struct callback_head *work)
+ 
+ 	if (p->numa_scan_period == 0) {
+ 		p->numa_scan_period_max = task_scan_max(p);
+-		p->numa_scan_period = task_scan_min(p);
++		p->numa_scan_period = task_scan_start(p);
+ 	}
+ 
+ 	next_scan = now + msecs_to_jiffies(p->numa_scan_period);
+@@ -2586,7 +2647,7 @@ void task_tick_numa(struct rq *rq, struct task_struct *curr)
+ 
+ 	if (now > curr->node_stamp + period) {
+ 		if (!curr->node_stamp)
+-			curr->numa_scan_period = task_scan_min(curr);
++			curr->numa_scan_period = task_scan_start(curr);
+ 		curr->node_stamp += period;
+ 
+ 		if (!time_before(jiffies, curr->mm->numa_next_scan)) {
