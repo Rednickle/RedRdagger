@@ -1,0 +1,122 @@
+From 90abb7109644cc1d3c328750c1cf7a5818cac20a Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Sun, 27 Aug 2017 13:55:12 -0700
+Subject: [PATCH] Minor page waitqueue cleanups
+
+References: bnc#971975 VM performance -- page waitqueue
+Patch-mainline: v4.13
+Git-commit: 3510ca20ece0150af6b10c77a74ff1b5c198e3e2
+
+Tim Chen and Kan Liang have been battling a customer load that shows
+extremely long page wakeup lists.  The cause seems to be constant NUMA
+migration of a hot page that is shared across a lot of threads, but the
+actual root cause for the exact behavior has not been found.
+
+Tim has a patch that batches the wait list traversal at wakeup time, so
+that we at least don't get long uninterruptible cases where we traverse
+and wake up thousands of processes and get nasty latency spikes.  That
+is likely 4.14 material, but we're still discussing the page waitqueue
+specific parts of it.
+
+In the meantime, I've tried to look at making the page wait queues less
+expensive, and failing miserably.  If you have thousands of threads
+waiting for the same page, it will be painful.  We'll need to try to
+figure out the NUMA balancing issue some day, in addition to avoiding
+the excessive spinlock hold times.
+
+That said, having tried to rewrite the page wait queues, I can at least
+fix up some of the braindamage in the current situation. In particular:
+
+ (a) we don't want to continue walking the page wait list if the bit
+     we're waiting for already got set again (which seems to be one of
+     the patterns of the bad load).  That makes no progress and just
+     causes pointless cache pollution chasing the pointers.
+
+ (b) we don't want to put the non-locking waiters always on the front of
+     the queue, and the locking waiters always on the back.  Not only is
+     that unfair, it means that we wake up thousands of reading threads
+     that will just end up being blocked by the writer later anyway.
+
+Also add a comment about the layout of 'struct wait_page_key' - there is
+an external user of it in the cachefiles code that means that it has to
+match the layout of 'struct wait_bit_key' in the two first members.  It
+so happens to match, because 'struct page *' and 'unsigned long *' end
+up having the same values simply because the page flags are the first
+member in struct page.
+
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: Kan Liang <kan.liang@intel.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Christopher Lameter <cl@linux.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/wait.c |  7 ++++---
+ mm/filemap.c        | 11 ++++++-----
+ 2 files changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/sched/wait.c b/kernel/sched/wait.c
+index b8c84c6dee64..58c31978391a 100644
+--- a/kernel/sched/wait.c
++++ b/kernel/sched/wait.c
+@@ -70,9 +70,10 @@ static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
+ 
+ 	list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+ 		unsigned flags = curr->flags;
+-
+-		if (curr->func(curr, mode, wake_flags, key) &&
+-				(flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
++		int ret = curr->func(curr, mode, wake_flags, key);
++		if (ret < 0)
++			break;
++		if (ret && (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+ 			break;
+ 	}
+ }
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 742034e56100..1b37ca88ccac 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -791,6 +791,7 @@ void __init pagecache_init(void)
+ 	page_writeback_init();
+ }
+ 
++/* This has the same layout as wait_bit_key - see fs/cachefiles/rdwr.c */
+ struct wait_page_key {
+ 	struct page *page;
+ 	int bit_nr;
+@@ -815,8 +816,10 @@ static int wake_page_function(wait_queue_t *wait, unsigned mode, int sync, void
+ 
+ 	if (wait_page->bit_nr != key->bit_nr)
+ 		return 0;
++
++	/* Stop walking if it's locked */
+ 	if (test_bit(key->bit_nr, &key->page->flags))
+-		return 0;
++		return -1;
+ 
+ 	return autoremove_wake_function(wait, mode, sync, key);
+ }
+@@ -870,6 +873,7 @@ static inline int wait_on_page_bit_common(wait_queue_head_t *q,
+ 	int ret = 0;
+ 
+ 	init_wait(wait);
++	wait->flags = lock ? WQ_FLAG_EXCLUSIVE : 0;
+ 	wait->func = wake_page_function;
+ 	wait_page.page = page;
+ 	wait_page.bit_nr = bit_nr;
+@@ -878,10 +882,7 @@ static inline int wait_on_page_bit_common(wait_queue_head_t *q,
+ 		spin_lock_irq(&q->lock);
+ 
+ 		if (likely(list_empty(&wait->task_list))) {
+-			if (lock)
+-				__add_wait_queue_tail_exclusive(q, wait);
+-			else
+-				__add_wait_queue(q, wait);
++			__add_wait_queue_tail(q, wait);
+ 			SetPageWaiters(page);
+ 		}
+ 
