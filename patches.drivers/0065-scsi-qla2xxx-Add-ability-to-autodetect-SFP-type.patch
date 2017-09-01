@@ -1,0 +1,621 @@
+From: Quinn Tran <quinn.tran@cavium.com>
+Date: Wed, 23 Aug 2017 15:05:07 -0700
+Subject: scsi: qla2xxx: Add ability to autodetect SFP type
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/jejb/scsi.git
+Git-commit: e4e3a2ce9556cc4da40dadaf94c0d3395b6e91d9
+References: FATE#322910
+
+SFP can come in 2 formats: short range/SR and long range/LR.  For LR,
+user the can increase the number of Buffer to Buffer credits between end
+points via Cavium's command line tool.  By default, FW uses a lower BB
+Credit value optimized for SR.  This patch will read the SFP for each
+link up event and during chip reset sequence. If the SFP type and
+setting are mismatch, then the chip is reset 1 time to use the
+appropriate setting.
+
+Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/scsi/qla2xxx/qla_attr.c |  42 ++----------
+ drivers/scsi/qla2xxx/qla_def.h  |  92 +++++++++++++++++++++++++-
+ drivers/scsi/qla2xxx/qla_gbl.h  |   3 +
+ drivers/scsi/qla2xxx/qla_init.c | 143 ++++++++++++++++++++++++++++++++++++++++
+ drivers/scsi/qla2xxx/qla_isr.c  |   5 ++
+ drivers/scsi/qla2xxx/qla_mbx.c  |  83 +++++++++++++++++++++--
+ drivers/scsi/qla2xxx/qla_os.c   |  36 +++++++++-
+ 7 files changed, 361 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/scsi/qla2xxx/qla_attr.c b/drivers/scsi/qla2xxx/qla_attr.c
+index 08a1feb3a195..9d2862233e3c 100644
+--- a/drivers/scsi/qla2xxx/qla_attr.c
++++ b/drivers/scsi/qla2xxx/qla_attr.c
+@@ -565,47 +565,17 @@ qla2x00_sysfs_read_sfp(struct file *filp, struct kobject *kobj,
+ {
+ 	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
+ 	    struct device, kobj)));
+-	struct qla_hw_data *ha = vha->hw;
+-	uint16_t iter, addr, offset;
+ 	int rval;
+ 
+-	if (!capable(CAP_SYS_ADMIN) || off != 0 || count != SFP_DEV_SIZE * 2)
++	if (!capable(CAP_SYS_ADMIN) || off != 0 || count < SFP_DEV_SIZE)
+ 		return 0;
+ 
+-	if (ha->sfp_data)
+-		goto do_read;
+-
+-	ha->sfp_data = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL,
+-	    &ha->sfp_data_dma);
+-	if (!ha->sfp_data) {
+-		ql_log(ql_log_warn, vha, 0x706c,
+-		    "Unable to allocate memory for SFP read-data.\n");
++	if (qla2x00_reset_active(vha))
+ 		return 0;
+-	}
+-
+-do_read:
+-	memset(ha->sfp_data, 0, SFP_BLOCK_SIZE);
+-	addr = 0xa0;
+-	for (iter = 0, offset = 0; iter < (SFP_DEV_SIZE * 2) / SFP_BLOCK_SIZE;
+-	    iter++, offset += SFP_BLOCK_SIZE) {
+-		if (iter == 4) {
+-			/* Skip to next device address. */
+-			addr = 0xa2;
+-			offset = 0;
+-		}
+-
+-		rval = qla2x00_read_sfp(vha, ha->sfp_data_dma, ha->sfp_data,
+-		    addr, offset, SFP_BLOCK_SIZE, BIT_1);
+-		if (rval != QLA_SUCCESS) {
+-			ql_log(ql_log_warn, vha, 0x706d,
+-			    "Unable to read SFP data (%x/%x/%x).\n", rval,
+-			    addr, offset);
+ 
+-			return -EIO;
+-		}
+-		memcpy(buf, ha->sfp_data, SFP_BLOCK_SIZE);
+-		buf += SFP_BLOCK_SIZE;
+-	}
++	rval = qla2x00_read_sfp_dev(vha, buf, count);
++	if (rval)
++		return -EIO;
+ 
+ 	return count;
+ }
+@@ -615,7 +585,7 @@ static struct bin_attribute sysfs_sfp_attr = {
+ 		.name = "sfp",
+ 		.mode = S_IRUSR | S_IWUSR,
+ 	},
+-	.size = SFP_DEV_SIZE * 2,
++	.size = SFP_DEV_SIZE,
+ 	.read = qla2x00_sysfs_read_sfp,
+ };
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index e3b225cc83f2..609687d04e3c 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3465,8 +3465,15 @@ struct qla_hw_data {
+ 		uint32_t	n2n_ae:1;
+ 		uint32_t	fw_started:1;
+ 		uint32_t	fw_init_done:1;
++
++		uint32_t	detected_lr_sfp:1;
++		uint32_t	using_lr_setting:1;
+ 	} flags;
+ 
++	u8 long_range_distance;	/* 32G & above */
++#define LR_DISTANCE_5K  1
++#define LR_DISTANCE_10K 0
++
+ 	/* This spinlock is used to protect "io transactions", you must
+ 	* acquire it before doing any IO to the card, eg with RD_REG*() and
+ 	* WRT_REG*() for the duration of your entire commandtransaction.
+@@ -3714,7 +3721,7 @@ struct qla_hw_data {
+ 	struct sns_cmd_pkt	*sns_cmd;
+ 	dma_addr_t		sns_cmd_dma;
+ 
+-#define SFP_DEV_SIZE    256
++#define SFP_DEV_SIZE    512
+ #define SFP_BLOCK_SIZE  64
+ 	void		*sfp_data;
+ 	dma_addr_t	sfp_data_dma;
+@@ -4095,6 +4102,7 @@ typedef struct scsi_qla_host {
+ #define FX00_HOST_INFO_RESEND	26
+ #define QPAIR_ONLINE_CHECK_NEEDED	27
+ #define SET_ZIO_THRESHOLD_NEEDED	28
++#define DETECT_SFP_CHANGE	29
+ 
+ 	unsigned long	pci_flags;
+ #define PFLG_DISCONNECTED	0	/* PCI device removed */
+@@ -4378,6 +4386,88 @@ enum nexus_wait_type {
+ 	WAIT_LUN,
+ };
+ 
++/* Refer to SNIA SFF 8247 */
++struct sff_8247_a0 {
++	u8 txid;	/* transceiver id */
++	u8 ext_txid;
++	u8 connector;
++	/* compliance code */
++	u8 eth_infi_cc3;	/* ethernet, inifiband */
++	u8 sonet_cc4[2];
++	u8 eth_cc6;
++	/* link length */
++#define FC_LL_VL BIT_7	/* very long */
++#define FC_LL_S  BIT_6	/* Short */
++#define FC_LL_I  BIT_5	/* Intermidiate*/
++#define FC_LL_L  BIT_4	/* Long */
++#define FC_LL_M  BIT_3	/* Medium */
++#define FC_LL_SA BIT_2	/* ShortWave laser */
++#define FC_LL_LC BIT_1	/* LongWave laser */
++#define FC_LL_EL BIT_0	/* Electrical inter enclosure */
++	u8 fc_ll_cc7;
++	/* FC technology */
++#define FC_TEC_EL BIT_7	/* Electrical inter enclosure */
++#define FC_TEC_SN BIT_6	/* short wave w/o OFC */
++#define FC_TEC_SL BIT_5	/* short wave with OFC */
++#define FC_TEC_LL BIT_4	/* Longwave Laser */
++#define FC_TEC_ACT BIT_3	/* Active cable */
++#define FC_TEC_PAS BIT_2	/* Passive cable */
++	u8 fc_tec_cc8;
++	/* Transmission Media */
++#define FC_MED_TW BIT_7	/* Twin Ax */
++#define FC_MED_TP BIT_6	/* Twited Pair */
++#define FC_MED_MI BIT_5	/* Min Coax */
++#define FC_MED_TV BIT_4	/* Video Coax */
++#define FC_MED_M6 BIT_3	/* Multimode, 62.5um */
++#define FC_MED_M5 BIT_2	/* Multimode, 50um */
++#define FC_MED_SM BIT_0	/* Single Mode */
++	u8 fc_med_cc9;
++	/* speed FC_SP_12: 12*100M = 1200 MB/s */
++#define FC_SP_12 BIT_7
++#define FC_SP_8  BIT_6
++#define FC_SP_16 BIT_5
++#define FC_SP_4  BIT_4
++#define FC_SP_32 BIT_3
++#define FC_SP_2  BIT_2
++#define FC_SP_1  BIT_0
++	u8 fc_sp_cc10;
++	u8 encode;
++	u8 bitrate;
++	u8 rate_id;
++	u8 length_km;		/* offset 14/eh */
++	u8 length_100m;
++	u8 length_50um_10m;
++	u8 length_62um_10m;
++	u8 length_om4_10m;
++	u8 length_om3_10m;
++#define SFF_VEN_NAME_LEN 16
++	u8 vendor_name[SFF_VEN_NAME_LEN];	/* offset 20/14h */
++	u8 tx_compat;
++	u8 vendor_oui[3];
++#define SFF_PART_NAME_LEN 16
++	u8 vendor_pn[SFF_PART_NAME_LEN];	/* part number */
++	u8 vendor_rev[4];
++	u8 wavelength[2];
++	u8 resv;
++	u8 cc_base;
++	u8 options[2];	/* offset 64 */
++	u8 br_max;
++	u8 br_min;
++	u8 vendor_sn[16];
++	u8 date_code[8];
++	u8 diag;
++	u8 enh_options;
++	u8 sff_revision;
++	u8 cc_ext;
++	u8 vendor_specific[32];
++	u8 resv2[128];
++};
++
++#define AUTO_DETECT_SFP_SUPPORT(_vha)\
++	(ql2xautodetectsfp && !_vha->vp_idx &&		\
++	(IS_QLA25XX(_vha->hw) || IS_QLA81XX(_vha->hw) ||\
++	IS_QLA83XX(_vha->hw) || IS_QLA27XX(_vha->hw)))
++
+ #define USER_CTRL_IRQ(_ha) (ql2xuctrlirq && QLA_TGT_MODE_ENABLED() && \
+ 	(IS_QLA27XX(_ha) || IS_QLA83XX(_ha)))
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index f614c37efc9c..3aada5dd597f 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -105,6 +105,7 @@ int qla24xx_async_notify_ack(scsi_qla_host_t *, fc_port_t *,
+ int qla24xx_post_newsess_work(struct scsi_qla_host *, port_id_t *, u8 *,
+     void *);
+ int qla24xx_fcport_handle_login(struct scsi_qla_host *, fc_port_t *);
++int qla24xx_detect_sfp(scsi_qla_host_t *vha);
+ 
+ /*
+  * Global Data in qla_os.c source file.
+@@ -142,6 +143,7 @@ extern int ql2xfwholdabts;
+ extern int ql2xmvasynctoatio;
+ extern int ql2xuctrlirq;
+ extern int ql2xnvmeenable;
++extern int ql2xautodetectsfp;
+ 
+ extern int qla2x00_loop_reset(scsi_qla_host_t *);
+ extern void qla2x00_abort_all_cmds(scsi_qla_host_t *, int);
+@@ -796,6 +798,7 @@ extern char *qdev_state(uint32_t);
+ extern void qla82xx_clear_pending_mbx(scsi_qla_host_t *);
+ extern int qla82xx_read_temperature(scsi_qla_host_t *);
+ extern int qla8044_read_temperature(scsi_qla_host_t *);
++extern int qla2x00_read_sfp_dev(struct scsi_qla_host *, char *, int);
+ 
+ /* BSG related functions */
+ extern int qla24xx_bsg_request(struct bsg_job *);
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index 8f84cedab853..b380a7c97d5b 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -2823,6 +2823,147 @@ qla2x00_alloc_outstanding_cmds(struct qla_hw_data *ha, struct req_que *req)
+ 	return QLA_SUCCESS;
+ }
+ 
++#define PRINT_FIELD(_field, _flag, _str) {		\
++	if (a0->_field & _flag) {\
++		if (p) {\
++			strcat(ptr, "|");\
++			ptr++;\
++			leftover--;\
++		} \
++		len = snprintf(ptr, leftover, "%s", _str);	\
++		p = 1;\
++		leftover -= len;\
++		ptr += len; \
++	} \
++}
++
++static void qla2xxx_print_sfp_info(struct scsi_qla_host *vha)
++{
++#define STR_LEN 64
++	struct sff_8247_a0 *a0 = (struct sff_8247_a0 *)vha->hw->sfp_data;
++	u8 str[STR_LEN], *ptr, p;
++	int leftover, len;
++
++	memset(str, 0, STR_LEN);
++	snprintf(str, SFF_VEN_NAME_LEN+1, a0->vendor_name);
++	ql_dbg(ql_dbg_init, vha, 0x015a,
++	    "SFP MFG Name: %s\n", str);
++
++	memset(str, 0, STR_LEN);
++	snprintf(str, SFF_PART_NAME_LEN+1, a0->vendor_pn);
++	ql_dbg(ql_dbg_init, vha, 0x015c,
++	    "SFP Part Name: %s\n", str);
++
++	/* media */
++	memset(str, 0, STR_LEN);
++	ptr = str;
++	leftover = STR_LEN;
++	p = len = 0;
++	PRINT_FIELD(fc_med_cc9, FC_MED_TW, "Twin AX");
++	PRINT_FIELD(fc_med_cc9, FC_MED_TP, "Twisted Pair");
++	PRINT_FIELD(fc_med_cc9, FC_MED_MI, "Min Coax");
++	PRINT_FIELD(fc_med_cc9, FC_MED_TV, "Video Coax");
++	PRINT_FIELD(fc_med_cc9, FC_MED_M6, "MultiMode 62.5um");
++	PRINT_FIELD(fc_med_cc9, FC_MED_M5, "MultiMode 50um");
++	PRINT_FIELD(fc_med_cc9, FC_MED_SM, "SingleMode");
++	ql_dbg(ql_dbg_init, vha, 0x0160,
++	    "SFP Media: %s\n", str);
++
++	/* link length */
++	memset(str, 0, STR_LEN);
++	ptr = str;
++	leftover = STR_LEN;
++	p = len = 0;
++	PRINT_FIELD(fc_ll_cc7, FC_LL_VL, "Very Long");
++	PRINT_FIELD(fc_ll_cc7, FC_LL_S, "Short");
++	PRINT_FIELD(fc_ll_cc7, FC_LL_I, "Intermediate");
++	PRINT_FIELD(fc_ll_cc7, FC_LL_L, "Long");
++	PRINT_FIELD(fc_ll_cc7, FC_LL_M, "Medium");
++	ql_dbg(ql_dbg_init, vha, 0x0196,
++	    "SFP Link Length: %s\n", str);
++
++	memset(str, 0, STR_LEN);
++	ptr = str;
++	leftover = STR_LEN;
++	p = len = 0;
++	PRINT_FIELD(fc_ll_cc7, FC_LL_SA, "Short Wave (SA)");
++	PRINT_FIELD(fc_ll_cc7, FC_LL_LC, "Long Wave(LC)");
++	PRINT_FIELD(fc_tec_cc8, FC_TEC_SN, "Short Wave (SN)");
++	PRINT_FIELD(fc_tec_cc8, FC_TEC_SL, "Short Wave (SL)");
++	PRINT_FIELD(fc_tec_cc8, FC_TEC_LL, "Long Wave (LL)");
++	ql_dbg(ql_dbg_init, vha, 0x016e,
++	    "SFP FC Link Tech: %s\n", str);
++
++	if (a0->length_km)
++		ql_dbg(ql_dbg_init, vha, 0x016f,
++		    "SFP Distant: %d km\n", a0->length_km);
++	if (a0->length_100m)
++		ql_dbg(ql_dbg_init, vha, 0x0170,
++		    "SFP Distant: %d m\n", a0->length_100m*100);
++	if (a0->length_50um_10m)
++		ql_dbg(ql_dbg_init, vha, 0x0189,
++		    "SFP Distant (WL=50um): %d m\n", a0->length_50um_10m * 10);
++	if (a0->length_62um_10m)
++		ql_dbg(ql_dbg_init, vha, 0x018a,
++		  "SFP Distant (WL=62.5um): %d m\n", a0->length_62um_10m * 10);
++	if (a0->length_om4_10m)
++		ql_dbg(ql_dbg_init, vha, 0x0194,
++		    "SFP Distant (OM4): %d m\n", a0->length_om4_10m * 10);
++	if (a0->length_om3_10m)
++		ql_dbg(ql_dbg_init, vha, 0x0195,
++		    "SFP Distant (OM3): %d m\n", a0->length_om3_10m * 10);
++}
++
++
++/*
++ * Return Code:
++ *   QLA_SUCCESS: no action
++ *   QLA_INTERFACE_ERROR: SFP is not there.
++ *   QLA_FUNCTION_FAILED: detected New SFP
++ */
++int
++qla24xx_detect_sfp(scsi_qla_host_t *vha)
++{
++	int rc = QLA_SUCCESS;
++	struct sff_8247_a0 *a;
++	struct qla_hw_data *ha = vha->hw;
++
++	if (!AUTO_DETECT_SFP_SUPPORT(vha))
++		goto out;
++
++	rc = qla2x00_read_sfp_dev(vha, NULL, 0);
++	if (rc)
++		goto out;
++
++	a = (struct sff_8247_a0 *)vha->hw->sfp_data;
++	qla2xxx_print_sfp_info(vha);
++
++	if (a->fc_ll_cc7 & FC_LL_VL || a->fc_ll_cc7 & FC_LL_L) {
++		/* long range */
++		ha->flags.detected_lr_sfp = 1;
++
++		if (a->length_km > 5 || a->length_100m > 50)
++			ha->long_range_distance = LR_DISTANCE_10K;
++		else
++			ha->long_range_distance = LR_DISTANCE_5K;
++
++		if (ha->flags.detected_lr_sfp != ha->flags.using_lr_setting)
++			ql_dbg(ql_dbg_async, vha, 0x507b,
++			    "Detected Long Range SFP.\n");
++	} else {
++		/* short range */
++		ha->flags.detected_lr_sfp = 0;
++		if (ha->flags.using_lr_setting)
++			ql_dbg(ql_dbg_async, vha, 0x5084,
++			    "Detected Short Range SFP.\n");
++	}
++
++	if (!vha->flags.init_done)
++		rc = QLA_SUCCESS;
++out:
++	return rc;
++}
++
+ /**
+  * qla2x00_setup_chip() - Load and start RISC firmware.
+  * @ha: HA context
+@@ -2879,6 +3020,8 @@ qla2x00_setup_chip(scsi_qla_host_t *vha)
+ 			rval = qla2x00_execute_fw(vha, srisc_address);
+ 			/* Retrieve firmware information. */
+ 			if (rval == QLA_SUCCESS) {
++				qla24xx_detect_sfp(vha);
++
+ 				rval = qla2x00_set_exlogins_buffer(vha);
+ 				if (rval != QLA_SUCCESS)
+ 					goto failed;
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index d0ca1be537d7..eb43fc8be758 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -801,6 +801,11 @@ qla2x00_async_event(scsi_qla_host_t *vha, struct rsp_que *rsp, uint16_t *mb)
+ 
+ 		vha->flags.management_server_logged_in = 0;
+ 		qla2x00_post_aen_work(vha, FCH_EVT_LINKUP, ha->link_data_rate);
++
++		if (AUTO_DETECT_SFP_SUPPORT(vha)) {
++			set_bit(DETECT_SFP_CHANGE, &vha->dpc_flags);
++			qla2xxx_wake_dpc(vha);
++		}
+ 		break;
+ 
+ 	case MBA_LOOP_DOWN:		/* Loop Down Event */
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index f101aaa5254b..52cb9882bf31 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -57,6 +57,7 @@ static struct rom_cmd {
+ 	{ MBC_INITIALIZE_MULTIQ },
+ 	{ MBC_IOCB_COMMAND_A64 },
+ 	{ MBC_GET_ADAPTER_LOOP_ID },
++	{ MBC_READ_SFP },
+ };
+ 
+ static int is_rom_cmd(uint16_t cmd)
+@@ -598,13 +599,29 @@ qla2x00_execute_fw(scsi_qla_host_t *vha, uint32_t risc_addr)
+ 		mcp->mb[1] = MSW(risc_addr);
+ 		mcp->mb[2] = LSW(risc_addr);
+ 		mcp->mb[3] = 0;
++		mcp->mb[4] = 0;
+ 		if (IS_QLA25XX(ha) || IS_QLA81XX(ha) || IS_QLA83XX(ha) ||
+ 		    IS_QLA27XX(ha)) {
+-			struct nvram_81xx *nv = ha->nvram;
+-			mcp->mb[4] = (nv->enhanced_features &
+-			    EXTENDED_BB_CREDITS);
+-		} else
+-			mcp->mb[4] = 0;
++			if (ql2xautodetectsfp) {
++				if (ha->flags.detected_lr_sfp) {
++					mcp->mb[4] |= EXTENDED_BB_CREDITS;
++					if (IS_QLA27XX(ha))
++						mcp->mb[4] |=
++					(u16)ha->long_range_distance << 12;
++					ha->flags.using_lr_setting = 1;
++				}
++			} else {
++				struct nvram_81xx *nv = ha->nvram;
++
++				if (nv->enhanced_features &
++				    EXTENDED_BB_CREDITS) {
++					mcp->mb[4] |= EXTENDED_BB_CREDITS;
++					ha->flags.using_lr_setting = 1;
++				}
++			}
++		} else {
++			ha->flags.using_lr_setting = 0;
++		}
+ 
+ 		if (ql2xnvmeenable && IS_QLA27XX(ha))
+ 			mcp->mb[4] |= NVME_ENABLE_FLAG;
+@@ -4585,6 +4602,10 @@ qla2x00_read_sfp(scsi_qla_host_t *vha, dma_addr_t sfp_dma, uint8_t *sfp,
+ 	if (rval != QLA_SUCCESS) {
+ 		ql_dbg(ql_dbg_mbx, vha, 0x10e9,
+ 		    "Failed=%x mb[0]=%x.\n", rval, mcp->mb[0]);
++		if (mcp->mb[0] == MBS_COMMAND_ERROR &&
++		    mcp->mb[1] == 0x22)
++			/* sfp is not there */
++			rval = QLA_INTERFACE_ERROR;
+ 	} else {
+ 		ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10ea,
+ 		    "Done %s.\n", __func__);
+@@ -6133,3 +6154,55 @@ int qla27xx_get_zio_threshold(scsi_qla_host_t *vha, uint16_t *value)
+ 
+ 	return rval;
+ }
++
++int
++qla2x00_read_sfp_dev(struct scsi_qla_host *vha, char *buf, int count)
++{
++	struct qla_hw_data *ha = vha->hw;
++	uint16_t iter, addr, offset;
++	dma_addr_t phys_addr;
++	int rval, c;
++	u8 *sfp_data;
++
++	memset(ha->sfp_data, 0, SFP_DEV_SIZE);
++	addr = 0xa0;
++	phys_addr = ha->sfp_data_dma;
++	sfp_data = ha->sfp_data;
++	offset = c = 0;
++
++	for (iter = 0; iter < SFP_DEV_SIZE / SFP_BLOCK_SIZE; iter++) {
++		if (iter == 4) {
++			/* Skip to next device address. */
++			addr = 0xa2;
++			offset = 0;
++		}
++
++		rval = qla2x00_read_sfp(vha, phys_addr, sfp_data,
++		    addr, offset, SFP_BLOCK_SIZE, BIT_1);
++		if (rval != QLA_SUCCESS) {
++			ql_log(ql_log_warn, vha, 0x706d,
++			    "Unable to read SFP data (%x/%x/%x).\n", rval,
++			    addr, offset);
++
++			return rval;
++		}
++
++		if (buf && (c < count)) {
++			u16 sz;
++
++			if ((count - c) >= SFP_BLOCK_SIZE)
++				sz = SFP_BLOCK_SIZE;
++			else
++				sz = count - c;
++
++			memcpy(buf, sfp_data, sz);
++			buf += SFP_BLOCK_SIZE;
++			c += sz;
++		}
++		phys_addr += SFP_BLOCK_SIZE;
++		sfp_data  += SFP_BLOCK_SIZE;
++		offset += SFP_BLOCK_SIZE;
++	}
++
++	return rval;
++}
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index da352f4fc0df..f12a4f81ba03 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -262,6 +262,12 @@ MODULE_PARM_DESC(ql2xmvasynctoatio,
+ 		"0 (Default). Do not move IOCBs"
+ 		"1 - Move IOCBs.");
+ 
++int ql2xautodetectsfp = 1;
++module_param(ql2xautodetectsfp, int, 0444);
++MODULE_PARM_DESC(ql2xautodetectsfp,
++		 "Detect SFP range and set appropriate distance.\n"
++		 "1 (Default): Enable\n");
++
+ /*
+  * SCSI host template entry points
+  */
+@@ -3330,6 +3336,13 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (test_bit(UNLOADING, &base_vha->dpc_flags))
+ 		return -ENODEV;
+ 
++	if (ha->flags.detected_lr_sfp) {
++		ql_log(ql_log_info, base_vha, 0xffff,
++		    "Reset chip to pick up LR SFP setting\n");
++		set_bit(ISP_ABORT_NEEDED, &base_vha->dpc_flags);
++		qla2xxx_wake_dpc(base_vha);
++	}
++
+ 	return 0;
+ 
+ probe_init_failed:
+@@ -4008,8 +4021,18 @@ qla2x00_mem_alloc(struct qla_hw_data *ha, uint16_t req_len, uint16_t rsp_len,
+ 		    "loop_id_map=%p.\n", ha->loop_id_map);
+ 	}
+ 
++	ha->sfp_data = dma_alloc_coherent(&ha->pdev->dev,
++	    SFP_DEV_SIZE, &ha->sfp_data_dma, GFP_KERNEL);
++	if (!ha->sfp_data) {
++		ql_dbg_pci(ql_dbg_init, ha->pdev, 0x011b,
++		    "Unable to allocate memory for SFP read-data.\n");
++		goto fail_sfp_data;
++	}
++
+ 	return 0;
+ 
++fail_sfp_data:
++	kfree(ha->loop_id_map);
+ fail_loop_id_map:
+ 	dma_pool_free(ha->s_dma_pool, ha->async_pd, ha->async_pd_dma);
+ fail_async_pd:
+@@ -4347,7 +4370,8 @@ qla2x00_mem_free(struct qla_hw_data *ha)
+ 		ha->ct_sns, ha->ct_sns_dma);
+ 
+ 	if (ha->sfp_data)
+-		dma_pool_free(ha->s_dma_pool, ha->sfp_data, ha->sfp_data_dma);
++		dma_free_coherent(&ha->pdev->dev, SFP_DEV_SIZE, ha->sfp_data,
++		    ha->sfp_data_dma);
+ 
+ 	if (ha->ms_iocb)
+ 		dma_pool_free(ha->s_dma_pool, ha->ms_iocb, ha->ms_iocb_dma);
+@@ -5689,6 +5713,16 @@ qla2x00_do_dpc(void *data)
+ 			}
+ 		}
+ 
++		if (test_and_clear_bit(DETECT_SFP_CHANGE,
++			&base_vha->dpc_flags) &&
++		    !test_bit(ISP_ABORT_NEEDED, &base_vha->dpc_flags)) {
++			qla24xx_detect_sfp(base_vha);
++
++			if (ha->flags.detected_lr_sfp !=
++			    ha->flags.using_lr_setting)
++				set_bit(ISP_ABORT_NEEDED, &base_vha->dpc_flags);
++		}
++
+ 		if (test_and_clear_bit(ISP_ABORT_NEEDED,
+ 						&base_vha->dpc_flags)) {
+ 
+-- 
+2.12.3
+
