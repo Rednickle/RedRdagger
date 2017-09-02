@@ -6,8 +6,8 @@ VARIANT=
 OBS_PROJECT=openSUSE:Factory
 OBS_PROJECT_ARM=openSUSE:Factory:ARM
 OBS_PROJECT_PPC=openSUSE:Factory:PowerPC
-IBS_PROJECT=SUSE:Factory:Head
-IBS_PROJECT_ARM=Devel:ARM:Factory
+OBS_PROJECT_S390=openSUSE:Factory:zSystems
+IBS_PROJECT=SUSE:SLE-15:GA
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="openSUSE Tumbleweed"
