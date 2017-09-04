@@ -1,0 +1,176 @@
+From: Tom Lendacky <thomas.lendacky@amd.com>
+Date: Mon, 17 Jul 2017 16:10:10 -0500
+Subject: x86/mm: Add support for early encryption/decryption of memory
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 7f8b7e7f4ccbbd1fb8badddfabd28c955aea87b4
+Patch-mainline: v4.14 or v4.13-rc7 (next release)
+References: fate#322123
+
+Add support to be able to either encrypt or decrypt data in place during
+the early stages of booting the kernel. This does not change the memory
+encryption attribute - it is used for ensuring that data present in either
+an encrypted or decrypted memory area is in the proper state (for example
+the initrd will have been loaded by the boot loader and will not be
+encrypted, but the memory that it resides in is marked as encrypted).
+
+Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brijesh Singh <brijesh.singh@amd.com>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Larry Woodman <lwoodman@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Matt Fleming <matt@codeblueprint.co.uk>
+Cc: Michael S. Tsirkin <mst@redhat.com>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+Cc: kasan-dev@googlegroups.com
+Cc: kvm@vger.kernel.org
+Cc: linux-arch@vger.kernel.org
+Cc: linux-doc@vger.kernel.org
+Cc: linux-efi@vger.kernel.org
+Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/f9968e9432cd6c4b57ef245729be04ff18852225.1500319216.git.thomas.lendacky@amd.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/include/asm/mem_encrypt.h | 10 +++++
+ arch/x86/mm/mem_encrypt.c          | 76 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 86 insertions(+)
+
+diff --git a/arch/x86/include/asm/mem_encrypt.h b/arch/x86/include/asm/mem_encrypt.h
+index dbae7a5a347d..8baa35ba2316 100644
+--- a/arch/x86/include/asm/mem_encrypt.h
++++ b/arch/x86/include/asm/mem_encrypt.h
+@@ -21,6 +21,11 @@
+ 
+ extern unsigned long sme_me_mask;
+ 
++void __init sme_early_encrypt(resource_size_t paddr,
++			      unsigned long size);
++void __init sme_early_decrypt(resource_size_t paddr,
++			      unsigned long size);
++
+ void __init sme_early_init(void);
+ 
+ void __init sme_encrypt_kernel(void);
+@@ -30,6 +35,11 @@
+ 
+ #define sme_me_mask	0UL
+ 
++static inline void __init sme_early_encrypt(resource_size_t paddr,
++					    unsigned long size) { }
++static inline void __init sme_early_decrypt(resource_size_t paddr,
++					    unsigned long size) { }
++
+ static inline void __init sme_early_init(void) { }
+ 
+ static inline void __init sme_encrypt_kernel(void) { }
+diff --git a/arch/x86/mm/mem_encrypt.c b/arch/x86/mm/mem_encrypt.c
+index f973d3dc3802..54bb73c3dd9d 100644
+--- a/arch/x86/mm/mem_encrypt.c
++++ b/arch/x86/mm/mem_encrypt.c
+@@ -14,6 +14,9 @@
+ #include <linux/init.h>
+ #include <linux/mm.h>
+ 
++#include <asm/tlbflush.h>
++#include <asm/fixmap.h>
++
+ /*
+  * Since SME related variables are set early in the boot process they must
+  * reside in the .data section so as not to be zeroed out when the .bss
+@@ -22,6 +25,79 @@
+ unsigned long sme_me_mask __section(.data) = 0;
+ EXPORT_SYMBOL_GPL(sme_me_mask);
+ 
++/* Buffer used for early in-place encryption by BSP, no locking needed */
++static char sme_early_buffer[PAGE_SIZE] __aligned(PAGE_SIZE);
++
++/*
++ * This routine does not change the underlying encryption setting of the
++ * page(s) that map this memory. It assumes that eventually the memory is
++ * meant to be accessed as either encrypted or decrypted but the contents
++ * are currently not in the desired state.
++ *
++ * This routine follows the steps outlined in the AMD64 Architecture
++ * Programmer's Manual Volume 2, Section 7.10.8 Encrypt-in-Place.
++ */
++static void __init __sme_early_enc_dec(resource_size_t paddr,
++				       unsigned long size, bool enc)
++{
++	void *src, *dst;
++	size_t len;
++
++	if (!sme_me_mask)
++		return;
++
++	local_flush_tlb();
++	wbinvd();
++
++	/*
++	 * There are limited number of early mapping slots, so map (at most)
++	 * one page at time.
++	 */
++	while (size) {
++		len = min_t(size_t, sizeof(sme_early_buffer), size);
++
++		/*
++		 * Create mappings for the current and desired format of
++		 * the memory. Use a write-protected mapping for the source.
++		 */
++		src = enc ? early_memremap_decrypted_wp(paddr, len) :
++			    early_memremap_encrypted_wp(paddr, len);
++
++		dst = enc ? early_memremap_encrypted(paddr, len) :
++			    early_memremap_decrypted(paddr, len);
++
++		/*
++		 * If a mapping can't be obtained to perform the operation,
++		 * then eventual access of that area in the desired mode
++		 * will cause a crash.
++		 */
++		BUG_ON(!src || !dst);
++
++		/*
++		 * Use a temporary buffer, of cache-line multiple size, to
++		 * avoid data corruption as documented in the APM.
++		 */
++		memcpy(sme_early_buffer, src, len);
++		memcpy(dst, sme_early_buffer, len);
++
++		early_memunmap(dst, len);
++		early_memunmap(src, len);
++
++		paddr += len;
++		size -= len;
++	}
++}
++
++void __init sme_early_encrypt(resource_size_t paddr, unsigned long size)
++{
++	__sme_early_enc_dec(paddr, size, true);
++}
++
++void __init sme_early_decrypt(resource_size_t paddr, unsigned long size)
++{
++	__sme_early_enc_dec(paddr, size, false);
++}
++
+ void __init sme_early_init(void)
+ {
+ 	unsigned int i;
+
