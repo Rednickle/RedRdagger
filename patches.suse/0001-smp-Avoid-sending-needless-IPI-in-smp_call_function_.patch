@@ -1,0 +1,116 @@
+From 3fc5b3b6a80b2e08a0fec0056208c5dff757e547 Mon Sep 17 00:00:00 2001
+From: Aaron Lu <aaron.lu@intel.com>
+Date: Fri, 19 May 2017 15:53:31 +0800
+Subject: [PATCH] smp: Avoid sending needless IPI in smp_call_function_many()
+Git-commit: 3fc5b3b6a80b2e08a0fec0056208c5dff757e547
+Patch-mainline: v4.14-rc1
+References: bsc#1050549
+
+Inter-Processor-Interrupt(IPI) is needed when a page is unmapped and the
+process' mm_cpumask() shows the process has ever run on other CPUs. page
+migration, page reclaim all need IPIs. The number of IPI needed to send
+to different CPUs is especially large for multi-threaded workload since
+mm_cpumask() is per process.
+
+For smp_call_function_many(), whenever a CPU queues a CSD to a target
+CPU, it will send an IPI to let the target CPU to handle the work.
+This isn't necessary - we need only send IPI when queueing a CSD
+to an empty call_single_queue.
+
+The reason:
+
+flush_smp_call_function_queue() that is called upon a CPU receiving an
+IPI will empty the queue and then handle all of the CSDs there. So if
+the target CPU's call_single_queue is not empty, we know that:
+i.  An IPI for the target CPU has already been sent by 'previous queuers';
+ii. flush_smp_call_function_queue() hasn't emptied that CPU's queue yet.
+Thus, it's safe for us to just queue our CSD there without sending an
+addtional IPI. And for the 'previous queuers', we can limit it to the
+first queuer.
+
+To demonstrate the effect of this patch, a multi-thread workload that
+spawns 80 threads to equally consume 100G memory is used. This is tested
+on a 2 node broadwell-EP which has 44cores/88threads and 32G memory. So
+after 32G memory is used up, page reclaiming starts to happen a lot.
+
+With this patch, IPI number dropped 88% and throughput increased about
+15% for the above workload.
+
+Signed-off-by: Aaron Lu <aaron.lu@intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Huang Ying <ying.huang@intel.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Link: http://lkml.kernel.org/r/20170519075331.GE2084@aaronlu.sh.intel.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+
+---
+ kernel/smp.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/smp.c b/kernel/smp.c
+index a817769b53c0..76d16fe3c427 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -30,6 +30,7 @@ enum {
+ struct call_function_data {
+ 	struct call_single_data	__percpu *csd;
+ 	cpumask_var_t		cpumask;
++	cpumask_var_t		cpumask_ipi;
+ };
+ 
+ static DEFINE_PER_CPU_SHARED_ALIGNED(struct call_function_data, cfd_data);
+@@ -45,9 +46,15 @@ int smpcfd_prepare_cpu(unsigned int cpu)
+ 	if (!zalloc_cpumask_var_node(&cfd->cpumask, GFP_KERNEL,
+ 				     cpu_to_node(cpu)))
+ 		return -ENOMEM;
++	if (!zalloc_cpumask_var_node(&cfd->cpumask_ipi, GFP_KERNEL,
++				     cpu_to_node(cpu))) {
++		free_cpumask_var(cfd->cpumask);
++		return -ENOMEM;
++	}
+ 	cfd->csd = alloc_percpu(struct call_single_data);
+ 	if (!cfd->csd) {
+ 		free_cpumask_var(cfd->cpumask);
++		free_cpumask_var(cfd->cpumask_ipi);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -59,6 +66,7 @@ int smpcfd_dead_cpu(unsigned int cpu)
+ 	struct call_function_data *cfd = &per_cpu(cfd_data, cpu);
+ 
+ 	free_cpumask_var(cfd->cpumask);
++	free_cpumask_var(cfd->cpumask_ipi);
+ 	free_percpu(cfd->csd);
+ 	return 0;
+ }
+@@ -434,6 +442,7 @@ void smp_call_function_many(const struct cpumask *mask,
+ 	if (unlikely(!cpumask_weight(cfd->cpumask)))
+ 		return;
+ 
++	cpumask_clear(cfd->cpumask_ipi);
+ 	for_each_cpu(cpu, cfd->cpumask) {
+ 		struct call_single_data *csd = per_cpu_ptr(cfd->csd, cpu);
+ 
+@@ -442,11 +451,12 @@ void smp_call_function_many(const struct cpumask *mask,
+ 			csd->flags |= CSD_FLAG_SYNCHRONOUS;
+ 		csd->func = func;
+ 		csd->info = info;
+-		llist_add(&csd->llist, &per_cpu(call_single_queue, cpu));
++		if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
++			cpumask_set_cpu(cpu, cfd->cpumask_ipi);
+ 	}
+ 
+ 	/* Send a message to all CPUs in the map */
+-	arch_send_call_function_ipi_mask(cfd->cpumask);
++	arch_send_call_function_ipi_mask(cfd->cpumask_ipi);
+ 
+ 	if (wait) {
+ 		for_each_cpu(cpu, cfd->cpumask) {
+-- 
+2.12.0
+
