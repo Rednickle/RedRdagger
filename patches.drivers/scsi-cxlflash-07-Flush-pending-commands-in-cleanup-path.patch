@@ -1,0 +1,164 @@
+From a1ea04b3ebd9ae5c1cd5bf48be37aba0d93c1acc Mon Sep 17 00:00:00 2001
+From: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+Date: Wed, 21 Jun 2017 21:14:56 -0500
+Subject: [PATCH] scsi: cxlflash: Flush pending commands in cleanup path
+
+References: fate#322239
+Patch-mainline: v4.13-rc1
+Git-commit: a1ea04b3ebd9ae5c1cd5bf48be37aba0d93c1acc
+
+When the AFU is reset in an error path, pending scsi commands can be
+silently dropped without completion or a formal abort. This puts the onus
+on the cxlflash driver to notify mid-layer and indicating that the command
+can be retried.
+
+Once the card has been quiesced, the hardware send queue lock is acquired
+to prevent any data movement while the pending commands are processed.
+
+Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+Acked-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ drivers/scsi/cxlflash/common.h |  5 +++-
+ drivers/scsi/cxlflash/main.c   | 57 +++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
+index 3eaa3be43d24..11a5b0a10a34 100644
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@ -157,7 +157,9 @@ struct afu_cmd {
+ 	struct list_head queue;
+ 	u32 hwq_index;
+ 
+-	u8 cmd_tmf:1;
++	u8 cmd_tmf:1,
++	   cmd_aborted:1;
++
+ 	struct list_head list;	/* Pending commands link */
+ 
+ 	/* As per the SISLITE spec the IOARCB EA has to be 16-byte aligned.
+@@ -176,6 +178,7 @@ static inline struct afu_cmd *sc_to_afucz(struct scsi_cmnd *sc)
+ 	struct afu_cmd *afuc = sc_to_afuc(sc);
+ 
+ 	memset(afuc, 0, sizeof(*afuc));
++	INIT_LIST_HEAD(&afuc->queue);
+ 	return afuc;
+ }
+ 
+diff --git a/drivers/scsi/cxlflash/main.c b/drivers/scsi/cxlflash/main.c
+index 1446fabe4cf6..0a3de42310ec 100644
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@ -194,6 +194,36 @@ static void cmd_complete(struct afu_cmd *cmd)
+ }
+ 
+ /**
++ * flush_pending_cmds() - flush all pending commands on this hardware queue
++ * @hwq:	Hardware queue to flush.
++ *
++ * The hardware send queue lock associated with this hardware queue must be
++ * held when calling this routine.
++ */
++static void flush_pending_cmds(struct hwq *hwq)
++{
++	struct afu_cmd *cmd, *tmp;
++	struct scsi_cmnd *scp;
++
++	list_for_each_entry_safe(cmd, tmp, &hwq->pending_cmds, list) {
++		/* Bypass command when on a doneq, cmd_complete() will handle */
++		if (!list_empty(&cmd->queue))
++			continue;
++
++		list_del(&cmd->list);
++
++		if (cmd->scp) {
++			scp = cmd->scp;
++			scp->result = (DID_IMM_RETRY << 16);
++			scp->scsi_done(scp);
++		} else {
++			cmd->cmd_aborted = true;
++			complete(&cmd->cevent);
++		}
++	}
++}
++
++/**
+  * context_reset() - reset context via specified register
+  * @hwq:	Hardware queue owning the context to be reset.
+  * @reset_reg:	MMIO register to perform reset.
+@@ -357,6 +387,9 @@ static int wait_resp(struct afu *afu, struct afu_cmd *cmd)
+ 	if (!timeout)
+ 		rc = -ETIMEDOUT;
+ 
++	if (cmd->cmd_aborted)
++		rc = -EAGAIN;
++
+ 	if (unlikely(cmd->sa.ioasc != 0)) {
+ 		dev_err(dev, "%s: cmd %02x failed, ioasc=%08x\n",
+ 			__func__, cmd->rcb.cdb[0], cmd->sa.ioasc);
+@@ -702,6 +735,7 @@ static void term_mc(struct cxlflash_cfg *cfg, u32 index)
+ 	struct afu *afu = cfg->afu;
+ 	struct device *dev = &cfg->dev->dev;
+ 	struct hwq *hwq;
++	ulong lock_flags;
+ 
+ 	if (!afu) {
+ 		dev_err(dev, "%s: returning with NULL afu\n", __func__);
+@@ -719,6 +753,10 @@ static void term_mc(struct cxlflash_cfg *cfg, u32 index)
+ 	if (index != PRIMARY_HWQ)
+ 		WARN_ON(cxl_release_context(hwq->ctx));
+ 	hwq->ctx = NULL;
++
++	spin_lock_irqsave(&hwq->hsq_slock, lock_flags);
++	flush_pending_cmds(hwq);
++	spin_unlock_irqrestore(&hwq->hsq_slock, lock_flags);
+ }
+ 
+ /**
+@@ -2155,7 +2193,7 @@ int cxlflash_afu_sync(struct afu *afu, ctx_hndl_t ctx_hndl_u,
+ 
+ 	mutex_lock(&sync_active);
+ 	atomic_inc(&afu->cmds_active);
+-	buf = kzalloc(sizeof(*cmd) + __alignof__(*cmd) - 1, GFP_KERNEL);
++	buf = kmalloc(sizeof(*cmd) + __alignof__(*cmd) - 1, GFP_KERNEL);
+ 	if (unlikely(!buf)) {
+ 		dev_err(dev, "%s: no memory for command\n", __func__);
+ 		rc = -ENOMEM;
+@@ -2165,6 +2203,8 @@ int cxlflash_afu_sync(struct afu *afu, ctx_hndl_t ctx_hndl_u,
+ 	cmd = (struct afu_cmd *)PTR_ALIGN(buf, __alignof__(*cmd));
+ 
+ retry:
++	memset(cmd, 0, sizeof(*cmd));
++	INIT_LIST_HEAD(&cmd->queue);
+ 	init_completion(&cmd->cevent);
+ 	cmd->parent = afu;
+ 	cmd->hwq_index = hwq->index;
+@@ -2191,11 +2231,20 @@ int cxlflash_afu_sync(struct afu *afu, ctx_hndl_t ctx_hndl_u,
+ 	}
+ 
+ 	rc = wait_resp(afu, cmd);
+-	if (rc == -ETIMEDOUT) {
++	switch (rc) {
++	case -ETIMEDOUT:
+ 		rc = afu->context_reset(hwq);
+-		if (!rc && ++nretry < 2)
++		if (rc) {
++			cxlflash_schedule_async_reset(cfg);
++			break;
++		}
++		/* fall through to retry */
++	case -EAGAIN:
++		if (++nretry < 2)
+ 			goto retry;
+-		cxlflash_schedule_async_reset(cfg);
++		/* fall through to exit */
++	default:
++		break;
+ 	}
+ 
+ out:
+-- 
+2.10.2
+
