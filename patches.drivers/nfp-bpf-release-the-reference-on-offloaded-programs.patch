@@ -1,0 +1,127 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Wed, 21 Jun 2017 18:25:07 -0700
+Subject: nfp: bpf: release the reference on offloaded programs
+Patch-mainline: v4.13-rc1
+Git-commit: 6a8ef5428c9fb5b589c2c912889d157abb50dd61
+References: bsc#1055968
+
+The xdp_prog member of the adapter's data path structure is used
+for XDP in driver mode.  In case a XDP program is loaded with in
+HW-only mode, we need to store it somewhere else.  Add a new XDP
+prog pointer in the main structure and use that when we need to
+know whether any XDP program is loaded, not only a driver mode
+one.  Only release our reference on adapter free instead of
+immediately after netdev unregister to allow offload to be disabled
+first.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/nfp_net.h        |    2 +
+ drivers/net/ethernet/netronome/nfp/nfp_net_common.c |   34 +++++++-------------
+ 2 files changed, 15 insertions(+), 21 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -542,6 +542,7 @@ struct nfp_net_dp {
+  * @rss_key:            RSS secret key
+  * @rss_itbl:           RSS indirection table
+  * @xdp_flags:		Flags with which XDP prog was loaded
++ * @xdp_prog:		XDP prog (for ctrl path, both DRV and HW modes)
+  * @max_r_vecs:		Number of allocated interrupt vectors for RX/TX
+  * @max_tx_rings:       Maximum number of TX rings supported by the Firmware
+  * @max_rx_rings:       Maximum number of RX rings supported by the Firmware
+@@ -592,6 +593,7 @@ struct nfp_net {
+ 	u8 rss_itbl[NFP_NET_CFG_RSS_ITBL_SZ];
+ 
+ 	u32 xdp_flags;
++	struct bpf_prog *xdp_prog;
+ 
+ 	unsigned int max_tx_rings;
+ 	unsigned int max_rx_rings;
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -3277,15 +3277,10 @@ static int
+ nfp_net_xdp_setup_drv(struct nfp_net *nn, struct bpf_prog *prog,
+ 		      struct netlink_ext_ack *extack)
+ {
+-	struct bpf_prog *old_prog = nn->dp.xdp_prog;
+ 	struct nfp_net_dp *dp;
+-	int err;
+ 
+-	if (!prog && !nn->dp.xdp_prog)
+-		return 0;
+-	if (prog && nn->dp.xdp_prog) {
+-		prog = xchg(&nn->dp.xdp_prog, prog);
+-		bpf_prog_put(prog);
++	if (!prog == !nn->dp.xdp_prog) {
++		WRITE_ONCE(nn->dp.xdp_prog, prog);
+ 		return 0;
+ 	}
+ 
+@@ -3299,14 +3294,7 @@ nfp_net_xdp_setup_drv(struct nfp_net *nn
+ 	dp->rx_dma_off = prog ? XDP_PACKET_HEADROOM - nn->dp.rx_offset : 0;
+ 
+ 	/* We need RX reconfig to remap the buffers (BIDIR vs FROM_DEV) */
+-	err = nfp_net_ring_reconfig(nn, dp, extack);
+-	if (err)
+-		return err;
+-
+-	if (old_prog)
+-		bpf_prog_put(old_prog);
+-
+-	return 0;
++	return nfp_net_ring_reconfig(nn, dp, extack);
+ }
+ 
+ static int
+@@ -3316,7 +3304,7 @@ nfp_net_xdp_setup(struct nfp_net *nn, st
+ 	struct bpf_prog *offload_prog;
+ 	int err;
+ 
+-	if (nn->dp.xdp_prog && (flags ^ nn->xdp_flags) & XDP_FLAGS_MODES)
++	if (nn->xdp_prog && (flags ^ nn->xdp_flags) & XDP_FLAGS_MODES)
+ 		return -EBUSY;
+ 
+ 	offload_prog = flags & XDP_FLAGS_DRV_MODE ? NULL : prog;
+@@ -3326,6 +3314,10 @@ nfp_net_xdp_setup(struct nfp_net *nn, st
+ 		return err;
+ 
+ 	nfp_app_xdp_offload(nn->app, nn, offload_prog);
++
++	if (nn->xdp_prog)
++		bpf_prog_put(nn->xdp_prog);
++	nn->xdp_prog = prog;
+ 	nn->xdp_flags = flags;
+ 
+ 	return 0;
+@@ -3340,8 +3332,8 @@ static int nfp_net_xdp(struct net_device
+ 		return nfp_net_xdp_setup(nn, xdp->prog, xdp->flags,
+ 					 xdp->extack);
+ 	case XDP_QUERY_PROG:
+-		xdp->prog_attached = !!nn->dp.xdp_prog;
+-		xdp->prog_id = nn->dp.xdp_prog ? nn->dp.xdp_prog->aux->id : 0;
++		xdp->prog_attached = !!nn->xdp_prog;
++		xdp->prog_id = nn->xdp_prog ? nn->xdp_prog->aux->id : 0;
+ 		return 0;
+ 	default:
+ 		return -EINVAL;
+@@ -3499,6 +3491,9 @@ struct nfp_net *nfp_net_alloc(struct pci
+  */
+ void nfp_net_free(struct nfp_net *nn)
+ {
++	if (nn->xdp_prog)
++		bpf_prog_put(nn->xdp_prog);
++
+ 	if (nn->dp.netdev)
+ 		free_netdev(nn->dp.netdev);
+ 	else
+@@ -3756,7 +3751,4 @@ void nfp_net_clean(struct nfp_net *nn)
+ 		return;
+ 
+ 	unregister_netdev(nn->dp.netdev);
+-
+-	if (nn->dp.xdp_prog)
+-		bpf_prog_put(nn->dp.xdp_prog);
+ }
