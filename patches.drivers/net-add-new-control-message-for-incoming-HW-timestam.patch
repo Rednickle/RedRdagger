@@ -1,0 +1,144 @@
+From: Miroslav Lichvar <mlichvar@redhat.com>
+Date: Fri, 19 May 2017 17:52:38 +0200
+Subject: net: add new control message for incoming HW-timestamped packets
+Patch-mainline: v4.13-rc1
+Git-commit: aad9c8c470f2a8321a99eb053630ce0e199558d6
+References: bsc#1056664 FATE#322185
+
+Add SOF_TIMESTAMPING_OPT_PKTINFO option to request a new control message
+for incoming packets with hardware timestamps. It contains the index of
+the real interface which received the packet and the length of the
+packet at layer 2.
+
+The index is useful with bonding, bridges and other interfaces, where
+IP_PKTINFO doesn't allow applications to determine which PHC made the
+timestamp. With the L2 length (and link speed) it is possible to
+transpose preamble timestamps to trailer timestamps, which are used in
+the NTP protocol.
+
+While this information could be provided by two new socket options
+independently from timestamping, it doesn't look like they would be very
+useful. With this option any performance impact is limited to hardware
+timestamping.
+
+Use dev_get_by_napi_id() to get the device and its index. On kernels
+with disabled CONFIG_NET_RX_BUSY_POLL or drivers not using NAPI, a zero
+index will be returned in the control message.
+
+CC: Richard Cochran <richardcochran@gmail.com>
+Acked-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Miroslav Lichvar <mlichvar@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.com>
+---
+ Documentation/networking/timestamping.txt |   10 ++++++++++
+ include/uapi/asm-generic/socket.h         |    2 ++
+ include/uapi/linux/net_tstamp.h           |   11 ++++++++++-
+ net/socket.c                              |   27 ++++++++++++++++++++++++++-
+ 4 files changed, 48 insertions(+), 2 deletions(-)
+
+--- a/Documentation/networking/timestamping.txt
++++ b/Documentation/networking/timestamping.txt
+@@ -193,6 +193,16 @@ SOF_TIMESTAMPING_OPT_STATS:
+   the transmit timestamps, such as how long a certain block of
+   data was limited by peer's receiver window.
+ 
++SOF_TIMESTAMPING_OPT_PKTINFO:
++
++  Enable the SCM_TIMESTAMPING_PKTINFO control message for incoming
++  packets with hardware timestamps. The message contains struct
++  scm_ts_pktinfo, which supplies the index of the real interface which
++  received the packet and its length at layer 2. A valid (non-zero)
++  interface index will be returned only if CONFIG_NET_RX_BUSY_POLL is
++  enabled and the driver is using NAPI. The struct contains also two
++  other fields, but they are reserved and undefined.
++
+ New applications are encouraged to pass SOF_TIMESTAMPING_OPT_ID to
+ disambiguate timestamps and SOF_TIMESTAMPING_OPT_TSONLY to operate
+ regardless of the setting of sysctl net.core.tstamp_allow_data.
+--- a/include/uapi/asm-generic/socket.h
++++ b/include/uapi/asm-generic/socket.h
+@@ -100,4 +100,6 @@
+ 
+ #define SO_COOKIE		57
+ 
++#define SCM_TIMESTAMPING_PKTINFO	58
++
+ #endif /* __ASM_GENERIC_SOCKET_H */
+--- a/include/uapi/linux/net_tstamp.h
++++ b/include/uapi/linux/net_tstamp.h
+@@ -9,6 +9,7 @@
+ #ifndef _NET_TIMESTAMPING_H
+ #define _NET_TIMESTAMPING_H
+ 
++#include <linux/types.h>
+ #include <linux/socket.h>   /* for SO_TIMESTAMPING */
+ 
+ /* SO_TIMESTAMPING gets an integer bit field comprised of these values */
+@@ -26,8 +27,9 @@ enum {
+ 	SOF_TIMESTAMPING_OPT_CMSG = (1<<10),
+ 	SOF_TIMESTAMPING_OPT_TSONLY = (1<<11),
+ 	SOF_TIMESTAMPING_OPT_STATS = (1<<12),
++	SOF_TIMESTAMPING_OPT_PKTINFO = (1<<13),
+ 
+-	SOF_TIMESTAMPING_LAST = SOF_TIMESTAMPING_OPT_STATS,
++	SOF_TIMESTAMPING_LAST = SOF_TIMESTAMPING_OPT_PKTINFO,
+ 	SOF_TIMESTAMPING_MASK = (SOF_TIMESTAMPING_LAST - 1) |
+ 				 SOF_TIMESTAMPING_LAST
+ };
+@@ -130,4 +132,11 @@ enum hwtstamp_rx_filters {
+ 	HWTSTAMP_FILTER_NTP_ALL,
+ };
+ 
++/* SCM_TIMESTAMPING_PKTINFO control message */
++struct scm_ts_pktinfo {
++	__u32 if_index;
++	__u32 pkt_length;
++	__u32 reserved[2];
++};
++
+ #endif /* _NET_TIMESTAMPING_H */
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -662,6 +662,27 @@ static bool skb_is_err_queue(const struc
+ 	return skb->pkt_type == PACKET_OUTGOING;
+ }
+ 
++static void put_ts_pktinfo(struct msghdr *msg, struct sk_buff *skb)
++{
++	struct scm_ts_pktinfo ts_pktinfo;
++	struct net_device *orig_dev;
++
++	if (!skb_mac_header_was_set(skb))
++		return;
++
++	memset(&ts_pktinfo, 0, sizeof(ts_pktinfo));
++
++	rcu_read_lock();
++	orig_dev = dev_get_by_napi_id(skb_napi_id(skb));
++	if (orig_dev)
++		ts_pktinfo.if_index = orig_dev->ifindex;
++	rcu_read_unlock();
++
++	ts_pktinfo.pkt_length = skb->len - skb_mac_offset(skb);
++	put_cmsg(msg, SOL_SOCKET, SCM_TIMESTAMPING_PKTINFO,
++		 sizeof(ts_pktinfo), &ts_pktinfo);
++}
++
+ /*
+  * called from sock_recv_timestamp() if sock_flag(sk, SOCK_RCVTSTAMP)
+  */
+@@ -699,8 +720,12 @@ void __sock_recv_timestamp(struct msghdr
+ 		empty = 0;
+ 	if (shhwtstamps &&
+ 	    (sk->sk_tsflags & SOF_TIMESTAMPING_RAW_HARDWARE) &&
+-	    ktime_to_timespec_cond(shhwtstamps->hwtstamp, tss.ts + 2))
++	    ktime_to_timespec_cond(shhwtstamps->hwtstamp, tss.ts + 2)) {
+ 		empty = 0;
++		if ((sk->sk_tsflags & SOF_TIMESTAMPING_OPT_PKTINFO) &&
++		    !skb_is_err_queue(skb))
++			put_ts_pktinfo(msg, skb);
++	}
+ 	if (!empty) {
+ 		put_cmsg(msg, SOL_SOCKET,
+ 			 SCM_TIMESTAMPING, sizeof(tss), &tss);
