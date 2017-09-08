@@ -1,0 +1,230 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Fri, 23 Jun 2017 22:11:58 +0200
+Subject: net: store port/representator id in metadata_dst
+Patch-mainline: v4.13-rc1
+Git-commit: 3fcece12bc1b6dcdf0986f2cd9e8f63b1f9b6aa0
+References: bsc#1056787
+
+Switches and modern SR-IOV enabled NICs may multiplex traffic from Port
+representators and control messages over single set of hardware queues.
+Control messages and muxed traffic may need ordered delivery.
+
+Those requirements make it hard to comfortably use TC infrastructure today
+unless we have a way of attaching metadata to skbs at the upper device.
+Because single set of queues is used for many netdevs stopping TC/sched
+queues of all of them reliably is impossible and lower device has to
+retreat to returning NETDEV_TX_BUSY and usually has to take extra locks on
+the fastpath.
+
+This patch attempts to enable port/representative devs to attach metadata
+to skbs which carry port id.  This way representatives can be queueless and
+all queuing can be performed at the lower netdev in the usual way.
+
+Traffic arriving on the port/representative interfaces will be have
+metadata attached and will subsequently be queued to the lower device for
+transmission.  The lower device should recognize the metadata and translate
+it to HW specific format which is most likely either a special header
+inserted before the network headers or descriptor/metadata fields.
+
+Metadata is associated with the lower device by storing the netdev pointer
+along with port id so that if TC decides to redirect or mirror the new
+netdev will not try to interpret it.
+
+This is mostly for SR-IOV devices since switches don't have lower netdevs
+today.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Sridhar Samudrala <sridhar.samudrala@intel.com>
+Signed-off-by: Simon Horman <horms@verge.net.au>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/dst_metadata.h     |   41 ++++++++++++++++++++++++++++++++---------
+ net/core/dst.c                 |   15 ++++++++++-----
+ net/core/filter.c              |    1 +
+ net/ipv4/ip_tunnel_core.c      |    6 ++++--
+ net/openvswitch/flow_netlink.c |    4 +++-
+ 5 files changed, 50 insertions(+), 17 deletions(-)
+
+--- a/include/net/dst_metadata.h
++++ b/include/net/dst_metadata.h
+@@ -5,10 +5,22 @@
+ #include <net/ip_tunnels.h>
+ #include <net/dst.h>
+ 
++enum metadata_type {
++	METADATA_IP_TUNNEL,
++	METADATA_HW_PORT_MUX,
++};
++
++struct hw_port_info {
++	struct net_device *lower_dev;
++	u32 port_id;
++};
++
+ struct metadata_dst {
+ 	struct dst_entry		dst;
++	enum metadata_type		type;
+ 	union {
+ 		struct ip_tunnel_info	tun_info;
++		struct hw_port_info	port_info;
+ 	} u;
+ };
+ 
+@@ -27,7 +39,7 @@ static inline struct ip_tunnel_info *skb
+ 	struct metadata_dst *md_dst = skb_metadata_dst(skb);
+ 	struct dst_entry *dst;
+ 
+-	if (md_dst)
++	if (md_dst && md_dst->type == METADATA_IP_TUNNEL)
+ 		return &md_dst->u.tun_info;
+ 
+ 	dst = skb_dst(skb);
+@@ -55,22 +67,33 @@ static inline int skb_metadata_dst_cmp(c
+ 	a = (const struct metadata_dst *) skb_dst(skb_a);
+ 	b = (const struct metadata_dst *) skb_dst(skb_b);
+ 
+-	if (!a != !b || a->u.tun_info.options_len != b->u.tun_info.options_len)
++	if (!a != !b || a->type != b->type)
+ 		return 1;
+ 
+-	return memcmp(&a->u.tun_info, &b->u.tun_info,
+-		      sizeof(a->u.tun_info) + a->u.tun_info.options_len);
++	switch (a->type) {
++	case METADATA_HW_PORT_MUX:
++		return memcmp(&a->u.port_info, &b->u.port_info,
++			      sizeof(a->u.port_info));
++	case METADATA_IP_TUNNEL:
++		return memcmp(&a->u.tun_info, &b->u.tun_info,
++			      sizeof(a->u.tun_info) +
++					 a->u.tun_info.options_len);
++	default:
++		return 1;
++	}
+ }
+ 
+ void metadata_dst_free(struct metadata_dst *);
+-struct metadata_dst *metadata_dst_alloc(u8 optslen, gfp_t flags);
+-struct metadata_dst __percpu *metadata_dst_alloc_percpu(u8 optslen, gfp_t flags);
++struct metadata_dst *metadata_dst_alloc(u8 optslen, enum metadata_type type,
++					gfp_t flags);
++struct metadata_dst __percpu *
++metadata_dst_alloc_percpu(u8 optslen, enum metadata_type type, gfp_t flags);
+ 
+ static inline struct metadata_dst *tun_rx_dst(int md_size)
+ {
+ 	struct metadata_dst *tun_dst;
+ 
+-	tun_dst = metadata_dst_alloc(md_size, GFP_ATOMIC);
++	tun_dst = metadata_dst_alloc(md_size, METADATA_IP_TUNNEL, GFP_ATOMIC);
+ 	if (!tun_dst)
+ 		return NULL;
+ 
+@@ -85,11 +108,11 @@ static inline struct metadata_dst *tun_d
+ 	int md_size;
+ 	struct metadata_dst *new_md;
+ 
+-	if (!md_dst)
++	if (!md_dst || md_dst->type != METADATA_IP_TUNNEL)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	md_size = md_dst->u.tun_info.options_len;
+-	new_md = metadata_dst_alloc(md_size, GFP_ATOMIC);
++	new_md = metadata_dst_alloc(md_size, METADATA_IP_TUNNEL, GFP_ATOMIC);
+ 	if (!new_md)
+ 		return ERR_PTR(-ENOMEM);
+ 
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@ -371,7 +371,9 @@ static int dst_md_discard(struct sk_buff
+ 	return 0;
+ }
+ 
+-static void __metadata_dst_init(struct metadata_dst *md_dst, u8 optslen)
++static void __metadata_dst_init(struct metadata_dst *md_dst,
++				enum metadata_type type, u8 optslen)
++
+ {
+ 	struct dst_entry *dst;
+ 
+@@ -383,9 +385,11 @@ static void __metadata_dst_init(struct m
+ 	dst->output = dst_md_discard_out;
+ 
+ 	memset(dst + 1, 0, sizeof(*md_dst) + optslen - sizeof(*dst));
++	md_dst->type = type;
+ }
+ 
+-struct metadata_dst *metadata_dst_alloc(u8 optslen, gfp_t flags)
++struct metadata_dst *metadata_dst_alloc(u8 optslen, enum metadata_type type,
++					gfp_t flags)
+ {
+ 	struct metadata_dst *md_dst;
+ 
+@@ -393,7 +397,7 @@ struct metadata_dst *metadata_dst_alloc(
+ 	if (!md_dst)
+ 		return NULL;
+ 
+-	__metadata_dst_init(md_dst, optslen);
++	__metadata_dst_init(md_dst, type, optslen);
+ 
+ 	return md_dst;
+ }
+@@ -407,7 +411,8 @@ void metadata_dst_free(struct metadata_d
+ 	kfree(md_dst);
+ }
+ 
+-struct metadata_dst __percpu *metadata_dst_alloc_percpu(u8 optslen, gfp_t flags)
++struct metadata_dst __percpu *
++metadata_dst_alloc_percpu(u8 optslen, enum metadata_type type, gfp_t flags)
+ {
+ 	int cpu;
+ 	struct metadata_dst __percpu *md_dst;
+@@ -418,7 +423,7 @@ struct metadata_dst __percpu *metadata_d
+ 		return NULL;
+ 
+ 	for_each_possible_cpu(cpu)
+-		__metadata_dst_init(per_cpu_ptr(md_dst, cpu), optslen);
++		__metadata_dst_init(per_cpu_ptr(md_dst, cpu), type, optslen);
+ 
+ 	return md_dst;
+ }
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -2557,6 +2557,7 @@ bpf_get_skb_set_tunnel_proto(enum bpf_fu
+ 		 * that is holding verifier mutex.
+ 		 */
+ 		md_dst = metadata_dst_alloc_percpu(IP_TUNNEL_OPTS_MAX,
++						   METADATA_IP_TUNNEL,
+ 						   GFP_KERNEL);
+ 		if (!md_dst)
+ 			return NULL;
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -134,10 +134,12 @@ struct metadata_dst *iptunnel_metadata_r
+ 	struct metadata_dst *res;
+ 	struct ip_tunnel_info *dst, *src;
+ 
+-	if (!md || md->u.tun_info.mode & IP_TUNNEL_INFO_TX)
++	if (!md || md->type != METADATA_IP_TUNNEL ||
++	    md->u.tun_info.mode & IP_TUNNEL_INFO_TX)
++
+ 		return NULL;
+ 
+-	res = metadata_dst_alloc(0, flags);
++	res = metadata_dst_alloc(0, METADATA_IP_TUNNEL, flags);
+ 	if (!res)
+ 		return NULL;
+ 
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@ -2202,7 +2202,9 @@ static int validate_and_copy_set_tun(con
+ 	if (start < 0)
+ 		return start;
+ 
+-	tun_dst = metadata_dst_alloc(key.tun_opts_len, GFP_KERNEL);
++	tun_dst = metadata_dst_alloc(key.tun_opts_len, METADATA_IP_TUNNEL,
++				     GFP_KERNEL);
++
+ 	if (!tun_dst)
+ 		return -ENOMEM;
+ 
