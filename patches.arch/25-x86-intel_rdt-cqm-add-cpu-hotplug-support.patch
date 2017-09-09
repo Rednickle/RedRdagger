@@ -1,0 +1,220 @@
+From: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+Date: Tue, 25 Jul 2017 14:14:44 -0700
+Subject: x86/intel_rdt/cqm: Add CPU hotplug support
+Git-commit: 895c663ecef16c8138e20a7d5c052e0fcc400241
+Patch-mainline: v4.14-rc1
+References: fate#323965
+
+Resource groups have a per domain directory under "mon_data". Add or
+remove these directories as and when domains come online and go offline.
+Also update the per cpu rmids and cache upon onlining and offlining
+cpus.
+
+Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: ravi.v.shankar@intel.com
+Cc: tony.luck@intel.com
+Cc: fenghua.yu@intel.com
+Cc: peterz@infradead.org
+Cc: eranian@google.com
+Cc: vikas.shivappa@intel.com
+Cc: ak@linux.intel.com
+Cc: davidcc@google.com
+Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-26-git-send-email-vikas.shivappa@linux.intel.com
+
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/kernel/cpu/intel_rdt.c          | 41 +++++++++++++++++++++++-----
+ arch/x86/kernel/cpu/intel_rdt.h          |  9 ++++++
+ arch/x86/kernel/cpu/intel_rdt_rdtgroup.c | 47 ++++++++++++++++++++++++++++++++
+ 3 files changed, 90 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/intel_rdt.c b/arch/x86/kernel/cpu/intel_rdt.c
+index 050ea15259ea..f12bb91b8c66 100644
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@ -479,6 +479,13 @@ static void domain_add_cpu(int cpu, struct rdt_resource *r)
+ 
+ 	cpumask_set_cpu(cpu, &d->cpu_mask);
+ 	list_add_tail(&d->list, add_pos);
++
++	/*
++	 * If resctrl is mounted, add
++	 * per domain monitor data directories.
++	 */
++	if (static_branch_unlikely(&rdt_mon_enable_key))
++		mkdir_mondata_subdir_allrdtgrp(r, d);
+ }
+ 
+ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
+@@ -494,6 +501,12 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
+ 
+ 	cpumask_clear_cpu(cpu, &d->cpu_mask);
+ 	if (cpumask_empty(&d->cpu_mask)) {
++		/*
++		 * If resctrl is mounted, remove all the
++		 * per domain monitor data directories.
++		 */
++		if (static_branch_unlikely(&rdt_mon_enable_key))
++			rmdir_mondata_subdir_allrdtgrp(r, d->id);
+ 		kfree(d->ctrl_val);
+ 		kfree(d->rmid_busy_llc);
+ 		list_del(&d->list);
+@@ -501,13 +514,14 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
+ 	}
+ }
+ 
+-static void clear_closid(int cpu)
++static void clear_closid_rmid(int cpu)
+ {
+ 	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
+ 
+ 	per_cpu(rdt_cpu_default.closid, cpu) = 0;
+ 	state->closid = 0;
+-	wrmsr(IA32_PQR_ASSOC, state->rmid, 0);
++	state->rmid = 0;
++	wrmsr(IA32_PQR_ASSOC, 0, 0);
+ }
+ 
+ static int intel_rdt_online_cpu(unsigned int cpu)
+@@ -515,29 +529,42 @@ static int intel_rdt_online_cpu(unsigned int cpu)
+ 	struct rdt_resource *r;
+ 
+ 	mutex_lock(&rdtgroup_mutex);
+-	for_each_alloc_capable_rdt_resource(r)
++	for_each_capable_rdt_resource(r)
+ 		domain_add_cpu(cpu, r);
+ 	/* The cpu is set in default rdtgroup after online. */
+ 	cpumask_set_cpu(cpu, &rdtgroup_default.cpu_mask);
+-	clear_closid(cpu);
++	clear_closid_rmid(cpu);
+ 	mutex_unlock(&rdtgroup_mutex);
+ 
+ 	return 0;
+ }
+ 
++static void clear_childcpus(struct rdtgroup *r, unsigned int cpu)
++{
++	struct rdtgroup *cr;
++
++	list_for_each_entry(cr, &r->mon.crdtgrp_list, mon.crdtgrp_list) {
++		if (cpumask_test_and_clear_cpu(cpu, &cr->cpu_mask)) {
++			break;
++		}
++	}
++}
++
+ static int intel_rdt_offline_cpu(unsigned int cpu)
+ {
+ 	struct rdtgroup *rdtgrp;
+ 	struct rdt_resource *r;
+ 
+ 	mutex_lock(&rdtgroup_mutex);
+-	for_each_alloc_capable_rdt_resource(r)
++	for_each_capable_rdt_resource(r)
+ 		domain_remove_cpu(cpu, r);
+ 	list_for_each_entry(rdtgrp, &rdt_all_groups, rdtgroup_list) {
+-		if (cpumask_test_and_clear_cpu(cpu, &rdtgrp->cpu_mask))
++		if (cpumask_test_and_clear_cpu(cpu, &rdtgrp->cpu_mask)) {
++			clear_childcpus(rdtgrp, cpu);
+ 			break;
++		}
+ 	}
+-	clear_closid(cpu);
++	clear_closid_rmid(cpu);
+ 	mutex_unlock(&rdtgroup_mutex);
+ 
+ 	return 0;
+diff --git a/arch/x86/kernel/cpu/intel_rdt.h b/arch/x86/kernel/cpu/intel_rdt.h
+index 7fcaa5f82bd0..2660d15d1712 100644
+--- a/arch/x86/kernel/cpu/intel_rdt.h
++++ b/arch/x86/kernel/cpu/intel_rdt.h
+@@ -301,6 +301,11 @@ enum {
+ 	RDT_NUM_RESOURCES,
+ };
+ 
++#define for_each_capable_rdt_resource(r)				      \
++	for (r = rdt_resources_all; r < rdt_resources_all + RDT_NUM_RESOURCES;\
++	     r++)							      \
++		if (r->alloc_capable || r->mon_capable)
++
+ #define for_each_alloc_capable_rdt_resource(r)				      \
+ 	for (r = rdt_resources_all; r < rdt_resources_all + RDT_NUM_RESOURCES;\
+ 	     r++)							      \
+@@ -360,5 +365,9 @@ int rdtgroup_schemata_show(struct kernfs_open_file *of,
+ int rdt_get_mon_l3_config(struct rdt_resource *r);
+ void mon_event_count(void *info);
+ int rdtgroup_mondata_show(struct seq_file *m, void *arg);
++void rmdir_mondata_subdir_allrdtgrp(struct rdt_resource *r,
++				    unsigned int dom_id);
++void mkdir_mondata_subdir_allrdtgrp(struct rdt_resource *r,
++				    struct rdt_domain *d);
+ 
+ #endif /* _ASM_X86_INTEL_RDT_H */
+diff --git a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+index 0a7be9b7a201..ea37b972df4f 100644
+--- a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
++++ b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+@@ -1323,6 +1323,27 @@ static int mon_addfile(struct kernfs_node *parent_kn, const char *name,
+ 	return ret;
+ }
+ 
++/*
++ * Remove all subdirectories of mon_data of ctrl_mon groups
++ * and monitor groups with given domain id.
++ */
++void rmdir_mondata_subdir_allrdtgrp(struct rdt_resource *r, unsigned int dom_id)
++{
++	struct rdtgroup *prgrp, *crgrp;
++	char name[32];
++
++	if (!r->mon_enabled)
++		return;
++
++	list_for_each_entry(prgrp, &rdt_all_groups, rdtgroup_list) {
++		sprintf(name, "mon_%s_%02d", r->name, dom_id);
++		kernfs_remove_by_name(prgrp->mon.mon_data_kn, name);
++
++		list_for_each_entry(crgrp, &prgrp->mon.crdtgrp_list, mon.crdtgrp_list)
++			kernfs_remove_by_name(crgrp->mon.mon_data_kn, name);
++	}
++}
++
+ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ 				struct rdt_domain *d,
+ 				struct rdt_resource *r, struct rdtgroup *prgrp)
+@@ -1369,6 +1390,32 @@ static int mkdir_mondata_subdir(struct kernfs_node *parent_kn,
+ 	return ret;
+ }
+ 
++/*
++ * Add all subdirectories of mon_data for "ctrl_mon" groups
++ * and "monitor" groups with given domain id.
++ */
++void mkdir_mondata_subdir_allrdtgrp(struct rdt_resource *r,
++				    struct rdt_domain *d)
++{
++	struct kernfs_node *parent_kn;
++	struct rdtgroup *prgrp, *crgrp;
++	struct list_head *head;
++
++	if (!r->mon_enabled)
++		return;
++
++	list_for_each_entry(prgrp, &rdt_all_groups, rdtgroup_list) {
++		parent_kn = prgrp->mon.mon_data_kn;
++		mkdir_mondata_subdir(parent_kn, d, r, prgrp);
++
++		head = &prgrp->mon.crdtgrp_list;
++		list_for_each_entry(crgrp, head, mon.crdtgrp_list) {
++			parent_kn = crgrp->mon.mon_data_kn;
++			mkdir_mondata_subdir(parent_kn, d, r, crgrp);
++		}
++	}
++}
++
+ static int mkdir_mondata_subdir_alldom(struct kernfs_node *parent_kn,
+ 				       struct rdt_resource *r,
+ 				       struct rdtgroup *prgrp)
+
