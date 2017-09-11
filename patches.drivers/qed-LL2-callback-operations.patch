@@ -1,0 +1,1553 @@
+From: Michal Kalderon <Michal.Kalderon@cavium.com>
+Date: Fri, 9 Jun 2017 17:13:22 +0300
+Subject: qed*: LL2 callback operations
+Patch-mainline: v4.13-rc1
+Git-commit: 0518c12f1f79dc2f2020836974c577404e42ae89
+References: bsc#1050536 FATE#322898 bsc#1050538 FATE#322897
+
+LL2 today is interrupt driven - when tx/rx completion arrives [or any
+other indication], qed needs to operate on the connection and pass
+the information to the protocol-driver [or internal qed consumer].
+Since we have several flavors of ll2 employeed by the driver,
+each handler needs to do an if-else to determine the right functionality
+to use based on the connection type.
+
+In order to make things more scalable [given that we're going to add
+additional types of ll2 flavors] move the infrastrucutre into using
+a callback-based approach - the callbacks would be provided as part
+of the connection's initialization parameters.
+
+Signed-off-by: Michal Kalderon <Michal.Kalderon@cavium.com>
+Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/qedr/main.c          |    6 
+ drivers/infiniband/hw/qedr/qedr.h          |    2 
+ drivers/infiniband/hw/qedr/qedr_cm.c       |  238 +++++++++++++++++-----
+ drivers/net/ethernet/qlogic/qed/qed.h      |    1 
+ drivers/net/ethernet/qlogic/qed/qed_ll2.c  |  197 +++++++++---------
+ drivers/net/ethernet/qlogic/qed/qed_ll2.h  |   34 +--
+ drivers/net/ethernet/qlogic/qed/qed_roce.c |  304 +----------------------------
+ drivers/net/ethernet/qlogic/qed/qed_roce.h |   43 ----
+ include/linux/qed/qed_ll2_if.h             |   36 +++
+ include/linux/qed/qed_roce_if.h            |   80 ++-----
+ 10 files changed, 384 insertions(+), 557 deletions(-)
+
+--- a/drivers/infiniband/hw/qedr/main.c
++++ b/drivers/infiniband/hw/qedr/main.c
+@@ -886,9 +886,9 @@ static void qedr_mac_address_change(stru
+ 	memcpy(&sgid->raw[8], guid, sizeof(guid));
+ 
+ 	/* Update LL2 */
+-	rc = dev->ops->roce_ll2_set_mac_filter(dev->cdev,
+-					       dev->gsi_ll2_mac_address,
+-					       dev->ndev->dev_addr);
++	rc = dev->ops->ll2_set_mac_filter(dev->cdev,
++					  dev->gsi_ll2_mac_address,
++					  dev->ndev->dev_addr);
+ 
+ 	ether_addr_copy(dev->gsi_ll2_mac_address, dev->ndev->dev_addr);
+ 
+--- a/drivers/infiniband/hw/qedr/qedr.h
++++ b/drivers/infiniband/hw/qedr/qedr.h
+@@ -153,6 +153,8 @@ struct qedr_dev {
+ 	u32			dp_module;
+ 	u8			dp_level;
+ 	u8			num_hwfns;
++	u8			gsi_ll2_handle;
++
+ 	uint			wq_multiplier;
+ 	u8			gsi_ll2_mac_address[ETH_ALEN];
+ 	int			gsi_qp_created;
+--- a/drivers/infiniband/hw/qedr/qedr_cm.c
++++ b/drivers/infiniband/hw/qedr/qedr_cm.c
+@@ -64,9 +64,14 @@ void qedr_store_gsi_qp_cq(struct qedr_de
+ 	dev->gsi_qp = qp;
+ }
+ 
+-void qedr_ll2_tx_cb(void *_qdev, struct qed_roce_ll2_packet *pkt)
++void qedr_ll2_complete_tx_packet(void *cxt,
++				 u8 connection_handle,
++				 void *cookie,
++				 dma_addr_t first_frag_addr,
++				 bool b_last_fragment, bool b_last_packet)
+ {
+-	struct qedr_dev *dev = (struct qedr_dev *)_qdev;
++	struct qedr_dev *dev = (struct qedr_dev *)cxt;
++	struct qed_roce_ll2_packet *pkt = cookie;
+ 	struct qedr_cq *cq = dev->gsi_sqcq;
+ 	struct qedr_qp *qp = dev->gsi_qp;
+ 	unsigned long flags;
+@@ -88,20 +93,26 @@ void qedr_ll2_tx_cb(void *_qdev, struct
+ 		(*cq->ibcq.comp_handler) (&cq->ibcq, cq->ibcq.cq_context);
+ }
+ 
+-void qedr_ll2_rx_cb(void *_dev, struct qed_roce_ll2_packet *pkt,
+-		    struct qed_roce_ll2_rx_params *params)
++void qedr_ll2_complete_rx_packet(void *cxt,
++				 struct qed_ll2_comp_rx_data *data)
+ {
+-	struct qedr_dev *dev = (struct qedr_dev *)_dev;
++	struct qedr_dev *dev = (struct qedr_dev *)cxt;
+ 	struct qedr_cq *cq = dev->gsi_rqcq;
+ 	struct qedr_qp *qp = dev->gsi_qp;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&qp->q_lock, flags);
+ 
+-	qp->rqe_wr_id[qp->rq.gsi_cons].rc = params->rc;
+-	qp->rqe_wr_id[qp->rq.gsi_cons].vlan_id = params->vlan_id;
+-	qp->rqe_wr_id[qp->rq.gsi_cons].sg_list[0].length = pkt->payload[0].len;
+-	ether_addr_copy(qp->rqe_wr_id[qp->rq.gsi_cons].smac, params->smac);
++	qp->rqe_wr_id[qp->rq.gsi_cons].rc = data->u.data_length_error ?
++		-EINVAL : 0;
++	qp->rqe_wr_id[qp->rq.gsi_cons].vlan_id = data->vlan;
++	/* note: length stands for data length i.e. GRH is excluded */
++	qp->rqe_wr_id[qp->rq.gsi_cons].sg_list[0].length =
++		data->length.data_length;
++	*((u32 *)&qp->rqe_wr_id[qp->rq.gsi_cons].smac[0]) =
++		ntohl(data->opaque_data_0);
++	*((u16 *)&qp->rqe_wr_id[qp->rq.gsi_cons].smac[4]) =
++		ntohs((u16)data->opaque_data_1);
+ 
+ 	qedr_inc_sw_gsi_cons(&qp->rq);
+ 
+@@ -111,6 +122,14 @@ void qedr_ll2_rx_cb(void *_dev, struct q
+ 		(*cq->ibcq.comp_handler) (&cq->ibcq, cq->ibcq.cq_context);
+ }
+ 
++void qedr_ll2_release_rx_packet(void *cxt,
++				u8 connection_handle,
++				void *cookie,
++				dma_addr_t rx_buf_addr, bool b_last_packet)
++{
++	/* Do nothing... */
++}
++
+ static void qedr_destroy_gsi_cq(struct qedr_dev *dev,
+ 				struct ib_qp_init_attr *attrs)
+ {
+@@ -159,27 +178,159 @@ static inline int qedr_check_gsi_qp_attr
+ 	return 0;
+ }
+ 
++static int qedr_ll2_post_tx(struct qedr_dev *dev,
++			    struct qed_roce_ll2_packet *pkt)
++{
++	enum qed_ll2_roce_flavor_type roce_flavor;
++	struct qed_ll2_tx_pkt_info ll2_tx_pkt;
++	int rc;
++	int i;
++
++	memset(&ll2_tx_pkt, 0, sizeof(ll2_tx_pkt));
++
++	roce_flavor = (pkt->roce_mode == ROCE_V1) ?
++	    QED_LL2_ROCE : QED_LL2_RROCE;
++
++	if (pkt->roce_mode == ROCE_V2_IPV4)
++		ll2_tx_pkt.enable_ip_cksum = 1;
++
++	ll2_tx_pkt.num_of_bds = 1 /* hdr */  + pkt->n_seg;
++	ll2_tx_pkt.vlan = 0;
++	ll2_tx_pkt.tx_dest = pkt->tx_dest;
++	ll2_tx_pkt.qed_roce_flavor = roce_flavor;
++	ll2_tx_pkt.first_frag = pkt->header.baddr;
++	ll2_tx_pkt.first_frag_len = pkt->header.len;
++	ll2_tx_pkt.cookie = pkt;
++
++	/* tx header */
++	rc = dev->ops->ll2_prepare_tx_packet(dev->rdma_ctx,
++					     dev->gsi_ll2_handle,
++					     &ll2_tx_pkt, 1);
++	if (rc) {
++		/* TX failed while posting header - release resources */
++		dma_free_coherent(&dev->pdev->dev, pkt->header.len,
++				  pkt->header.vaddr, pkt->header.baddr);
++		kfree(pkt);
++
++		DP_ERR(dev, "roce ll2 tx: header failed (rc=%d)\n", rc);
++		return rc;
++	}
++
++	/* tx payload */
++	for (i = 0; i < pkt->n_seg; i++) {
++		rc = dev->ops->ll2_set_fragment_of_tx_packet(
++			dev->rdma_ctx,
++			dev->gsi_ll2_handle,
++			pkt->payload[i].baddr,
++			pkt->payload[i].len);
++
++		if (rc) {
++			/* if failed not much to do here, partial packet has
++			 * been posted we can't free memory, will need to wait
++			 * for completion
++			 */
++			DP_ERR(dev, "ll2 tx: payload failed (rc=%d)\n", rc);
++			return rc;
++		}
++	}
++
++	return 0;
++}
++
++int qedr_ll2_stop(struct qedr_dev *dev)
++{
++	int rc;
++
++	if (dev->gsi_ll2_handle == QED_LL2_UNUSED_HANDLE)
++		return 0;
++
++	/* remove LL2 MAC address filter */
++	rc = dev->ops->ll2_set_mac_filter(dev->cdev,
++					  dev->gsi_ll2_mac_address, NULL);
++
++	rc = dev->ops->ll2_terminate_connection(dev->rdma_ctx,
++						dev->gsi_ll2_handle);
++	if (rc)
++		DP_ERR(dev, "Failed to terminate LL2 connection (rc=%d)\n", rc);
++
++	dev->ops->ll2_release_connection(dev->rdma_ctx, dev->gsi_ll2_handle);
++
++	dev->gsi_ll2_handle = QED_LL2_UNUSED_HANDLE;
++
++	return rc;
++}
++
++int qedr_ll2_start(struct qedr_dev *dev,
++		   struct ib_qp_init_attr *attrs, struct qedr_qp *qp)
++{
++	struct qed_ll2_acquire_data data;
++	struct qed_ll2_cbs cbs;
++	int rc;
++
++	/* configure and start LL2 */
++	cbs.rx_comp_cb = qedr_ll2_complete_rx_packet;
++	cbs.tx_comp_cb = qedr_ll2_complete_tx_packet;
++	cbs.rx_release_cb = qedr_ll2_release_rx_packet;
++	cbs.tx_release_cb = qedr_ll2_complete_tx_packet;
++	cbs.cookie = dev;
++
++	memset(&data, 0, sizeof(data));
++	data.input.conn_type = QED_LL2_TYPE_ROCE;
++	data.input.mtu = dev->ndev->mtu;
++	data.input.rx_num_desc = attrs->cap.max_recv_wr;
++	data.input.rx_drop_ttl0_flg = true;
++	data.input.rx_vlan_removal_en = false;
++	data.input.tx_num_desc = attrs->cap.max_send_wr;
++	data.input.tx_tc = 0;
++	data.input.tx_dest = QED_LL2_TX_DEST_NW;
++	data.input.ai_err_packet_too_big = QED_LL2_DROP_PACKET;
++	data.input.ai_err_no_buf = QED_LL2_DROP_PACKET;
++	data.input.gsi_enable = 1;
++	data.p_connection_handle = &dev->gsi_ll2_handle;
++	data.cbs = &cbs;
++
++	rc = dev->ops->ll2_acquire_connection(dev->rdma_ctx, &data);
++	if (rc) {
++		DP_ERR(dev,
++		       "ll2 start: failed to acquire LL2 connection (rc=%d)\n",
++		       rc);
++		return rc;
++	}
++
++	rc = dev->ops->ll2_establish_connection(dev->rdma_ctx,
++						dev->gsi_ll2_handle);
++	if (rc) {
++		DP_ERR(dev,
++		       "ll2 start: failed to establish LL2 connection (rc=%d)\n",
++		       rc);
++		goto err1;
++	}
++
++	rc = dev->ops->ll2_set_mac_filter(dev->cdev, NULL, dev->ndev->dev_addr);
++	if (rc)
++		goto err2;
++
++	return 0;
++
++err2:
++	dev->ops->ll2_terminate_connection(dev->rdma_ctx, dev->gsi_ll2_handle);
++err1:
++	dev->ops->ll2_release_connection(dev->rdma_ctx, dev->gsi_ll2_handle);
++
++	return rc;
++}
++
+ struct ib_qp *qedr_create_gsi_qp(struct qedr_dev *dev,
+ 				 struct ib_qp_init_attr *attrs,
+ 				 struct qedr_qp *qp)
+ {
+-	struct qed_roce_ll2_params ll2_params;
+ 	int rc;
+ 
+ 	rc = qedr_check_gsi_qp_attrs(dev, attrs);
+ 	if (rc)
+ 		return ERR_PTR(rc);
+ 
+-	/* configure and start LL2 */
+-	memset(&ll2_params, 0, sizeof(ll2_params));
+-	ll2_params.max_tx_buffers = attrs->cap.max_send_wr;
+-	ll2_params.max_rx_buffers = attrs->cap.max_recv_wr;
+-	ll2_params.cbs.tx_cb = qedr_ll2_tx_cb;
+-	ll2_params.cbs.rx_cb = qedr_ll2_rx_cb;
+-	ll2_params.cb_cookie = (void *)dev;
+-	ll2_params.mtu = dev->ndev->mtu;
+-	ether_addr_copy(ll2_params.mac_address, dev->ndev->dev_addr);
+-	rc = dev->ops->roce_ll2_start(dev->cdev, &ll2_params);
++	rc = qedr_ll2_start(dev, attrs, qp);
+ 	if (rc) {
+ 		DP_ERR(dev, "create gsi qp: failed on ll2 start. rc=%d\n", rc);
+ 		return ERR_PTR(rc);
+@@ -214,7 +365,7 @@ struct ib_qp *qedr_create_gsi_qp(struct
+ err:
+ 	kfree(qp->rqe_wr_id);
+ 
+-	rc = dev->ops->roce_ll2_stop(dev->cdev);
++	rc = qedr_ll2_stop(dev);
+ 	if (rc)
+ 		DP_ERR(dev, "create gsi qp: failed destroy on create\n");
+ 
+@@ -223,15 +374,7 @@ err:
+ 
+ int qedr_destroy_gsi_qp(struct qedr_dev *dev)
+ {
+-	int rc;
+-
+-	rc = dev->ops->roce_ll2_stop(dev->cdev);
+-	if (rc)
+-		DP_ERR(dev, "destroy gsi qp: failed (rc=%d)\n", rc);
+-	else
+-		DP_DEBUG(dev, QEDR_MSG_GSI, "destroy gsi qp: success\n");
+-
+-	return rc;
++	return qedr_ll2_stop(dev);
+ }
+ 
+ #define QEDR_MAX_UD_HEADER_SIZE	(100)
+@@ -421,7 +564,6 @@ int qedr_gsi_post_send(struct ib_qp *ibq
+ {
+ 	struct qed_roce_ll2_packet *pkt = NULL;
+ 	struct qedr_qp *qp = get_qedr_qp(ibqp);
+-	struct qed_roce_ll2_tx_params params;
+ 	struct qedr_dev *dev = qp->dev;
+ 	unsigned long flags;
+ 	int rc;
+@@ -449,8 +591,6 @@ int qedr_gsi_post_send(struct ib_qp *ibq
+ 		goto err;
+ 	}
+ 
+-	memset(&params, 0, sizeof(params));
+-
+ 	spin_lock_irqsave(&qp->q_lock, flags);
+ 
+ 	rc = qedr_gsi_build_packet(dev, qp, wr, &pkt);
+@@ -459,7 +599,8 @@ int qedr_gsi_post_send(struct ib_qp *ibq
+ 		goto err;
+ 	}
+ 
+-	rc = dev->ops->roce_ll2_tx(dev->cdev, pkt, &params);
++	rc = qedr_ll2_post_tx(dev, pkt);
++
+ 	if (!rc) {
+ 		qp->wqe_wr_id[qp->sq.prod].wr_id = wr->wr_id;
+ 		qedr_inc_sw_prod(&qp->sq);
+@@ -467,17 +608,6 @@ int qedr_gsi_post_send(struct ib_qp *ibq
+ 			 "gsi post send: opcode=%d, in_irq=%ld, irqs_disabled=%d, wr_id=%llx\n",
+ 			 wr->opcode, in_irq(), irqs_disabled(), wr->wr_id);
+ 	} else {
+-		if (rc == QED_ROCE_TX_HEAD_FAILURE) {
+-			/* TX failed while posting header - release resources */
+-			dma_free_coherent(&dev->pdev->dev, pkt->header.len,
+-					  pkt->header.vaddr, pkt->header.baddr);
+-			kfree(pkt);
+-		} else if (rc == QED_ROCE_TX_FRAG_FAILURE) {
+-			/* NTD since TX failed while posting a fragment. We will
+-			 * release the resources on TX callback
+-			 */
+-		}
+-
+ 		DP_ERR(dev, "gsi post send: failed to transmit (rc=%d)\n", rc);
+ 		rc = -EAGAIN;
+ 		*bad_wr = wr;
+@@ -504,10 +634,8 @@ int qedr_gsi_post_recv(struct ib_qp *ibq
+ {
+ 	struct qedr_dev *dev = get_qedr_dev(ibqp->device);
+ 	struct qedr_qp *qp = get_qedr_qp(ibqp);
+-	struct qed_roce_ll2_buffer buf;
+ 	unsigned long flags;
+-	int status = 0;
+-	int rc;
++	int rc = 0;
+ 
+ 	if ((qp->state != QED_ROCE_QP_STATE_RTR) &&
+ 	    (qp->state != QED_ROCE_QP_STATE_RTS)) {
+@@ -518,8 +646,6 @@ int qedr_gsi_post_recv(struct ib_qp *ibq
+ 		return -EINVAL;
+ 	}
+ 
+-	memset(&buf, 0, sizeof(buf));
+-
+ 	spin_lock_irqsave(&qp->q_lock, flags);
+ 
+ 	while (wr) {
+@@ -530,10 +656,12 @@ int qedr_gsi_post_recv(struct ib_qp *ibq
+ 			goto err;
+ 		}
+ 
+-		buf.baddr = wr->sg_list[0].addr;
+-		buf.len = wr->sg_list[0].length;
+-
+-		rc = dev->ops->roce_ll2_post_rx_buffer(dev->cdev, &buf, 0, 1);
++		rc = dev->ops->ll2_post_rx_buffer(dev->rdma_ctx,
++						  dev->gsi_ll2_handle,
++						  wr->sg_list[0].addr,
++						  wr->sg_list[0].length,
++						  0 /* cookie */,
++						  1 /* notify_fw */);
+ 		if (rc) {
+ 			DP_ERR(dev,
+ 			       "gsi post recv: failed to post rx buffer (rc=%d)\n",
+@@ -553,7 +681,7 @@ int qedr_gsi_post_recv(struct ib_qp *ibq
+ 
+ 	spin_unlock_irqrestore(&qp->q_lock, flags);
+ 
+-	return status;
++	return rc;
+ err:
+ 	spin_unlock_irqrestore(&qp->q_lock, flags);
+ 	*bad_wr = wr;
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -552,7 +552,6 @@ struct qed_hwfn {
+ #endif
+ 
+ 	struct z_stream_s		*stream;
+-	struct qed_roce_ll2_info	*ll2;
+ };
+ 
+ struct pci_params {
+--- a/drivers/net/ethernet/qlogic/qed/qed_ll2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_ll2.c
+@@ -89,13 +89,14 @@ struct qed_ll2_buffer {
+ 	dma_addr_t phys_addr;
+ };
+ 
+-static void qed_ll2b_complete_tx_packet(struct qed_hwfn *p_hwfn,
++static void qed_ll2b_complete_tx_packet(void *cxt,
+ 					u8 connection_handle,
+ 					void *cookie,
+ 					dma_addr_t first_frag_addr,
+ 					bool b_last_fragment,
+ 					bool b_last_packet)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_dev *cdev = p_hwfn->cdev;
+ 	struct sk_buff *skb = cookie;
+ 
+@@ -164,9 +165,9 @@ static void qed_ll2_kill_buffers(struct
+ 		qed_ll2_dealloc_buffer(cdev, buffer);
+ }
+ 
+-static void qed_ll2b_complete_rx_packet(struct qed_hwfn *p_hwfn,
+-				 struct qed_ll2_comp_rx_data *data)
++void qed_ll2b_complete_rx_packet(void *cxt, struct qed_ll2_comp_rx_data *data)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_ll2_buffer *buffer = data->cookie;
+ 	struct qed_dev *cdev = p_hwfn->cdev;
+ 	dma_addr_t new_phys_addr;
+@@ -327,21 +328,12 @@ static void qed_ll2_txq_flush(struct qed
+ 			b_last_frag =
+ 				p_tx->cur_completing_bd_idx == p_pkt->bd_used;
+ 			tx_frag = p_pkt->bds_set[0].tx_frag;
+-			if (p_ll2_conn->input.gsi_enable)
+-				qed_ll2b_release_tx_gsi_packet(p_hwfn,
+-							       p_ll2_conn->
+-							       my_id,
+-							       p_pkt->cookie,
+-							       tx_frag,
+-							       b_last_frag,
+-							       b_last_packet);
+-			else
+-				qed_ll2b_complete_tx_packet(p_hwfn,
+-							    p_ll2_conn->my_id,
+-							    p_pkt->cookie,
+-							    tx_frag,
+-							    b_last_frag,
+-							    b_last_packet);
++			p_ll2_conn->cbs.tx_release_cb(p_ll2_conn->cbs.cookie,
++						      p_ll2_conn->my_id,
++						      p_pkt->cookie,
++						      tx_frag,
++						      b_last_frag,
++						      b_last_packet);
+ 		}
+ 	}
+ }
+@@ -354,7 +346,6 @@ static int qed_ll2_txq_completion(struct
+ 	struct qed_ll2_tx_packet *p_pkt;
+ 	bool b_last_frag = false;
+ 	unsigned long flags;
+-	dma_addr_t tx_frag;
+ 	int rc = -EINVAL;
+ 
+ 	spin_lock_irqsave(&p_tx->lock, flags);
+@@ -395,19 +386,13 @@ static int qed_ll2_txq_completion(struct
+ 		list_add_tail(&p_pkt->list_entry, &p_tx->free_descq);
+ 
+ 		spin_unlock_irqrestore(&p_tx->lock, flags);
+-		tx_frag = p_pkt->bds_set[0].tx_frag;
+-		if (p_ll2_conn->input.gsi_enable)
+-			qed_ll2b_complete_tx_gsi_packet(p_hwfn,
+-							p_ll2_conn->my_id,
+-							p_pkt->cookie,
+-							tx_frag,
+-							b_last_frag, !num_bds);
+-		else
+-			qed_ll2b_complete_tx_packet(p_hwfn,
+-						    p_ll2_conn->my_id,
+-						    p_pkt->cookie,
+-						    tx_frag,
+-						    b_last_frag, !num_bds);
++
++		p_ll2_conn->cbs.tx_comp_cb(p_ll2_conn->cbs.cookie,
++					   p_ll2_conn->my_id,
++					   p_pkt->cookie,
++					   p_pkt->bds_set[0].tx_frag,
++					   b_last_frag, !num_bds);
++
+ 		spin_lock_irqsave(&p_tx->lock, flags);
+ 	}
+ 
+@@ -418,52 +403,16 @@ out:
+ 	return rc;
+ }
+ 
+-static int
+-qed_ll2_rxq_completion_gsi(struct qed_hwfn *p_hwfn,
+-			   struct qed_ll2_info *p_ll2_info,
+-			   union core_rx_cqe_union *p_cqe,
+-			   unsigned long lock_flags, bool b_last_cqe)
++static void qed_ll2_rxq_parse_gsi(struct qed_hwfn *p_hwfn,
++				  union core_rx_cqe_union *p_cqe,
++				  struct qed_ll2_comp_rx_data *data)
+ {
+-	struct qed_ll2_rx_queue *p_rx = &p_ll2_info->rx_queue;
+-	struct qed_ll2_rx_packet *p_pkt = NULL;
+-	u16 packet_length, parse_flags, vlan;
+-	u32 src_mac_addrhi;
+-	u16 src_mac_addrlo;
+-
+-	if (!list_empty(&p_rx->active_descq))
+-		p_pkt = list_first_entry(&p_rx->active_descq,
+-					 struct qed_ll2_rx_packet, list_entry);
+-	if (!p_pkt) {
+-		DP_NOTICE(p_hwfn,
+-			  "GSI Rx completion but active_descq is empty\n");
+-		return -EIO;
+-	}
+-
+-	list_del(&p_pkt->list_entry);
+-	parse_flags = le16_to_cpu(p_cqe->rx_cqe_gsi.parse_flags.flags);
+-	packet_length = le16_to_cpu(p_cqe->rx_cqe_gsi.data_length);
+-	vlan = le16_to_cpu(p_cqe->rx_cqe_gsi.vlan);
+-	src_mac_addrhi = le32_to_cpu(p_cqe->rx_cqe_gsi.src_mac_addrhi);
+-	src_mac_addrlo = le16_to_cpu(p_cqe->rx_cqe_gsi.src_mac_addrlo);
+-	if (qed_chain_consume(&p_rx->rxq_chain) != p_pkt->rxq_bd)
+-		DP_NOTICE(p_hwfn,
+-			  "Mismatch between active_descq and the LL2 Rx chain\n");
+-	list_add_tail(&p_pkt->list_entry, &p_rx->free_descq);
+-
+-	spin_unlock_irqrestore(&p_rx->lock, lock_flags);
+-	qed_ll2b_complete_rx_gsi_packet(p_hwfn,
+-					p_ll2_info->my_id,
+-					p_pkt->cookie,
+-					p_pkt->rx_buf_addr,
+-					packet_length,
+-					p_cqe->rx_cqe_gsi.data_length_error,
+-					parse_flags,
+-					vlan,
+-					src_mac_addrhi,
+-					src_mac_addrlo, b_last_cqe);
+-	spin_lock_irqsave(&p_rx->lock, lock_flags);
+-
+-	return 0;
++	data->parse_flags = le16_to_cpu(p_cqe->rx_cqe_gsi.parse_flags.flags);
++	data->length.data_length = le16_to_cpu(p_cqe->rx_cqe_gsi.data_length);
++	data->vlan = le16_to_cpu(p_cqe->rx_cqe_gsi.vlan);
++	data->opaque_data_0 = le32_to_cpu(p_cqe->rx_cqe_gsi.src_mac_addrhi);
++	data->opaque_data_1 = le16_to_cpu(p_cqe->rx_cqe_gsi.src_mac_addrlo);
++	data->u.data_length_error = p_cqe->rx_cqe_gsi.data_length_error;
+ }
+ 
+ static void qed_ll2_rxq_parse_reg(struct qed_hwfn *p_hwfn,
+@@ -501,7 +450,10 @@ qed_ll2_rxq_handle_completion(struct qed
+ 	}
+ 	list_del(&p_pkt->list_entry);
+ 
+-	qed_ll2_rxq_parse_reg(p_hwfn, p_cqe, &data);
++	if (p_cqe->rx_cqe_sp.type == CORE_RX_CQE_TYPE_REGULAR)
++		qed_ll2_rxq_parse_reg(p_hwfn, p_cqe, &data);
++	else
++		qed_ll2_rxq_parse_gsi(p_hwfn, p_cqe, &data);
+ 	if (qed_chain_consume(&p_rx->rxq_chain) != p_pkt->rxq_bd)
+ 		DP_NOTICE(p_hwfn,
+ 			  "Mismatch between active_descq and the LL2 Rx chain\n");
+@@ -514,7 +466,8 @@ qed_ll2_rxq_handle_completion(struct qed
+ 	data.b_last_packet = b_last_cqe;
+ 
+ 	spin_unlock_irqrestore(&p_rx->lock, *p_lock_flags);
+-	qed_ll2b_complete_rx_packet(p_hwfn, &data);
++	p_ll2_conn->cbs.rx_comp_cb(p_ll2_conn->cbs.cookie, &data);
++
+ 	spin_lock_irqsave(&p_rx->lock, *p_lock_flags);
+ 
+ 	return 0;
+@@ -552,9 +505,6 @@ static int qed_ll2_rxq_completion(struct
+ 			rc = -EINVAL;
+ 			break;
+ 		case CORE_RX_CQE_TYPE_GSI_OFFLOAD:
+-			rc = qed_ll2_rxq_completion_gsi(p_hwfn, p_ll2_conn,
+-							cqe, flags, b_last_cqe);
+-			break;
+ 		case CORE_RX_CQE_TYPE_REGULAR:
+ 			rc = qed_ll2_rxq_handle_completion(p_hwfn, p_ll2_conn,
+ 							   cqe, &flags,
+@@ -1244,6 +1194,23 @@ out:
+ 	return rc;
+ }
+ 
++static int
++qed_ll2_set_cbs(struct qed_ll2_info *p_ll2_info, const struct qed_ll2_cbs *cbs)
++{
++	if (!cbs || (!cbs->rx_comp_cb ||
++		     !cbs->rx_release_cb ||
++		     !cbs->tx_comp_cb || !cbs->tx_release_cb || !cbs->cookie))
++		return -EINVAL;
++
++	p_ll2_info->cbs.rx_comp_cb = cbs->rx_comp_cb;
++	p_ll2_info->cbs.rx_release_cb = cbs->rx_release_cb;
++	p_ll2_info->cbs.tx_comp_cb = cbs->tx_comp_cb;
++	p_ll2_info->cbs.tx_release_cb = cbs->tx_release_cb;
++	p_ll2_info->cbs.cookie = cbs->cookie;
++
++	return 0;
++}
++
+ static enum core_error_handle
+ qed_ll2_get_error_choice(enum qed_ll2_error_handle err)
+ {
+@@ -1259,9 +1226,9 @@ qed_ll2_get_error_choice(enum qed_ll2_er
+ 	}
+ }
+ 
+-int qed_ll2_acquire_connection(struct qed_hwfn *p_hwfn,
+-			       struct qed_ll2_acquire_data *data)
++int qed_ll2_acquire_connection(void *cxt, struct qed_ll2_acquire_data *data)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	qed_int_comp_cb_t comp_rx_cb, comp_tx_cb;
+ 	struct qed_ll2_info *p_ll2_info = NULL;
+ 	u8 i, *p_tx_max;
+@@ -1298,6 +1265,13 @@ int qed_ll2_acquire_connection(struct qe
+ 	else
+ 		*p_tx_max = min_t(u8, *p_tx_max,
+ 				  CORE_LL2_TX_MAX_BDS_PER_PACKET);
++
++	rc = qed_ll2_set_cbs(p_ll2_info, data->cbs);
++	if (rc) {
++		DP_NOTICE(p_hwfn, "Invalid callback functions\n");
++		goto q_allocate_fail;
++	}
++
+ 	rc = qed_ll2_acquire_connection_rx(p_hwfn, p_ll2_info);
+ 	if (rc)
+ 		goto q_allocate_fail;
+@@ -1377,8 +1351,10 @@ qed_ll2_establish_connection_ooo(struct
+ 	qed_ooo_release_all_isles(p_hwfn, p_hwfn->p_ooo_info);
+ 	qed_ooo_submit_rx_buffers(p_hwfn, p_ll2_conn);
+ }
+-int qed_ll2_establish_connection(struct qed_hwfn *p_hwfn, u8 connection_handle)
++
++int qed_ll2_establish_connection(void *cxt, u8 connection_handle)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_ll2_info *p_ll2_conn;
+ 	struct qed_ll2_rx_queue *p_rx;
+ 	struct qed_ll2_tx_queue *p_tx;
+@@ -1505,11 +1481,12 @@ static void qed_ll2_post_rx_buffer_notif
+ 	DIRECT_REG_WR(p_rx->set_prod_addr, *((u32 *)&rx_prod));
+ }
+ 
+-int qed_ll2_post_rx_buffer(struct qed_hwfn *p_hwfn,
++int qed_ll2_post_rx_buffer(void *cxt,
+ 			   u8 connection_handle,
+ 			   dma_addr_t addr,
+ 			   u16 buf_len, void *cookie, u8 notify_fw)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct core_rx_bd_with_buff_len *p_curb = NULL;
+ 	struct qed_ll2_rx_packet *p_curp = NULL;
+ 	struct qed_ll2_info *p_ll2_conn;
+@@ -1699,11 +1676,12 @@ static void qed_ll2_tx_packet_notify(str
+ 		   p_ll2_conn->input.conn_type, db_msg.spq_prod);
+ }
+ 
+-int qed_ll2_prepare_tx_packet(struct qed_hwfn *p_hwfn,
++int qed_ll2_prepare_tx_packet(void *cxt,
+ 			      u8 connection_handle,
+ 			      struct qed_ll2_tx_pkt_info *pkt,
+ 			      bool notify_fw)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_ll2_tx_packet *p_curp = NULL;
+ 	struct qed_ll2_info *p_ll2_conn = NULL;
+ 	struct qed_ll2_tx_queue *p_tx;
+@@ -1750,11 +1728,12 @@ out:
+ 	return rc;
+ }
+ 
+-int qed_ll2_set_fragment_of_tx_packet(struct qed_hwfn *p_hwfn,
++int qed_ll2_set_fragment_of_tx_packet(void *cxt,
+ 				      u8 connection_handle,
+ 				      dma_addr_t addr, u16 nbytes)
+ {
+ 	struct qed_ll2_tx_packet *p_cur_send_packet = NULL;
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_ll2_info *p_ll2_conn = NULL;
+ 	u16 cur_send_frag_num = 0;
+ 	struct core_tx_bd *p_bd;
+@@ -1789,8 +1768,9 @@ int qed_ll2_set_fragment_of_tx_packet(st
+ 	return 0;
+ }
+ 
+-int qed_ll2_terminate_connection(struct qed_hwfn *p_hwfn, u8 connection_handle)
++int qed_ll2_terminate_connection(void *cxt, u8 connection_handle)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_ll2_info *p_ll2_conn = NULL;
+ 	int rc = -EINVAL;
+ 	struct qed_ptt *p_ptt;
+@@ -1855,8 +1835,10 @@ static void qed_ll2_release_connection_o
+ 		kfree(p_buffer);
+ 	}
+ }
+-void qed_ll2_release_connection(struct qed_hwfn *p_hwfn, u8 connection_handle)
++
++void qed_ll2_release_connection(void *cxt, u8 connection_handle)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_ll2_info *p_ll2_conn = NULL;
+ 
+ 	p_ll2_conn = qed_ll2_handle_sanity(p_hwfn, connection_handle);
+@@ -1989,9 +1971,10 @@ static void _qed_ll2_get_pstats(struct q
+ 	p_stats->sent_bcast_pkts = HILO_64_REGPAIR(pstats.sent_bcast_pkts);
+ }
+ 
+-int qed_ll2_get_stats(struct qed_hwfn *p_hwfn,
++int qed_ll2_get_stats(void *cxt,
+ 		      u8 connection_handle, struct qed_ll2_stats *p_stats)
+ {
++	struct qed_hwfn *p_hwfn = cxt;
+ 	struct qed_ll2_info *p_ll2_conn = NULL;
+ 	struct qed_ptt *p_ptt;
+ 
+@@ -2018,6 +2001,17 @@ int qed_ll2_get_stats(struct qed_hwfn *p
+ 	return 0;
+ }
+ 
++static void qed_ll2b_release_rx_packet(void *cxt,
++				       u8 connection_handle,
++				       void *cookie,
++				       dma_addr_t rx_buf_addr,
++				       bool b_last_packet)
++{
++	struct qed_hwfn *p_hwfn = cxt;
++
++	qed_ll2_dealloc_buffer(p_hwfn->cdev, cookie);
++}
++
+ static void qed_ll2_register_cb_ops(struct qed_dev *cdev,
+ 				    const struct qed_ll2_cb_ops *ops,
+ 				    void *cookie)
+@@ -2026,11 +2020,18 @@ static void qed_ll2_register_cb_ops(stru
+ 	cdev->ll2->cb_cookie = cookie;
+ }
+ 
++struct qed_ll2_cbs ll2_cbs = {
++	.rx_comp_cb = &qed_ll2b_complete_rx_packet,
++	.rx_release_cb = &qed_ll2b_release_rx_packet,
++	.tx_comp_cb = &qed_ll2b_complete_tx_packet,
++	.tx_release_cb = &qed_ll2b_complete_tx_packet,
++};
++
+ static void qed_ll2_set_conn_data(struct qed_dev *cdev,
+ 				  struct qed_ll2_acquire_data *data,
+ 				  struct qed_ll2_params *params,
+ 				  enum qed_ll2_conn_type conn_type,
+-				  u8 *handle, bool lb, u8 gsi_enable)
++				  u8 *handle, bool lb)
+ {
+ 	memset(data, 0, sizeof(*data));
+ 
+@@ -2040,8 +2041,10 @@ static void qed_ll2_set_conn_data(struct
+ 	data->input.rx_drop_ttl0_flg = params->drop_ttl0_packets;
+ 	data->input.rx_vlan_removal_en = params->rx_vlan_stripping;
+ 	data->input.tx_num_desc = QED_LL2_TX_SIZE;
+-	data->input.gsi_enable = gsi_enable;
+ 	data->p_connection_handle = handle;
++	data->cbs = &ll2_cbs;
++	ll2_cbs.cookie = QED_LEADING_HWFN(cdev);
++
+ 	if (lb) {
+ 		data->input.tx_tc = OOO_LB_TC;
+ 		data->input.tx_dest = QED_LL2_TX_DEST_LB;
+@@ -2060,7 +2063,7 @@ static int qed_ll2_start_ooo(struct qed_
+ 	int rc;
+ 
+ 	qed_ll2_set_conn_data(cdev, &data, params,
+-			      QED_LL2_TYPE_ISCSI_OOO, handle, true, 0);
++			      QED_LL2_TYPE_ISCSI_OOO, handle, true);
+ 
+ 	rc = qed_ll2_acquire_connection(hwfn, &data);
+ 	if (rc) {
+@@ -2090,7 +2093,7 @@ static int qed_ll2_start(struct qed_dev
+ 	struct qed_ll2_acquire_data data;
+ 	struct qed_ptt *p_ptt;
+ 	int rc, i;
+-	u8 gsi_enable = 1;
++
+ 
+ 	/* Initialize LL2 locks & lists */
+ 	INIT_LIST_HEAD(&cdev->ll2->list);
+@@ -2122,11 +2125,9 @@ static int qed_ll2_start(struct qed_dev
+ 	switch (QED_LEADING_HWFN(cdev)->hw_info.personality) {
+ 	case QED_PCI_FCOE:
+ 		conn_type = QED_LL2_TYPE_FCOE;
+-		gsi_enable = 0;
+ 		break;
+ 	case QED_PCI_ISCSI:
+ 		conn_type = QED_LL2_TYPE_ISCSI;
+-		gsi_enable = 0;
+ 		break;
+ 	case QED_PCI_ETH_ROCE:
+ 		conn_type = QED_LL2_TYPE_ROCE;
+@@ -2136,7 +2137,7 @@ static int qed_ll2_start(struct qed_dev
+ 	}
+ 
+ 	qed_ll2_set_conn_data(cdev, &data, params, conn_type,
+-			      &cdev->ll2->handle, false, gsi_enable);
++			      &cdev->ll2->handle, false);
+ 
+ 	rc = qed_ll2_acquire_connection(QED_LEADING_HWFN(cdev), &data);
+ 	if (rc) {
+--- a/drivers/net/ethernet/qlogic/qed/qed_ll2.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_ll2.h
+@@ -126,6 +126,7 @@ struct qed_ll2_info {
+ 	u8 tx_stats_en;
+ 	struct qed_ll2_rx_queue rx_queue;
+ 	struct qed_ll2_tx_queue tx_queue;
++	struct qed_ll2_cbs cbs;
+ };
+ 
+ /**
+@@ -134,30 +135,29 @@ struct qed_ll2_info {
+  *        connecion handler as output parameter.
+  *
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param data - describes connection parameters
+  * @return int
+  */
+-int qed_ll2_acquire_connection(struct qed_hwfn *p_hwfn,
+-			       struct qed_ll2_acquire_data *data);
++int qed_ll2_acquire_connection(void *cxt, struct qed_ll2_acquire_data *data);
+ 
+ /**
+  * @brief qed_ll2_establish_connection - start previously
+  *        allocated LL2 queues pair
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param p_ptt
+  * @param connection_handle	LL2 connection's handle obtained from
+  *                              qed_ll2_require_connection
+  *
+  * @return 0 on success, failure otherwise
+  */
+-int qed_ll2_establish_connection(struct qed_hwfn *p_hwfn, u8 connection_handle);
++int qed_ll2_establish_connection(void *cxt, u8 connection_handle);
+ 
+ /**
+  * @brief qed_ll2_post_rx_buffers - submit buffers to LL2 Rx queue.
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param connection_handle	LL2 connection's handle obtained from
+  *				qed_ll2_require_connection
+  * @param addr			rx (physical address) buffers to submit
+@@ -166,7 +166,7 @@ int qed_ll2_establish_connection(struct
+  *
+  * @return 0 on success, failure otherwise
+  */
+-int qed_ll2_post_rx_buffer(struct qed_hwfn *p_hwfn,
++int qed_ll2_post_rx_buffer(void *cxt,
+ 			   u8 connection_handle,
+ 			   dma_addr_t addr,
+ 			   u16 buf_len, void *cookie, u8 notify_fw);
+@@ -175,14 +175,14 @@ int qed_ll2_post_rx_buffer(struct qed_hw
+  * @brief qed_ll2_prepare_tx_packet - request for start Tx BD
+  *				      to prepare Tx packet submission to FW.
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param connection_handle
+  * @param pkt - info regarding the tx packet
+  * @param notify_fw - issue doorbell to fw for this packet
+  *
+  * @return 0 on success, failure otherwise
+  */
+-int qed_ll2_prepare_tx_packet(struct qed_hwfn *p_hwfn,
++int qed_ll2_prepare_tx_packet(void *cxt,
+ 			      u8 connection_handle,
+ 			      struct qed_ll2_tx_pkt_info *pkt,
+ 			      bool notify_fw);
+@@ -191,18 +191,18 @@ int qed_ll2_prepare_tx_packet(struct qed
+  * @brief qed_ll2_release_connection -	releases resources
+  *					allocated for LL2 connection
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param connection_handle		LL2 connection's handle obtained from
+  *					qed_ll2_require_connection
+  */
+-void qed_ll2_release_connection(struct qed_hwfn *p_hwfn, u8 connection_handle);
++void qed_ll2_release_connection(void *cxt, u8 connection_handle);
+ 
+ /**
+  * @brief qed_ll2_set_fragment_of_tx_packet -	provides fragments to fill
+  *						Tx BD of BDs requested by
+  *						qed_ll2_prepare_tx_packet
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param connection_handle			LL2 connection's handle
+  *						obtained from
+  *						qed_ll2_require_connection
+@@ -211,7 +211,7 @@ void qed_ll2_release_connection(struct q
+  *
+  * @return 0 on success, failure otherwise
+  */
+-int qed_ll2_set_fragment_of_tx_packet(struct qed_hwfn *p_hwfn,
++int qed_ll2_set_fragment_of_tx_packet(void *cxt,
+ 				      u8 connection_handle,
+ 				      dma_addr_t addr, u16 nbytes);
+ 
+@@ -219,27 +219,27 @@ int qed_ll2_set_fragment_of_tx_packet(st
+  * @brief qed_ll2_terminate_connection -	stops Tx/Rx queues
+  *
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param connection_handle			LL2 connection's handle
+  *						obtained from
+  *						qed_ll2_require_connection
+  *
+  * @return 0 on success, failure otherwise
+  */
+-int qed_ll2_terminate_connection(struct qed_hwfn *p_hwfn, u8 connection_handle);
++int qed_ll2_terminate_connection(void *cxt, u8 connection_handle);
+ 
+ /**
+  * @brief qed_ll2_get_stats -	get LL2 queue's statistics
+  *
+  *
+- * @param p_hwfn
++ * @param cxt - pointer to the hw-function [opaque to some]
+  * @param connection_handle	LL2 connection's handle obtained from
+  *				qed_ll2_require_connection
+  * @param p_stats
+  *
+  * @return 0 on success, failure otherwise
+  */
+-int qed_ll2_get_stats(struct qed_hwfn *p_hwfn,
++int qed_ll2_get_stats(void *cxt,
+ 		      u8 connection_handle, struct qed_ll2_stats *p_stats);
+ 
+ /**
+--- a/drivers/net/ethernet/qlogic/qed/qed_roce.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_roce.c
+@@ -35,7 +35,6 @@
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/errno.h>
+-#include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
+ #include <linux/io.h>
+@@ -65,6 +64,7 @@
+ #include "qed_sp.h"
+ #include "qed_roce.h"
+ #include "qed_ll2.h"
++#include <linux/qed/qed_ll2_if.h>
+ 
+ static void qed_roce_free_real_icid(struct qed_hwfn *p_hwfn, u16 icid);
+ 
+@@ -2709,310 +2709,35 @@ static void qed_rdma_remove_user(void *r
+ 	spin_unlock_bh(&p_hwfn->p_rdma_info->lock);
+ }
+ 
+-void qed_ll2b_complete_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+-				     u8 connection_handle,
+-				     void *cookie,
+-				     dma_addr_t first_frag_addr,
+-				     bool b_last_fragment, bool b_last_packet)
+-{
+-	struct qed_roce_ll2_packet *packet = cookie;
+-	struct qed_roce_ll2_info *roce_ll2 = p_hwfn->ll2;
+-
+-	roce_ll2->cbs.tx_cb(roce_ll2->cb_cookie, packet);
+-}
+-
+-void qed_ll2b_release_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+-				    u8 connection_handle,
+-				    void *cookie,
+-				    dma_addr_t first_frag_addr,
+-				    bool b_last_fragment, bool b_last_packet)
+-{
+-	qed_ll2b_complete_tx_gsi_packet(p_hwfn, connection_handle,
+-					cookie, first_frag_addr,
+-					b_last_fragment, b_last_packet);
+-}
+-
+-void qed_ll2b_complete_rx_gsi_packet(struct qed_hwfn *p_hwfn,
+-				     u8 connection_handle,
+-				     void *cookie,
+-				     dma_addr_t rx_buf_addr,
+-				     u16 data_length,
+-				     u8 data_length_error,
+-				     u16 parse_flags,
+-				     u16 vlan,
+-				     u32 src_mac_addr_hi,
+-				     u16 src_mac_addr_lo, bool b_last_packet)
+-{
+-	struct qed_roce_ll2_info *roce_ll2 = p_hwfn->ll2;
+-	struct qed_roce_ll2_rx_params params;
+-	struct qed_dev *cdev = p_hwfn->cdev;
+-	struct qed_roce_ll2_packet pkt;
+-
+-	DP_VERBOSE(cdev,
+-		   QED_MSG_LL2,
+-		   "roce ll2 rx complete: bus_addr=%p, len=%d, data_len_err=%d\n",
+-		   (void *)(uintptr_t)rx_buf_addr,
+-		   data_length, data_length_error);
+-
+-	memset(&pkt, 0, sizeof(pkt));
+-	pkt.n_seg = 1;
+-	pkt.payload[0].baddr = rx_buf_addr;
+-	pkt.payload[0].len = data_length;
+-
+-	memset(&params, 0, sizeof(params));
+-	params.vlan_id = vlan;
+-	*((u32 *)&params.smac[0]) = ntohl(src_mac_addr_hi);
+-	*((u16 *)&params.smac[4]) = ntohs(src_mac_addr_lo);
+-
+-	if (data_length_error) {
+-		DP_ERR(cdev,
+-		       "roce ll2 rx complete: data length error %d, length=%d\n",
+-		       data_length_error, data_length);
+-		params.rc = -EINVAL;
+-	}
+-
+-	roce_ll2->cbs.rx_cb(roce_ll2->cb_cookie, &pkt, &params);
+-}
+-
+ static int qed_roce_ll2_set_mac_filter(struct qed_dev *cdev,
+ 				       u8 *old_mac_address,
+ 				       u8 *new_mac_address)
+ {
+-	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
++	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
+ 	struct qed_ptt *p_ptt;
+ 	int rc = 0;
+ 
+-	if (!hwfn->ll2 || hwfn->ll2->handle == QED_LL2_UNUSED_HANDLE) {
+-		DP_ERR(cdev,
+-		       "qed roce mac filter failed - roce_info/ll2 NULL\n");
+-		return -EINVAL;
+-	}
+-
+-	p_ptt = qed_ptt_acquire(QED_LEADING_HWFN(cdev));
++	p_ptt = qed_ptt_acquire(p_hwfn);
+ 	if (!p_ptt) {
+ 		DP_ERR(cdev,
+ 		       "qed roce ll2 mac filter set: failed to acquire PTT\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	mutex_lock(&hwfn->ll2->lock);
+ 	if (old_mac_address)
+-		qed_llh_remove_mac_filter(QED_LEADING_HWFN(cdev), p_ptt,
+-					  old_mac_address);
++		qed_llh_remove_mac_filter(p_hwfn, p_ptt, old_mac_address);
+ 	if (new_mac_address)
+-		rc = qed_llh_add_mac_filter(QED_LEADING_HWFN(cdev), p_ptt,
+-					    new_mac_address);
+-	mutex_unlock(&hwfn->ll2->lock);
+-
+-	qed_ptt_release(QED_LEADING_HWFN(cdev), p_ptt);
+-
+-	if (rc)
+-		DP_ERR(cdev,
+-		       "qed roce ll2 mac filter set: failed to add mac filter\n");
+-
+-	return rc;
+-}
+-
+-static int qed_roce_ll2_start(struct qed_dev *cdev,
+-			      struct qed_roce_ll2_params *params)
+-{
+-	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+-	struct qed_roce_ll2_info *roce_ll2;
+-	struct qed_ll2_acquire_data data;
+-	int rc;
+-
+-	if (!params) {
+-		DP_ERR(cdev, "qed roce ll2 start: failed due to NULL params\n");
+-		return -EINVAL;
+-	}
+-	if (!params->cbs.tx_cb || !params->cbs.rx_cb) {
+-		DP_ERR(cdev,
+-		       "qed roce ll2 start: failed due to NULL tx/rx. tx_cb=%p, rx_cb=%p\n",
+-		       params->cbs.tx_cb, params->cbs.rx_cb);
+-		return -EINVAL;
+-	}
+-	if (!is_valid_ether_addr(params->mac_address)) {
+-		DP_ERR(cdev,
+-		       "qed roce ll2 start: failed due to invalid Ethernet address %pM\n",
+-		       params->mac_address);
+-		return -EINVAL;
+-	}
+-
+-	/* Initialize */
+-	roce_ll2 = kzalloc(sizeof(*roce_ll2), GFP_ATOMIC);
+-	if (!roce_ll2) {
+-		DP_ERR(cdev, "qed roce ll2 start: failed memory allocation\n");
+-		return -ENOMEM;
+-	}
+-
+-	roce_ll2->handle = QED_LL2_UNUSED_HANDLE;
+-	roce_ll2->cbs = params->cbs;
+-	roce_ll2->cb_cookie = params->cb_cookie;
+-	mutex_init(&roce_ll2->lock);
+-
+-	memset(&data, 0, sizeof(data));
+-	data.input.conn_type = QED_LL2_TYPE_ROCE;
+-	data.input.mtu = params->mtu;
+-	data.input.rx_num_desc = params->max_rx_buffers;
+-	data.input.tx_num_desc = params->max_tx_buffers;
+-	data.input.rx_drop_ttl0_flg = true;
+-	data.input.rx_vlan_removal_en = false;
+-	data.input.tx_dest = QED_LL2_TX_DEST_NW;
+-	data.input.ai_err_packet_too_big = LL2_DROP_PACKET;
+-	data.input.ai_err_no_buf = LL2_DROP_PACKET;
+-	data.p_connection_handle = &roce_ll2->handle;
+-	data.input.gsi_enable = true;
+-
+-	rc = qed_ll2_acquire_connection(QED_LEADING_HWFN(cdev), &data);
+-	if (rc) {
+-		DP_ERR(cdev,
+-		       "qed roce ll2 start: failed to acquire LL2 connection (rc=%d)\n",
+-		       rc);
+-		goto err;
+-	}
+-
+-	rc = qed_ll2_establish_connection(QED_LEADING_HWFN(cdev),
+-					  roce_ll2->handle);
+-	if (rc) {
+-		DP_ERR(cdev,
+-		       "qed roce ll2 start: failed to establish LL2 connection (rc=%d)\n",
+-		       rc);
+-		goto err1;
+-	}
+-
+-	hwfn->ll2 = roce_ll2;
++		rc = qed_llh_add_mac_filter(p_hwfn, p_ptt, new_mac_address);
+ 
+-	rc = qed_roce_ll2_set_mac_filter(cdev, NULL, params->mac_address);
+-	if (rc) {
+-		hwfn->ll2 = NULL;
+-		goto err2;
+-	}
+-	ether_addr_copy(roce_ll2->mac_address, params->mac_address);
+-
+-	return 0;
+-
+-err2:
+-	qed_ll2_terminate_connection(QED_LEADING_HWFN(cdev), roce_ll2->handle);
+-err1:
+-	qed_ll2_release_connection(QED_LEADING_HWFN(cdev), roce_ll2->handle);
+-err:
+-	kfree(roce_ll2);
+-	return rc;
+-}
+-
+-static int qed_roce_ll2_stop(struct qed_dev *cdev)
+-{
+-	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+-	struct qed_roce_ll2_info *roce_ll2 = hwfn->ll2;
+-	int rc;
+-
+-	if (roce_ll2->handle == QED_LL2_UNUSED_HANDLE) {
+-		DP_ERR(cdev, "qed roce ll2 stop: cannot stop an unused LL2\n");
+-		return -EINVAL;
+-	}
+-
+-	/* remove LL2 MAC address filter */
+-	rc = qed_roce_ll2_set_mac_filter(cdev, roce_ll2->mac_address, NULL);
+-	eth_zero_addr(roce_ll2->mac_address);
++	qed_ptt_release(p_hwfn, p_ptt);
+ 
+-	rc = qed_ll2_terminate_connection(QED_LEADING_HWFN(cdev),
+-					  roce_ll2->handle);
+ 	if (rc)
+ 		DP_ERR(cdev,
+-		       "qed roce ll2 stop: failed to terminate LL2 connection (rc=%d)\n",
+-		       rc);
+-
+-	qed_ll2_release_connection(QED_LEADING_HWFN(cdev), roce_ll2->handle);
+-
+-	roce_ll2->handle = QED_LL2_UNUSED_HANDLE;
+-
+-	kfree(roce_ll2);
++		       "qed roce ll2 mac filter set: failed to add MAC filter\n");
+ 
+ 	return rc;
+ }
+ 
+-static int qed_roce_ll2_tx(struct qed_dev *cdev,
+-			   struct qed_roce_ll2_packet *pkt,
+-			   struct qed_roce_ll2_tx_params *params)
+-{
+-	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+-	struct qed_roce_ll2_info *roce_ll2 = hwfn->ll2;
+-	enum qed_ll2_roce_flavor_type qed_roce_flavor;
+-	struct qed_ll2_tx_pkt_info ll2_pkt;
+-	u8 flags = 0;
+-	int rc;
+-	int i;
+-
+-	if (!pkt || !params) {
+-		DP_ERR(cdev,
+-		       "roce ll2 tx: failed tx because one of the following is NULL - drv=%p, pkt=%p, params=%p\n",
+-		       cdev, pkt, params);
+-		return -EINVAL;
+-	}
+-
+-	qed_roce_flavor = (pkt->roce_mode == ROCE_V1) ? QED_LL2_ROCE
+-						      : QED_LL2_RROCE;
+-
+-	if (pkt->roce_mode == ROCE_V2_IPV4)
+-		flags |= BIT(CORE_TX_BD_DATA_IP_CSUM_SHIFT);
+-
+-	/* Tx header */
+-	memset(&ll2_pkt, 0, sizeof(ll2_pkt));
+-	ll2_pkt.num_of_bds = 1 + pkt->n_seg;
+-	ll2_pkt.bd_flags = flags;
+-	ll2_pkt.tx_dest = QED_LL2_TX_DEST_NW;
+-	ll2_pkt.qed_roce_flavor = qed_roce_flavor;
+-	ll2_pkt.first_frag = pkt->header.baddr;
+-	ll2_pkt.first_frag_len = pkt->header.len;
+-	ll2_pkt.cookie = pkt;
+-
+-	rc = qed_ll2_prepare_tx_packet(QED_LEADING_HWFN(cdev),
+-				       roce_ll2->handle,
+-				       &ll2_pkt, 1);
+-	if (rc) {
+-		DP_ERR(cdev, "roce ll2 tx: header failed (rc=%d)\n", rc);
+-		return QED_ROCE_TX_HEAD_FAILURE;
+-	}
+-
+-	/* Tx payload */
+-	for (i = 0; i < pkt->n_seg; i++) {
+-		rc = qed_ll2_set_fragment_of_tx_packet(QED_LEADING_HWFN(cdev),
+-						       roce_ll2->handle,
+-						       pkt->payload[i].baddr,
+-						       pkt->payload[i].len);
+-		if (rc) {
+-			/* If failed not much to do here, partial packet has
+-			 * been posted * we can't free memory, will need to wait
+-			 * for completion
+-			 */
+-			DP_ERR(cdev,
+-			       "roce ll2 tx: payload failed (rc=%d)\n", rc);
+-			return QED_ROCE_TX_FRAG_FAILURE;
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+-static int qed_roce_ll2_post_rx_buffer(struct qed_dev *cdev,
+-				       struct qed_roce_ll2_buffer *buf,
+-				       u64 cookie, u8 notify_fw)
+-{
+-	return qed_ll2_post_rx_buffer(QED_LEADING_HWFN(cdev),
+-				      QED_LEADING_HWFN(cdev)->ll2->handle,
+-				      buf->baddr, buf->len,
+-				      (void *)(uintptr_t)cookie, notify_fw);
+-}
+-
+-static int qed_roce_ll2_stats(struct qed_dev *cdev, struct qed_ll2_stats *stats)
+-{
+-	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+-	struct qed_roce_ll2_info *roce_ll2 = hwfn->ll2;
+-
+-	return qed_ll2_get_stats(QED_LEADING_HWFN(cdev),
+-				 roce_ll2->handle, stats);
+-}
+-
+ static const struct qed_rdma_ops qed_rdma_ops_pass = {
+ 	.common = &qed_common_ops_pass,
+ 	.fill_dev_info = &qed_fill_rdma_dev_info,
+@@ -3040,12 +2765,15 @@ static const struct qed_rdma_ops qed_rdm
+ 	.rdma_free_tid = &qed_rdma_free_tid,
+ 	.rdma_register_tid = &qed_rdma_register_tid,
+ 	.rdma_deregister_tid = &qed_rdma_deregister_tid,
+-	.roce_ll2_start = &qed_roce_ll2_start,
+-	.roce_ll2_stop = &qed_roce_ll2_stop,
+-	.roce_ll2_tx = &qed_roce_ll2_tx,
+-	.roce_ll2_post_rx_buffer = &qed_roce_ll2_post_rx_buffer,
+-	.roce_ll2_set_mac_filter = &qed_roce_ll2_set_mac_filter,
+-	.roce_ll2_stats = &qed_roce_ll2_stats,
++	.ll2_acquire_connection = &qed_ll2_acquire_connection,
++	.ll2_establish_connection = &qed_ll2_establish_connection,
++	.ll2_terminate_connection = &qed_ll2_terminate_connection,
++	.ll2_release_connection = &qed_ll2_release_connection,
++	.ll2_post_rx_buffer = &qed_ll2_post_rx_buffer,
++	.ll2_prepare_tx_packet = &qed_ll2_prepare_tx_packet,
++	.ll2_set_fragment_of_tx_packet = &qed_ll2_set_fragment_of_tx_packet,
++	.ll2_set_mac_filter = &qed_roce_ll2_set_mac_filter,
++	.ll2_get_stats = &qed_ll2_get_stats,
+ };
+ 
+ const struct qed_rdma_ops *qed_get_rdma_ops(void)
+--- a/drivers/net/ethernet/qlogic/qed/qed_roce.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_roce.h
+@@ -170,53 +170,10 @@ struct qed_rdma_qp {
+ void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
+ void qed_roce_async_event(struct qed_hwfn *p_hwfn,
+ 			  u8 fw_event_code, union rdma_eqe_data *rdma_data);
+-void qed_ll2b_complete_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+-				     u8 connection_handle,
+-				     void *cookie,
+-				     dma_addr_t first_frag_addr,
+-				     bool b_last_fragment, bool b_last_packet);
+-void qed_ll2b_release_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+-				    u8 connection_handle,
+-				    void *cookie,
+-				    dma_addr_t first_frag_addr,
+-				    bool b_last_fragment, bool b_last_packet);
+-void qed_ll2b_complete_rx_gsi_packet(struct qed_hwfn *p_hwfn,
+-				     u8 connection_handle,
+-				     void *cookie,
+-				     dma_addr_t rx_buf_addr,
+-				     u16 data_length,
+-				     u8 data_length_error,
+-				     u16 parse_flags,
+-				     u16 vlan,
+-				     u32 src_mac_addr_hi,
+-				     u16 src_mac_addr_lo, bool b_last_packet);
+ #else
+ static inline void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt) {}
+ static inline void qed_roce_async_event(struct qed_hwfn *p_hwfn,
+ 					u8 fw_event_code,
+ 					union rdma_eqe_data *rdma_data) {}
+-static inline void qed_ll2b_complete_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+-						   u8 connection_handle,
+-						   void *cookie,
+-						   dma_addr_t first_frag_addr,
+-						   bool b_last_fragment,
+-						   bool b_last_packet) {}
+-static inline void qed_ll2b_release_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+-						  u8 connection_handle,
+-						  void *cookie,
+-						  dma_addr_t first_frag_addr,
+-						  bool b_last_fragment,
+-						  bool b_last_packet) {}
+-static inline void qed_ll2b_complete_rx_gsi_packet(struct qed_hwfn *p_hwfn,
+-						   u8 connection_handle,
+-						   void *cookie,
+-						   dma_addr_t rx_buf_addr,
+-						   u16 data_length,
+-						   u8 data_length_error,
+-						   u16 parse_flags,
+-						   u16 vlan,
+-						   u32 src_mac_addr_hi,
+-						   u16 src_mac_addr_lo,
+-						   bool b_last_packet) {}
+ #endif
+ #endif
+--- a/include/linux/qed/qed_ll2_if.h
++++ b/include/linux/qed/qed_ll2_if.h
+@@ -122,6 +122,40 @@ struct qed_ll2_comp_rx_data {
+ 	} u;
+ };
+ 
++typedef
++void (*qed_ll2_complete_rx_packet_cb)(void *cxt,
++				      struct qed_ll2_comp_rx_data *data);
++
++typedef
++void (*qed_ll2_release_rx_packet_cb)(void *cxt,
++				     u8 connection_handle,
++				     void *cookie,
++				     dma_addr_t rx_buf_addr,
++				     bool b_last_packet);
++
++typedef
++void (*qed_ll2_complete_tx_packet_cb)(void *cxt,
++				      u8 connection_handle,
++				      void *cookie,
++				      dma_addr_t first_frag_addr,
++				      bool b_last_fragment,
++				      bool b_last_packet);
++
++typedef
++void (*qed_ll2_release_tx_packet_cb)(void *cxt,
++				     u8 connection_handle,
++				     void *cookie,
++				     dma_addr_t first_frag_addr,
++				     bool b_last_fragment, bool b_last_packet);
++
++struct qed_ll2_cbs {
++	qed_ll2_complete_rx_packet_cb rx_comp_cb;
++	qed_ll2_release_rx_packet_cb rx_release_cb;
++	qed_ll2_complete_tx_packet_cb tx_comp_cb;
++	qed_ll2_release_tx_packet_cb tx_release_cb;
++	void *cookie;
++};
++
+ struct qed_ll2_acquire_data_inputs {
+ 	enum qed_ll2_conn_type conn_type;
+ 	u16 mtu;
+@@ -140,6 +174,8 @@ struct qed_ll2_acquire_data_inputs {
+ 
+ struct qed_ll2_acquire_data {
+ 	struct qed_ll2_acquire_data_inputs input;
++	const struct qed_ll2_cbs *cbs;
++
+ 	/* Output container for LL2 connection's handle */
+ 	u8 *p_connection_handle;
+ };
+--- a/include/linux/qed/qed_roce_if.h
++++ b/include/linux/qed/qed_roce_if.h
+@@ -34,8 +34,6 @@
+ #include <linux/types.h>
+ #include <linux/delay.h>
+ #include <linux/list.h>
+-#include <linux/mutex.h>
+-#include <linux/pci.h>
+ #include <linux/slab.h>
+ #include <linux/qed/qed_if.h>
+ #include <linux/qed/qed_ll2_if.h>
+@@ -491,42 +489,6 @@ struct qed_roce_ll2_packet {
+ 	enum qed_roce_ll2_tx_dest tx_dest;
+ };
+ 
+-struct qed_roce_ll2_tx_params {
+-	int reserved;
+-};
+-
+-struct qed_roce_ll2_rx_params {
+-	u16 vlan_id;
+-	u8 smac[ETH_ALEN];
+-	int rc;
+-};
+-
+-struct qed_roce_ll2_cbs {
+-	void (*tx_cb)(void *pdev, struct qed_roce_ll2_packet *pkt);
+-
+-	void (*rx_cb)(void *pdev, struct qed_roce_ll2_packet *pkt,
+-		      struct qed_roce_ll2_rx_params *params);
+-};
+-
+-struct qed_roce_ll2_params {
+-	u16 max_rx_buffers;
+-	u16 max_tx_buffers;
+-	u16 mtu;
+-	u8 mac_address[ETH_ALEN];
+-	struct qed_roce_ll2_cbs cbs;
+-	void *cb_cookie;
+-};
+-
+-struct qed_roce_ll2_info {
+-	u8 handle;
+-	struct qed_roce_ll2_cbs cbs;
+-	u8 mac_address[ETH_ALEN];
+-	void *cb_cookie;
+-
+-	/* Lock to protect ll2 */
+-	struct mutex lock;
+-};
+-
+ enum qed_rdma_type {
+ 	QED_RDMA_TYPE_ROCE,
+ };
+@@ -579,26 +541,40 @@ struct qed_rdma_ops {
+ 	int (*rdma_query_qp)(void *rdma_cxt, struct qed_rdma_qp *qp,
+ 			     struct qed_rdma_query_qp_out_params *oparams);
+ 	int (*rdma_destroy_qp)(void *rdma_cxt, struct qed_rdma_qp *qp);
++
+ 	int
+ 	(*rdma_register_tid)(void *rdma_cxt,
+ 			     struct qed_rdma_register_tid_in_params *iparams);
++
+ 	int (*rdma_deregister_tid)(void *rdma_cxt, u32 itid);
+ 	int (*rdma_alloc_tid)(void *rdma_cxt, u32 *itid);
+ 	void (*rdma_free_tid)(void *rdma_cxt, u32 itid);
+-	int (*roce_ll2_start)(struct qed_dev *cdev,
+-			      struct qed_roce_ll2_params *params);
+-	int (*roce_ll2_stop)(struct qed_dev *cdev);
+-	int (*roce_ll2_tx)(struct qed_dev *cdev,
+-			   struct qed_roce_ll2_packet *packet,
+-			   struct qed_roce_ll2_tx_params *params);
+-	int (*roce_ll2_post_rx_buffer)(struct qed_dev *cdev,
+-				       struct qed_roce_ll2_buffer *buf,
+-				       u64 cookie, u8 notify_fw);
+-	int (*roce_ll2_set_mac_filter)(struct qed_dev *cdev,
+-				       u8 *old_mac_address,
+-				       u8 *new_mac_address);
+-	int (*roce_ll2_stats)(struct qed_dev *cdev,
+-			      struct qed_ll2_stats *stats);
++
++	int (*ll2_acquire_connection)(void *rdma_cxt,
++				      struct qed_ll2_acquire_data *data);
++
++	int (*ll2_establish_connection)(void *rdma_cxt, u8 connection_handle);
++	int (*ll2_terminate_connection)(void *rdma_cxt, u8 connection_handle);
++	void (*ll2_release_connection)(void *rdma_cxt, u8 connection_handle);
++
++	int (*ll2_prepare_tx_packet)(void *rdma_cxt,
++				     u8 connection_handle,
++				     struct qed_ll2_tx_pkt_info *pkt,
++				     bool notify_fw);
++
++	int (*ll2_set_fragment_of_tx_packet)(void *rdma_cxt,
++					     u8 connection_handle,
++					     dma_addr_t addr,
++					     u16 nbytes);
++	int (*ll2_post_rx_buffer)(void *rdma_cxt, u8 connection_handle,
++				  dma_addr_t addr, u16 buf_len, void *cookie,
++				  u8 notify_fw);
++	int (*ll2_get_stats)(void *rdma_cxt,
++			     u8 connection_handle,
++			     struct qed_ll2_stats *p_stats);
++	int (*ll2_set_mac_filter)(struct qed_dev *cdev,
++				  u8 *old_mac_address, u8 *new_mac_address);
++
+ };
+ 
+ const struct qed_rdma_ops *qed_get_rdma_ops(void);
