@@ -1,0 +1,152 @@
+From: Ilan Tayari <ilant@mellanox.com>
+Date: Tue, 18 Apr 2017 12:54:27 +0300
+Subject: net/mlx5: FPGA, Add SBU bypass and reset flows
+Patch-mainline: v4.13-rc1
+Git-commit: c43051d72a8dc4a00d49db27292a76d26e8df7af
+References: bsc#1046303 FATE#322944
+
+The Innova FPGA includes shell hardware and Sandbox-Unit (SBU) hardware.
+The shell hardware is handled by mlx5_core itself, while the SBU is
+handled by a client driver.
+
+Reset the SBU to a well-known initial state when initializing a new
+device, and set the FPGA to bypass mode when uninitializing a device.
+This allows the client driver to assume that its device has been
+reset when a new device is detected.
+
+During SBU reset, the FPGA is put into SBU-bypass mode. In this mode
+packets do not pass through the SBU, so it cannot affect the network
+data stream at all.
+
+A factory-image does not have an SBU, so skip these flows.
+
+Signed-off-by: Ilan Tayari <ilant@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/fpga/cmd.c  |   11 +++++
+ drivers/net/ethernet/mellanox/mlx5/core/fpga/cmd.h  |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/fpga/core.c |   40 ++++++++++++++++++++
+ include/linux/mlx5/mlx5_ifc_fpga.h                  |    9 ++++
+ 4 files changed, 61 insertions(+)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/cmd.c
+@@ -47,6 +47,17 @@ int mlx5_fpga_caps(struct mlx5_core_dev
+ 				    MLX5_REG_FPGA_CAP, 0, 0);
+ }
+ 
++int mlx5_fpga_ctrl_op(struct mlx5_core_dev *dev, u8 op)
++{
++	u32 in[MLX5_ST_SZ_DW(fpga_ctrl)] = {0};
++	u32 out[MLX5_ST_SZ_DW(fpga_ctrl)];
++
++	MLX5_SET(fpga_ctrl, in, operation, op);
++
++	return mlx5_core_access_reg(dev, in, sizeof(in), out, sizeof(out),
++				    MLX5_REG_FPGA_CTRL, 0, true);
++}
++
+ int mlx5_fpga_query(struct mlx5_core_dev *dev, struct mlx5_fpga_query *query)
+ {
+ 	u32 in[MLX5_ST_SZ_DW(fpga_ctrl)] = {0};
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/cmd.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/cmd.h
+@@ -67,6 +67,7 @@ struct mlx5_fpga_qp_counters {
+ 
+ int mlx5_fpga_caps(struct mlx5_core_dev *dev, u32 *caps);
+ int mlx5_fpga_query(struct mlx5_core_dev *dev, struct mlx5_fpga_query *query);
++int mlx5_fpga_ctrl_op(struct mlx5_core_dev *dev, u8 op);
+ 
+ int mlx5_fpga_create_qp(struct mlx5_core_dev *dev, void *fpga_qpc,
+ 			u32 *fpga_qpn);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/core.c
+@@ -102,6 +102,29 @@ static int mlx5_fpga_device_load_check(s
+ 	return 0;
+ }
+ 
++int mlx5_fpga_device_brb(struct mlx5_fpga_device *fdev)
++{
++	int err;
++	struct mlx5_core_dev *mdev = fdev->mdev;
++
++	err = mlx5_fpga_ctrl_op(mdev, MLX5_FPGA_CTRL_OPERATION_SANDBOX_BYPASS_ON);
++	if (err) {
++		mlx5_fpga_err(fdev, "Failed to set bypass on: %d\n", err);
++		return err;
++	}
++	err = mlx5_fpga_ctrl_op(mdev, MLX5_FPGA_CTRL_OPERATION_RESET_SANDBOX);
++	if (err) {
++		mlx5_fpga_err(fdev, "Failed to reset SBU: %d\n", err);
++		return err;
++	}
++	err = mlx5_fpga_ctrl_op(mdev, MLX5_FPGA_CTRL_OPERATION_SANDBOX_BYPASS_OFF);
++	if (err) {
++		mlx5_fpga_err(fdev, "Failed to set bypass off: %d\n", err);
++		return err;
++	}
++	return 0;
++}
++
+ int mlx5_fpga_device_start(struct mlx5_core_dev *mdev)
+ {
+ 	struct mlx5_fpga_device *fdev = mdev->fpga;
+@@ -135,8 +158,17 @@ int mlx5_fpga_device_start(struct mlx5_c
+ 	if (err)
+ 		goto err_rsvd_gid;
+ 
++	if (fdev->last_oper_image == MLX5_FPGA_IMAGE_USER) {
++		err = mlx5_fpga_device_brb(fdev);
++		if (err)
++			goto err_conn_init;
++	}
++
+ 	goto out;
+ 
++err_conn_init:
++	mlx5_fpga_conn_device_cleanup(fdev);
++
+ err_rsvd_gid:
+ 	mlx5_core_unreserve_gids(mdev, max_num_qps);
+ out:
+@@ -172,6 +204,7 @@ void mlx5_fpga_device_stop(struct mlx5_c
+ 	struct mlx5_fpga_device *fdev = mdev->fpga;
+ 	unsigned int max_num_qps;
+ 	unsigned long flags;
++	int err;
+ 
+ 	if (!fdev)
+ 		return;
+@@ -184,6 +217,13 @@ void mlx5_fpga_device_stop(struct mlx5_c
+ 	fdev->state = MLX5_FPGA_STATUS_NONE;
+ 	spin_unlock_irqrestore(&fdev->state_lock, flags);
+ 
++	if (fdev->last_oper_image == MLX5_FPGA_IMAGE_USER) {
++		err = mlx5_fpga_ctrl_op(mdev, MLX5_FPGA_CTRL_OPERATION_SANDBOX_BYPASS_ON);
++		if (err)
++			mlx5_fpga_err(fdev, "Failed to re-set SBU bypass on: %d\n",
++				      err);
++	}
++
+ 	mlx5_fpga_conn_device_cleanup(fdev);
+ 	max_num_qps = MLX5_CAP_FPGA(mdev, shell_caps.max_num_qps);
+ 	mlx5_core_unreserve_gids(mdev, max_num_qps);
+--- a/include/linux/mlx5/mlx5_ifc_fpga.h
++++ b/include/linux/mlx5/mlx5_ifc_fpga.h
+@@ -108,6 +108,15 @@ struct mlx5_ifc_fpga_cap_bits {
+ 	u8         reserved_at_500[0x300];
+ };
+ 
++enum {
++	MLX5_FPGA_CTRL_OPERATION_LOAD                = 0x1,
++	MLX5_FPGA_CTRL_OPERATION_RESET               = 0x2,
++	MLX5_FPGA_CTRL_OPERATION_FLASH_SELECT        = 0x3,
++	MLX5_FPGA_CTRL_OPERATION_SANDBOX_BYPASS_ON   = 0x4,
++	MLX5_FPGA_CTRL_OPERATION_SANDBOX_BYPASS_OFF  = 0x5,
++	MLX5_FPGA_CTRL_OPERATION_RESET_SANDBOX       = 0x6,
++};
++
+ struct mlx5_ifc_fpga_ctrl_bits {
+ 	u8         reserved_at_0[0x8];
+ 	u8         operation[0x8];
