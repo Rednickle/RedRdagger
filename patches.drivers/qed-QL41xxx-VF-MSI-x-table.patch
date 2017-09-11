@@ -1,0 +1,144 @@
+From: "Mintz, Yuval" <Yuval.Mintz@cavium.com>
+Date: Mon, 29 May 2017 09:53:08 +0300
+Subject: qed: QL41xxx VF MSI-x table
+Patch-mainline: v4.13-rc1
+Git-commit: 88072fd4002a9976063d8f2babd3d030bd6ae0f9
+References: bsc#1050536 FATE#322898 bsc#1050538 FATE#322897
+
+The QL41xxx adapters' PCI allows a single configuration for the
+MSI-x table size of all child VFs of a given PF.
+The existing code wouldn't cause the management firmware to set
+that value, meaning the VFs would retain the default MSI-x table
+size.
+
+Introduce a new scheme so that whenever a VF is enabled, driver
+would set the number of MSI-x to be the maximum over the various
+VFs' needs.
+
+Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qed/qed_hsi.h   |    3 +-
+ drivers/net/ethernet/qlogic/qed/qed_mcp.c   |   35 ++++++++++++++++++++++++++--
+ drivers/net/ethernet/qlogic/qed/qed_sriov.c |   32 ++++++++++++++++++++++++-
+ 3 files changed, 66 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qed/qed_hsi.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+@@ -11477,6 +11477,7 @@ struct public_drv_mb {
+ #define DRV_MSG_CODE_INITIATE_PF_FLR            0x02010000
+ #define DRV_MSG_CODE_VF_DISABLED_DONE		0xc0000000
+ #define DRV_MSG_CODE_CFG_VF_MSIX		0xc0010000
++#define DRV_MSG_CODE_CFG_PF_VFS_MSIX		0xc0020000
+ #define DRV_MSG_CODE_NVM_GET_FILE_ATT		0x00030000
+ #define DRV_MSG_CODE_NVM_READ_NVRAM		0x00050000
+ #define DRV_MSG_CODE_MCP_RESET			0x00090000
+@@ -11640,7 +11641,7 @@ struct public_drv_mb {
+ 
+ #define FW_MSG_CODE_OS_WOL_SUPPORTED            0x00800000
+ #define FW_MSG_CODE_OS_WOL_NOT_SUPPORTED        0x00810000
+-
++#define FW_MSG_CODE_DRV_CFG_PF_VFS_MSIX_DONE	0x00870000
+ #define FW_MSG_SEQ_NUMBER_MASK			0x0000ffff
+ 
+ 	u32 fw_mb_param;
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -1801,8 +1801,9 @@ int qed_mcp_get_flash_size(struct qed_hw
+ 	return 0;
+ }
+ 
+-int qed_mcp_config_vf_msix(struct qed_hwfn *p_hwfn,
+-			   struct qed_ptt *p_ptt, u8 vf_id, u8 num)
++static int
++qed_mcp_config_vf_msix_bb(struct qed_hwfn *p_hwfn,
++			  struct qed_ptt *p_ptt, u8 vf_id, u8 num)
+ {
+ 	u32 resp = 0, param = 0, rc_param = 0;
+ 	int rc;
+@@ -1832,6 +1833,36 @@ int qed_mcp_config_vf_msix(struct qed_hw
+ 	return rc;
+ }
+ 
++static int
++qed_mcp_config_vf_msix_ah(struct qed_hwfn *p_hwfn,
++			  struct qed_ptt *p_ptt, u8 num)
++{
++	u32 resp = 0, param = num, rc_param = 0;
++	int rc;
++
++	rc = qed_mcp_cmd(p_hwfn, p_ptt, DRV_MSG_CODE_CFG_PF_VFS_MSIX,
++			 param, &resp, &rc_param);
++
++	if (resp != FW_MSG_CODE_DRV_CFG_PF_VFS_MSIX_DONE) {
++		DP_NOTICE(p_hwfn, "MFW failed to set MSI-X for VFs\n");
++		rc = -EINVAL;
++	} else {
++		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
++			   "Requested 0x%02x MSI-x interrupts for VFs\n", num);
++	}
++
++	return rc;
++}
++
++int qed_mcp_config_vf_msix(struct qed_hwfn *p_hwfn,
++			   struct qed_ptt *p_ptt, u8 vf_id, u8 num)
++{
++	if (QED_IS_BB(p_hwfn->cdev))
++		return qed_mcp_config_vf_msix_bb(p_hwfn, p_ptt, vf_id, num);
++	else
++		return qed_mcp_config_vf_msix_ah(p_hwfn, p_ptt, num);
++}
++
+ int
+ qed_mcp_send_drv_version(struct qed_hwfn *p_hwfn,
+ 			 struct qed_ptt *p_ptt,
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@ -747,6 +747,35 @@ static void qed_iov_vf_igu_set_int(struc
+ 	qed_fid_pretend(p_hwfn, p_ptt, (u16) p_hwfn->hw_info.concrete_fid);
+ }
+ 
++static int
++qed_iov_enable_vf_access_msix(struct qed_hwfn *p_hwfn,
++			      struct qed_ptt *p_ptt, u8 abs_vf_id, u8 num_sbs)
++{
++	u8 current_max = 0;
++	int i;
++
++	/* For AH onward, configuration is per-PF. Find maximum of all
++	 * the currently enabled child VFs, and set the number to be that.
++	 */
++	if (!QED_IS_BB(p_hwfn->cdev)) {
++		qed_for_each_vf(p_hwfn, i) {
++			struct qed_vf_info *p_vf;
++
++			p_vf = qed_iov_get_vf_info(p_hwfn, (u16)i, true);
++			if (!p_vf)
++				continue;
++
++			current_max = max_t(u8, current_max, p_vf->num_sbs);
++		}
++	}
++
++	if (num_sbs > current_max)
++		return qed_mcp_config_vf_msix(p_hwfn, p_ptt,
++					      abs_vf_id, num_sbs);
++
++	return 0;
++}
++
+ static int qed_iov_enable_vf_access(struct qed_hwfn *p_hwfn,
+ 				    struct qed_ptt *p_ptt,
+ 				    struct qed_vf_info *vf)
+@@ -771,7 +800,8 @@ static int qed_iov_enable_vf_access(stru
+ 
+ 	qed_iov_vf_igu_reset(p_hwfn, p_ptt, vf);
+ 
+-	rc = qed_mcp_config_vf_msix(p_hwfn, p_ptt, vf->abs_vf_id, vf->num_sbs);
++	rc = qed_iov_enable_vf_access_msix(p_hwfn, p_ptt,
++					   vf->abs_vf_id, vf->num_sbs);
+ 	if (rc)
+ 		return rc;
+ 
