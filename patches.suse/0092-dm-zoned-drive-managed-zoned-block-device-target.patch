@@ -1,0 +1,4565 @@
+From 3b1a94c88b798d4f3bd1a5b61f5c8fb9d987c242 Mon Sep 17 00:00:00 2001
+From: Damien Le Moal <damien.lemoal@wdc.com>
+Date: Wed, 7 Jun 2017 15:55:39 +0900
+Subject: [PATCH] dm zoned: drive-managed zoned block device target
+Git-commit: 3b1a94c88b798d4f3bd1a5b61f5c8fb9d987c242
+Patch-mainline: v4.13-rc1
+References: fate#322738,fate#322919,fate#322950,fate#323773 
+
+The dm-zoned device mapper target provides transparent write access
+to zoned block devices (ZBC and ZAC compliant block devices).
+dm-zoned hides to the device user (a file system or an application
+doing raw block device accesses) any constraint imposed on write
+requests by the device, equivalent to a drive-managed zoned block
+device model.
+
+Write requests are processed using a combination of on-disk buffering
+using the device conventional zones and direct in-place processing for
+requests aligned to a zone sequential write pointer position.
+A background reclaim process implemented using dm_kcopyd_copy ensures
+that conventional zones are always available for executing unaligned
+write requests. The reclaim process overhead is minimized by managing
+buffer zones in a least-recently-written order and first targeting the
+oldest buffer zones. Doing so, blocks under regular write access (such
+as metadata blocks of a file system) remain stored in conventional
+zones, resulting in no apparent overhead.
+
+dm-zoned implementation focus on simplicity and on minimizing overhead
+(CPU, memory and storage overhead). For a 14TB host-managed disk with
+256 MB zones, dm-zoned memory usage per disk instance is at most about
+3 MB and as little as 5 zones will be used internally for storing metadata
+and performing buffer zone reclaim operations. This is achieved using
+zone level indirection rather than a full block indirection system for
+managing block movement between zones.
+
+dm-zoned primary target is host-managed zoned block devices but it can
+also be used with host-aware device models to mitigate potential
+device-side performance degradation due to excessive random writing.
+
+Zoned block devices can be formatted and checked for use with the dm-zoned
+target using the dmzadm utility available at:
+
+https://github.com/hgst/dm-zoned-tools
+
+Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+[Mike Snitzer partly refactored Damien's original work to cleanup the code]
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ Documentation/device-mapper/dm-zoned.txt |  144 ++
+ drivers/md/Kconfig                       |   17 +
+ drivers/md/Makefile                      |    2 +
+ drivers/md/dm-zoned-metadata.c           | 2509 ++++++++++++++++++++++++++++++
+ drivers/md/dm-zoned-reclaim.c            |  570 +++++++
+ drivers/md/dm-zoned-target.c             |  967 ++++++++++++
+ drivers/md/dm-zoned.h                    |  228 +++
+ 7 files changed, 4437 insertions(+)
+ create mode 100644 Documentation/device-mapper/dm-zoned.txt
+ create mode 100644 drivers/md/dm-zoned-metadata.c
+ create mode 100644 drivers/md/dm-zoned-reclaim.c
+ create mode 100644 drivers/md/dm-zoned-target.c
+ create mode 100644 drivers/md/dm-zoned.h
+
+diff --git a/Documentation/device-mapper/dm-zoned.txt b/Documentation/device-mapper/dm-zoned.txt
+new file mode 100644
+index 000000000000..736fcc78d193
+--- /dev/null
++++ b/Documentation/device-mapper/dm-zoned.txt
+@@ -0,0 +1,144 @@
++dm-zoned
++========
++
++The dm-zoned device mapper target exposes a zoned block device (ZBC and
++ZAC compliant devices) as a regular block device without any write
++pattern constraints. In effect, it implements a drive-managed zoned
++block device which hides from the user (a file system or an application
++doing raw block device accesses) the sequential write constraints of
++host-managed zoned block devices and can mitigate the potential
++device-side performance degradation due to excessive random writes on
++host-aware zoned block devices.
++
++For a more detailed description of the zoned block device models and
++their constraints see (for SCSI devices):
++
++http://www.t10.org/drafts.htm#ZBC_Family
++
++and (for ATA devices):
++
++http://www.t13.org/Documents/UploadedDocuments/docs2015/di537r05-Zoned_Device_ATA_Command_Set_ZAC.pdf
++
++The dm-zoned implementation is simple and minimizes system overhead (CPU
++and memory usage as well as storage capacity loss). For a 10TB
++host-managed disk with 256 MB zones, dm-zoned memory usage per disk
++instance is at most 4.5 MB and as little as 5 zones will be used
++internally for storing metadata and performaing reclaim operations.
++
++dm-zoned target devices are formatted and checked using the dmzadm
++utility available at:
++
++https://github.com/hgst/dm-zoned-tools
++
++Algorithm
++=========
++
++dm-zoned implements an on-disk buffering scheme to handle non-sequential
++write accesses to the sequential zones of a zoned block device.
++Conventional zones are used for caching as well as for storing internal
++metadata.
++
++The zones of the device are separated into 2 types:
++
++1) Metadata zones: these are conventional zones used to store metadata.
++Metadata zones are not reported as useable capacity to the user.
++
++2) Data zones: all remaining zones, the vast majority of which will be
++sequential zones used exclusively to store user data. The conventional
++zones of the device may be used also for buffering user random writes.
++Data in these zones may be directly mapped to the conventional zone, but
++later moved to a sequential zone so that the conventional zone can be
++reused for buffering incoming random writes.
++
++dm-zoned exposes a logical device with a sector size of 4096 bytes,
++irrespective of the physical sector size of the backend zoned block
++device being used. This allows reducing the amount of metadata needed to
++manage valid blocks (blocks written).
++
++The on-disk metadata format is as follows:
++
++1) The first block of the first conventional zone found contains the
++super block which describes the on disk amount and position of metadata
++blocks.
++
++2) Following the super block, a set of blocks is used to describe the
++mapping of the logical device blocks. The mapping is done per chunk of
++blocks, with the chunk size equal to the zoned block device size. The
++mapping table is indexed by chunk number and each mapping entry
++indicates the zone number of the device storing the chunk of data. Each
++mapping entry may also indicate if the zone number of a conventional
++zone used to buffer random modification to the data zone.
++
++3) A set of blocks used to store bitmaps indicating the validity of
++blocks in the data zones follows the mapping table. A valid block is
++defined as a block that was written and not discarded. For a buffered
++data chunk, a block is always valid only in the data zone mapping the
++chunk or in the buffer zone of the chunk.
++
++For a logical chunk mapped to a conventional zone, all write operations
++are processed by directly writing to the zone. If the mapping zone is a
++sequential zone, the write operation is processed directly only if the
++write offset within the logical chunk is equal to the write pointer
++offset within of the sequential data zone (i.e. the write operation is
++aligned on the zone write pointer). Otherwise, write operations are
++processed indirectly using a buffer zone. In that case, an unused
++conventional zone is allocated and assigned to the chunk being
++accessed. Writing a block to the buffer zone of a chunk will
++automatically invalidate the same block in the sequential zone mapping
++the chunk. If all blocks of the sequential zone become invalid, the zone
++is freed and the chunk buffer zone becomes the primary zone mapping the
++chunk, resulting in native random write performance similar to a regular
++block device.
++
++Read operations are processed according to the block validity
++information provided by the bitmaps. Valid blocks are read either from
++the sequential zone mapping a chunk, or if the chunk is buffered, from
++the buffer zone assigned. If the accessed chunk has no mapping, or the
++accessed blocks are invalid, the read buffer is zeroed and the read
++operation terminated.
++
++After some time, the limited number of convnetional zones available may
++be exhausted (all used to map chunks or buffer sequential zones) and
++unaligned writes to unbuffered chunks become impossible. To avoid this
++situation, a reclaim process regularly scans used conventional zones and
++tries to reclaim the least recently used zones by copying the valid
++blocks of the buffer zone to a free sequential zone. Once the copy
++completes, the chunk mapping is updated to point to the sequential zone
++and the buffer zone freed for reuse.
++
++Metadata Protection
++===================
++
++To protect metadata against corruption in case of sudden power loss or
++system crash, 2 sets of metadata zones are used. One set, the primary
++set, is used as the main metadata region, while the secondary set is
++used as a staging area. Modified metadata is first written to the
++secondary set and validated by updating the super block in the secondary
++set, a generation counter is used to indicate that this set contains the
++newest metadata. Once this operation completes, in place of metadata
++block updates can be done in the primary metadata set. This ensures that
++one of the set is always consistent (all modifications committed or none
++at all). Flush operations are used as a commit point. Upon reception of
++a flush request, metadata modification activity is temporarily blocked
++(for both incoming BIO processing and reclaim process) and all dirty
++metadata blocks are staged and updated. Normal operation is then
++resumed. Flushing metadata thus only temporarily delays write and
++discard requests. Read requests can be processed concurrently while
++metadata flush is being executed.
++
++Usage
++=====
++
++A zoned block device must first be formatted using the dmzadm tool. This
++will analyze the device zone configuration, determine where to place the
++metadata sets on the device and initialize the metadata sets.
++
++Ex:
++
++dmzadm --format /dev/sdxx
++
++For a formatted device, the target can be created normally with the
++dmsetup utility. The only parameter that dm-zoned requires is the
++underlying zoned block device name. Ex:
++
++echo "0 `blockdev --getsize ${dev}` zoned ${dev}" | dmsetup create dmz-`basename ${dev}`
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index 906103c168ea..4a249ee86364 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -521,6 +521,23 @@ config DM_INTEGRITY
+ 	  To compile this code as a module, choose M here: the module will
+ 	  be called dm-integrity.
+ 
++config DM_ZONED
++	tristate "Drive-managed zoned block device target support"
++	depends on BLK_DEV_DM
++	depends on BLK_DEV_ZONED
++	---help---
++	  This device-mapper target takes a host-managed or host-aware zoned
++	  block device and exposes most of its capacity as a regular block
++	  device (drive-managed zoned block device) without any write
++	  constraints. This is mainly intended for use with file systems that
++	  do not natively support zoned block devices but still want to
++	  benefit from the increased capacity offered by SMR disks. Other uses
++	  by applications using raw block devices (for example object stores)
++	  are also possible.
++
++	  To compile this code as a module, choose M here: the module will
++	  be called dm-zoned.
++
+ 	  If unsure, say N.
+ 
+ endif # MD
+diff --git a/drivers/md/Makefile b/drivers/md/Makefile
+index 913720bd81c1..786ec9e86d65 100644
+--- a/drivers/md/Makefile
++++ b/drivers/md/Makefile
+@@ -20,6 +20,7 @@ dm-era-y	+= dm-era-target.o
+ dm-verity-y	+= dm-verity-target.o
+ md-mod-y	+= md.o bitmap.o
+ raid456-y	+= raid5.o raid5-cache.o raid5-ppl.o
++dm-zoned-y	+= dm-zoned-target.o dm-zoned-metadata.o dm-zoned-reclaim.o
+ 
+ # Note: link order is important.  All raid personalities
+ # and must come before md.o, as they each initialise 
+@@ -60,6 +61,7 @@ obj-$(CONFIG_DM_CACHE_SMQ)	+= dm-cache-smq.o
+ obj-$(CONFIG_DM_ERA)		+= dm-era.o
+ obj-$(CONFIG_DM_LOG_WRITES)	+= dm-log-writes.o
+ obj-$(CONFIG_DM_INTEGRITY)	+= dm-integrity.o
++obj-$(CONFIG_DM_ZONED)		+= dm-zoned.o
+ 
+ ifeq ($(CONFIG_DM_UEVENT),y)
+ dm-mod-objs			+= dm-uevent.o
+diff --git a/drivers/md/dm-zoned-metadata.c b/drivers/md/dm-zoned-metadata.c
+new file mode 100644
+index 000000000000..4618441cc412
+--- /dev/null
++++ b/drivers/md/dm-zoned-metadata.c
+@@ -0,0 +1,2509 @@
++/*
++ * Copyright (C) 2017 Western Digital Corporation or its affiliates.
++ *
++ * This file is released under the GPL.
++ */
++
++#include "dm-zoned.h"
++
++#include <linux/module.h>
++#include <linux/crc32.h>
++
++#define	DM_MSG_PREFIX		"zoned metadata"
++
++/*
++ * Metadata version.
++ */
++#define DMZ_META_VER	1
++
++/*
++ * On-disk super block magic.
++ */
++#define DMZ_MAGIC	((((unsigned int)('D')) << 24) | \
++			 (((unsigned int)('Z')) << 16) | \
++			 (((unsigned int)('B')) <<  8) | \
++			 ((unsigned int)('D')))
++
++/*
++ * On disk super block.
++ * This uses only 512 B but uses on disk a full 4KB block. This block is
++ * followed on disk by the mapping table of chunks to zones and the bitmap
++ * blocks indicating zone block validity.
++ * The overall resulting metadata format is:
++ *    (1) Super block (1 block)
++ *    (2) Chunk mapping table (nr_map_blocks)
++ *    (3) Bitmap blocks (nr_bitmap_blocks)
++ * All metadata blocks are stored in conventional zones, starting from the
++ * the first conventional zone found on disk.
++ */
++struct dmz_super {
++	/* Magic number */
++	__le32		magic;			/*   4 */
++
++	/* Metadata version number */
++	__le32		version;		/*   8 */
++
++	/* Generation number */
++	__le64		gen;			/*  16 */
++
++	/* This block number */
++	__le64		sb_block;		/*  24 */
++
++	/* The number of metadata blocks, including this super block */
++	__le32		nr_meta_blocks;		/*  28 */
++
++	/* The number of sequential zones reserved for reclaim */
++	__le32		nr_reserved_seq;	/*  32 */
++
++	/* The number of entries in the mapping table */
++	__le32		nr_chunks;		/*  36 */
++
++	/* The number of blocks used for the chunk mapping table */
++	__le32		nr_map_blocks;		/*  40 */
++
++	/* The number of blocks used for the block bitmaps */
++	__le32		nr_bitmap_blocks;	/*  44 */
++
++	/* Checksum */
++	__le32		crc;			/*  48 */
++
++	/* Padding to full 512B sector */
++	u8		reserved[464];		/* 512 */
++};
++
++/*
++ * Chunk mapping entry: entries are indexed by chunk number
++ * and give the zone ID (dzone_id) mapping the chunk on disk.
++ * This zone may be sequential or random. If it is a sequential
++ * zone, a second zone (bzone_id) used as a write buffer may
++ * also be specified. This second zone will always be a randomly
++ * writeable zone.
++ */
++struct dmz_map {
++	__le32			dzone_id;
++	__le32			bzone_id;
++};
++
++/*
++ * Chunk mapping table metadata: 512 8-bytes entries per 4KB block.
++ */
++#define DMZ_MAP_ENTRIES		(DMZ_BLOCK_SIZE / sizeof(struct dmz_map))
++#define DMZ_MAP_ENTRIES_SHIFT	(ilog2(DMZ_MAP_ENTRIES))
++#define DMZ_MAP_ENTRIES_MASK	(DMZ_MAP_ENTRIES - 1)
++#define DMZ_MAP_UNMAPPED	UINT_MAX
++
++/*
++ * Meta data block descriptor (for cached metadata blocks).
++ */
++struct dmz_mblock {
++	struct rb_node		node;
++	struct list_head	link;
++	sector_t		no;
++	atomic_t		ref;
++	unsigned long		state;
++	struct page		*page;
++	void			*data;
++};
++
++/*
++ * Metadata block state flags.
++ */
++enum {
++	DMZ_META_DIRTY,
++	DMZ_META_READING,
++	DMZ_META_WRITING,
++	DMZ_META_ERROR,
++};
++
++/*
++ * Super block information (one per metadata set).
++ */
++struct dmz_sb {
++	sector_t		block;
++	struct dmz_mblock	*mblk;
++	struct dmz_super	*sb;
++};
++
++/*
++ * In-memory metadata.
++ */
++struct dmz_metadata {
++	struct dmz_dev		*dev;
++
++	sector_t		zone_bitmap_size;
++	unsigned int		zone_nr_bitmap_blocks;
++
++	unsigned int		nr_bitmap_blocks;
++	unsigned int		nr_map_blocks;
++
++	unsigned int		nr_useable_zones;
++	unsigned int		nr_meta_blocks;
++	unsigned int		nr_meta_zones;
++	unsigned int		nr_data_zones;
++	unsigned int		nr_rnd_zones;
++	unsigned int		nr_reserved_seq;
++	unsigned int		nr_chunks;
++
++	/* Zone information array */
++	struct dm_zone		*zones;
++
++	struct dm_zone		*sb_zone;
++	struct dmz_sb		sb[2];
++	unsigned int		mblk_primary;
++	u64			sb_gen;
++	unsigned int		min_nr_mblks;
++	unsigned int		max_nr_mblks;
++	atomic_t		nr_mblks;
++	struct rw_semaphore	mblk_sem;
++	struct mutex		mblk_flush_lock;
++	spinlock_t		mblk_lock;
++	struct rb_root		mblk_rbtree;
++	struct list_head	mblk_lru_list;
++	struct list_head	mblk_dirty_list;
++	struct shrinker		mblk_shrinker;
++
++	/* Zone allocation management */
++	struct mutex		map_lock;
++	struct dmz_mblock	**map_mblk;
++	unsigned int		nr_rnd;
++	atomic_t		unmap_nr_rnd;
++	struct list_head	unmap_rnd_list;
++	struct list_head	map_rnd_list;
++
++	unsigned int		nr_seq;
++	atomic_t		unmap_nr_seq;
++	struct list_head	unmap_seq_list;
++	struct list_head	map_seq_list;
++
++	atomic_t		nr_reserved_seq_zones;
++	struct list_head	reserved_seq_zones_list;
++
++	wait_queue_head_t	free_wq;
++};
++
++/*
++ * Various accessors
++ */
++unsigned int dmz_id(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	return ((unsigned int)(zone - zmd->zones));
++}
++
++sector_t dmz_start_sect(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	return dmz_id(zmd, zone) << zmd->dev->zone_nr_sectors_shift;
++}
++
++sector_t dmz_start_block(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	return dmz_id(zmd, zone) << zmd->dev->zone_nr_blocks_shift;
++}
++
++unsigned int dmz_nr_chunks(struct dmz_metadata *zmd)
++{
++	return zmd->nr_chunks;
++}
++
++unsigned int dmz_nr_rnd_zones(struct dmz_metadata *zmd)
++{
++	return zmd->nr_rnd;
++}
++
++unsigned int dmz_nr_unmap_rnd_zones(struct dmz_metadata *zmd)
++{
++	return atomic_read(&zmd->unmap_nr_rnd);
++}
++
++/*
++ * Lock/unlock mapping table.
++ * The map lock also protects all the zone lists.
++ */
++void dmz_lock_map(struct dmz_metadata *zmd)
++{
++	mutex_lock(&zmd->map_lock);
++}
++
++void dmz_unlock_map(struct dmz_metadata *zmd)
++{
++	mutex_unlock(&zmd->map_lock);
++}
++
++/*
++ * Lock/unlock metadata access. This is a "read" lock on a semaphore
++ * that prevents metadata flush from running while metadata are being
++ * modified. The actual metadata write mutual exclusion is achieved with
++ * the map lock and zone styate management (active and reclaim state are
++ * mutually exclusive).
++ */
++void dmz_lock_metadata(struct dmz_metadata *zmd)
++{
++	down_read(&zmd->mblk_sem);
++}
++
++void dmz_unlock_metadata(struct dmz_metadata *zmd)
++{
++	up_read(&zmd->mblk_sem);
++}
++
++/*
++ * Lock/unlock flush: prevent concurrent executions
++ * of dmz_flush_metadata as well as metadata modification in reclaim
++ * while flush is being executed.
++ */
++void dmz_lock_flush(struct dmz_metadata *zmd)
++{
++	mutex_lock(&zmd->mblk_flush_lock);
++}
++
++void dmz_unlock_flush(struct dmz_metadata *zmd)
++{
++	mutex_unlock(&zmd->mblk_flush_lock);
++}
++
++/*
++ * Allocate a metadata block.
++ */
++static struct dmz_mblock *dmz_alloc_mblock(struct dmz_metadata *zmd,
++					   sector_t mblk_no)
++{
++	struct dmz_mblock *mblk = NULL;
++
++	/* See if we can reuse cached blocks */
++	if (zmd->max_nr_mblks && atomic_read(&zmd->nr_mblks) > zmd->max_nr_mblks) {
++		spin_lock(&zmd->mblk_lock);
++		mblk = list_first_entry_or_null(&zmd->mblk_lru_list,
++						struct dmz_mblock, link);
++		if (mblk) {
++			list_del_init(&mblk->link);
++			rb_erase(&mblk->node, &zmd->mblk_rbtree);
++			mblk->no = mblk_no;
++		}
++		spin_unlock(&zmd->mblk_lock);
++		if (mblk)
++			return mblk;
++	}
++
++	/* Allocate a new block */
++	mblk = kmalloc(sizeof(struct dmz_mblock), GFP_NOIO);
++	if (!mblk)
++		return NULL;
++
++	mblk->page = alloc_page(GFP_NOIO);
++	if (!mblk->page) {
++		kfree(mblk);
++		return NULL;
++	}
++
++	RB_CLEAR_NODE(&mblk->node);
++	INIT_LIST_HEAD(&mblk->link);
++	atomic_set(&mblk->ref, 0);
++	mblk->state = 0;
++	mblk->no = mblk_no;
++	mblk->data = page_address(mblk->page);
++
++	atomic_inc(&zmd->nr_mblks);
++
++	return mblk;
++}
++
++/*
++ * Free a metadata block.
++ */
++static void dmz_free_mblock(struct dmz_metadata *zmd, struct dmz_mblock *mblk)
++{
++	__free_pages(mblk->page, 0);
++	kfree(mblk);
++
++	atomic_dec(&zmd->nr_mblks);
++}
++
++/*
++ * Insert a metadata block in the rbtree.
++ */
++static void dmz_insert_mblock(struct dmz_metadata *zmd, struct dmz_mblock *mblk)
++{
++	struct rb_root *root = &zmd->mblk_rbtree;
++	struct rb_node **new = &(root->rb_node), *parent = NULL;
++	struct dmz_mblock *b;
++
++	/* Figure out where to put the new node */
++	while (*new) {
++		b = container_of(*new, struct dmz_mblock, node);
++		parent = *new;
++		new = (b->no < mblk->no) ? &((*new)->rb_left) : &((*new)->rb_right);
++	}
++
++	/* Add new node and rebalance tree */
++	rb_link_node(&mblk->node, parent, new);
++	rb_insert_color(&mblk->node, root);
++}
++
++/*
++ * Lookup a metadata block in the rbtree.
++ */
++static struct dmz_mblock *dmz_lookup_mblock(struct dmz_metadata *zmd,
++					    sector_t mblk_no)
++{
++	struct rb_root *root = &zmd->mblk_rbtree;
++	struct rb_node *node = root->rb_node;
++	struct dmz_mblock *mblk;
++
++	while (node) {
++		mblk = container_of(node, struct dmz_mblock, node);
++		if (mblk->no == mblk_no)
++			return mblk;
++		node = (mblk->no < mblk_no) ? node->rb_left : node->rb_right;
++	}
++
++	return NULL;
++}
++
++/*
++ * Metadata block BIO end callback.
++ */
++static void dmz_mblock_bio_end_io(struct bio *bio)
++{
++	struct dmz_mblock *mblk = bio->bi_private;
++	int flag;
++
++	if (bio->bi_status)
++		set_bit(DMZ_META_ERROR, &mblk->state);
++
++	if (bio_op(bio) == REQ_OP_WRITE)
++		flag = DMZ_META_WRITING;
++	else
++		flag = DMZ_META_READING;
++
++	clear_bit_unlock(flag, &mblk->state);
++	smp_mb__after_atomic();
++	wake_up_bit(&mblk->state, flag);
++
++	bio_put(bio);
++}
++
++/*
++ * Read a metadata block from disk.
++ */
++static struct dmz_mblock *dmz_fetch_mblock(struct dmz_metadata *zmd,
++					   sector_t mblk_no)
++{
++	struct dmz_mblock *mblk;
++	sector_t block = zmd->sb[zmd->mblk_primary].block + mblk_no;
++	struct bio *bio;
++
++	/* Get block and insert it */
++	mblk = dmz_alloc_mblock(zmd, mblk_no);
++	if (!mblk)
++		return NULL;
++
++	spin_lock(&zmd->mblk_lock);
++	atomic_inc(&mblk->ref);
++	set_bit(DMZ_META_READING, &mblk->state);
++	dmz_insert_mblock(zmd, mblk);
++	spin_unlock(&zmd->mblk_lock);
++
++	bio = bio_alloc(GFP_NOIO, 1);
++	if (!bio) {
++		dmz_free_mblock(zmd, mblk);
++		return NULL;
++	}
++
++	bio->bi_iter.bi_sector = dmz_blk2sect(block);
++	bio->bi_bdev = zmd->dev->bdev;
++	bio->bi_private = mblk;
++	bio->bi_end_io = dmz_mblock_bio_end_io;
++	bio_set_op_attrs(bio, REQ_OP_READ, REQ_META | REQ_PRIO);
++	bio_add_page(bio, mblk->page, DMZ_BLOCK_SIZE, 0);
++	submit_bio(bio);
++
++	return mblk;
++}
++
++/*
++ * Free metadata blocks.
++ */
++static unsigned long dmz_shrink_mblock_cache(struct dmz_metadata *zmd,
++					     unsigned long limit)
++{
++	struct dmz_mblock *mblk;
++	unsigned long count = 0;
++
++	if (!zmd->max_nr_mblks)
++		return 0;
++
++	while (!list_empty(&zmd->mblk_lru_list) &&
++	       atomic_read(&zmd->nr_mblks) > zmd->min_nr_mblks &&
++	       count < limit) {
++		mblk = list_first_entry(&zmd->mblk_lru_list,
++					struct dmz_mblock, link);
++		list_del_init(&mblk->link);
++		rb_erase(&mblk->node, &zmd->mblk_rbtree);
++		dmz_free_mblock(zmd, mblk);
++		count++;
++	}
++
++	return count;
++}
++
++/*
++ * For mblock shrinker: get the number of unused metadata blocks in the cache.
++ */
++static unsigned long dmz_mblock_shrinker_count(struct shrinker *shrink,
++					       struct shrink_control *sc)
++{
++	struct dmz_metadata *zmd = container_of(shrink, struct dmz_metadata, mblk_shrinker);
++
++	return atomic_read(&zmd->nr_mblks);
++}
++
++/*
++ * For mblock shrinker: scan unused metadata blocks and shrink the cache.
++ */
++static unsigned long dmz_mblock_shrinker_scan(struct shrinker *shrink,
++					      struct shrink_control *sc)
++{
++	struct dmz_metadata *zmd = container_of(shrink, struct dmz_metadata, mblk_shrinker);
++	unsigned long count;
++
++	spin_lock(&zmd->mblk_lock);
++	count = dmz_shrink_mblock_cache(zmd, sc->nr_to_scan);
++	spin_unlock(&zmd->mblk_lock);
++
++	return count ? count : SHRINK_STOP;
++}
++
++/*
++ * Release a metadata block.
++ */
++static void dmz_release_mblock(struct dmz_metadata *zmd,
++			       struct dmz_mblock *mblk)
++{
++
++	if (!mblk)
++		return;
++
++	spin_lock(&zmd->mblk_lock);
++
++	if (atomic_dec_and_test(&mblk->ref)) {
++		if (test_bit(DMZ_META_ERROR, &mblk->state)) {
++			rb_erase(&mblk->node, &zmd->mblk_rbtree);
++			dmz_free_mblock(zmd, mblk);
++		} else if (!test_bit(DMZ_META_DIRTY, &mblk->state)) {
++			list_add_tail(&mblk->link, &zmd->mblk_lru_list);
++			dmz_shrink_mblock_cache(zmd, 1);
++		}
++	}
++
++	spin_unlock(&zmd->mblk_lock);
++}
++
++/*
++ * Get a metadata block from the rbtree. If the block
++ * is not present, read it from disk.
++ */
++static struct dmz_mblock *dmz_get_mblock(struct dmz_metadata *zmd,
++					 sector_t mblk_no)
++{
++	struct dmz_mblock *mblk;
++
++	/* Check rbtree */
++	spin_lock(&zmd->mblk_lock);
++	mblk = dmz_lookup_mblock(zmd, mblk_no);
++	if (mblk) {
++		/* Cache hit: remove block from LRU list */
++		if (atomic_inc_return(&mblk->ref) == 1 &&
++		    !test_bit(DMZ_META_DIRTY, &mblk->state))
++			list_del_init(&mblk->link);
++	}
++	spin_unlock(&zmd->mblk_lock);
++
++	if (!mblk) {
++		/* Cache miss: read the block from disk */
++		mblk = dmz_fetch_mblock(zmd, mblk_no);
++		if (!mblk)
++			return ERR_PTR(-ENOMEM);
++	}
++
++	/* Wait for on-going read I/O and check for error */
++	wait_on_bit_io(&mblk->state, DMZ_META_READING,
++		       TASK_UNINTERRUPTIBLE);
++	if (test_bit(DMZ_META_ERROR, &mblk->state)) {
++		dmz_release_mblock(zmd, mblk);
++		return ERR_PTR(-EIO);
++	}
++
++	return mblk;
++}
++
++/*
++ * Mark a metadata block dirty.
++ */
++static void dmz_dirty_mblock(struct dmz_metadata *zmd, struct dmz_mblock *mblk)
++{
++	spin_lock(&zmd->mblk_lock);
++	if (!test_and_set_bit(DMZ_META_DIRTY, &mblk->state))
++		list_add_tail(&mblk->link, &zmd->mblk_dirty_list);
++	spin_unlock(&zmd->mblk_lock);
++}
++
++/*
++ * Issue a metadata block write BIO.
++ */
++static void dmz_write_mblock(struct dmz_metadata *zmd, struct dmz_mblock *mblk,
++			     unsigned int set)
++{
++	sector_t block = zmd->sb[set].block + mblk->no;
++	struct bio *bio;
++
++	bio = bio_alloc(GFP_NOIO, 1);
++	if (!bio) {
++		set_bit(DMZ_META_ERROR, &mblk->state);
++		return;
++	}
++
++	set_bit(DMZ_META_WRITING, &mblk->state);
++
++	bio->bi_iter.bi_sector = dmz_blk2sect(block);
++	bio->bi_bdev = zmd->dev->bdev;
++	bio->bi_private = mblk;
++	bio->bi_end_io = dmz_mblock_bio_end_io;
++	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_META | REQ_PRIO);
++	bio_add_page(bio, mblk->page, DMZ_BLOCK_SIZE, 0);
++	submit_bio(bio);
++}
++
++/*
++ * Read/write a metadata block.
++ */
++static int dmz_rdwr_block(struct dmz_metadata *zmd, int op, sector_t block,
++			  struct page *page)
++{
++	struct bio *bio;
++	int ret;
++
++	bio = bio_alloc(GFP_NOIO, 1);
++	if (!bio)
++		return -ENOMEM;
++
++	bio->bi_iter.bi_sector = dmz_blk2sect(block);
++	bio->bi_bdev = zmd->dev->bdev;
++	bio_set_op_attrs(bio, op, REQ_SYNC | REQ_META | REQ_PRIO);
++	bio_add_page(bio, page, DMZ_BLOCK_SIZE, 0);
++	ret = submit_bio_wait(bio);
++	bio_put(bio);
++
++	return ret;
++}
++
++/*
++ * Write super block of the specified metadata set.
++ */
++static int dmz_write_sb(struct dmz_metadata *zmd, unsigned int set)
++{
++	sector_t block = zmd->sb[set].block;
++	struct dmz_mblock *mblk = zmd->sb[set].mblk;
++	struct dmz_super *sb = zmd->sb[set].sb;
++	u64 sb_gen = zmd->sb_gen + 1;
++	int ret;
++
++	sb->magic = cpu_to_le32(DMZ_MAGIC);
++	sb->version = cpu_to_le32(DMZ_META_VER);
++
++	sb->gen = cpu_to_le64(sb_gen);
++
++	sb->sb_block = cpu_to_le64(block);
++	sb->nr_meta_blocks = cpu_to_le32(zmd->nr_meta_blocks);
++	sb->nr_reserved_seq = cpu_to_le32(zmd->nr_reserved_seq);
++	sb->nr_chunks = cpu_to_le32(zmd->nr_chunks);
++
++	sb->nr_map_blocks = cpu_to_le32(zmd->nr_map_blocks);
++	sb->nr_bitmap_blocks = cpu_to_le32(zmd->nr_bitmap_blocks);
++
++	sb->crc = 0;
++	sb->crc = cpu_to_le32(crc32_le(sb_gen, (unsigned char *)sb, DMZ_BLOCK_SIZE));
++
++	ret = dmz_rdwr_block(zmd, REQ_OP_WRITE, block, mblk->page);
++	if (ret == 0)
++		ret = blkdev_issue_flush(zmd->dev->bdev, GFP_KERNEL, NULL);
++
++	return ret;
++}
++
++/*
++ * Write dirty metadata blocks to the specified set.
++ */
++static int dmz_write_dirty_mblocks(struct dmz_metadata *zmd,
++				   struct list_head *write_list,
++				   unsigned int set)
++{
++	struct dmz_mblock *mblk;
++	struct blk_plug plug;
++	int ret = 0;
++
++	/* Issue writes */
++	blk_start_plug(&plug);
++	list_for_each_entry(mblk, write_list, link)
++		dmz_write_mblock(zmd, mblk, set);
++	blk_finish_plug(&plug);
++
++	/* Wait for completion */
++	list_for_each_entry(mblk, write_list, link) {
++		wait_on_bit_io(&mblk->state, DMZ_META_WRITING,
++			       TASK_UNINTERRUPTIBLE);
++		if (test_bit(DMZ_META_ERROR, &mblk->state)) {
++			clear_bit(DMZ_META_ERROR, &mblk->state);
++			ret = -EIO;
++		}
++	}
++
++	/* Flush drive cache (this will also sync data) */
++	if (ret == 0)
++		ret = blkdev_issue_flush(zmd->dev->bdev, GFP_KERNEL, NULL);
++
++	return ret;
++}
++
++/*
++ * Log dirty metadata blocks.
++ */
++static int dmz_log_dirty_mblocks(struct dmz_metadata *zmd,
++				 struct list_head *write_list)
++{
++	unsigned int log_set = zmd->mblk_primary ^ 0x1;
++	int ret;
++
++	/* Write dirty blocks to the log */
++	ret = dmz_write_dirty_mblocks(zmd, write_list, log_set);
++	if (ret)
++		return ret;
++
++	/*
++	 * No error so far: now validate the log by updating the
++	 * log index super block generation.
++	 */
++	ret = dmz_write_sb(zmd, log_set);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++/*
++ * Flush dirty metadata blocks.
++ */
++int dmz_flush_metadata(struct dmz_metadata *zmd)
++{
++	struct dmz_mblock *mblk;
++	struct list_head write_list;
++	int ret;
++
++	if (WARN_ON(!zmd))
++		return 0;
++
++	INIT_LIST_HEAD(&write_list);
++
++	/*
++	 * Make sure that metadata blocks are stable before logging: take
++	 * the write lock on the metadata semaphore to prevent target BIOs
++	 * from modifying metadata.
++	 */
++	down_write(&zmd->mblk_sem);
++
++	/*
++	 * This is called from the target flush work and reclaim work.
++	 * Concurrent execution is not allowed.
++	 */
++	dmz_lock_flush(zmd);
++
++	/* Get dirty blocks */
++	spin_lock(&zmd->mblk_lock);
++	list_splice_init(&zmd->mblk_dirty_list, &write_list);
++	spin_unlock(&zmd->mblk_lock);
++
++	/* If there are no dirty metadata blocks, just flush the device cache */
++	if (list_empty(&write_list)) {
++		ret = blkdev_issue_flush(zmd->dev->bdev, GFP_KERNEL, NULL);
++		goto out;
++	}
++
++	/*
++	 * The primary metadata set is still clean. Keep it this way until
++	 * all updates are successful in the secondary set. That is, use
++	 * the secondary set as a log.
++	 */
++	ret = dmz_log_dirty_mblocks(zmd, &write_list);
++	if (ret)
++		goto out;
++
++	/*
++	 * The log is on disk. It is now safe to update in place
++	 * in the primary metadata set.
++	 */
++	ret = dmz_write_dirty_mblocks(zmd, &write_list, zmd->mblk_primary);
++	if (ret)
++		goto out;
++
++	ret = dmz_write_sb(zmd, zmd->mblk_primary);
++	if (ret)
++		goto out;
++
++	while (!list_empty(&write_list)) {
++		mblk = list_first_entry(&write_list, struct dmz_mblock, link);
++		list_del_init(&mblk->link);
++
++		spin_lock(&zmd->mblk_lock);
++		clear_bit(DMZ_META_DIRTY, &mblk->state);
++		if (atomic_read(&mblk->ref) == 0)
++			list_add_tail(&mblk->link, &zmd->mblk_lru_list);
++		spin_unlock(&zmd->mblk_lock);
++	}
++
++	zmd->sb_gen++;
++out:
++	if (ret && !list_empty(&write_list)) {
++		spin_lock(&zmd->mblk_lock);
++		list_splice(&write_list, &zmd->mblk_dirty_list);
++		spin_unlock(&zmd->mblk_lock);
++	}
++
++	dmz_unlock_flush(zmd);
++	up_write(&zmd->mblk_sem);
++
++	return ret;
++}
++
++/*
++ * Check super block.
++ */
++static int dmz_check_sb(struct dmz_metadata *zmd, struct dmz_super *sb)
++{
++	unsigned int nr_meta_zones, nr_data_zones;
++	struct dmz_dev *dev = zmd->dev;
++	u32 crc, stored_crc;
++	u64 gen;
++
++	gen = le64_to_cpu(sb->gen);
++	stored_crc = le32_to_cpu(sb->crc);
++	sb->crc = 0;
++	crc = crc32_le(gen, (unsigned char *)sb, DMZ_BLOCK_SIZE);
++	if (crc != stored_crc) {
++		dmz_dev_err(dev, "Invalid checksum (needed 0x%08x, got 0x%08x)",
++			    crc, stored_crc);
++		return -ENXIO;
++	}
++
++	if (le32_to_cpu(sb->magic) != DMZ_MAGIC) {
++		dmz_dev_err(dev, "Invalid meta magic (needed 0x%08x, got 0x%08x)",
++			    DMZ_MAGIC, le32_to_cpu(sb->magic));
++		return -ENXIO;
++	}
++
++	if (le32_to_cpu(sb->version) != DMZ_META_VER) {
++		dmz_dev_err(dev, "Invalid meta version (needed %d, got %d)",
++			    DMZ_META_VER, le32_to_cpu(sb->version));
++		return -ENXIO;
++	}
++
++	nr_meta_zones = (le32_to_cpu(sb->nr_meta_blocks) + dev->zone_nr_blocks - 1)
++		>> dev->zone_nr_blocks_shift;
++	if (!nr_meta_zones ||
++	    nr_meta_zones >= zmd->nr_rnd_zones) {
++		dmz_dev_err(dev, "Invalid number of metadata blocks");
++		return -ENXIO;
++	}
++
++	if (!le32_to_cpu(sb->nr_reserved_seq) ||
++	    le32_to_cpu(sb->nr_reserved_seq) >= (zmd->nr_useable_zones - nr_meta_zones)) {
++		dmz_dev_err(dev, "Invalid number of reserved sequential zones");
++		return -ENXIO;
++	}
++
++	nr_data_zones = zmd->nr_useable_zones -
++		(nr_meta_zones * 2 + le32_to_cpu(sb->nr_reserved_seq));
++	if (le32_to_cpu(sb->nr_chunks) > nr_data_zones) {
++		dmz_dev_err(dev, "Invalid number of chunks %u / %u",
++			    le32_to_cpu(sb->nr_chunks), nr_data_zones);
++		return -ENXIO;
++	}
++
++	/* OK */
++	zmd->nr_meta_blocks = le32_to_cpu(sb->nr_meta_blocks);
++	zmd->nr_reserved_seq = le32_to_cpu(sb->nr_reserved_seq);
++	zmd->nr_chunks = le32_to_cpu(sb->nr_chunks);
++	zmd->nr_map_blocks = le32_to_cpu(sb->nr_map_blocks);
++	zmd->nr_bitmap_blocks = le32_to_cpu(sb->nr_bitmap_blocks);
++	zmd->nr_meta_zones = nr_meta_zones;
++	zmd->nr_data_zones = nr_data_zones;
++
++	return 0;
++}
++
++/*
++ * Read the first or second super block from disk.
++ */
++static int dmz_read_sb(struct dmz_metadata *zmd, unsigned int set)
++{
++	return dmz_rdwr_block(zmd, REQ_OP_READ, zmd->sb[set].block,
++			      zmd->sb[set].mblk->page);
++}
++
++/*
++ * Determine the position of the secondary super blocks on disk.
++ * This is used only if a corruption of the primary super block
++ * is detected.
++ */
++static int dmz_lookup_secondary_sb(struct dmz_metadata *zmd)
++{
++	unsigned int zone_nr_blocks = zmd->dev->zone_nr_blocks;
++	struct dmz_mblock *mblk;
++	int i;
++
++	/* Allocate a block */
++	mblk = dmz_alloc_mblock(zmd, 0);
++	if (!mblk)
++		return -ENOMEM;
++
++	zmd->sb[1].mblk = mblk;
++	zmd->sb[1].sb = mblk->data;
++
++	/* Bad first super block: search for the second one */
++	zmd->sb[1].block = zmd->sb[0].block + zone_nr_blocks;
++	for (i = 0; i < zmd->nr_rnd_zones - 1; i++) {
++		if (dmz_read_sb(zmd, 1) != 0)
++			break;
++		if (le32_to_cpu(zmd->sb[1].sb->magic) == DMZ_MAGIC)
++			return 0;
++		zmd->sb[1].block += zone_nr_blocks;
++	}
++
++	dmz_free_mblock(zmd, mblk);
++	zmd->sb[1].mblk = NULL;
++
++	return -EIO;
++}
++
++/*
++ * Read the first or second super block from disk.
++ */
++static int dmz_get_sb(struct dmz_metadata *zmd, unsigned int set)
++{
++	struct dmz_mblock *mblk;
++	int ret;
++
++	/* Allocate a block */
++	mblk = dmz_alloc_mblock(zmd, 0);
++	if (!mblk)
++		return -ENOMEM;
++
++	zmd->sb[set].mblk = mblk;
++	zmd->sb[set].sb = mblk->data;
++
++	/* Read super block */
++	ret = dmz_read_sb(zmd, set);
++	if (ret) {
++		dmz_free_mblock(zmd, mblk);
++		zmd->sb[set].mblk = NULL;
++		return ret;
++	}
++
++	return 0;
++}
++
++/*
++ * Recover a metadata set.
++ */
++static int dmz_recover_mblocks(struct dmz_metadata *zmd, unsigned int dst_set)
++{
++	unsigned int src_set = dst_set ^ 0x1;
++	struct page *page;
++	int i, ret;
++
++	dmz_dev_warn(zmd->dev, "Metadata set %u invalid: recovering", dst_set);
++
++	if (dst_set == 0)
++		zmd->sb[0].block = dmz_start_block(zmd, zmd->sb_zone);
++	else {
++		zmd->sb[1].block = zmd->sb[0].block +
++			(zmd->nr_meta_zones << zmd->dev->zone_nr_blocks_shift);
++	}
++
++	page = alloc_page(GFP_KERNEL);
++	if (!page)
++		return -ENOMEM;
++
++	/* Copy metadata blocks */
++	for (i = 1; i < zmd->nr_meta_blocks; i++) {
++		ret = dmz_rdwr_block(zmd, REQ_OP_READ,
++				     zmd->sb[src_set].block + i, page);
++		if (ret)
++			goto out;
++		ret = dmz_rdwr_block(zmd, REQ_OP_WRITE,
++				     zmd->sb[dst_set].block + i, page);
++		if (ret)
++			goto out;
++	}
++
++	/* Finalize with the super block */
++	if (!zmd->sb[dst_set].mblk) {
++		zmd->sb[dst_set].mblk = dmz_alloc_mblock(zmd, 0);
++		if (!zmd->sb[dst_set].mblk) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		zmd->sb[dst_set].sb = zmd->sb[dst_set].mblk->data;
++	}
++
++	ret = dmz_write_sb(zmd, dst_set);
++out:
++	__free_pages(page, 0);
++
++	return ret;
++}
++
++/*
++ * Get super block from disk.
++ */
++static int dmz_load_sb(struct dmz_metadata *zmd)
++{
++	bool sb_good[2] = {false, false};
++	u64 sb_gen[2] = {0, 0};
++	int ret;
++
++	/* Read and check the primary super block */
++	zmd->sb[0].block = dmz_start_block(zmd, zmd->sb_zone);
++	ret = dmz_get_sb(zmd, 0);
++	if (ret) {
++		dmz_dev_err(zmd->dev, "Read primary super block failed");
++		return ret;
++	}
++
++	ret = dmz_check_sb(zmd, zmd->sb[0].sb);
++
++	/* Read and check secondary super block */
++	if (ret == 0) {
++		sb_good[0] = true;
++		zmd->sb[1].block = zmd->sb[0].block +
++			(zmd->nr_meta_zones << zmd->dev->zone_nr_blocks_shift);
++		ret = dmz_get_sb(zmd, 1);
++	} else
++		ret = dmz_lookup_secondary_sb(zmd);
++
++	if (ret) {
++		dmz_dev_err(zmd->dev, "Read secondary super block failed");
++		return ret;
++	}
++
++	ret = dmz_check_sb(zmd, zmd->sb[1].sb);
++	if (ret == 0)
++		sb_good[1] = true;
++
++	/* Use highest generation sb first */
++	if (!sb_good[0] && !sb_good[1]) {
++		dmz_dev_err(zmd->dev, "No valid super block found");
++		return -EIO;
++	}
++
++	if (sb_good[0])
++		sb_gen[0] = le64_to_cpu(zmd->sb[0].sb->gen);
++	else
++		ret = dmz_recover_mblocks(zmd, 0);
++
++	if (sb_good[1])
++		sb_gen[1] = le64_to_cpu(zmd->sb[1].sb->gen);
++	else
++		ret = dmz_recover_mblocks(zmd, 1);
++
++	if (ret) {
++		dmz_dev_err(zmd->dev, "Recovery failed");
++		return -EIO;
++	}
++
++	if (sb_gen[0] >= sb_gen[1]) {
++		zmd->sb_gen = sb_gen[0];
++		zmd->mblk_primary = 0;
++	} else {
++		zmd->sb_gen = sb_gen[1];
++		zmd->mblk_primary = 1;
++	}
++
++	dmz_dev_debug(zmd->dev, "Using super block %u (gen %llu)",
++		      zmd->mblk_primary, zmd->sb_gen);
++
++	return 0;
++}
++
++/*
++ * Initialize a zone descriptor.
++ */
++static int dmz_init_zone(struct dmz_metadata *zmd, struct dm_zone *zone,
++			 struct blk_zone *blkz)
++{
++	struct dmz_dev *dev = zmd->dev;
++
++	/* Ignore the eventual last runt (smaller) zone */
++	if (blkz->len != dev->zone_nr_sectors) {
++		if (blkz->start + blkz->len == dev->capacity)
++			return 0;
++		return -ENXIO;
++	}
++
++	INIT_LIST_HEAD(&zone->link);
++	atomic_set(&zone->refcount, 0);
++	zone->chunk = DMZ_MAP_UNMAPPED;
++
++	if (blkz->type == BLK_ZONE_TYPE_CONVENTIONAL) {
++		set_bit(DMZ_RND, &zone->flags);
++		zmd->nr_rnd_zones++;
++	} else if (blkz->type == BLK_ZONE_TYPE_SEQWRITE_REQ ||
++		   blkz->type == BLK_ZONE_TYPE_SEQWRITE_PREF) {
++		set_bit(DMZ_SEQ, &zone->flags);
++	} else
++		return -ENXIO;
++
++	if (blkz->cond == BLK_ZONE_COND_OFFLINE)
++		set_bit(DMZ_OFFLINE, &zone->flags);
++	else if (blkz->cond == BLK_ZONE_COND_READONLY)
++		set_bit(DMZ_READ_ONLY, &zone->flags);
++
++	if (dmz_is_rnd(zone))
++		zone->wp_block = 0;
++	else
++		zone->wp_block = dmz_sect2blk(blkz->wp - blkz->start);
++
++	if (!dmz_is_offline(zone) && !dmz_is_readonly(zone)) {
++		zmd->nr_useable_zones++;
++		if (dmz_is_rnd(zone)) {
++			zmd->nr_rnd_zones++;
++			if (!zmd->sb_zone) {
++				/* Super block zone */
++				zmd->sb_zone = zone;
++			}
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Free zones descriptors.
++ */
++static void dmz_drop_zones(struct dmz_metadata *zmd)
++{
++	kfree(zmd->zones);
++	zmd->zones = NULL;
++}
++
++/*
++ * The size of a zone report in number of zones.
++ * This results in 4096*64B=256KB report zones commands.
++ */
++#define DMZ_REPORT_NR_ZONES	4096
++
++/*
++ * Allocate and initialize zone descriptors using the zone
++ * information from disk.
++ */
++static int dmz_init_zones(struct dmz_metadata *zmd)
++{
++	struct dmz_dev *dev = zmd->dev;
++	struct dm_zone *zone;
++	struct blk_zone *blkz;
++	unsigned int nr_blkz;
++	sector_t sector = 0;
++	int i, ret = 0;
++
++	/* Init */
++	zmd->zone_bitmap_size = dev->zone_nr_blocks >> 3;
++	zmd->zone_nr_bitmap_blocks = zmd->zone_bitmap_size >> DMZ_BLOCK_SHIFT;
++
++	/* Allocate zone array */
++	zmd->zones = kcalloc(dev->nr_zones, sizeof(struct dm_zone), GFP_KERNEL);
++	if (!zmd->zones)
++		return -ENOMEM;
++
++	dmz_dev_info(dev, "Using %zu B for zone information",
++		     sizeof(struct dm_zone) * dev->nr_zones);
++
++	/* Get zone information */
++	nr_blkz = DMZ_REPORT_NR_ZONES;
++	blkz = kcalloc(nr_blkz, sizeof(struct blk_zone), GFP_KERNEL);
++	if (!blkz) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	/*
++	 * Get zone information and initialize zone descriptors.
++	 * At the same time, determine where the super block
++	 * should be: first block of the first randomly writable
++	 * zone.
++	 */
++	zone = zmd->zones;
++	while (sector < dev->capacity) {
++		/* Get zone information */
++		nr_blkz = DMZ_REPORT_NR_ZONES;
++		ret = blkdev_report_zones(dev->bdev, sector, blkz,
++					  &nr_blkz, GFP_KERNEL);
++		if (ret) {
++			dmz_dev_err(dev, "Report zones failed %d", ret);
++			goto out;
++		}
++
++		/* Process report */
++		for (i = 0; i < nr_blkz; i++) {
++			ret = dmz_init_zone(zmd, zone, &blkz[i]);
++			if (ret)
++				goto out;
++			sector += dev->zone_nr_sectors;
++			zone++;
++		}
++	}
++
++	/* The entire zone configuration of the disk should now be known */
++	if (sector < dev->capacity) {
++		dmz_dev_err(dev, "Failed to get correct zone information");
++		ret = -ENXIO;
++	}
++out:
++	kfree(blkz);
++	if (ret)
++		dmz_drop_zones(zmd);
++
++	return ret;
++}
++
++/*
++ * Update a zone information.
++ */
++static int dmz_update_zone(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	unsigned int nr_blkz = 1;
++	struct blk_zone blkz;
++	int ret;
++
++	/* Get zone information from disk */
++	ret = blkdev_report_zones(zmd->dev->bdev, dmz_start_sect(zmd, zone),
++				  &blkz, &nr_blkz, GFP_KERNEL);
++	if (ret) {
++		dmz_dev_err(zmd->dev, "Get zone %u report failed",
++			    dmz_id(zmd, zone));
++		return ret;
++	}
++
++	clear_bit(DMZ_OFFLINE, &zone->flags);
++	clear_bit(DMZ_READ_ONLY, &zone->flags);
++	if (blkz.cond == BLK_ZONE_COND_OFFLINE)
++		set_bit(DMZ_OFFLINE, &zone->flags);
++	else if (blkz.cond == BLK_ZONE_COND_READONLY)
++		set_bit(DMZ_READ_ONLY, &zone->flags);
++
++	if (dmz_is_seq(zone))
++		zone->wp_block = dmz_sect2blk(blkz.wp - blkz.start);
++	else
++		zone->wp_block = 0;
++
++	return 0;
++}
++
++/*
++ * Check a zone write pointer position when the zone is marked
++ * with the sequential write error flag.
++ */
++static int dmz_handle_seq_write_err(struct dmz_metadata *zmd,
++				    struct dm_zone *zone)
++{
++	unsigned int wp = 0;
++	int ret;
++
++	wp = zone->wp_block;
++	ret = dmz_update_zone(zmd, zone);
++	if (ret)
++		return ret;
++
++	dmz_dev_warn(zmd->dev, "Processing zone %u write error (zone wp %u/%u)",
++		     dmz_id(zmd, zone), zone->wp_block, wp);
++
++	if (zone->wp_block < wp) {
++		dmz_invalidate_blocks(zmd, zone, zone->wp_block,
++				      wp - zone->wp_block);
++	}
++
++	return 0;
++}
++
++static struct dm_zone *dmz_get(struct dmz_metadata *zmd, unsigned int zone_id)
++{
++	return &zmd->zones[zone_id];
++}
++
++/*
++ * Reset a zone write pointer.
++ */
++static int dmz_reset_zone(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	int ret;
++
++	/*
++	 * Ignore offline zones, read only zones,
++	 * and conventional zones.
++	 */
++	if (dmz_is_offline(zone) ||
++	    dmz_is_readonly(zone) ||
++	    dmz_is_rnd(zone))
++		return 0;
++
++	if (!dmz_is_empty(zone) || dmz_seq_write_err(zone)) {
++		struct dmz_dev *dev = zmd->dev;
++
++		ret = blkdev_reset_zones(dev->bdev,
++					 dmz_start_sect(zmd, zone),
++					 dev->zone_nr_sectors, GFP_KERNEL);
++		if (ret) {
++			dmz_dev_err(dev, "Reset zone %u failed %d",
++				    dmz_id(zmd, zone), ret);
++			return ret;
++		}
++	}
++
++	/* Clear write error bit and rewind write pointer position */
++	clear_bit(DMZ_SEQ_WRITE_ERR, &zone->flags);
++	zone->wp_block = 0;
++
++	return 0;
++}
++
++static void dmz_get_zone_weight(struct dmz_metadata *zmd, struct dm_zone *zone);
++
++/*
++ * Initialize chunk mapping.
++ */
++static int dmz_load_mapping(struct dmz_metadata *zmd)
++{
++	struct dmz_dev *dev = zmd->dev;
++	struct dm_zone *dzone, *bzone;
++	struct dmz_mblock *dmap_mblk = NULL;
++	struct dmz_map *dmap;
++	unsigned int i = 0, e = 0, chunk = 0;
++	unsigned int dzone_id;
++	unsigned int bzone_id;
++
++	/* Metadata block array for the chunk mapping table */
++	zmd->map_mblk = kcalloc(zmd->nr_map_blocks,
++				sizeof(struct dmz_mblk *), GFP_KERNEL);
++	if (!zmd->map_mblk)
++		return -ENOMEM;
++
++	/* Get chunk mapping table blocks and initialize zone mapping */
++	while (chunk < zmd->nr_chunks) {
++		if (!dmap_mblk) {
++			/* Get mapping block */
++			dmap_mblk = dmz_get_mblock(zmd, i + 1);
++			if (IS_ERR(dmap_mblk))
++				return PTR_ERR(dmap_mblk);
++			zmd->map_mblk[i] = dmap_mblk;
++			dmap = (struct dmz_map *) dmap_mblk->data;
++			i++;
++			e = 0;
++		}
++
++		/* Check data zone */
++		dzone_id = le32_to_cpu(dmap[e].dzone_id);
++		if (dzone_id == DMZ_MAP_UNMAPPED)
++			goto next;
++
++		if (dzone_id >= dev->nr_zones) {
++			dmz_dev_err(dev, "Chunk %u mapping: invalid data zone ID %u",
++				    chunk, dzone_id);
++			return -EIO;
++		}
++
++		dzone = dmz_get(zmd, dzone_id);
++		set_bit(DMZ_DATA, &dzone->flags);
++		dzone->chunk = chunk;
++		dmz_get_zone_weight(zmd, dzone);
++
++		if (dmz_is_rnd(dzone))
++			list_add_tail(&dzone->link, &zmd->map_rnd_list);
++		else
++			list_add_tail(&dzone->link, &zmd->map_seq_list);
++
++		/* Check buffer zone */
++		bzone_id = le32_to_cpu(dmap[e].bzone_id);
++		if (bzone_id == DMZ_MAP_UNMAPPED)
++			goto next;
++
++		if (bzone_id >= dev->nr_zones) {
++			dmz_dev_err(dev, "Chunk %u mapping: invalid buffer zone ID %u",
++				    chunk, bzone_id);
++			return -EIO;
++		}
++
++		bzone = dmz_get(zmd, bzone_id);
++		if (!dmz_is_rnd(bzone)) {
++			dmz_dev_err(dev, "Chunk %u mapping: invalid buffer zone %u",
++				    chunk, bzone_id);
++			return -EIO;
++		}
++
++		set_bit(DMZ_DATA, &bzone->flags);
++		set_bit(DMZ_BUF, &bzone->flags);
++		bzone->chunk = chunk;
++		bzone->bzone = dzone;
++		dzone->bzone = bzone;
++		dmz_get_zone_weight(zmd, bzone);
++		list_add_tail(&bzone->link, &zmd->map_rnd_list);
++next:
++		chunk++;
++		e++;
++		if (e >= DMZ_MAP_ENTRIES)
++			dmap_mblk = NULL;
++	}
++
++	/*
++	 * At this point, only meta zones and mapped data zones were
++	 * fully initialized. All remaining zones are unmapped data
++	 * zones. Finish initializing those here.
++	 */
++	for (i = 0; i < dev->nr_zones; i++) {
++		dzone = dmz_get(zmd, i);
++		if (dmz_is_meta(dzone))
++			continue;
++
++		if (dmz_is_rnd(dzone))
++			zmd->nr_rnd++;
++		else
++			zmd->nr_seq++;
++
++		if (dmz_is_data(dzone)) {
++			/* Already initialized */
++			continue;
++		}
++
++		/* Unmapped data zone */
++		set_bit(DMZ_DATA, &dzone->flags);
++		dzone->chunk = DMZ_MAP_UNMAPPED;
++		if (dmz_is_rnd(dzone)) {
++			list_add_tail(&dzone->link, &zmd->unmap_rnd_list);
++			atomic_inc(&zmd->unmap_nr_rnd);
++		} else if (atomic_read(&zmd->nr_reserved_seq_zones) < zmd->nr_reserved_seq) {
++			list_add_tail(&dzone->link, &zmd->reserved_seq_zones_list);
++			atomic_inc(&zmd->nr_reserved_seq_zones);
++			zmd->nr_seq--;
++		} else {
++			list_add_tail(&dzone->link, &zmd->unmap_seq_list);
++			atomic_inc(&zmd->unmap_nr_seq);
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Set a data chunk mapping.
++ */
++static void dmz_set_chunk_mapping(struct dmz_metadata *zmd, unsigned int chunk,
++				  unsigned int dzone_id, unsigned int bzone_id)
++{
++	struct dmz_mblock *dmap_mblk = zmd->map_mblk[chunk >> DMZ_MAP_ENTRIES_SHIFT];
++	struct dmz_map *dmap = (struct dmz_map *) dmap_mblk->data;
++	int map_idx = chunk & DMZ_MAP_ENTRIES_MASK;
++
++	dmap[map_idx].dzone_id = cpu_to_le32(dzone_id);
++	dmap[map_idx].bzone_id = cpu_to_le32(bzone_id);
++	dmz_dirty_mblock(zmd, dmap_mblk);
++}
++
++/*
++ * The list of mapped zones is maintained in LRU order.
++ * This rotates a zone at the end of its map list.
++ */
++static void __dmz_lru_zone(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	if (list_empty(&zone->link))
++		return;
++
++	list_del_init(&zone->link);
++	if (dmz_is_seq(zone)) {
++		/* LRU rotate sequential zone */
++		list_add_tail(&zone->link, &zmd->map_seq_list);
++	} else {
++		/* LRU rotate random zone */
++		list_add_tail(&zone->link, &zmd->map_rnd_list);
++	}
++}
++
++/*
++ * The list of mapped random zones is maintained
++ * in LRU order. This rotates a zone at the end of the list.
++ */
++static void dmz_lru_zone(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	__dmz_lru_zone(zmd, zone);
++	if (zone->bzone)
++		__dmz_lru_zone(zmd, zone->bzone);
++}
++
++/*
++ * Wait for any zone to be freed.
++ */
++static void dmz_wait_for_free_zones(struct dmz_metadata *zmd)
++{
++	DEFINE_WAIT(wait);
++
++	prepare_to_wait(&zmd->free_wq, &wait, TASK_UNINTERRUPTIBLE);
++	dmz_unlock_map(zmd);
++	dmz_unlock_metadata(zmd);
++
++	io_schedule_timeout(HZ);
++
++	dmz_lock_metadata(zmd);
++	dmz_lock_map(zmd);
++	finish_wait(&zmd->free_wq, &wait);
++}
++
++/*
++ * Lock a zone for reclaim (set the zone RECLAIM bit).
++ * Returns false if the zone cannot be locked or if it is already locked
++ * and 1 otherwise.
++ */
++int dmz_lock_zone_reclaim(struct dm_zone *zone)
++{
++	/* Active zones cannot be reclaimed */
++	if (dmz_is_active(zone))
++		return 0;
++
++	return !test_and_set_bit(DMZ_RECLAIM, &zone->flags);
++}
++
++/*
++ * Clear a zone reclaim flag.
++ */
++void dmz_unlock_zone_reclaim(struct dm_zone *zone)
++{
++	WARN_ON(dmz_is_active(zone));
++	WARN_ON(!dmz_in_reclaim(zone));
++
++	clear_bit_unlock(DMZ_RECLAIM, &zone->flags);
++	smp_mb__after_atomic();
++	wake_up_bit(&zone->flags, DMZ_RECLAIM);
++}
++
++/*
++ * Wait for a zone reclaim to complete.
++ */
++static void dmz_wait_for_reclaim(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	dmz_unlock_map(zmd);
++	dmz_unlock_metadata(zmd);
++	wait_on_bit_timeout(&zone->flags, DMZ_RECLAIM, TASK_UNINTERRUPTIBLE, HZ);
++	dmz_lock_metadata(zmd);
++	dmz_lock_map(zmd);
++}
++
++/*
++ * Select a random write zone for reclaim.
++ */
++static struct dm_zone *dmz_get_rnd_zone_for_reclaim(struct dmz_metadata *zmd)
++{
++	struct dm_zone *dzone = NULL;
++	struct dm_zone *zone;
++
++	if (list_empty(&zmd->map_rnd_list))
++		return NULL;
++
++	list_for_each_entry(zone, &zmd->map_rnd_list, link) {
++		if (dmz_is_buf(zone))
++			dzone = zone->bzone;
++		else
++			dzone = zone;
++		if (dmz_lock_zone_reclaim(dzone))
++			return dzone;
++	}
++
++	return NULL;
++}
++
++/*
++ * Select a buffered sequential zone for reclaim.
++ */
++static struct dm_zone *dmz_get_seq_zone_for_reclaim(struct dmz_metadata *zmd)
++{
++	struct dm_zone *zone;
++
++	if (list_empty(&zmd->map_seq_list))
++		return NULL;
++
++	list_for_each_entry(zone, &zmd->map_seq_list, link) {
++		if (!zone->bzone)
++			continue;
++		if (dmz_lock_zone_reclaim(zone))
++			return zone;
++	}
++
++	return NULL;
++}
++
++/*
++ * Select a zone for reclaim.
++ */
++struct dm_zone *dmz_get_zone_for_reclaim(struct dmz_metadata *zmd)
++{
++	struct dm_zone *zone;
++
++	/*
++	 * Search for a zone candidate to reclaim: 2 cases are possible.
++	 * (1) There is no free sequential zones. Then a random data zone
++	 *     cannot be reclaimed. So choose a sequential zone to reclaim so
++	 *     that afterward a random zone can be reclaimed.
++	 * (2) At least one free sequential zone is available, then choose
++	 *     the oldest random zone (data or buffer) that can be locked.
++	 */
++	dmz_lock_map(zmd);
++	if (list_empty(&zmd->reserved_seq_zones_list))
++		zone = dmz_get_seq_zone_for_reclaim(zmd);
++	else
++		zone = dmz_get_rnd_zone_for_reclaim(zmd);
++	dmz_unlock_map(zmd);
++
++	return zone;
++}
++
++/*
++ * Activate a zone (increment its reference count).
++ */
++void dmz_activate_zone(struct dm_zone *zone)
++{
++	set_bit(DMZ_ACTIVE, &zone->flags);
++	atomic_inc(&zone->refcount);
++}
++
++/*
++ * Deactivate a zone. This decrement the zone reference counter
++ * and clears the active state of the zone once the count reaches 0,
++ * indicating that all BIOs to the zone have completed. Returns
++ * true if the zone was deactivated.
++ */
++void dmz_deactivate_zone(struct dm_zone *zone)
++{
++	if (atomic_dec_and_test(&zone->refcount)) {
++		WARN_ON(!test_bit(DMZ_ACTIVE, &zone->flags));
++		clear_bit_unlock(DMZ_ACTIVE, &zone->flags);
++		smp_mb__after_atomic();
++	}
++}
++
++/*
++ * Get the zone mapping a chunk, if the chunk is mapped already.
++ * If no mapping exist and the operation is WRITE, a zone is
++ * allocated and used to map the chunk.
++ * The zone returned will be set to the active state.
++ */
++struct dm_zone *dmz_get_chunk_mapping(struct dmz_metadata *zmd, unsigned int chunk, int op)
++{
++	struct dmz_mblock *dmap_mblk = zmd->map_mblk[chunk >> DMZ_MAP_ENTRIES_SHIFT];
++	struct dmz_map *dmap = (struct dmz_map *) dmap_mblk->data;
++	int dmap_idx = chunk & DMZ_MAP_ENTRIES_MASK;
++	unsigned int dzone_id;
++	struct dm_zone *dzone = NULL;
++	int ret = 0;
++
++	dmz_lock_map(zmd);
++again:
++	/* Get the chunk mapping */
++	dzone_id = le32_to_cpu(dmap[dmap_idx].dzone_id);
++	if (dzone_id == DMZ_MAP_UNMAPPED) {
++		/*
++		 * Read or discard in unmapped chunks are fine. But for
++		 * writes, we need a mapping, so get one.
++		 */
++		if (op != REQ_OP_WRITE)
++			goto out;
++
++		/* Alloate a random zone */
++		dzone = dmz_alloc_zone(zmd, DMZ_ALLOC_RND);
++		if (!dzone) {
++			dmz_wait_for_free_zones(zmd);
++			goto again;
++		}
++
++		dmz_map_zone(zmd, dzone, chunk);
++
++	} else {
++		/* The chunk is already mapped: get the mapping zone */
++		dzone = dmz_get(zmd, dzone_id);
++		if (dzone->chunk != chunk) {
++			dzone = ERR_PTR(-EIO);
++			goto out;
++		}
++
++		/* Repair write pointer if the sequential dzone has error */
++		if (dmz_seq_write_err(dzone)) {
++			ret = dmz_handle_seq_write_err(zmd, dzone);
++			if (ret) {
++				dzone = ERR_PTR(-EIO);
++				goto out;
++			}
++			clear_bit(DMZ_SEQ_WRITE_ERR, &dzone->flags);
++		}
++	}
++
++	/*
++	 * If the zone is being reclaimed, the chunk mapping may change
++	 * to a different zone. So wait for reclaim and retry. Otherwise,
++	 * activate the zone (this will prevent reclaim from touching it).
++	 */
++	if (dmz_in_reclaim(dzone)) {
++		dmz_wait_for_reclaim(zmd, dzone);
++		goto again;
++	}
++	dmz_activate_zone(dzone);
++	dmz_lru_zone(zmd, dzone);
++out:
++	dmz_unlock_map(zmd);
++
++	return dzone;
++}
++
++/*
++ * Write and discard change the block validity of data zones and their buffer
++ * zones. Check here that valid blocks are still present. If all blocks are
++ * invalid, the zones can be unmapped on the fly without waiting for reclaim
++ * to do it.
++ */
++void dmz_put_chunk_mapping(struct dmz_metadata *zmd, struct dm_zone *dzone)
++{
++	struct dm_zone *bzone;
++
++	dmz_lock_map(zmd);
++
++	bzone = dzone->bzone;
++	if (bzone) {
++		if (dmz_weight(bzone))
++			dmz_lru_zone(zmd, bzone);
++		else {
++			/* Empty buffer zone: reclaim it */
++			dmz_unmap_zone(zmd, bzone);
++			dmz_free_zone(zmd, bzone);
++			bzone = NULL;
++		}
++	}
++
++	/* Deactivate the data zone */
++	dmz_deactivate_zone(dzone);
++	if (dmz_is_active(dzone) || bzone || dmz_weight(dzone))
++		dmz_lru_zone(zmd, dzone);
++	else {
++		/* Unbuffered inactive empty data zone: reclaim it */
++		dmz_unmap_zone(zmd, dzone);
++		dmz_free_zone(zmd, dzone);
++	}
++
++	dmz_unlock_map(zmd);
++}
++
++/*
++ * Allocate and map a random zone to buffer a chunk
++ * already mapped to a sequential zone.
++ */
++struct dm_zone *dmz_get_chunk_buffer(struct dmz_metadata *zmd,
++				     struct dm_zone *dzone)
++{
++	struct dm_zone *bzone;
++
++	dmz_lock_map(zmd);
++again:
++	bzone = dzone->bzone;
++	if (bzone)
++		goto out;
++
++	/* Alloate a random zone */
++	bzone = dmz_alloc_zone(zmd, DMZ_ALLOC_RND);
++	if (!bzone) {
++		dmz_wait_for_free_zones(zmd);
++		goto again;
++	}
++
++	/* Update the chunk mapping */
++	dmz_set_chunk_mapping(zmd, dzone->chunk, dmz_id(zmd, dzone),
++			      dmz_id(zmd, bzone));
++
++	set_bit(DMZ_BUF, &bzone->flags);
++	bzone->chunk = dzone->chunk;
++	bzone->bzone = dzone;
++	dzone->bzone = bzone;
++	list_add_tail(&bzone->link, &zmd->map_rnd_list);
++out:
++	dmz_unlock_map(zmd);
++
++	return bzone;
++}
++
++/*
++ * Get an unmapped (free) zone.
++ * This must be called with the mapping lock held.
++ */
++struct dm_zone *dmz_alloc_zone(struct dmz_metadata *zmd, unsigned long flags)
++{
++	struct list_head *list;
++	struct dm_zone *zone;
++
++	if (flags & DMZ_ALLOC_RND)
++		list = &zmd->unmap_rnd_list;
++	else
++		list = &zmd->unmap_seq_list;
++again:
++	if (list_empty(list)) {
++		/*
++		 * No free zone: if this is for reclaim, allow using the
++		 * reserved sequential zones.
++		 */
++		if (!(flags & DMZ_ALLOC_RECLAIM) ||
++		    list_empty(&zmd->reserved_seq_zones_list))
++			return NULL;
++
++		zone = list_first_entry(&zmd->reserved_seq_zones_list,
++					struct dm_zone, link);
++		list_del_init(&zone->link);
++		atomic_dec(&zmd->nr_reserved_seq_zones);
++		return zone;
++	}
++
++	zone = list_first_entry(list, struct dm_zone, link);
++	list_del_init(&zone->link);
++
++	if (dmz_is_rnd(zone))
++		atomic_dec(&zmd->unmap_nr_rnd);
++	else
++		atomic_dec(&zmd->unmap_nr_seq);
++
++	if (dmz_is_offline(zone)) {
++		dmz_dev_warn(zmd->dev, "Zone %u is offline", dmz_id(zmd, zone));
++		zone = NULL;
++		goto again;
++	}
++
++	return zone;
++}
++
++/*
++ * Free a zone.
++ * This must be called with the mapping lock held.
++ */
++void dmz_free_zone(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	/* If this is a sequential zone, reset it */
++	if (dmz_is_seq(zone))
++		dmz_reset_zone(zmd, zone);
++
++	/* Return the zone to its type unmap list */
++	if (dmz_is_rnd(zone)) {
++		list_add_tail(&zone->link, &zmd->unmap_rnd_list);
++		atomic_inc(&zmd->unmap_nr_rnd);
++	} else if (atomic_read(&zmd->nr_reserved_seq_zones) <
++		   zmd->nr_reserved_seq) {
++		list_add_tail(&zone->link, &zmd->reserved_seq_zones_list);
++		atomic_inc(&zmd->nr_reserved_seq_zones);
++	} else {
++		list_add_tail(&zone->link, &zmd->unmap_seq_list);
++		atomic_inc(&zmd->unmap_nr_seq);
++	}
++
++	wake_up_all(&zmd->free_wq);
++}
++
++/*
++ * Map a chunk to a zone.
++ * This must be called with the mapping lock held.
++ */
++void dmz_map_zone(struct dmz_metadata *zmd, struct dm_zone *dzone,
++		  unsigned int chunk)
++{
++	/* Set the chunk mapping */
++	dmz_set_chunk_mapping(zmd, chunk, dmz_id(zmd, dzone),
++			      DMZ_MAP_UNMAPPED);
++	dzone->chunk = chunk;
++	if (dmz_is_rnd(dzone))
++		list_add_tail(&dzone->link, &zmd->map_rnd_list);
++	else
++		list_add_tail(&dzone->link, &zmd->map_seq_list);
++}
++
++/*
++ * Unmap a zone.
++ * This must be called with the mapping lock held.
++ */
++void dmz_unmap_zone(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	unsigned int chunk = zone->chunk;
++	unsigned int dzone_id;
++
++	if (chunk == DMZ_MAP_UNMAPPED) {
++		/* Already unmapped */
++		return;
++	}
++
++	if (test_and_clear_bit(DMZ_BUF, &zone->flags)) {
++		/*
++		 * Unmapping the chunk buffer zone: clear only
++		 * the chunk buffer mapping
++		 */
++		dzone_id = dmz_id(zmd, zone->bzone);
++		zone->bzone->bzone = NULL;
++		zone->bzone = NULL;
++
++	} else {
++		/*
++		 * Unmapping the chunk data zone: the zone must
++		 * not be buffered.
++		 */
++		if (WARN_ON(zone->bzone)) {
++			zone->bzone->bzone = NULL;
++			zone->bzone = NULL;
++		}
++		dzone_id = DMZ_MAP_UNMAPPED;
++	}
++
++	dmz_set_chunk_mapping(zmd, chunk, dzone_id, DMZ_MAP_UNMAPPED);
++
++	zone->chunk = DMZ_MAP_UNMAPPED;
++	list_del_init(&zone->link);
++}
++
++/*
++ * Set @nr_bits bits in @bitmap starting from @bit.
++ * Return the number of bits changed from 0 to 1.
++ */
++static unsigned int dmz_set_bits(unsigned long *bitmap,
++				 unsigned int bit, unsigned int nr_bits)
++{
++	unsigned long *addr;
++	unsigned int end = bit + nr_bits;
++	unsigned int n = 0;
++
++	while (bit < end) {
++		if (((bit & (BITS_PER_LONG - 1)) == 0) &&
++		    ((end - bit) >= BITS_PER_LONG)) {
++			/* Try to set the whole word at once */
++			addr = bitmap + BIT_WORD(bit);
++			if (*addr == 0) {
++				*addr = ULONG_MAX;
++				n += BITS_PER_LONG;
++				bit += BITS_PER_LONG;
++				continue;
++			}
++		}
++
++		if (!test_and_set_bit(bit, bitmap))
++			n++;
++		bit++;
++	}
++
++	return n;
++}
++
++/*
++ * Get the bitmap block storing the bit for chunk_block in zone.
++ */
++static struct dmz_mblock *dmz_get_bitmap(struct dmz_metadata *zmd,
++					 struct dm_zone *zone,
++					 sector_t chunk_block)
++{
++	sector_t bitmap_block = 1 + zmd->nr_map_blocks +
++		(sector_t)(dmz_id(zmd, zone) * zmd->zone_nr_bitmap_blocks) +
++		(chunk_block >> DMZ_BLOCK_SHIFT_BITS);
++
++	return dmz_get_mblock(zmd, bitmap_block);
++}
++
++/*
++ * Copy the valid blocks bitmap of from_zone to the bitmap of to_zone.
++ */
++int dmz_copy_valid_blocks(struct dmz_metadata *zmd, struct dm_zone *from_zone,
++			  struct dm_zone *to_zone)
++{
++	struct dmz_mblock *from_mblk, *to_mblk;
++	sector_t chunk_block = 0;
++
++	/* Get the zones bitmap blocks */
++	while (chunk_block < zmd->dev->zone_nr_blocks) {
++		from_mblk = dmz_get_bitmap(zmd, from_zone, chunk_block);
++		if (IS_ERR(from_mblk))
++			return PTR_ERR(from_mblk);
++		to_mblk = dmz_get_bitmap(zmd, to_zone, chunk_block);
++		if (IS_ERR(to_mblk)) {
++			dmz_release_mblock(zmd, from_mblk);
++			return PTR_ERR(to_mblk);
++		}
++
++		memcpy(to_mblk->data, from_mblk->data, DMZ_BLOCK_SIZE);
++		dmz_dirty_mblock(zmd, to_mblk);
++
++		dmz_release_mblock(zmd, to_mblk);
++		dmz_release_mblock(zmd, from_mblk);
++
++		chunk_block += DMZ_BLOCK_SIZE_BITS;
++	}
++
++	to_zone->weight = from_zone->weight;
++
++	return 0;
++}
++
++/*
++ * Merge the valid blocks bitmap of from_zone into the bitmap of to_zone,
++ * starting from chunk_block.
++ */
++int dmz_merge_valid_blocks(struct dmz_metadata *zmd, struct dm_zone *from_zone,
++			   struct dm_zone *to_zone, sector_t chunk_block)
++{
++	unsigned int nr_blocks;
++	int ret;
++
++	/* Get the zones bitmap blocks */
++	while (chunk_block < zmd->dev->zone_nr_blocks) {
++		/* Get a valid region from the source zone */
++		ret = dmz_first_valid_block(zmd, from_zone, &chunk_block);
++		if (ret <= 0)
++			return ret;
++
++		nr_blocks = ret;
++		ret = dmz_validate_blocks(zmd, to_zone, chunk_block, nr_blocks);
++		if (ret)
++			return ret;
++
++		chunk_block += nr_blocks;
++	}
++
++	return 0;
++}
++
++/*
++ * Validate all the blocks in the range [block..block+nr_blocks-1].
++ */
++int dmz_validate_blocks(struct dmz_metadata *zmd, struct dm_zone *zone,
++			sector_t chunk_block, unsigned int nr_blocks)
++{
++	unsigned int count, bit, nr_bits;
++	unsigned int zone_nr_blocks = zmd->dev->zone_nr_blocks;
++	struct dmz_mblock *mblk;
++	unsigned int n = 0;
++
++	dmz_dev_debug(zmd->dev, "=> VALIDATE zone %u, block %llu, %u blocks",
++		      dmz_id(zmd, zone), (unsigned long long)chunk_block,
++		      nr_blocks);
++
++	WARN_ON(chunk_block + nr_blocks > zone_nr_blocks);
++
++	while (nr_blocks) {
++		/* Get bitmap block */
++		mblk = dmz_get_bitmap(zmd, zone, chunk_block);
++		if (IS_ERR(mblk))
++			return PTR_ERR(mblk);
++
++		/* Set bits */
++		bit = chunk_block & DMZ_BLOCK_MASK_BITS;
++		nr_bits = min(nr_blocks, DMZ_BLOCK_SIZE_BITS - bit);
++
++		count = dmz_set_bits((unsigned long *)mblk->data, bit, nr_bits);
++		if (count) {
++			dmz_dirty_mblock(zmd, mblk);
++			n += count;
++		}
++		dmz_release_mblock(zmd, mblk);
++
++		nr_blocks -= nr_bits;
++		chunk_block += nr_bits;
++	}
++
++	if (likely(zone->weight + n <= zone_nr_blocks))
++		zone->weight += n;
++	else {
++		dmz_dev_warn(zmd->dev, "Zone %u: weight %u should be <= %u",
++			     dmz_id(zmd, zone), zone->weight,
++			     zone_nr_blocks - n);
++		zone->weight = zone_nr_blocks;
++	}
++
++	return 0;
++}
++
++/*
++ * Clear nr_bits bits in bitmap starting from bit.
++ * Return the number of bits cleared.
++ */
++static int dmz_clear_bits(unsigned long *bitmap, int bit, int nr_bits)
++{
++	unsigned long *addr;
++	int end = bit + nr_bits;
++	int n = 0;
++
++	while (bit < end) {
++		if (((bit & (BITS_PER_LONG - 1)) == 0) &&
++		    ((end - bit) >= BITS_PER_LONG)) {
++			/* Try to clear whole word at once */
++			addr = bitmap + BIT_WORD(bit);
++			if (*addr == ULONG_MAX) {
++				*addr = 0;
++				n += BITS_PER_LONG;
++				bit += BITS_PER_LONG;
++				continue;
++			}
++		}
++
++		if (test_and_clear_bit(bit, bitmap))
++			n++;
++		bit++;
++	}
++
++	return n;
++}
++
++/*
++ * Invalidate all the blocks in the range [block..block+nr_blocks-1].
++ */
++int dmz_invalidate_blocks(struct dmz_metadata *zmd, struct dm_zone *zone,
++			  sector_t chunk_block, unsigned int nr_blocks)
++{
++	unsigned int count, bit, nr_bits;
++	struct dmz_mblock *mblk;
++	unsigned int n = 0;
++
++	dmz_dev_debug(zmd->dev, "=> INVALIDATE zone %u, block %llu, %u blocks",
++		      dmz_id(zmd, zone), (u64)chunk_block, nr_blocks);
++
++	WARN_ON(chunk_block + nr_blocks > zmd->dev->zone_nr_blocks);
++
++	while (nr_blocks) {
++		/* Get bitmap block */
++		mblk = dmz_get_bitmap(zmd, zone, chunk_block);
++		if (IS_ERR(mblk))
++			return PTR_ERR(mblk);
++
++		/* Clear bits */
++		bit = chunk_block & DMZ_BLOCK_MASK_BITS;
++		nr_bits = min(nr_blocks, DMZ_BLOCK_SIZE_BITS - bit);
++
++		count = dmz_clear_bits((unsigned long *)mblk->data,
++				       bit, nr_bits);
++		if (count) {
++			dmz_dirty_mblock(zmd, mblk);
++			n += count;
++		}
++		dmz_release_mblock(zmd, mblk);
++
++		nr_blocks -= nr_bits;
++		chunk_block += nr_bits;
++	}
++
++	if (zone->weight >= n)
++		zone->weight -= n;
++	else {
++		dmz_dev_warn(zmd->dev, "Zone %u: weight %u should be >= %u",
++			     dmz_id(zmd, zone), zone->weight, n);
++		zone->weight = 0;
++	}
++
++	return 0;
++}
++
++/*
++ * Get a block bit value.
++ */
++static int dmz_test_block(struct dmz_metadata *zmd, struct dm_zone *zone,
++			  sector_t chunk_block)
++{
++	struct dmz_mblock *mblk;
++	int ret;
++
++	WARN_ON(chunk_block >= zmd->dev->zone_nr_blocks);
++
++	/* Get bitmap block */
++	mblk = dmz_get_bitmap(zmd, zone, chunk_block);
++	if (IS_ERR(mblk))
++		return PTR_ERR(mblk);
++
++	/* Get offset */
++	ret = test_bit(chunk_block & DMZ_BLOCK_MASK_BITS,
++		       (unsigned long *) mblk->data) != 0;
++
++	dmz_release_mblock(zmd, mblk);
++
++	return ret;
++}
++
++/*
++ * Return the number of blocks from chunk_block to the first block with a bit
++ * value specified by set. Search at most nr_blocks blocks from chunk_block.
++ */
++static int dmz_to_next_set_block(struct dmz_metadata *zmd, struct dm_zone *zone,
++				 sector_t chunk_block, unsigned int nr_blocks,
++				 int set)
++{
++	struct dmz_mblock *mblk;
++	unsigned int bit, set_bit, nr_bits;
++	unsigned long *bitmap;
++	int n = 0;
++
++	WARN_ON(chunk_block + nr_blocks > zmd->dev->zone_nr_blocks);
++
++	while (nr_blocks) {
++		/* Get bitmap block */
++		mblk = dmz_get_bitmap(zmd, zone, chunk_block);
++		if (IS_ERR(mblk))
++			return PTR_ERR(mblk);
++
++		/* Get offset */
++		bitmap = (unsigned long *) mblk->data;
++		bit = chunk_block & DMZ_BLOCK_MASK_BITS;
++		nr_bits = min(nr_blocks, DMZ_BLOCK_SIZE_BITS - bit);
++		if (set)
++			set_bit = find_next_bit(bitmap, DMZ_BLOCK_SIZE_BITS, bit);
++		else
++			set_bit = find_next_zero_bit(bitmap, DMZ_BLOCK_SIZE_BITS, bit);
++		dmz_release_mblock(zmd, mblk);
++
++		n += set_bit - bit;
++		if (set_bit < DMZ_BLOCK_SIZE_BITS)
++			break;
++
++		nr_blocks -= nr_bits;
++		chunk_block += nr_bits;
++	}
++
++	return n;
++}
++
++/*
++ * Test if chunk_block is valid. If it is, the number of consecutive
++ * valid blocks from chunk_block will be returned.
++ */
++int dmz_block_valid(struct dmz_metadata *zmd, struct dm_zone *zone,
++		    sector_t chunk_block)
++{
++	int valid;
++
++	valid = dmz_test_block(zmd, zone, chunk_block);
++	if (valid <= 0)
++		return valid;
++
++	/* The block is valid: get the number of valid blocks from block */
++	return dmz_to_next_set_block(zmd, zone, chunk_block,
++				     zmd->dev->zone_nr_blocks - chunk_block, 0);
++}
++
++/*
++ * Find the first valid block from @chunk_block in @zone.
++ * If such a block is found, its number is returned using
++ * @chunk_block and the total number of valid blocks from @chunk_block
++ * is returned.
++ */
++int dmz_first_valid_block(struct dmz_metadata *zmd, struct dm_zone *zone,
++			  sector_t *chunk_block)
++{
++	sector_t start_block = *chunk_block;
++	int ret;
++
++	ret = dmz_to_next_set_block(zmd, zone, start_block,
++				    zmd->dev->zone_nr_blocks - start_block, 1);
++	if (ret < 0)
++		return ret;
++
++	start_block += ret;
++	*chunk_block = start_block;
++
++	return dmz_to_next_set_block(zmd, zone, start_block,
++				     zmd->dev->zone_nr_blocks - start_block, 0);
++}
++
++/*
++ * Count the number of bits set starting from bit up to bit + nr_bits - 1.
++ */
++static int dmz_count_bits(void *bitmap, int bit, int nr_bits)
++{
++	unsigned long *addr;
++	int end = bit + nr_bits;
++	int n = 0;
++
++	while (bit < end) {
++		if (((bit & (BITS_PER_LONG - 1)) == 0) &&
++		    ((end - bit) >= BITS_PER_LONG)) {
++			addr = (unsigned long *)bitmap + BIT_WORD(bit);
++			if (*addr == ULONG_MAX) {
++				n += BITS_PER_LONG;
++				bit += BITS_PER_LONG;
++				continue;
++			}
++		}
++
++		if (test_bit(bit, bitmap))
++			n++;
++		bit++;
++	}
++
++	return n;
++}
++
++/*
++ * Get a zone weight.
++ */
++static void dmz_get_zone_weight(struct dmz_metadata *zmd, struct dm_zone *zone)
++{
++	struct dmz_mblock *mblk;
++	sector_t chunk_block = 0;
++	unsigned int bit, nr_bits;
++	unsigned int nr_blocks = zmd->dev->zone_nr_blocks;
++	void *bitmap;
++	int n = 0;
++
++	while (nr_blocks) {
++		/* Get bitmap block */
++		mblk = dmz_get_bitmap(zmd, zone, chunk_block);
++		if (IS_ERR(mblk)) {
++			n = 0;
++			break;
++		}
++
++		/* Count bits in this block */
++		bitmap = mblk->data;
++		bit = chunk_block & DMZ_BLOCK_MASK_BITS;
++		nr_bits = min(nr_blocks, DMZ_BLOCK_SIZE_BITS - bit);
++		n += dmz_count_bits(bitmap, bit, nr_bits);
++
++		dmz_release_mblock(zmd, mblk);
++
++		nr_blocks -= nr_bits;
++		chunk_block += nr_bits;
++	}
++
++	zone->weight = n;
++}
++
++/*
++ * Cleanup the zoned metadata resources.
++ */
++static void dmz_cleanup_metadata(struct dmz_metadata *zmd)
++{
++	struct rb_root *root;
++	struct dmz_mblock *mblk, *next;
++	int i;
++
++	/* Release zone mapping resources */
++	if (zmd->map_mblk) {
++		for (i = 0; i < zmd->nr_map_blocks; i++)
++			dmz_release_mblock(zmd, zmd->map_mblk[i]);
++		kfree(zmd->map_mblk);
++		zmd->map_mblk = NULL;
++	}
++
++	/* Release super blocks */
++	for (i = 0; i < 2; i++) {
++		if (zmd->sb[i].mblk) {
++			dmz_free_mblock(zmd, zmd->sb[i].mblk);
++			zmd->sb[i].mblk = NULL;
++		}
++	}
++
++	/* Free cached blocks */
++	while (!list_empty(&zmd->mblk_dirty_list)) {
++		mblk = list_first_entry(&zmd->mblk_dirty_list,
++					struct dmz_mblock, link);
++		dmz_dev_warn(zmd->dev, "mblock %llu still in dirty list (ref %u)",
++			     (u64)mblk->no, atomic_read(&mblk->ref));
++		list_del_init(&mblk->link);
++		rb_erase(&mblk->node, &zmd->mblk_rbtree);
++		dmz_free_mblock(zmd, mblk);
++	}
++
++	while (!list_empty(&zmd->mblk_lru_list)) {
++		mblk = list_first_entry(&zmd->mblk_lru_list,
++					struct dmz_mblock, link);
++		list_del_init(&mblk->link);
++		rb_erase(&mblk->node, &zmd->mblk_rbtree);
++		dmz_free_mblock(zmd, mblk);
++	}
++
++	/* Sanity checks: the mblock rbtree should now be empty */
++	root = &zmd->mblk_rbtree;
++	rbtree_postorder_for_each_entry_safe(mblk, next, root, node) {
++		dmz_dev_warn(zmd->dev, "mblock %llu ref %u still in rbtree",
++			     (u64)mblk->no, atomic_read(&mblk->ref));
++		atomic_set(&mblk->ref, 0);
++		dmz_free_mblock(zmd, mblk);
++	}
++
++	/* Free the zone descriptors */
++	dmz_drop_zones(zmd);
++}
++
++/*
++ * Initialize the zoned metadata.
++ */
++int dmz_ctr_metadata(struct dmz_dev *dev, struct dmz_metadata **metadata)
++{
++	struct dmz_metadata *zmd;
++	unsigned int i, zid;
++	struct dm_zone *zone;
++	int ret;
++
++	zmd = kzalloc(sizeof(struct dmz_metadata), GFP_KERNEL);
++	if (!zmd)
++		return -ENOMEM;
++
++	zmd->dev = dev;
++	zmd->mblk_rbtree = RB_ROOT;
++	init_rwsem(&zmd->mblk_sem);
++	mutex_init(&zmd->mblk_flush_lock);
++	spin_lock_init(&zmd->mblk_lock);
++	INIT_LIST_HEAD(&zmd->mblk_lru_list);
++	INIT_LIST_HEAD(&zmd->mblk_dirty_list);
++
++	mutex_init(&zmd->map_lock);
++	atomic_set(&zmd->unmap_nr_rnd, 0);
++	INIT_LIST_HEAD(&zmd->unmap_rnd_list);
++	INIT_LIST_HEAD(&zmd->map_rnd_list);
++
++	atomic_set(&zmd->unmap_nr_seq, 0);
++	INIT_LIST_HEAD(&zmd->unmap_seq_list);
++	INIT_LIST_HEAD(&zmd->map_seq_list);
++
++	atomic_set(&zmd->nr_reserved_seq_zones, 0);
++	INIT_LIST_HEAD(&zmd->reserved_seq_zones_list);
++
++	init_waitqueue_head(&zmd->free_wq);
++
++	/* Initialize zone descriptors */
++	ret = dmz_init_zones(zmd);
++	if (ret)
++		goto err;
++
++	/* Get super block */
++	ret = dmz_load_sb(zmd);
++	if (ret)
++		goto err;
++
++	/* Set metadata zones starting from sb_zone */
++	zid = dmz_id(zmd, zmd->sb_zone);
++	for (i = 0; i < zmd->nr_meta_zones << 1; i++) {
++		zone = dmz_get(zmd, zid + i);
++		if (!dmz_is_rnd(zone))
++			goto err;
++		set_bit(DMZ_META, &zone->flags);
++	}
++
++	/* Load mapping table */
++	ret = dmz_load_mapping(zmd);
++	if (ret)
++		goto err;
++
++	/*
++	 * Cache size boundaries: allow at least 2 super blocks, the chunk map
++	 * blocks and enough blocks to be able to cache the bitmap blocks of
++	 * up to 16 zones when idle (min_nr_mblks). Otherwise, if busy, allow
++	 * the cache to add 512 more metadata blocks.
++	 */
++	zmd->min_nr_mblks = 2 + zmd->nr_map_blocks + zmd->zone_nr_bitmap_blocks * 16;
++	zmd->max_nr_mblks = zmd->min_nr_mblks + 512;
++	zmd->mblk_shrinker.count_objects = dmz_mblock_shrinker_count;
++	zmd->mblk_shrinker.scan_objects = dmz_mblock_shrinker_scan;
++	zmd->mblk_shrinker.seeks = DEFAULT_SEEKS;
++
++	/* Metadata cache shrinker */
++	ret = register_shrinker(&zmd->mblk_shrinker);
++	if (ret) {
++		dmz_dev_err(dev, "Register metadata cache shrinker failed");
++		goto err;
++	}
++
++	dmz_dev_info(dev, "Host-%s zoned block device",
++		     bdev_zoned_model(dev->bdev) == BLK_ZONED_HA ?
++		     "aware" : "managed");
++	dmz_dev_info(dev, "  %llu 512-byte logical sectors",
++		     (u64)dev->capacity);
++	dmz_dev_info(dev, "  %u zones of %llu 512-byte logical sectors",
++		     dev->nr_zones, (u64)dev->zone_nr_sectors);
++	dmz_dev_info(dev, "  %u metadata zones",
++		     zmd->nr_meta_zones * 2);
++	dmz_dev_info(dev, "  %u data zones for %u chunks",
++		     zmd->nr_data_zones, zmd->nr_chunks);
++	dmz_dev_info(dev, "    %u random zones (%u unmapped)",
++		     zmd->nr_rnd, atomic_read(&zmd->unmap_nr_rnd));
++	dmz_dev_info(dev, "    %u sequential zones (%u unmapped)",
++		     zmd->nr_seq, atomic_read(&zmd->unmap_nr_seq));
++	dmz_dev_info(dev, "  %u reserved sequential data zones",
++		     zmd->nr_reserved_seq);
++
++	dmz_dev_debug(dev, "Format:");
++	dmz_dev_debug(dev, "%u metadata blocks per set (%u max cache)",
++		      zmd->nr_meta_blocks, zmd->max_nr_mblks);
++	dmz_dev_debug(dev, "  %u data zone mapping blocks",
++		      zmd->nr_map_blocks);
++	dmz_dev_debug(dev, "  %u bitmap blocks",
++		      zmd->nr_bitmap_blocks);
++
++	*metadata = zmd;
++
++	return 0;
++err:
++	dmz_cleanup_metadata(zmd);
++	kfree(zmd);
++	*metadata = NULL;
++
++	return ret;
++}
++
++/*
++ * Cleanup the zoned metadata resources.
++ */
++void dmz_dtr_metadata(struct dmz_metadata *zmd)
++{
++	unregister_shrinker(&zmd->mblk_shrinker);
++	dmz_cleanup_metadata(zmd);
++	kfree(zmd);
++}
++
++/*
++ * Check zone information on resume.
++ */
++int dmz_resume_metadata(struct dmz_metadata *zmd)
++{
++	struct dmz_dev *dev = zmd->dev;
++	struct dm_zone *zone;
++	sector_t wp_block;
++	unsigned int i;
++	int ret;
++
++	/* Check zones */
++	for (i = 0; i < dev->nr_zones; i++) {
++		zone = dmz_get(zmd, i);
++		if (!zone) {
++			dmz_dev_err(dev, "Unable to get zone %u", i);
++			return -EIO;
++		}
++
++		wp_block = zone->wp_block;
++
++		ret = dmz_update_zone(zmd, zone);
++		if (ret) {
++			dmz_dev_err(dev, "Broken zone %u", i);
++			return ret;
++		}
++
++		if (dmz_is_offline(zone)) {
++			dmz_dev_warn(dev, "Zone %u is offline", i);
++			continue;
++		}
++
++		/* Check write pointer */
++		if (!dmz_is_seq(zone))
++			zone->wp_block = 0;
++		else if (zone->wp_block != wp_block) {
++			dmz_dev_err(dev, "Zone %u: Invalid wp (%llu / %llu)",
++				    i, (u64)zone->wp_block, (u64)wp_block);
++			zone->wp_block = wp_block;
++			dmz_invalidate_blocks(zmd, zone, zone->wp_block,
++					      dev->zone_nr_blocks - zone->wp_block);
++		}
++	}
++
++	return 0;
++}
+diff --git a/drivers/md/dm-zoned-reclaim.c b/drivers/md/dm-zoned-reclaim.c
+new file mode 100644
+index 000000000000..05c0a126f5c8
+--- /dev/null
++++ b/drivers/md/dm-zoned-reclaim.c
+@@ -0,0 +1,570 @@
++/*
++ * Copyright (C) 2017 Western Digital Corporation or its affiliates.
++ *
++ * This file is released under the GPL.
++ */
++
++#include "dm-zoned.h"
++
++#include <linux/module.h>
++
++#define	DM_MSG_PREFIX		"zoned reclaim"
++
++struct dmz_reclaim {
++	struct dmz_metadata     *metadata;
++	struct dmz_dev		*dev;
++
++	struct delayed_work	work;
++	struct workqueue_struct *wq;
++
++	struct dm_kcopyd_client	*kc;
++	struct dm_kcopyd_throttle kc_throttle;
++	int			kc_err;
++
++	unsigned long		flags;
++
++	/* Last target access time */
++	unsigned long		atime;
++};
++
++/*
++ * Reclaim state flags.
++ */
++enum {
++	DMZ_RECLAIM_KCOPY,
++};
++
++/*
++ * Number of seconds of target BIO inactivity to consider the target idle.
++ */
++#define DMZ_IDLE_PERIOD		(10UL * HZ)
++
++/*
++ * Percentage of unmapped (free) random zones below which reclaim starts
++ * even if the target is busy.
++ */
++#define DMZ_RECLAIM_LOW_UNMAP_RND	30
++
++/*
++ * Percentage of unmapped (free) random zones above which reclaim will
++ * stop if the target is busy.
++ */
++#define DMZ_RECLAIM_HIGH_UNMAP_RND	50
++
++/*
++ * Align a sequential zone write pointer to chunk_block.
++ */
++static int dmz_reclaim_align_wp(struct dmz_reclaim *zrc, struct dm_zone *zone,
++				sector_t block)
++{
++	struct dmz_metadata *zmd = zrc->metadata;
++	sector_t wp_block = zone->wp_block;
++	unsigned int nr_blocks;
++	int ret;
++
++	if (wp_block == block)
++		return 0;
++
++	if (wp_block > block)
++		return -EIO;
++
++	/*
++	 * Zeroout the space between the write
++	 * pointer and the requested position.
++	 */
++	nr_blocks = block - wp_block;
++	ret = blkdev_issue_zeroout(zrc->dev->bdev,
++				   dmz_start_sect(zmd, zone) + dmz_blk2sect(wp_block),
++				   dmz_blk2sect(nr_blocks), GFP_NOFS, false);
++	if (ret) {
++		dmz_dev_err(zrc->dev,
++			    "Align zone %u wp %llu to %llu (wp+%u) blocks failed %d",
++			    dmz_id(zmd, zone), (unsigned long long)wp_block,
++			    (unsigned long long)block, nr_blocks, ret);
++		return ret;
++	}
++
++	zone->wp_block = block;
++
++	return 0;
++}
++
++/*
++ * dm_kcopyd_copy end notification.
++ */
++static void dmz_reclaim_kcopy_end(int read_err, unsigned long write_err,
++				  void *context)
++{
++	struct dmz_reclaim *zrc = context;
++
++	if (read_err || write_err)
++		zrc->kc_err = -EIO;
++	else
++		zrc->kc_err = 0;
++
++	clear_bit_unlock(DMZ_RECLAIM_KCOPY, &zrc->flags);
++	smp_mb__after_atomic();
++	wake_up_bit(&zrc->flags, DMZ_RECLAIM_KCOPY);
++}
++
++/*
++ * Copy valid blocks of src_zone into dst_zone.
++ */
++static int dmz_reclaim_copy(struct dmz_reclaim *zrc,
++			    struct dm_zone *src_zone, struct dm_zone *dst_zone)
++{
++	struct dmz_metadata *zmd = zrc->metadata;
++	struct dmz_dev *dev = zrc->dev;
++	struct dm_io_region src, dst;
++	sector_t block = 0, end_block;
++	sector_t nr_blocks;
++	sector_t src_zone_block;
++	sector_t dst_zone_block;
++	unsigned long flags = 0;
++	int ret;
++
++	if (dmz_is_seq(src_zone))
++		end_block = src_zone->wp_block;
++	else
++		end_block = dev->zone_nr_blocks;
++	src_zone_block = dmz_start_block(zmd, src_zone);
++	dst_zone_block = dmz_start_block(zmd, dst_zone);
++
++	if (dmz_is_seq(dst_zone))
++		set_bit(DM_KCOPYD_WRITE_SEQ, &flags);
++
++	while (block < end_block) {
++		/* Get a valid region from the source zone */
++		ret = dmz_first_valid_block(zmd, src_zone, &block);
++		if (ret <= 0)
++			return ret;
++		nr_blocks = ret;
++
++		/*
++		 * If we are writing in a sequential zone, we must make sure
++		 * that writes are sequential. So Zeroout any eventual hole
++		 * between writes.
++		 */
++		if (dmz_is_seq(dst_zone)) {
++			ret = dmz_reclaim_align_wp(zrc, dst_zone, block);
++			if (ret)
++				return ret;
++		}
++
++		src.bdev = dev->bdev;
++		src.sector = dmz_blk2sect(src_zone_block + block);
++		src.count = dmz_blk2sect(nr_blocks);
++
++		dst.bdev = dev->bdev;
++		dst.sector = dmz_blk2sect(dst_zone_block + block);
++		dst.count = src.count;
++
++		/* Copy the valid region */
++		set_bit(DMZ_RECLAIM_KCOPY, &zrc->flags);
++		ret = dm_kcopyd_copy(zrc->kc, &src, 1, &dst, flags,
++				     dmz_reclaim_kcopy_end, zrc);
++		if (ret)
++			return ret;
++
++		/* Wait for copy to complete */
++		wait_on_bit_io(&zrc->flags, DMZ_RECLAIM_KCOPY,
++			       TASK_UNINTERRUPTIBLE);
++		if (zrc->kc_err)
++			return zrc->kc_err;
++
++		block += nr_blocks;
++		if (dmz_is_seq(dst_zone))
++			dst_zone->wp_block = block;
++	}
++
++	return 0;
++}
++
++/*
++ * Move valid blocks of dzone buffer zone into dzone (after its write pointer)
++ * and free the buffer zone.
++ */
++static int dmz_reclaim_buf(struct dmz_reclaim *zrc, struct dm_zone *dzone)
++{
++	struct dm_zone *bzone = dzone->bzone;
++	sector_t chunk_block = dzone->wp_block;
++	struct dmz_metadata *zmd = zrc->metadata;
++	int ret;
++
++	dmz_dev_debug(zrc->dev,
++		      "Chunk %u, move buf zone %u (weight %u) to data zone %u (weight %u)",
++		      dzone->chunk, dmz_id(zmd, bzone), dmz_weight(bzone),
++		      dmz_id(zmd, dzone), dmz_weight(dzone));
++
++	/* Flush data zone into the buffer zone */
++	ret = dmz_reclaim_copy(zrc, bzone, dzone);
++	if (ret < 0)
++		return ret;
++
++	dmz_lock_flush(zmd);
++
++	/* Validate copied blocks */
++	ret = dmz_merge_valid_blocks(zmd, bzone, dzone, chunk_block);
++	if (ret == 0) {
++		/* Free the buffer zone */
++		dmz_invalidate_blocks(zmd, bzone, 0, zrc->dev->zone_nr_blocks);
++		dmz_lock_map(zmd);
++		dmz_unmap_zone(zmd, bzone);
++		dmz_unlock_zone_reclaim(dzone);
++		dmz_free_zone(zmd, bzone);
++		dmz_unlock_map(zmd);
++	}
++
++	dmz_unlock_flush(zmd);
++
++	return 0;
++}
++
++/*
++ * Merge valid blocks of dzone into its buffer zone and free dzone.
++ */
++static int dmz_reclaim_seq_data(struct dmz_reclaim *zrc, struct dm_zone *dzone)
++{
++	unsigned int chunk = dzone->chunk;
++	struct dm_zone *bzone = dzone->bzone;
++	struct dmz_metadata *zmd = zrc->metadata;
++	int ret = 0;
++
++	dmz_dev_debug(zrc->dev,
++		      "Chunk %u, move data zone %u (weight %u) to buf zone %u (weight %u)",
++		      chunk, dmz_id(zmd, dzone), dmz_weight(dzone),
++		      dmz_id(zmd, bzone), dmz_weight(bzone));
++
++	/* Flush data zone into the buffer zone */
++	ret = dmz_reclaim_copy(zrc, dzone, bzone);
++	if (ret < 0)
++		return ret;
++
++	dmz_lock_flush(zmd);
++
++	/* Validate copied blocks */
++	ret = dmz_merge_valid_blocks(zmd, dzone, bzone, 0);
++	if (ret == 0) {
++		/*
++		 * Free the data zone and remap the chunk to
++		 * the buffer zone.
++		 */
++		dmz_invalidate_blocks(zmd, dzone, 0, zrc->dev->zone_nr_blocks);
++		dmz_lock_map(zmd);
++		dmz_unmap_zone(zmd, bzone);
++		dmz_unmap_zone(zmd, dzone);
++		dmz_unlock_zone_reclaim(dzone);
++		dmz_free_zone(zmd, dzone);
++		dmz_map_zone(zmd, bzone, chunk);
++		dmz_unlock_map(zmd);
++	}
++
++	dmz_unlock_flush(zmd);
++
++	return 0;
++}
++
++/*
++ * Move valid blocks of the random data zone dzone into a free sequential zone.
++ * Once blocks are moved, remap the zone chunk to the sequential zone.
++ */
++static int dmz_reclaim_rnd_data(struct dmz_reclaim *zrc, struct dm_zone *dzone)
++{
++	unsigned int chunk = dzone->chunk;
++	struct dm_zone *szone = NULL;
++	struct dmz_metadata *zmd = zrc->metadata;
++	int ret;
++
++	/* Get a free sequential zone */
++	dmz_lock_map(zmd);
++	szone = dmz_alloc_zone(zmd, DMZ_ALLOC_RECLAIM);
++	dmz_unlock_map(zmd);
++	if (!szone)
++		return -ENOSPC;
++
++	dmz_dev_debug(zrc->dev,
++		      "Chunk %u, move rnd zone %u (weight %u) to seq zone %u",
++		      chunk, dmz_id(zmd, dzone), dmz_weight(dzone),
++		      dmz_id(zmd, szone));
++
++	/* Flush the random data zone into the sequential zone */
++	ret = dmz_reclaim_copy(zrc, dzone, szone);
++
++	dmz_lock_flush(zmd);
++
++	if (ret == 0) {
++		/* Validate copied blocks */
++		ret = dmz_copy_valid_blocks(zmd, dzone, szone);
++	}
++	if (ret) {
++		/* Free the sequential zone */
++		dmz_lock_map(zmd);
++		dmz_free_zone(zmd, szone);
++		dmz_unlock_map(zmd);
++	} else {
++		/* Free the data zone and remap the chunk */
++		dmz_invalidate_blocks(zmd, dzone, 0, zrc->dev->zone_nr_blocks);
++		dmz_lock_map(zmd);
++		dmz_unmap_zone(zmd, dzone);
++		dmz_unlock_zone_reclaim(dzone);
++		dmz_free_zone(zmd, dzone);
++		dmz_map_zone(zmd, szone, chunk);
++		dmz_unlock_map(zmd);
++	}
++
++	dmz_unlock_flush(zmd);
++
++	return 0;
++}
++
++/*
++ * Reclaim an empty zone.
++ */
++static void dmz_reclaim_empty(struct dmz_reclaim *zrc, struct dm_zone *dzone)
++{
++	struct dmz_metadata *zmd = zrc->metadata;
++
++	dmz_lock_flush(zmd);
++	dmz_lock_map(zmd);
++	dmz_unmap_zone(zmd, dzone);
++	dmz_unlock_zone_reclaim(dzone);
++	dmz_free_zone(zmd, dzone);
++	dmz_unlock_map(zmd);
++	dmz_unlock_flush(zmd);
++}
++
++/*
++ * Find a candidate zone for reclaim and process it.
++ */
++static void dmz_reclaim(struct dmz_reclaim *zrc)
++{
++	struct dmz_metadata *zmd = zrc->metadata;
++	struct dm_zone *dzone;
++	struct dm_zone *rzone;
++	unsigned long start;
++	int ret;
++
++	/* Get a data zone */
++	dzone = dmz_get_zone_for_reclaim(zmd);
++	if (!dzone)
++		return;
++
++	start = jiffies;
++
++	if (dmz_is_rnd(dzone)) {
++		if (!dmz_weight(dzone)) {
++			/* Empty zone */
++			dmz_reclaim_empty(zrc, dzone);
++			ret = 0;
++		} else {
++			/*
++			 * Reclaim the random data zone by moving its
++			 * valid data blocks to a free sequential zone.
++			 */
++			ret = dmz_reclaim_rnd_data(zrc, dzone);
++		}
++		rzone = dzone;
++
++	} else {
++		struct dm_zone *bzone = dzone->bzone;
++		sector_t chunk_block = 0;
++
++		ret = dmz_first_valid_block(zmd, bzone, &chunk_block);
++		if (ret < 0)
++			goto out;
++
++		if (ret == 0 || chunk_block >= dzone->wp_block) {
++			/*
++			 * The buffer zone is empty or its valid blocks are
++			 * after the data zone write pointer.
++			 */
++			ret = dmz_reclaim_buf(zrc, dzone);
++			rzone = bzone;
++		} else {
++			/*
++			 * Reclaim the data zone by merging it into the
++			 * buffer zone so that the buffer zone itself can
++			 * be later reclaimed.
++			 */
++			ret = dmz_reclaim_seq_data(zrc, dzone);
++			rzone = dzone;
++		}
++	}
++out:
++	if (ret) {
++		dmz_unlock_zone_reclaim(dzone);
++		return;
++	}
++
++	(void) dmz_flush_metadata(zrc->metadata);
++
++	dmz_dev_debug(zrc->dev, "Reclaimed zone %u in %u ms",
++		      dmz_id(zmd, rzone), jiffies_to_msecs(jiffies - start));
++}
++
++/*
++ * Test if the target device is idle.
++ */
++static inline int dmz_target_idle(struct dmz_reclaim *zrc)
++{
++	return time_is_before_jiffies(zrc->atime + DMZ_IDLE_PERIOD);
++}
++
++/*
++ * Test if reclaim is necessary.
++ */
++static bool dmz_should_reclaim(struct dmz_reclaim *zrc)
++{
++	struct dmz_metadata *zmd = zrc->metadata;
++	unsigned int nr_rnd = dmz_nr_rnd_zones(zmd);
++	unsigned int nr_unmap_rnd = dmz_nr_unmap_rnd_zones(zmd);
++	unsigned int p_unmap_rnd = nr_unmap_rnd * 100 / nr_rnd;
++
++	/* Reclaim when idle */
++	if (dmz_target_idle(zrc) && nr_unmap_rnd < nr_rnd)
++		return true;
++
++	/* If there are still plenty of random zones, do not reclaim */
++	if (p_unmap_rnd >= DMZ_RECLAIM_HIGH_UNMAP_RND)
++		return false;
++
++	/*
++	 * If the percentage of unmappped random zones is low,
++	 * reclaim even if the target is busy.
++	 */
++	return p_unmap_rnd <= DMZ_RECLAIM_LOW_UNMAP_RND;
++}
++
++/*
++ * Reclaim work function.
++ */
++static void dmz_reclaim_work(struct work_struct *work)
++{
++	struct dmz_reclaim *zrc = container_of(work, struct dmz_reclaim, work.work);
++	struct dmz_metadata *zmd = zrc->metadata;
++	unsigned int nr_rnd, nr_unmap_rnd;
++	unsigned int p_unmap_rnd;
++
++	if (!dmz_should_reclaim(zrc)) {
++		mod_delayed_work(zrc->wq, &zrc->work, DMZ_IDLE_PERIOD);
++		return;
++	}
++
++	/*
++	 * We need to start reclaiming random zones: set up zone copy
++	 * throttling to either go fast if we are very low on random zones
++	 * and slower if there are still some free random zones to avoid
++	 * as much as possible to negatively impact the user workload.
++	 */
++	nr_rnd = dmz_nr_rnd_zones(zmd);
++	nr_unmap_rnd = dmz_nr_unmap_rnd_zones(zmd);
++	p_unmap_rnd = nr_unmap_rnd * 100 / nr_rnd;
++	if (dmz_target_idle(zrc) || p_unmap_rnd < DMZ_RECLAIM_LOW_UNMAP_RND / 2) {
++		/* Idle or very low percentage: go fast */
++		zrc->kc_throttle.throttle = 100;
++	} else {
++		/* Busy but we still have some random zone: throttle */
++		zrc->kc_throttle.throttle = min(75U, 100U - p_unmap_rnd / 2);
++	}
++
++	dmz_dev_debug(zrc->dev,
++		      "Reclaim (%u): %s, %u%% free rnd zones (%u/%u)",
++		      zrc->kc_throttle.throttle,
++		      (dmz_target_idle(zrc) ? "Idle" : "Busy"),
++		      p_unmap_rnd, nr_unmap_rnd, nr_rnd);
++
++	dmz_reclaim(zrc);
++
++	dmz_schedule_reclaim(zrc);
++}
++
++/*
++ * Initialize reclaim.
++ */
++int dmz_ctr_reclaim(struct dmz_dev *dev, struct dmz_metadata *zmd,
++		    struct dmz_reclaim **reclaim)
++{
++	struct dmz_reclaim *zrc;
++	int ret;
++
++	zrc = kzalloc(sizeof(struct dmz_reclaim), GFP_KERNEL);
++	if (!zrc)
++		return -ENOMEM;
++
++	zrc->dev = dev;
++	zrc->metadata = zmd;
++	zrc->atime = jiffies;
++
++	/* Reclaim kcopyd client */
++	zrc->kc = dm_kcopyd_client_create(&zrc->kc_throttle);
++	if (IS_ERR(zrc->kc)) {
++		ret = PTR_ERR(zrc->kc);
++		zrc->kc = NULL;
++		goto err;
++	}
++
++	/* Reclaim work */
++	INIT_DELAYED_WORK(&zrc->work, dmz_reclaim_work);
++	zrc->wq = alloc_ordered_workqueue("dmz_rwq_%s", WQ_MEM_RECLAIM,
++					  dev->name);
++	if (!zrc->wq) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	*reclaim = zrc;
++	queue_delayed_work(zrc->wq, &zrc->work, 0);
++
++	return 0;
++err:
++	if (zrc->kc)
++		dm_kcopyd_client_destroy(zrc->kc);
++	kfree(zrc);
++
++	return ret;
++}
++
++/*
++ * Terminate reclaim.
++ */
++void dmz_dtr_reclaim(struct dmz_reclaim *zrc)
++{
++	cancel_delayed_work_sync(&zrc->work);
++	destroy_workqueue(zrc->wq);
++	dm_kcopyd_client_destroy(zrc->kc);
++	kfree(zrc);
++}
++
++/*
++ * Suspend reclaim.
++ */
++void dmz_suspend_reclaim(struct dmz_reclaim *zrc)
++{
++	cancel_delayed_work_sync(&zrc->work);
++}
++
++/*
++ * Resume reclaim.
++ */
++void dmz_resume_reclaim(struct dmz_reclaim *zrc)
++{
++	queue_delayed_work(zrc->wq, &zrc->work, DMZ_IDLE_PERIOD);
++}
++
++/*
++ * BIO accounting.
++ */
++void dmz_reclaim_bio_acc(struct dmz_reclaim *zrc)
++{
++	zrc->atime = jiffies;
++}
++
++/*
++ * Start reclaim if necessary.
++ */
++void dmz_schedule_reclaim(struct dmz_reclaim *zrc)
++{
++	if (dmz_should_reclaim(zrc))
++		mod_delayed_work(zrc->wq, &zrc->work, 0);
++}
++
+diff --git a/drivers/md/dm-zoned-target.c b/drivers/md/dm-zoned-target.c
+new file mode 100644
+index 000000000000..2b538fa817f4
+--- /dev/null
++++ b/drivers/md/dm-zoned-target.c
+@@ -0,0 +1,967 @@
++/*
++ * Copyright (C) 2017 Western Digital Corporation or its affiliates.
++ *
++ * This file is released under the GPL.
++ */
++
++#include "dm-zoned.h"
++
++#include <linux/module.h>
++
++#define	DM_MSG_PREFIX		"zoned"
++
++#define DMZ_MIN_BIOS		8192
++
++/*
++ * Zone BIO context.
++ */
++struct dmz_bioctx {
++	struct dmz_target	*target;
++	struct dm_zone		*zone;
++	struct bio		*bio;
++	atomic_t		ref;
++	blk_status_t		status;
++};
++
++/*
++ * Chunk work descriptor.
++ */
++struct dm_chunk_work {
++	struct work_struct	work;
++	atomic_t		refcount;
++	struct dmz_target	*target;
++	unsigned int		chunk;
++	struct bio_list		bio_list;
++};
++
++/*
++ * Target descriptor.
++ */
++struct dmz_target {
++	struct dm_dev		*ddev;
++
++	unsigned long		flags;
++
++	/* Zoned block device information */
++	struct dmz_dev		*dev;
++
++	/* For metadata handling */
++	struct dmz_metadata     *metadata;
++
++	/* For reclaim */
++	struct dmz_reclaim	*reclaim;
++
++	/* For chunk work */
++	struct mutex		chunk_lock;
++	struct radix_tree_root	chunk_rxtree;
++	struct workqueue_struct *chunk_wq;
++
++	/* For cloned BIOs to zones */
++	struct bio_set		*bio_set;
++
++	/* For flush */
++	spinlock_t		flush_lock;
++	struct bio_list		flush_list;
++	struct delayed_work	flush_work;
++	struct workqueue_struct *flush_wq;
++};
++
++/*
++ * Flush intervals (seconds).
++ */
++#define DMZ_FLUSH_PERIOD	(10 * HZ)
++
++/*
++ * Target BIO completion.
++ */
++static inline void dmz_bio_endio(struct bio *bio, blk_status_t status)
++{
++	struct dmz_bioctx *bioctx = dm_per_bio_data(bio, sizeof(struct dmz_bioctx));
++
++	if (bioctx->status == BLK_STS_OK && status != BLK_STS_OK)
++		bioctx->status = status;
++	bio_endio(bio);
++}
++
++/*
++ * Partial clone read BIO completion callback. This terminates the
++ * target BIO when there are no more references to its context.
++ */
++static void dmz_read_bio_end_io(struct bio *bio)
++{
++	struct dmz_bioctx *bioctx = bio->bi_private;
++	blk_status_t status = bio->bi_status;
++
++	bio_put(bio);
++	dmz_bio_endio(bioctx->bio, status);
++}
++
++/*
++ * Issue a BIO to a zone. The BIO may only partially process the
++ * original target BIO.
++ */
++static int dmz_submit_read_bio(struct dmz_target *dmz, struct dm_zone *zone,
++			       struct bio *bio, sector_t chunk_block,
++			       unsigned int nr_blocks)
++{
++	struct dmz_bioctx *bioctx = dm_per_bio_data(bio, sizeof(struct dmz_bioctx));
++	sector_t sector;
++	struct bio *clone;
++
++	/* BIO remap sector */
++	sector = dmz_start_sect(dmz->metadata, zone) + dmz_blk2sect(chunk_block);
++
++	/* If the read is not partial, there is no need to clone the BIO */
++	if (nr_blocks == dmz_bio_blocks(bio)) {
++		/* Setup and submit the BIO */
++		bio->bi_iter.bi_sector = sector;
++		atomic_inc(&bioctx->ref);
++		generic_make_request(bio);
++		return 0;
++	}
++
++	/* Partial BIO: we need to clone the BIO */
++	clone = bio_clone_fast(bio, GFP_NOIO, dmz->bio_set);
++	if (!clone)
++		return -ENOMEM;
++
++	/* Setup the clone */
++	clone->bi_iter.bi_sector = sector;
++	clone->bi_iter.bi_size = dmz_blk2sect(nr_blocks) << SECTOR_SHIFT;
++	clone->bi_end_io = dmz_read_bio_end_io;
++	clone->bi_private = bioctx;
++
++	bio_advance(bio, clone->bi_iter.bi_size);
++
++	/* Submit the clone */
++	atomic_inc(&bioctx->ref);
++	generic_make_request(clone);
++
++	return 0;
++}
++
++/*
++ * Zero out pages of discarded blocks accessed by a read BIO.
++ */
++static void dmz_handle_read_zero(struct dmz_target *dmz, struct bio *bio,
++				 sector_t chunk_block, unsigned int nr_blocks)
++{
++	unsigned int size = nr_blocks << DMZ_BLOCK_SHIFT;
++
++	/* Clear nr_blocks */
++	swap(bio->bi_iter.bi_size, size);
++	zero_fill_bio(bio);
++	swap(bio->bi_iter.bi_size, size);
++
++	bio_advance(bio, size);
++}
++
++/*
++ * Process a read BIO.
++ */
++static int dmz_handle_read(struct dmz_target *dmz, struct dm_zone *zone,
++			   struct bio *bio)
++{
++	sector_t chunk_block = dmz_chunk_block(dmz->dev, dmz_bio_block(bio));
++	unsigned int nr_blocks = dmz_bio_blocks(bio);
++	sector_t end_block = chunk_block + nr_blocks;
++	struct dm_zone *rzone, *bzone;
++	int ret;
++
++	/* Read into unmapped chunks need only zeroing the BIO buffer */
++	if (!zone) {
++		zero_fill_bio(bio);
++		return 0;
++	}
++
++	dmz_dev_debug(dmz->dev, "READ chunk %llu -> %s zone %u, block %llu, %u blocks",
++		      (unsigned long long)dmz_bio_chunk(dmz->dev, bio),
++		      (dmz_is_rnd(zone) ? "RND" : "SEQ"),
++		      dmz_id(dmz->metadata, zone),
++		      (unsigned long long)chunk_block, nr_blocks);
++
++	/* Check block validity to determine the read location */
++	bzone = zone->bzone;
++	while (chunk_block < end_block) {
++		nr_blocks = 0;
++		if (dmz_is_rnd(zone) || chunk_block < zone->wp_block) {
++			/* Test block validity in the data zone */
++			ret = dmz_block_valid(dmz->metadata, zone, chunk_block);
++			if (ret < 0)
++				return ret;
++			if (ret > 0) {
++				/* Read data zone blocks */
++				nr_blocks = ret;
++				rzone = zone;
++			}
++		}
++
++		/*
++		 * No valid blocks found in the data zone.
++		 * Check the buffer zone, if there is one.
++		 */
++		if (!nr_blocks && bzone) {
++			ret = dmz_block_valid(dmz->metadata, bzone, chunk_block);
++			if (ret < 0)
++				return ret;
++			if (ret > 0) {
++				/* Read buffer zone blocks */
++				nr_blocks = ret;
++				rzone = bzone;
++			}
++		}
++
++		if (nr_blocks) {
++			/* Valid blocks found: read them */
++			nr_blocks = min_t(unsigned int, nr_blocks, end_block - chunk_block);
++			ret = dmz_submit_read_bio(dmz, rzone, bio, chunk_block, nr_blocks);
++			if (ret)
++				return ret;
++			chunk_block += nr_blocks;
++		} else {
++			/* No valid block: zeroout the current BIO block */
++			dmz_handle_read_zero(dmz, bio, chunk_block, 1);
++			chunk_block++;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Issue a write BIO to a zone.
++ */
++static void dmz_submit_write_bio(struct dmz_target *dmz, struct dm_zone *zone,
++				 struct bio *bio, sector_t chunk_block,
++				 unsigned int nr_blocks)
++{
++	struct dmz_bioctx *bioctx = dm_per_bio_data(bio, sizeof(struct dmz_bioctx));
++
++	/* Setup and submit the BIO */
++	bio->bi_bdev = dmz->dev->bdev;
++	bio->bi_iter.bi_sector = dmz_start_sect(dmz->metadata, zone) + dmz_blk2sect(chunk_block);
++	atomic_inc(&bioctx->ref);
++	generic_make_request(bio);
++
++	if (dmz_is_seq(zone))
++		zone->wp_block += nr_blocks;
++}
++
++/*
++ * Write blocks directly in a data zone, at the write pointer.
++ * If a buffer zone is assigned, invalidate the blocks written
++ * in place.
++ */
++static int dmz_handle_direct_write(struct dmz_target *dmz,
++				   struct dm_zone *zone, struct bio *bio,
++				   sector_t chunk_block,
++				   unsigned int nr_blocks)
++{
++	struct dmz_metadata *zmd = dmz->metadata;
++	struct dm_zone *bzone = zone->bzone;
++	int ret;
++
++	if (dmz_is_readonly(zone))
++		return -EROFS;
++
++	/* Submit write */
++	dmz_submit_write_bio(dmz, zone, bio, chunk_block, nr_blocks);
++
++	/*
++	 * Validate the blocks in the data zone and invalidate
++	 * in the buffer zone, if there is one.
++	 */
++	ret = dmz_validate_blocks(zmd, zone, chunk_block, nr_blocks);
++	if (ret == 0 && bzone)
++		ret = dmz_invalidate_blocks(zmd, bzone, chunk_block, nr_blocks);
++
++	return ret;
++}
++
++/*
++ * Write blocks in the buffer zone of @zone.
++ * If no buffer zone is assigned yet, get one.
++ * Called with @zone write locked.
++ */
++static int dmz_handle_buffered_write(struct dmz_target *dmz,
++				     struct dm_zone *zone, struct bio *bio,
++				     sector_t chunk_block,
++				     unsigned int nr_blocks)
++{
++	struct dmz_metadata *zmd = dmz->metadata;
++	struct dm_zone *bzone;
++	int ret;
++
++	/* Get the buffer zone. One will be allocated if needed */
++	bzone = dmz_get_chunk_buffer(zmd, zone);
++	if (!bzone)
++		return -ENOSPC;
++
++	if (dmz_is_readonly(bzone))
++		return -EROFS;
++
++	/* Submit write */
++	dmz_submit_write_bio(dmz, bzone, bio, chunk_block, nr_blocks);
++
++	/*
++	 * Validate the blocks in the buffer zone
++	 * and invalidate in the data zone.
++	 */
++	ret = dmz_validate_blocks(zmd, bzone, chunk_block, nr_blocks);
++	if (ret == 0 && chunk_block < zone->wp_block)
++		ret = dmz_invalidate_blocks(zmd, zone, chunk_block, nr_blocks);
++
++	return ret;
++}
++
++/*
++ * Process a write BIO.
++ */
++static int dmz_handle_write(struct dmz_target *dmz, struct dm_zone *zone,
++			    struct bio *bio)
++{
++	sector_t chunk_block = dmz_chunk_block(dmz->dev, dmz_bio_block(bio));
++	unsigned int nr_blocks = dmz_bio_blocks(bio);
++
++	if (!zone)
++		return -ENOSPC;
++
++	dmz_dev_debug(dmz->dev, "WRITE chunk %llu -> %s zone %u, block %llu, %u blocks",
++		      (unsigned long long)dmz_bio_chunk(dmz->dev, bio),
++		      (dmz_is_rnd(zone) ? "RND" : "SEQ"),
++		      dmz_id(dmz->metadata, zone),
++		      (unsigned long long)chunk_block, nr_blocks);
++
++	if (dmz_is_rnd(zone) || chunk_block == zone->wp_block) {
++		/*
++		 * zone is a random zone or it is a sequential zone
++		 * and the BIO is aligned to the zone write pointer:
++		 * direct write the zone.
++		 */
++		return dmz_handle_direct_write(dmz, zone, bio, chunk_block, nr_blocks);
++	}
++
++	/*
++	 * This is an unaligned write in a sequential zone:
++	 * use buffered write.
++	 */
++	return dmz_handle_buffered_write(dmz, zone, bio, chunk_block, nr_blocks);
++}
++
++/*
++ * Process a discard BIO.
++ */
++static int dmz_handle_discard(struct dmz_target *dmz, struct dm_zone *zone,
++			      struct bio *bio)
++{
++	struct dmz_metadata *zmd = dmz->metadata;
++	sector_t block = dmz_bio_block(bio);
++	unsigned int nr_blocks = dmz_bio_blocks(bio);
++	sector_t chunk_block = dmz_chunk_block(dmz->dev, block);
++	int ret = 0;
++
++	/* For unmapped chunks, there is nothing to do */
++	if (!zone)
++		return 0;
++
++	if (dmz_is_readonly(zone))
++		return -EROFS;
++
++	dmz_dev_debug(dmz->dev, "DISCARD chunk %llu -> zone %u, block %llu, %u blocks",
++		      (unsigned long long)dmz_bio_chunk(dmz->dev, bio),
++		      dmz_id(zmd, zone),
++		      (unsigned long long)chunk_block, nr_blocks);
++
++	/*
++	 * Invalidate blocks in the data zone and its
++	 * buffer zone if one is mapped.
++	 */
++	if (dmz_is_rnd(zone) || chunk_block < zone->wp_block)
++		ret = dmz_invalidate_blocks(zmd, zone, chunk_block, nr_blocks);
++	if (ret == 0 && zone->bzone)
++		ret = dmz_invalidate_blocks(zmd, zone->bzone,
++					    chunk_block, nr_blocks);
++	return ret;
++}
++
++/*
++ * Process a BIO.
++ */
++static void dmz_handle_bio(struct dmz_target *dmz, struct dm_chunk_work *cw,
++			   struct bio *bio)
++{
++	struct dmz_bioctx *bioctx = dm_per_bio_data(bio, sizeof(struct dmz_bioctx));
++	struct dmz_metadata *zmd = dmz->metadata;
++	struct dm_zone *zone;
++	int ret;
++
++	/*
++	 * Write may trigger a zone allocation. So make sure the
++	 * allocation can succeed.
++	 */
++	if (bio_op(bio) == REQ_OP_WRITE)
++		dmz_schedule_reclaim(dmz->reclaim);
++
++	dmz_lock_metadata(zmd);
++
++	/*
++	 * Get the data zone mapping the chunk. There may be no
++	 * mapping for read and discard. If a mapping is obtained,
++	 + the zone returned will be set to active state.
++	 */
++	zone = dmz_get_chunk_mapping(zmd, dmz_bio_chunk(dmz->dev, bio),
++				     bio_op(bio));
++	if (IS_ERR(zone)) {
++		ret = PTR_ERR(zone);
++		goto out;
++	}
++
++	/* Process the BIO */
++	if (zone) {
++		dmz_activate_zone(zone);
++		bioctx->zone = zone;
++	}
++
++	switch (bio_op(bio)) {
++	case REQ_OP_READ:
++		ret = dmz_handle_read(dmz, zone, bio);
++		break;
++	case REQ_OP_WRITE:
++		ret = dmz_handle_write(dmz, zone, bio);
++		break;
++	case REQ_OP_DISCARD:
++	case REQ_OP_WRITE_ZEROES:
++		ret = dmz_handle_discard(dmz, zone, bio);
++		break;
++	default:
++		dmz_dev_err(dmz->dev, "Unsupported BIO operation 0x%x",
++			    bio_op(bio));
++		ret = -EIO;
++	}
++
++	/*
++	 * Release the chunk mapping. This will check that the mapping
++	 * is still valid, that is, that the zone used still has valid blocks.
++	 */
++	if (zone)
++		dmz_put_chunk_mapping(zmd, zone);
++out:
++	dmz_bio_endio(bio, errno_to_blk_status(ret));
++
++	dmz_unlock_metadata(zmd);
++}
++
++/*
++ * Increment a chunk reference counter.
++ */
++static inline void dmz_get_chunk_work(struct dm_chunk_work *cw)
++{
++	atomic_inc(&cw->refcount);
++}
++
++/*
++ * Decrement a chunk work reference count and
++ * free it if it becomes 0.
++ */
++static void dmz_put_chunk_work(struct dm_chunk_work *cw)
++{
++	if (atomic_dec_and_test(&cw->refcount)) {
++		WARN_ON(!bio_list_empty(&cw->bio_list));
++		radix_tree_delete(&cw->target->chunk_rxtree, cw->chunk);
++		kfree(cw);
++	}
++}
++
++/*
++ * Chunk BIO work function.
++ */
++static void dmz_chunk_work(struct work_struct *work)
++{
++	struct dm_chunk_work *cw = container_of(work, struct dm_chunk_work, work);
++	struct dmz_target *dmz = cw->target;
++	struct bio *bio;
++
++	mutex_lock(&dmz->chunk_lock);
++
++	/* Process the chunk BIOs */
++	while ((bio = bio_list_pop(&cw->bio_list))) {
++		mutex_unlock(&dmz->chunk_lock);
++		dmz_handle_bio(dmz, cw, bio);
++		mutex_lock(&dmz->chunk_lock);
++		dmz_put_chunk_work(cw);
++	}
++
++	/* Queueing the work incremented the work refcount */
++	dmz_put_chunk_work(cw);
++
++	mutex_unlock(&dmz->chunk_lock);
++}
++
++/*
++ * Flush work.
++ */
++static void dmz_flush_work(struct work_struct *work)
++{
++	struct dmz_target *dmz = container_of(work, struct dmz_target, flush_work.work);
++	struct bio *bio;
++	int ret;
++
++	/* Flush dirty metadata blocks */
++	ret = dmz_flush_metadata(dmz->metadata);
++
++	/* Process queued flush requests */
++	while (1) {
++		spin_lock(&dmz->flush_lock);
++		bio = bio_list_pop(&dmz->flush_list);
++		spin_unlock(&dmz->flush_lock);
++
++		if (!bio)
++			break;
++
++		dmz_bio_endio(bio, errno_to_blk_status(ret));
++	}
++
++	queue_delayed_work(dmz->flush_wq, &dmz->flush_work, DMZ_FLUSH_PERIOD);
++}
++
++/*
++ * Get a chunk work and start it to process a new BIO.
++ * If the BIO chunk has no work yet, create one.
++ */
++static void dmz_queue_chunk_work(struct dmz_target *dmz, struct bio *bio)
++{
++	unsigned int chunk = dmz_bio_chunk(dmz->dev, bio);
++	struct dm_chunk_work *cw;
++
++	mutex_lock(&dmz->chunk_lock);
++
++	/* Get the BIO chunk work. If one is not active yet, create one */
++	cw = radix_tree_lookup(&dmz->chunk_rxtree, chunk);
++	if (!cw) {
++		int ret;
++
++		/* Create a new chunk work */
++		cw = kmalloc(sizeof(struct dm_chunk_work), GFP_NOFS);
++		if (!cw)
++			goto out;
++
++		INIT_WORK(&cw->work, dmz_chunk_work);
++		atomic_set(&cw->refcount, 0);
++		cw->target = dmz;
++		cw->chunk = chunk;
++		bio_list_init(&cw->bio_list);
++
++		ret = radix_tree_insert(&dmz->chunk_rxtree, chunk, cw);
++		if (unlikely(ret)) {
++			kfree(cw);
++			cw = NULL;
++			goto out;
++		}
++	}
++
++	bio_list_add(&cw->bio_list, bio);
++	dmz_get_chunk_work(cw);
++
++	if (queue_work(dmz->chunk_wq, &cw->work))
++		dmz_get_chunk_work(cw);
++out:
++	mutex_unlock(&dmz->chunk_lock);
++}
++
++/*
++ * Process a new BIO.
++ */
++static int dmz_map(struct dm_target *ti, struct bio *bio)
++{
++	struct dmz_target *dmz = ti->private;
++	struct dmz_dev *dev = dmz->dev;
++	struct dmz_bioctx *bioctx = dm_per_bio_data(bio, sizeof(struct dmz_bioctx));
++	sector_t sector = bio->bi_iter.bi_sector;
++	unsigned int nr_sectors = bio_sectors(bio);
++	sector_t chunk_sector;
++
++	dmz_dev_debug(dev, "BIO op %d sector %llu + %u => chunk %llu, block %llu, %u blocks",
++		      bio_op(bio), (unsigned long long)sector, nr_sectors,
++		      (unsigned long long)dmz_bio_chunk(dmz->dev, bio),
++		      (unsigned long long)dmz_chunk_block(dmz->dev, dmz_bio_block(bio)),
++		      (unsigned int)dmz_bio_blocks(bio));
++
++	bio->bi_bdev = dev->bdev;
++
++	if (!nr_sectors && (bio_op(bio) != REQ_OP_FLUSH) && (bio_op(bio) != REQ_OP_WRITE))
++		return DM_MAPIO_REMAPPED;
++
++	/* The BIO should be block aligned */
++	if ((nr_sectors & DMZ_BLOCK_SECTORS_MASK) || (sector & DMZ_BLOCK_SECTORS_MASK))
++		return DM_MAPIO_KILL;
++
++	/* Initialize the BIO context */
++	bioctx->target = dmz;
++	bioctx->zone = NULL;
++	bioctx->bio = bio;
++	atomic_set(&bioctx->ref, 1);
++	bioctx->status = BLK_STS_OK;
++
++	/* Set the BIO pending in the flush list */
++	if (bio_op(bio) == REQ_OP_FLUSH || (!nr_sectors && bio_op(bio) == REQ_OP_WRITE)) {
++		spin_lock(&dmz->flush_lock);
++		bio_list_add(&dmz->flush_list, bio);
++		spin_unlock(&dmz->flush_lock);
++		mod_delayed_work(dmz->flush_wq, &dmz->flush_work, 0);
++		return DM_MAPIO_SUBMITTED;
++	}
++
++	/* Split zone BIOs to fit entirely into a zone */
++	chunk_sector = sector & (dev->zone_nr_sectors - 1);
++	if (chunk_sector + nr_sectors > dev->zone_nr_sectors)
++		dm_accept_partial_bio(bio, dev->zone_nr_sectors - chunk_sector);
++
++	/* Now ready to handle this BIO */
++	dmz_reclaim_bio_acc(dmz->reclaim);
++	dmz_queue_chunk_work(dmz, bio);
++
++	return DM_MAPIO_SUBMITTED;
++}
++
++/*
++ * Completed target BIO processing.
++ */
++static int dmz_end_io(struct dm_target *ti, struct bio *bio, blk_status_t *error)
++{
++	struct dmz_bioctx *bioctx = dm_per_bio_data(bio, sizeof(struct dmz_bioctx));
++
++	if (bioctx->status == BLK_STS_OK && *error)
++		bioctx->status = *error;
++
++	if (!atomic_dec_and_test(&bioctx->ref))
++		return DM_ENDIO_INCOMPLETE;
++
++	/* Done */
++	bio->bi_status = bioctx->status;
++
++	if (bioctx->zone) {
++		struct dm_zone *zone = bioctx->zone;
++
++		if (*error && bio_op(bio) == REQ_OP_WRITE) {
++			if (dmz_is_seq(zone))
++				set_bit(DMZ_SEQ_WRITE_ERR, &zone->flags);
++		}
++		dmz_deactivate_zone(zone);
++	}
++
++	return DM_ENDIO_DONE;
++}
++
++/*
++ * Get zoned device information.
++ */
++static int dmz_get_zoned_device(struct dm_target *ti, char *path)
++{
++	struct dmz_target *dmz = ti->private;
++	struct request_queue *q;
++	struct dmz_dev *dev;
++	int ret;
++
++	/* Get the target device */
++	ret = dm_get_device(ti, path, dm_table_get_mode(ti->table), &dmz->ddev);
++	if (ret) {
++		ti->error = "Get target device failed";
++		dmz->ddev = NULL;
++		return ret;
++	}
++
++	dev = kzalloc(sizeof(struct dmz_dev), GFP_KERNEL);
++	if (!dev) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	dev->bdev = dmz->ddev->bdev;
++	(void)bdevname(dev->bdev, dev->name);
++
++	if (bdev_zoned_model(dev->bdev) == BLK_ZONED_NONE) {
++		ti->error = "Not a zoned block device";
++		ret = -EINVAL;
++		goto err;
++	}
++
++	dev->capacity = i_size_read(dev->bdev->bd_inode) >> SECTOR_SHIFT;
++	if (ti->begin || (ti->len != dev->capacity)) {
++		ti->error = "Partial mapping not supported";
++		ret = -EINVAL;
++		goto err;
++	}
++
++	q = bdev_get_queue(dev->bdev);
++	dev->zone_nr_sectors = q->limits.chunk_sectors;
++	dev->zone_nr_sectors_shift = ilog2(dev->zone_nr_sectors);
++
++	dev->zone_nr_blocks = dmz_sect2blk(dev->zone_nr_sectors);
++	dev->zone_nr_blocks_shift = ilog2(dev->zone_nr_blocks);
++
++	dev->nr_zones = (dev->capacity + dev->zone_nr_sectors - 1)
++		>> dev->zone_nr_sectors_shift;
++
++	dmz->dev = dev;
++
++	return 0;
++err:
++	dm_put_device(ti, dmz->ddev);
++	kfree(dev);
++
++	return ret;
++}
++
++/*
++ * Cleanup zoned device information.
++ */
++static void dmz_put_zoned_device(struct dm_target *ti)
++{
++	struct dmz_target *dmz = ti->private;
++
++	dm_put_device(ti, dmz->ddev);
++	kfree(dmz->dev);
++	dmz->dev = NULL;
++}
++
++/*
++ * Setup target.
++ */
++static int dmz_ctr(struct dm_target *ti, unsigned int argc, char **argv)
++{
++	struct dmz_target *dmz;
++	struct dmz_dev *dev;
++	int ret;
++
++	/* Check arguments */
++	if (argc != 1) {
++		ti->error = "Invalid argument count";
++		return -EINVAL;
++	}
++
++	/* Allocate and initialize the target descriptor */
++	dmz = kzalloc(sizeof(struct dmz_target), GFP_KERNEL);
++	if (!dmz) {
++		ti->error = "Unable to allocate the zoned target descriptor";
++		return -ENOMEM;
++	}
++	ti->private = dmz;
++
++	/* Get the target zoned block device */
++	ret = dmz_get_zoned_device(ti, argv[0]);
++	if (ret) {
++		dmz->ddev = NULL;
++		goto err;
++	}
++
++	/* Initialize metadata */
++	dev = dmz->dev;
++	ret = dmz_ctr_metadata(dev, &dmz->metadata);
++	if (ret) {
++		ti->error = "Metadata initialization failed";
++		goto err_dev;
++	}
++
++	/* Set target (no write same support) */
++	ti->max_io_len = dev->zone_nr_sectors << 9;
++	ti->num_flush_bios = 1;
++	ti->num_discard_bios = 1;
++	ti->num_write_zeroes_bios = 1;
++	ti->per_io_data_size = sizeof(struct dmz_bioctx);
++	ti->flush_supported = true;
++	ti->discards_supported = true;
++	ti->split_discard_bios = true;
++
++	/* The exposed capacity is the number of chunks that can be mapped */
++	ti->len = (sector_t)dmz_nr_chunks(dmz->metadata) << dev->zone_nr_sectors_shift;
++
++	/* Zone BIO */
++	dmz->bio_set = bioset_create(DMZ_MIN_BIOS, 0, 0);
++	if (!dmz->bio_set) {
++		ti->error = "Create BIO set failed";
++		ret = -ENOMEM;
++		goto err_meta;
++	}
++
++	/* Chunk BIO work */
++	mutex_init(&dmz->chunk_lock);
++	INIT_RADIX_TREE(&dmz->chunk_rxtree, GFP_NOFS);
++	dmz->chunk_wq = alloc_workqueue("dmz_cwq_%s", WQ_MEM_RECLAIM | WQ_UNBOUND,
++					0, dev->name);
++	if (!dmz->chunk_wq) {
++		ti->error = "Create chunk workqueue failed";
++		ret = -ENOMEM;
++		goto err_bio;
++	}
++
++	/* Flush work */
++	spin_lock_init(&dmz->flush_lock);
++	bio_list_init(&dmz->flush_list);
++	INIT_DELAYED_WORK(&dmz->flush_work, dmz_flush_work);
++	dmz->flush_wq = alloc_ordered_workqueue("dmz_fwq_%s", WQ_MEM_RECLAIM,
++						dev->name);
++	if (!dmz->flush_wq) {
++		ti->error = "Create flush workqueue failed";
++		ret = -ENOMEM;
++		goto err_cwq;
++	}
++	mod_delayed_work(dmz->flush_wq, &dmz->flush_work, DMZ_FLUSH_PERIOD);
++
++	/* Initialize reclaim */
++	ret = dmz_ctr_reclaim(dev, dmz->metadata, &dmz->reclaim);
++	if (ret) {
++		ti->error = "Zone reclaim initialization failed";
++		goto err_fwq;
++	}
++
++	dmz_dev_info(dev, "Target device: %llu 512-byte logical sectors (%llu blocks)",
++		     (unsigned long long)ti->len,
++		     (unsigned long long)dmz_sect2blk(ti->len));
++
++	return 0;
++err_fwq:
++	destroy_workqueue(dmz->flush_wq);
++err_cwq:
++	destroy_workqueue(dmz->chunk_wq);
++err_bio:
++	bioset_free(dmz->bio_set);
++err_meta:
++	dmz_dtr_metadata(dmz->metadata);
++err_dev:
++	dmz_put_zoned_device(ti);
++err:
++	kfree(dmz);
++
++	return ret;
++}
++
++/*
++ * Cleanup target.
++ */
++static void dmz_dtr(struct dm_target *ti)
++{
++	struct dmz_target *dmz = ti->private;
++
++	flush_workqueue(dmz->chunk_wq);
++	destroy_workqueue(dmz->chunk_wq);
++
++	dmz_dtr_reclaim(dmz->reclaim);
++
++	cancel_delayed_work_sync(&dmz->flush_work);
++	destroy_workqueue(dmz->flush_wq);
++
++	(void) dmz_flush_metadata(dmz->metadata);
++
++	dmz_dtr_metadata(dmz->metadata);
++
++	bioset_free(dmz->bio_set);
++
++	dmz_put_zoned_device(ti);
++
++	kfree(dmz);
++}
++
++/*
++ * Setup target request queue limits.
++ */
++static void dmz_io_hints(struct dm_target *ti, struct queue_limits *limits)
++{
++	struct dmz_target *dmz = ti->private;
++	unsigned int chunk_sectors = dmz->dev->zone_nr_sectors;
++
++	limits->logical_block_size = DMZ_BLOCK_SIZE;
++	limits->physical_block_size = DMZ_BLOCK_SIZE;
++
++	blk_limits_io_min(limits, DMZ_BLOCK_SIZE);
++	blk_limits_io_opt(limits, DMZ_BLOCK_SIZE);
++
++	limits->discard_alignment = DMZ_BLOCK_SIZE;
++	limits->discard_granularity = DMZ_BLOCK_SIZE;
++	limits->max_discard_sectors = chunk_sectors;
++	limits->max_hw_discard_sectors = chunk_sectors;
++	limits->max_write_zeroes_sectors = chunk_sectors;
++
++	/* FS hint to try to align to the device zone size */
++	limits->chunk_sectors = chunk_sectors;
++	limits->max_sectors = chunk_sectors;
++
++	/* We are exposing a drive-managed zoned block device */
++	limits->zoned = BLK_ZONED_NONE;
++}
++
++/*
++ * Pass on ioctl to the backend device.
++ */
++static int dmz_prepare_ioctl(struct dm_target *ti,
++			     struct block_device **bdev, fmode_t *mode)
++{
++	struct dmz_target *dmz = ti->private;
++
++	*bdev = dmz->dev->bdev;
++
++	return 0;
++}
++
++/*
++ * Stop works on suspend.
++ */
++static void dmz_suspend(struct dm_target *ti)
++{
++	struct dmz_target *dmz = ti->private;
++
++	flush_workqueue(dmz->chunk_wq);
++	dmz_suspend_reclaim(dmz->reclaim);
++	cancel_delayed_work_sync(&dmz->flush_work);
++}
++
++/*
++ * Restart works on resume or if suspend failed.
++ */
++static void dmz_resume(struct dm_target *ti)
++{
++	struct dmz_target *dmz = ti->private;
++
++	queue_delayed_work(dmz->flush_wq, &dmz->flush_work, DMZ_FLUSH_PERIOD);
++	dmz_resume_reclaim(dmz->reclaim);
++}
++
++static int dmz_iterate_devices(struct dm_target *ti,
++			       iterate_devices_callout_fn fn, void *data)
++{
++	struct dmz_target *dmz = ti->private;
++
++	return fn(ti, dmz->ddev, 0, dmz->dev->capacity, data);
++}
++
++static struct target_type dmz_type = {
++	.name		 = "zoned",
++	.version	 = {1, 0, 0},
++	.features	 = DM_TARGET_SINGLETON | DM_TARGET_ZONED_HM,
++	.module		 = THIS_MODULE,
++	.ctr		 = dmz_ctr,
++	.dtr		 = dmz_dtr,
++	.map		 = dmz_map,
++	.end_io		 = dmz_end_io,
++	.io_hints	 = dmz_io_hints,
++	.prepare_ioctl	 = dmz_prepare_ioctl,
++	.postsuspend	 = dmz_suspend,
++	.resume		 = dmz_resume,
++	.iterate_devices = dmz_iterate_devices,
++};
++
++static int __init dmz_init(void)
++{
++	return dm_register_target(&dmz_type);
++}
++
++static void __exit dmz_exit(void)
++{
++	dm_unregister_target(&dmz_type);
++}
++
++module_init(dmz_init);
++module_exit(dmz_exit);
++
++MODULE_DESCRIPTION(DM_NAME " target for zoned block devices");
++MODULE_AUTHOR("Damien Le Moal <damien.lemoal@wdc.com>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/md/dm-zoned.h b/drivers/md/dm-zoned.h
+new file mode 100644
+index 000000000000..12419f0bfe78
+--- /dev/null
++++ b/drivers/md/dm-zoned.h
+@@ -0,0 +1,228 @@
++/*
++ * Copyright (C) 2017 Western Digital Corporation or its affiliates.
++ *
++ * This file is released under the GPL.
++ */
++
++#ifndef DM_ZONED_H
++#define DM_ZONED_H
++
++#include <linux/types.h>
++#include <linux/blkdev.h>
++#include <linux/device-mapper.h>
++#include <linux/dm-kcopyd.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
++#include <linux/rwsem.h>
++#include <linux/rbtree.h>
++#include <linux/radix-tree.h>
++#include <linux/shrinker.h>
++
++/*
++ * dm-zoned creates block devices with 4KB blocks, always.
++ */
++#define DMZ_BLOCK_SHIFT		12
++#define DMZ_BLOCK_SIZE		(1 << DMZ_BLOCK_SHIFT)
++#define DMZ_BLOCK_MASK		(DMZ_BLOCK_SIZE - 1)
++
++#define DMZ_BLOCK_SHIFT_BITS	(DMZ_BLOCK_SHIFT + 3)
++#define DMZ_BLOCK_SIZE_BITS	(1 << DMZ_BLOCK_SHIFT_BITS)
++#define DMZ_BLOCK_MASK_BITS	(DMZ_BLOCK_SIZE_BITS - 1)
++
++#define DMZ_BLOCK_SECTORS_SHIFT	(DMZ_BLOCK_SHIFT - SECTOR_SHIFT)
++#define DMZ_BLOCK_SECTORS	(DMZ_BLOCK_SIZE >> SECTOR_SHIFT)
++#define DMZ_BLOCK_SECTORS_MASK	(DMZ_BLOCK_SECTORS - 1)
++
++/*
++ * 4KB block <-> 512B sector conversion.
++ */
++#define dmz_blk2sect(b)		((sector_t)(b) << DMZ_BLOCK_SECTORS_SHIFT)
++#define dmz_sect2blk(s)		((sector_t)(s) >> DMZ_BLOCK_SECTORS_SHIFT)
++
++#define dmz_bio_block(bio)	dmz_sect2blk((bio)->bi_iter.bi_sector)
++#define dmz_bio_blocks(bio)	dmz_sect2blk(bio_sectors(bio))
++
++/*
++ * Zoned block device information.
++ */
++struct dmz_dev {
++	struct block_device	*bdev;
++
++	char			name[BDEVNAME_SIZE];
++
++	sector_t		capacity;
++
++	unsigned int		nr_zones;
++
++	sector_t		zone_nr_sectors;
++	unsigned int		zone_nr_sectors_shift;
++
++	sector_t		zone_nr_blocks;
++	sector_t		zone_nr_blocks_shift;
++};
++
++#define dmz_bio_chunk(dev, bio)	((bio)->bi_iter.bi_sector >> \
++				 (dev)->zone_nr_sectors_shift)
++#define dmz_chunk_block(dev, b)	((b) & ((dev)->zone_nr_blocks - 1))
++
++/*
++ * Zone descriptor.
++ */
++struct dm_zone {
++	/* For listing the zone depending on its state */
++	struct list_head	link;
++
++	/* Zone type and state */
++	unsigned long		flags;
++
++	/* Zone activation reference count */
++	atomic_t		refcount;
++
++	/* Zone write pointer block (relative to the zone start block) */
++	unsigned int		wp_block;
++
++	/* Zone weight (number of valid blocks in the zone) */
++	unsigned int		weight;
++
++	/* The chunk that the zone maps */
++	unsigned int		chunk;
++
++	/*
++	 * For a sequential data zone, pointer to the random zone
++	 * used as a buffer for processing unaligned writes.
++	 * For a buffer zone, this points back to the data zone.
++	 */
++	struct dm_zone		*bzone;
++};
++
++/*
++ * Zone flags.
++ */
++enum {
++	/* Zone write type */
++	DMZ_RND,
++	DMZ_SEQ,
++
++	/* Zone critical condition */
++	DMZ_OFFLINE,
++	DMZ_READ_ONLY,
++
++	/* How the zone is being used */
++	DMZ_META,
++	DMZ_DATA,
++	DMZ_BUF,
++
++	/* Zone internal state */
++	DMZ_ACTIVE,
++	DMZ_RECLAIM,
++	DMZ_SEQ_WRITE_ERR,
++};
++
++/*
++ * Zone data accessors.
++ */
++#define dmz_is_rnd(z)		test_bit(DMZ_RND, &(z)->flags)
++#define dmz_is_seq(z)		test_bit(DMZ_SEQ, &(z)->flags)
++#define dmz_is_empty(z)		((z)->wp_block == 0)
++#define dmz_is_offline(z)	test_bit(DMZ_OFFLINE, &(z)->flags)
++#define dmz_is_readonly(z)	test_bit(DMZ_READ_ONLY, &(z)->flags)
++#define dmz_is_active(z)	test_bit(DMZ_ACTIVE, &(z)->flags)
++#define dmz_in_reclaim(z)	test_bit(DMZ_RECLAIM, &(z)->flags)
++#define dmz_seq_write_err(z)	test_bit(DMZ_SEQ_WRITE_ERR, &(z)->flags)
++
++#define dmz_is_meta(z)		test_bit(DMZ_META, &(z)->flags)
++#define dmz_is_buf(z)		test_bit(DMZ_BUF, &(z)->flags)
++#define dmz_is_data(z)		test_bit(DMZ_DATA, &(z)->flags)
++
++#define dmz_weight(z)		((z)->weight)
++
++/*
++ * Message functions.
++ */
++#define dmz_dev_info(dev, format, args...)	\
++	DMINFO("(%s): " format, (dev)->name, ## args)
++
++#define dmz_dev_err(dev, format, args...)	\
++	DMERR("(%s): " format, (dev)->name, ## args)
++
++#define dmz_dev_warn(dev, format, args...)	\
++	DMWARN("(%s): " format, (dev)->name, ## args)
++
++#define dmz_dev_debug(dev, format, args...)	\
++	DMDEBUG("(%s): " format, (dev)->name, ## args)
++
++struct dmz_metadata;
++struct dmz_reclaim;
++
++/*
++ * Functions defined in dm-zoned-metadata.c
++ */
++int dmz_ctr_metadata(struct dmz_dev *dev, struct dmz_metadata **zmd);
++void dmz_dtr_metadata(struct dmz_metadata *zmd);
++int dmz_resume_metadata(struct dmz_metadata *zmd);
++
++void dmz_lock_map(struct dmz_metadata *zmd);
++void dmz_unlock_map(struct dmz_metadata *zmd);
++void dmz_lock_metadata(struct dmz_metadata *zmd);
++void dmz_unlock_metadata(struct dmz_metadata *zmd);
++void dmz_lock_flush(struct dmz_metadata *zmd);
++void dmz_unlock_flush(struct dmz_metadata *zmd);
++int dmz_flush_metadata(struct dmz_metadata *zmd);
++
++unsigned int dmz_id(struct dmz_metadata *zmd, struct dm_zone *zone);
++sector_t dmz_start_sect(struct dmz_metadata *zmd, struct dm_zone *zone);
++sector_t dmz_start_block(struct dmz_metadata *zmd, struct dm_zone *zone);
++unsigned int dmz_nr_chunks(struct dmz_metadata *zmd);
++
++#define DMZ_ALLOC_RND		0x01
++#define DMZ_ALLOC_RECLAIM	0x02
++
++struct dm_zone *dmz_alloc_zone(struct dmz_metadata *zmd, unsigned long flags);
++void dmz_free_zone(struct dmz_metadata *zmd, struct dm_zone *zone);
++
++void dmz_map_zone(struct dmz_metadata *zmd, struct dm_zone *zone,
++		  unsigned int chunk);
++void dmz_unmap_zone(struct dmz_metadata *zmd, struct dm_zone *zone);
++unsigned int dmz_nr_rnd_zones(struct dmz_metadata *zmd);
++unsigned int dmz_nr_unmap_rnd_zones(struct dmz_metadata *zmd);
++
++void dmz_activate_zone(struct dm_zone *zone);
++void dmz_deactivate_zone(struct dm_zone *zone);
++
++int dmz_lock_zone_reclaim(struct dm_zone *zone);
++void dmz_unlock_zone_reclaim(struct dm_zone *zone);
++struct dm_zone *dmz_get_zone_for_reclaim(struct dmz_metadata *zmd);
++
++struct dm_zone *dmz_get_chunk_mapping(struct dmz_metadata *zmd,
++				      unsigned int chunk, int op);
++void dmz_put_chunk_mapping(struct dmz_metadata *zmd, struct dm_zone *zone);
++struct dm_zone *dmz_get_chunk_buffer(struct dmz_metadata *zmd,
++				     struct dm_zone *dzone);
++
++int dmz_validate_blocks(struct dmz_metadata *zmd, struct dm_zone *zone,
++			sector_t chunk_block, unsigned int nr_blocks);
++int dmz_invalidate_blocks(struct dmz_metadata *zmd, struct dm_zone *zone,
++			  sector_t chunk_block, unsigned int nr_blocks);
++int dmz_block_valid(struct dmz_metadata *zmd, struct dm_zone *zone,
++		    sector_t chunk_block);
++int dmz_first_valid_block(struct dmz_metadata *zmd, struct dm_zone *zone,
++			  sector_t *chunk_block);
++int dmz_copy_valid_blocks(struct dmz_metadata *zmd, struct dm_zone *from_zone,
++			  struct dm_zone *to_zone);
++int dmz_merge_valid_blocks(struct dmz_metadata *zmd, struct dm_zone *from_zone,
++			   struct dm_zone *to_zone, sector_t chunk_block);
++
++/*
++ * Functions defined in dm-zoned-reclaim.c
++ */
++int dmz_ctr_reclaim(struct dmz_dev *dev, struct dmz_metadata *zmd,
++		    struct dmz_reclaim **zrc);
++void dmz_dtr_reclaim(struct dmz_reclaim *zrc);
++void dmz_suspend_reclaim(struct dmz_reclaim *zrc);
++void dmz_resume_reclaim(struct dmz_reclaim *zrc);
++void dmz_reclaim_bio_acc(struct dmz_reclaim *zrc);
++void dmz_schedule_reclaim(struct dmz_reclaim *zrc);
++
++#endif /* DM_ZONED_H */
+-- 
+2.13.1
+
