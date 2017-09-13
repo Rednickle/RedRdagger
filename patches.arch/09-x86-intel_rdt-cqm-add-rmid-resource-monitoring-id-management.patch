@@ -1,0 +1,381 @@
+From: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+Date: Tue, 25 Jul 2017 14:14:28 -0700
+Subject: x86/intel_rdt/cqm: Add RMID (Resource monitoring ID) management
+Git-commit: edf6fa1c4a951b3a03e94b63e6483c5d9da3ab11
+Patch-mainline: v4.14-rc1
+References: fate#323965
+
+Hardware uses RMID(Resource monitoring ID) to keep track of each of the
+RDT events associated with tasks. The number of RMIDs is dependent on
+the SKU and is enumerated via CPUID. We add support to manage the RMIDs
+which include managing the RMID allocation and reading LLC occupancy
+for an RMID.
+
+RMID allocation is managed by keeping a free list which is initialized
+to all available RMIDs except for RMID 0 which is always reserved for
+root group. RMIDs goto a limbo list once they are
+freed since the RMIDs are still tagged to cache lines of the tasks which
+were using them - thereby still having some occupancy. They continue to
+be in limbo list until the occupancy < threshold_occupancy. The
+threshold_occupancy is a user configurable value.
+OS uses IA32_QM_CTR MSR to read the occupancy associated with an RMID
+after programming the IA32_EVENTSEL MSR with the RMID.
+
+[Tony: Improved limbo search]
+
+Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: ravi.v.shankar@intel.com
+Cc: tony.luck@intel.com
+Cc: fenghua.yu@intel.com
+Cc: peterz@infradead.org
+Cc: eranian@google.com
+Cc: vikas.shivappa@intel.com
+Cc: ak@linux.intel.com
+Cc: davidcc@google.com
+Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-10-git-send-email-vikas.shivappa@linux.intel.com
+
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/kernel/cpu/intel_rdt.c         |  32 +++++
+ arch/x86/kernel/cpu/intel_rdt.h         |   6 +
+ arch/x86/kernel/cpu/intel_rdt_monitor.c | 213 ++++++++++++++++++++++++++++++++
+ 3 files changed, 251 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/intel_rdt.c b/arch/x86/kernel/cpu/intel_rdt.c
+index cb520dd73bc8..d30830a8eafd 100644
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@ -320,6 +320,19 @@ static u32 delay_bw_map(unsigned long bw, struct rdt_resource *r)
+ 		wrmsrl(r->msr_base + cbm_idx(r, i), d->ctrl_val[i]);
+ }
+ 
++struct rdt_domain *get_domain_from_cpu(int cpu, struct rdt_resource *r)
++{
++	struct rdt_domain *d;
++
++	list_for_each_entry(d, &r->domains, list) {
++		/* Find the domain that contains this CPU */
++		if (cpumask_test_cpu(cpu, &d->cpu_mask))
++			return d;
++	}
++
++	return NULL;
++}
++
+ void rdt_ctrl_update(void *arg)
+ {
+ 	struct msr_param *m = arg;
+@@ -397,6 +410,19 @@ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
+ 	return 0;
+ }
+ 
++static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
++{
++	if (is_llc_occupancy_enabled()) {
++		d->rmid_busy_llc = kcalloc(BITS_TO_LONGS(r->num_rmid),
++					   sizeof(unsigned long),
++					   GFP_KERNEL);
++		if (!d->rmid_busy_llc)
++			return -ENOMEM;
++	}
++
++	return 0;
++}
++
+ /*
+  * domain_add_cpu - Add a cpu to a resource's domain list.
+  *
+@@ -438,6 +464,11 @@ static void domain_add_cpu(int cpu, struct rdt_resource *r)
+ 		return;
+ 	}
+ 
++	if (r->mon_capable && domain_setup_mon_state(r, d)) {
++		kfree(d);
++		return;
++	}
++
+ 	cpumask_set_cpu(cpu, &d->cpu_mask);
+ 	list_add_tail(&d->list, add_pos);
+ }
+@@ -456,6 +487,7 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
+ 	cpumask_clear_cpu(cpu, &d->cpu_mask);
+ 	if (cpumask_empty(&d->cpu_mask)) {
+ 		kfree(d->ctrl_val);
++		kfree(d->rmid_busy_llc);
+ 		list_del(&d->list);
+ 		kfree(d);
+ 	}
+diff --git a/arch/x86/kernel/cpu/intel_rdt.h b/arch/x86/kernel/cpu/intel_rdt.h
+index 993ab9d678bc..35bf8eb8437c 100644
+--- a/arch/x86/kernel/cpu/intel_rdt.h
++++ b/arch/x86/kernel/cpu/intel_rdt.h
+@@ -19,6 +19,8 @@
+ #define QOS_L3_OCCUP_EVENT_ID		0x01
+ #define QOS_L3_MBM_TOTAL_EVENT_ID	0x02
+ #define QOS_L3_MBM_LOCAL_EVENT_ID	0x03
++#define RMID_VAL_ERROR			BIT_ULL(63)
++#define RMID_VAL_UNAVAIL		BIT_ULL(62)
+ 
+ /**
+  * struct mon_evt - Entry in the event list of a resource
+@@ -98,6 +100,8 @@ struct rftype {
+  * @list:	all instances of this resource
+  * @id:		unique id for this instance
+  * @cpu_mask:	which cpus share this resource
++ * @rmid_busy_llc:
++ *		bitmap of which limbo RMIDs are above threshold
+  * @ctrl_val:	array of cache or mem ctrl values (indexed by CLOSID)
+  * @new_ctrl:	new ctrl value to be loaded
+  * @have_new_ctrl: did user provide new_ctrl for this domain
+@@ -106,6 +110,7 @@ struct rdt_domain {
+ 	struct list_head	list;
+ 	int			id;
+ 	struct cpumask		cpu_mask;
++	unsigned long		*rmid_busy_llc;
+ 	u32			*ctrl_val;
+ 	u32			new_ctrl;
+ 	bool			have_new_ctrl;
+@@ -282,6 +287,7 @@ ssize_t rdtgroup_schemata_write(struct kernfs_open_file *of,
+ 				char *buf, size_t nbytes, loff_t off);
+ int rdtgroup_schemata_show(struct kernfs_open_file *of,
+ 			   struct seq_file *s, void *v);
++struct rdt_domain *get_domain_from_cpu(int cpu, struct rdt_resource *r);
+ int rdt_get_mon_l3_config(struct rdt_resource *r);
+ 
+ #endif /* _ASM_X86_INTEL_RDT_H */
+diff --git a/arch/x86/kernel/cpu/intel_rdt_monitor.c b/arch/x86/kernel/cpu/intel_rdt_monitor.c
+index f6d43c3eba4e..b6732c51829b 100644
+--- a/arch/x86/kernel/cpu/intel_rdt_monitor.c
++++ b/arch/x86/kernel/cpu/intel_rdt_monitor.c
+@@ -28,8 +28,12 @@
+ #include <asm/cpu_device_id.h>
+ #include "intel_rdt.h"
+ 
++#define MSR_IA32_QM_CTR		0x0c8e
++#define MSR_IA32_QM_EVTSEL		0x0c8d
++
+ struct rmid_entry {
+ 	u32				rmid;
++	atomic_t			busy;
+ 	struct list_head		list;
+ };
+ 
+@@ -81,6 +85,215 @@ static inline struct rmid_entry *__rmid_entry(u32 rmid)
+ 	return entry;
+ }
+ 
++static u64 __rmid_read(u32 rmid, u32 eventid)
++{
++	u64 val;
++
++	/*
++	 * As per the SDM, when IA32_QM_EVTSEL.EvtID (bits 7:0) is configured
++	 * with a valid event code for supported resource type and the bits
++	 * IA32_QM_EVTSEL.RMID (bits 41:32) are configured with valid RMID,
++	 * IA32_QM_CTR.data (bits 61:0) reports the monitored data.
++	 * IA32_QM_CTR.Error (bit 63) and IA32_QM_CTR.Unavailable (bit 62)
++	 * are error bits.
++	 */
++	wrmsr(MSR_IA32_QM_EVTSEL, eventid, rmid);
++	rdmsrl(MSR_IA32_QM_CTR, val);
++
++	return val;
++}
++
++/*
++ * Walk the limbo list looking at any RMIDs that are flagged in the
++ * domain rmid_busy_llc bitmap as busy. If the reported LLC occupancy
++ * is below the threshold clear the busy bit and decrement the count.
++ * If the busy count gets to zero on an RMID we stop looking.
++ * This can be called from an IPI.
++ * We need an atomic for the busy count because multiple CPUs may check
++ * the same RMID at the same time.
++ */
++static bool __check_limbo(struct rdt_domain *d)
++{
++	struct rmid_entry *entry;
++	u64 val;
++
++	list_for_each_entry(entry, &rmid_limbo_lru, list) {
++		if (!test_bit(entry->rmid, d->rmid_busy_llc))
++			continue;
++		val = __rmid_read(entry->rmid, QOS_L3_OCCUP_EVENT_ID);
++		if (val <= intel_cqm_threshold) {
++			clear_bit(entry->rmid, d->rmid_busy_llc);
++			if (atomic_dec_and_test(&entry->busy))
++				return true;
++		}
++	}
++	return false;
++}
++
++static void check_limbo(void *arg)
++{
++	struct rdt_domain *d;
++
++	d = get_domain_from_cpu(smp_processor_id(),
++				&rdt_resources_all[RDT_RESOURCE_L3]);
++
++	if (d)
++		__check_limbo(d);
++}
++
++static bool has_busy_rmid(struct rdt_resource *r, struct rdt_domain *d)
++{
++	return find_first_bit(d->rmid_busy_llc, r->num_rmid) != r->num_rmid;
++}
++
++/*
++ * Scan the limbo list and move all entries that are below the
++ * intel_cqm_threshold to the free list.
++ * Return "true" if the limbo list is empty, "false" if there are
++ * still some RMIDs there.
++ */
++static bool try_freeing_limbo_rmid(void)
++{
++	struct rmid_entry *entry, *tmp;
++	struct rdt_resource *r;
++	cpumask_var_t cpu_mask;
++	struct rdt_domain *d;
++	bool ret = true;
++	int cpu;
++
++	if (list_empty(&rmid_limbo_lru))
++		return ret;
++
++	r = &rdt_resources_all[RDT_RESOURCE_L3];
++
++	cpu = get_cpu();
++
++	/*
++	 * First see if we can free up an RMID by checking busy values
++	 * on the local package.
++	 */
++	d = get_domain_from_cpu(cpu, r);
++	if (d && has_busy_rmid(r, d) && __check_limbo(d)) {
++		list_for_each_entry_safe(entry, tmp, &rmid_limbo_lru, list) {
++			if (atomic_read(&entry->busy) == 0) {
++				list_del(&entry->list);
++				list_add_tail(&entry->list, &rmid_free_lru);
++				goto done;
++			}
++		}
++	}
++
++	if (!zalloc_cpumask_var(&cpu_mask, GFP_KERNEL)) {
++		ret = false;
++		goto done;
++	}
++
++	/*
++	 * Build a mask of other domains that have busy RMIDs
++	 */
++	list_for_each_entry(d, &r->domains, list) {
++		if (!cpumask_test_cpu(cpu, &d->cpu_mask) &&
++		    has_busy_rmid(r, d))
++			cpumask_set_cpu(cpumask_any(&d->cpu_mask), cpu_mask);
++	}
++	if (cpumask_empty(cpu_mask)) {
++		ret = false;
++		goto free_mask;
++	}
++
++	/*
++	 * Scan domains with busy RMIDs to check if they still are busy
++	 */
++	on_each_cpu_mask(cpu_mask, check_limbo, NULL, true);
++
++	/* Walk limbo list moving all free RMIDs to the &rmid_free_lru list */
++	list_for_each_entry_safe(entry, tmp, &rmid_limbo_lru, list) {
++		if (atomic_read(&entry->busy) != 0) {
++			ret = false;
++			continue;
++		}
++		list_del(&entry->list);
++		list_add_tail(&entry->list, &rmid_free_lru);
++	}
++
++free_mask:
++	free_cpumask_var(cpu_mask);
++done:
++	put_cpu();
++	return ret;
++}
++
++/*
++ * As of now the RMIDs allocation is global.
++ * However we keep track of which packages the RMIDs
++ * are used to optimize the limbo list management.
++ */
++int alloc_rmid(void)
++{
++	struct rmid_entry *entry;
++	bool ret;
++
++	lockdep_assert_held(&rdtgroup_mutex);
++
++	if (list_empty(&rmid_free_lru)) {
++		ret = try_freeing_limbo_rmid();
++		if (list_empty(&rmid_free_lru))
++			return ret ? -ENOSPC : -EBUSY;
++	}
++
++	entry = list_first_entry(&rmid_free_lru,
++				 struct rmid_entry, list);
++	list_del(&entry->list);
++
++	return entry->rmid;
++}
++
++static void add_rmid_to_limbo(struct rmid_entry *entry)
++{
++	struct rdt_resource *r;
++	struct rdt_domain *d;
++	int cpu, nbusy = 0;
++	u64 val;
++
++	r = &rdt_resources_all[RDT_RESOURCE_L3];
++
++	cpu = get_cpu();
++	list_for_each_entry(d, &r->domains, list) {
++		if (cpumask_test_cpu(cpu, &d->cpu_mask)) {
++			val = __rmid_read(entry->rmid, QOS_L3_OCCUP_EVENT_ID);
++			if (val <= intel_cqm_threshold)
++				continue;
++		}
++		set_bit(entry->rmid, d->rmid_busy_llc);
++		nbusy++;
++	}
++	put_cpu();
++
++	if (nbusy) {
++		atomic_set(&entry->busy, nbusy);
++		list_add_tail(&entry->list, &rmid_limbo_lru);
++	} else {
++		list_add_tail(&entry->list, &rmid_free_lru);
++	}
++}
++
++void free_rmid(u32 rmid)
++{
++	struct rmid_entry *entry;
++
++	if (!rmid)
++		return;
++
++	lockdep_assert_held(&rdtgroup_mutex);
++
++	entry = __rmid_entry(rmid);
++
++	if (is_llc_occupancy_enabled())
++		add_rmid_to_limbo(entry);
++	else
++		list_add_tail(&entry->list, &rmid_free_lru);
++}
++
+ static int dom_data_init(struct rdt_resource *r)
+ {
+ 	struct rmid_entry *entry = NULL;
+
