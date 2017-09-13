@@ -1,0 +1,216 @@
+From 5bbf4e5a8e3a780874b2ed77bd1bd57850f3f6da Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Fri, 16 Jun 2017 18:15:26 +0200
+Subject: [PATCH] blk-mq-sched: unify request prepare methods
+Git-commit: 5bbf4e5a8e3a780874b2ed77bd1bd57850f3f6da
+Patch-mainline: v4.13-rc1
+References: fate#322738,fate#322919,fate#322950,fate#323773
+
+This patch makes sure we always allocate requests in the core blk-mq
+code and use a common prepare_request method to initialize them for
+both mq I/O schedulers.  For Kyber and additional limit_depth method
+is added that is called before allocating the request.
+
+Also because none of the intializations can really fail the new method
+does not return an error - instead the bfq finish method is hardened
+to deal with the no-IOC case.
+
+Last but not least this removes the abuse of RQF_QUEUE by the blk-mq
+scheduling code as RQF_ELFPRIV is all that is needed now.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ block/bfq-iosched.c      | 19 ++++++++++++-------
+ block/blk-mq.c           | 22 ++++++----------------
+ block/kyber-iosched.c    | 23 +++++++++++------------
+ include/linux/elevator.h |  4 ++--
+ 4 files changed, 31 insertions(+), 37 deletions(-)
+
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index f037b005faa1..60d32700f104 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -4292,8 +4292,14 @@ static void bfq_put_rq_priv_body(struct bfq_queue *bfqq)
+ 
+ static void bfq_finish_request(struct request *rq)
+ {
+-	struct bfq_queue *bfqq = RQ_BFQQ(rq);
+-	struct bfq_data *bfqd = bfqq->bfqd;
++	struct bfq_queue *bfqq;
++	struct bfq_data *bfqd;
++
++	if (!rq->elv.icq)
++		return;
++
++	bfqq = RQ_BFQQ(rq);
++	bfqd = bfqq->bfqd;
+ 
+ 	if (rq->rq_flags & RQF_STARTED)
+ 		bfqg_stats_update_completion(bfqq_group(bfqq),
+@@ -4394,9 +4400,9 @@ static struct bfq_queue *bfq_get_bfqq_handle_split(struct bfq_data *bfqd,
+ /*
+  * Allocate bfq data structures associated with this request.
+  */
+-static int bfq_get_rq_private(struct request_queue *q, struct request *rq,
+-			      struct bio *bio)
++static void bfq_prepare_request(struct request *rq, struct bio *bio)
+ {
++	struct request_queue *q = rq->q;
+ 	struct bfq_data *bfqd = q->elevator->elevator_data;
+ 	struct bfq_io_cq *bic;
+ 	const int is_sync = rq_is_sync(rq);
+@@ -4405,7 +4411,7 @@ static int bfq_get_rq_private(struct request_queue *q, struct request *rq,
+ 	bool split = false;
+ 
+ 	if (!rq->elv.icq)
+-		return 1;
++		return;
+ 	bic = icq_to_bic(rq->elv.icq);
+ 
+ 	spin_lock_irq(&bfqd->lock);
+@@ -4466,7 +4472,6 @@ static int bfq_get_rq_private(struct request_queue *q, struct request *rq,
+ 		bfq_handle_burst(bfqd, bfqq);
+ 
+ 	spin_unlock_irq(&bfqd->lock);
+-	return 0;
+ }
+ 
+ static void bfq_idle_slice_timer_body(struct bfq_queue *bfqq)
+@@ -4945,7 +4950,7 @@ static struct elv_fs_entry bfq_attrs[] = {
+ 
+ static struct elevator_type iosched_bfq_mq = {
+ 	.ops.mq = {
+-		.get_rq_priv		= bfq_get_rq_private,
++		.prepare_request	= bfq_prepare_request,
+ 		.finish_request		= bfq_finish_request,
+ 		.exit_icq		= bfq_exit_icq,
+ 		.insert_requests	= bfq_insert_requests,
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 2f380ab7a603..81d05c19d4b3 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -298,16 +298,11 @@ static struct request *blk_mq_get_request(struct request_queue *q,
+ 		 * Flush requests are special and go directly to the
+ 		 * dispatch list.
+ 		 */
+-		if (!op_is_flush(op) && e->type->ops.mq.get_request) {
+-			rq = e->type->ops.mq.get_request(q, op, data);
+-			if (rq)
+-				rq->rq_flags |= RQF_QUEUED;
+-			goto allocated;
+-		}
++		if (!op_is_flush(op) && e->type->ops.mq.limit_depth)
++			e->type->ops.mq.limit_depth(op, data);
+ 	}
+ 
+ 	rq = __blk_mq_alloc_request(data, op);
+-allocated:
+ 	if (!rq) {
+ 		blk_queue_exit(q);
+ 		return NULL;
+@@ -315,17 +310,12 @@ static struct request *blk_mq_get_request(struct request_queue *q,
+ 
+ 	if (!op_is_flush(op)) {
+ 		rq->elv.icq = NULL;
+-		if (e && e->type->ops.mq.get_rq_priv) {
++		if (e && e->type->ops.mq.prepare_request) {
+ 			if (e->type->icq_cache && rq_ioc(bio))
+ 				blk_mq_sched_assign_ioc(rq, bio);
+ 
+-			if (e->type->ops.mq.get_rq_priv(q, rq, bio)) {
+-				if (rq->elv.icq)
+-					put_io_context(rq->elv.icq->ioc);
+-				rq->elv.icq = NULL;
+-			} else {
+-				rq->rq_flags |= RQF_ELVPRIV;
+-			}
++			e->type->ops.mq.prepare_request(rq, bio);
++			rq->rq_flags |= RQF_ELVPRIV;
+ 		}
+ 	}
+ 	data->hctx->queued++;
+@@ -413,7 +403,7 @@ void blk_mq_free_request(struct request *rq)
+ 	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
+ 	const int sched_tag = rq->internal_tag;
+ 
+-	if (rq->rq_flags & (RQF_ELVPRIV | RQF_QUEUED)) {
++	if (rq->rq_flags & RQF_ELVPRIV) {
+ 		if (e && e->type->ops.mq.finish_request)
+ 			e->type->ops.mq.finish_request(rq);
+ 		if (rq->elv.icq) {
+diff --git a/block/kyber-iosched.c b/block/kyber-iosched.c
+index 2557b399f0a8..a9f6fd3fab8e 100644
+--- a/block/kyber-iosched.c
++++ b/block/kyber-iosched.c
+@@ -426,24 +426,22 @@ static void rq_clear_domain_token(struct kyber_queue_data *kqd,
+ 	}
+ }
+ 
+-static struct request *kyber_get_request(struct request_queue *q,
+-					 unsigned int op,
+-					 struct blk_mq_alloc_data *data)
++static void kyber_limit_depth(unsigned int op, struct blk_mq_alloc_data *data)
+ {
+-	struct kyber_queue_data *kqd = q->elevator->elevator_data;
+-	struct request *rq;
+-
+ 	/*
+ 	 * We use the scheduler tags as per-hardware queue queueing tokens.
+ 	 * Async requests can be limited at this stage.
+ 	 */
+-	if (!op_is_sync(op))
++	if (!op_is_sync(op)) {
++		struct kyber_queue_data *kqd = data->q->elevator->elevator_data;
++
+ 		data->shallow_depth = kqd->async_depth;
++	}
++}
+ 
+-	rq = __blk_mq_alloc_request(data, op);
+-	if (rq)
+-		rq_set_domain_token(rq, -1);
+-	return rq;
++static void kyber_prepare_request(struct request *rq, struct bio *bio)
++{
++	rq_set_domain_token(rq, -1);
+ }
+ 
+ static void kyber_finish_request(struct request *rq)
+@@ -813,7 +811,8 @@ static struct elevator_type kyber_sched = {
+ 		.exit_sched = kyber_exit_sched,
+ 		.init_hctx = kyber_init_hctx,
+ 		.exit_hctx = kyber_exit_hctx,
+-		.get_request = kyber_get_request,
++		.limit_depth = kyber_limit_depth,
++		.prepare_request = kyber_prepare_request,
+ 		.finish_request = kyber_finish_request,
+ 		.completed_request = kyber_completed_request,
+ 		.dispatch_request = kyber_dispatch_request,
+diff --git a/include/linux/elevator.h b/include/linux/elevator.h
+index 4acea351d43f..5bc8f8682a3e 100644
+--- a/include/linux/elevator.h
++++ b/include/linux/elevator.h
+@@ -104,7 +104,8 @@ struct elevator_mq_ops {
+ 	int (*request_merge)(struct request_queue *q, struct request **, struct bio *);
+ 	void (*request_merged)(struct request_queue *, struct request *, enum elv_merge);
+ 	void (*requests_merged)(struct request_queue *, struct request *, struct request *);
+-	struct request *(*get_request)(struct request_queue *, unsigned int, struct blk_mq_alloc_data *);
++	void (*limit_depth)(unsigned int, struct blk_mq_alloc_data *);
++	void (*prepare_request)(struct request *, struct bio *bio);
+ 	void (*finish_request)(struct request *);
+ 	void (*insert_requests)(struct blk_mq_hw_ctx *, struct list_head *, bool);
+ 	struct request *(*dispatch_request)(struct blk_mq_hw_ctx *);
+@@ -114,7 +115,6 @@ struct elevator_mq_ops {
+ 	void (*requeue_request)(struct request *);
+ 	struct request *(*former_request)(struct request_queue *, struct request *);
+ 	struct request *(*next_request)(struct request_queue *, struct request *);
+-	int (*get_rq_priv)(struct request_queue *, struct request *, struct bio *);
+ 	void (*init_icq)(struct io_cq *);
+ 	void (*exit_icq)(struct io_cq *);
+ };
+-- 
+2.13.1
+
