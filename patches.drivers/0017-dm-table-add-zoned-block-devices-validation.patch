@@ -1,0 +1,290 @@
+From dd88d313bef0277e27597aa394607ed26c658724 Mon Sep 17 00:00:00 2001
+From: Damien Le Moal <damien.lemoal@wdc.com>
+Date: Mon, 8 May 2017 16:40:43 -0700
+Subject: [PATCH] dm table: add zoned block devices validation
+Git-commit: dd88d313bef0277e27597aa394607ed26c658724
+Patch-mainline: v4.13-rc1
+References: fate#322738,fate#322919,fate#322950,fate#323773
+
+1) Introduce DM_TARGET_ZONED_HM feature flag:
+
+The target drivers currently available will not operate correctly if a
+table target maps onto a host-managed zoned block device.
+
+To avoid problems, introduce the new feature flag DM_TARGET_ZONED_HM to
+allow a target to explicitly state that it supports host-managed zoned
+block devices.  This feature is checked for all targets in a table if
+any of the table's block devices are host-managed.
+
+Note that as host-aware zoned block devices are backward compatible with
+regular block devices, they can be used by any of the current target
+types.  This new feature is thus restricted to host-managed zoned block
+devices.
+
+2) Check device area zone alignment:
+
+If a target maps to a zoned block device, check that the device area is
+aligned on zone boundaries to avoid problems with REQ_OP_ZONE_RESET
+operations (resetting a partially mapped sequential zone would not be
+possible).  This also facilitates the processing of zone report with
+REQ_OP_ZONE_REPORT bios.
+
+3) Check block devices zone model compatibility
+
+When setting the DM device's queue limits, several possibilities exists
+for zoned block devices:
+1) The DM target driver may want to expose a different zone model
+(e.g. host-managed device emulation or regular block device on top of
+host-managed zoned block devices)
+2) Expose the underlying zone model of the devices as-is
+
+To allow both cases, the underlying block device zone model must be set
+in the target limits in dm_set_device_limits() and the compatibility of
+all devices checked similarly to the logical block size alignment.  For
+this last check, introduce validate_hardware_zoned_model() to check that
+all targets of a table have the same zone model and that the zone size
+of the target devices are equal.
+
+Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+[Mike Snitzer refactored Damien's original work to simplify the code]
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/dm-table.c         | 162 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/device-mapper.h |   6 ++
+ 2 files changed, 168 insertions(+)
+
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 5f5eae41f804..a39bcd9b982a 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -319,6 +319,39 @@ static int device_area_is_invalid(struct dm_target *ti, struct dm_dev *dev,
+ 		return 1;
+ 	}
+ 
++	/*
++	 * If the target is mapped to zoned block device(s), check
++	 * that the zones are not partially mapped.
++	 */
++	if (bdev_zoned_model(bdev) != BLK_ZONED_NONE) {
++		unsigned int zone_sectors = bdev_zone_sectors(bdev);
++
++		if (start & (zone_sectors - 1)) {
++			DMWARN("%s: start=%llu not aligned to h/w zone size %u of %s",
++			       dm_device_name(ti->table->md),
++			       (unsigned long long)start,
++			       zone_sectors, bdevname(bdev, b));
++			return 1;
++		}
++
++		/*
++		 * Note: The last zone of a zoned block device may be smaller
++		 * than other zones. So for a target mapping the end of a
++		 * zoned block device with such a zone, len would not be zone
++		 * aligned. We do not allow such last smaller zone to be part
++		 * of the mapping here to ensure that mappings with multiple
++		 * devices do not end up with a smaller zone in the middle of
++		 * the sector range.
++		 */
++		if (len & (zone_sectors - 1)) {
++			DMWARN("%s: len=%llu not aligned to h/w zone size %u of %s",
++			       dm_device_name(ti->table->md),
++			       (unsigned long long)len,
++			       zone_sectors, bdevname(bdev, b));
++			return 1;
++		}
++	}
++
+ 	if (logical_block_size_sectors <= 1)
+ 		return 0;
+ 
+@@ -456,6 +489,8 @@ static int dm_set_device_limits(struct dm_target *ti, struct dm_dev *dev,
+ 		       q->limits.alignment_offset,
+ 		       (unsigned long long) start << SECTOR_SHIFT);
+ 
++	limits->zoned = blk_queue_zoned_model(q);
++
+ 	return 0;
+ }
+ 
+@@ -1346,6 +1381,88 @@ bool dm_table_has_no_data_devices(struct dm_table *table)
+ 	return true;
+ }
+ 
++static int device_is_zoned_model(struct dm_target *ti, struct dm_dev *dev,
++				 sector_t start, sector_t len, void *data)
++{
++	struct request_queue *q = bdev_get_queue(dev->bdev);
++	enum blk_zoned_model *zoned_model = data;
++
++	return q && blk_queue_zoned_model(q) == *zoned_model;
++}
++
++static bool dm_table_supports_zoned_model(struct dm_table *t,
++					  enum blk_zoned_model zoned_model)
++{
++	struct dm_target *ti;
++	unsigned i;
++
++	for (i = 0; i < dm_table_get_num_targets(t); i++) {
++		ti = dm_table_get_target(t, i);
++
++		if (zoned_model == BLK_ZONED_HM &&
++		    !dm_target_supports_zoned_hm(ti->type))
++			return false;
++
++		if (!ti->type->iterate_devices ||
++		    !ti->type->iterate_devices(ti, device_is_zoned_model, &zoned_model))
++			return false;
++	}
++
++	return true;
++}
++
++static int device_matches_zone_sectors(struct dm_target *ti, struct dm_dev *dev,
++				       sector_t start, sector_t len, void *data)
++{
++	struct request_queue *q = bdev_get_queue(dev->bdev);
++	unsigned int *zone_sectors = data;
++
++	return q && blk_queue_zone_sectors(q) == *zone_sectors;
++}
++
++static bool dm_table_matches_zone_sectors(struct dm_table *t,
++					  unsigned int zone_sectors)
++{
++	struct dm_target *ti;
++	unsigned i;
++
++	for (i = 0; i < dm_table_get_num_targets(t); i++) {
++		ti = dm_table_get_target(t, i);
++
++		if (!ti->type->iterate_devices ||
++		    !ti->type->iterate_devices(ti, device_matches_zone_sectors, &zone_sectors))
++			return false;
++	}
++
++	return true;
++}
++
++static int validate_hardware_zoned_model(struct dm_table *table,
++					 enum blk_zoned_model zoned_model,
++					 unsigned int zone_sectors)
++{
++	if (zoned_model == BLK_ZONED_NONE)
++		return 0;
++
++	if (!dm_table_supports_zoned_model(table, zoned_model)) {
++		DMERR("%s: zoned model is not consistent across all devices",
++		      dm_device_name(table->md));
++		return -EINVAL;
++	}
++
++	/* Check zone size validity and compatibility */
++	if (!zone_sectors || !is_power_of_2(zone_sectors))
++		return -EINVAL;
++
++	if (!dm_table_matches_zone_sectors(table, zone_sectors)) {
++		DMERR("%s: zone sectors is not consistent across all devices",
++		      dm_device_name(table->md));
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /*
+  * Establish the new table's queue_limits and validate them.
+  */
+@@ -1355,6 +1472,8 @@ int dm_calculate_queue_limits(struct dm_table *table,
+ 	struct dm_target *ti;
+ 	struct queue_limits ti_limits;
+ 	unsigned i;
++	enum blk_zoned_model zoned_model = BLK_ZONED_NONE;
++	unsigned int zone_sectors = 0;
+ 
+ 	blk_set_stacking_limits(limits);
+ 
+@@ -1372,6 +1491,15 @@ int dm_calculate_queue_limits(struct dm_table *table,
+ 		ti->type->iterate_devices(ti, dm_set_device_limits,
+ 					  &ti_limits);
+ 
++		if (zoned_model == BLK_ZONED_NONE && ti_limits.zoned != BLK_ZONED_NONE) {
++			/*
++			 * After stacking all limits, validate all devices
++			 * in table support this zoned model and zone sectors.
++			 */
++			zoned_model = ti_limits.zoned;
++			zone_sectors = ti_limits.chunk_sectors;
++		}
++
+ 		/* Set I/O hints portion of queue limits */
+ 		if (ti->type->io_hints)
+ 			ti->type->io_hints(ti, &ti_limits);
+@@ -1396,8 +1524,42 @@ int dm_calculate_queue_limits(struct dm_table *table,
+ 			       dm_device_name(table->md),
+ 			       (unsigned long long) ti->begin,
+ 			       (unsigned long long) ti->len);
++
++		/*
++		 * FIXME: this should likely be moved to blk_stack_limits(), would
++		 * also eliminate limits->zoned stacking hack in dm_set_device_limits()
++		 */
++		if (limits->zoned == BLK_ZONED_NONE && ti_limits.zoned != BLK_ZONED_NONE) {
++			/*
++			 * By default, the stacked limits zoned model is set to
++			 * BLK_ZONED_NONE in blk_set_stacking_limits(). Update
++			 * this model using the first target model reported
++			 * that is not BLK_ZONED_NONE. This will be either the
++			 * first target device zoned model or the model reported
++			 * by the target .io_hints.
++			 */
++			limits->zoned = ti_limits.zoned;
++		}
+ 	}
+ 
++	/*
++	 * Verify that the zoned model and zone sectors, as determined before
++	 * any .io_hints override, are the same across all devices in the table.
++	 * - this is especially relevant if .io_hints is emulating a disk-managed
++	 *   zoned model (aka BLK_ZONED_NONE) on host-managed zoned block devices.
++	 * BUT...
++	 */
++	if (limits->zoned != BLK_ZONED_NONE) {
++		/*
++		 * ...IF the above limits stacking determined a zoned model
++		 * validate that all of the table's devices conform to it.
++		 */
++		zoned_model = limits->zoned;
++		zone_sectors = limits->chunk_sectors;
++	}
++	if (validate_hardware_zoned_model(table, zoned_model, zone_sectors))
++		return -EINVAL;
++
+ 	return validate_hardware_logical_block_alignment(table, limits);
+ }
+ 
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index 19bc7fdfd6da..186ef74009cb 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -237,6 +237,12 @@ typedef unsigned (*dm_num_write_bios_fn) (struct dm_target *ti, struct bio *bio)
+ #define DM_TARGET_PASSES_INTEGRITY	0x00000020
+ #define dm_target_passes_integrity(type) ((type)->features & DM_TARGET_PASSES_INTEGRITY)
+ 
++/*
++ * Indicates that a target supports host-managed zoned block devices.
++ */
++#define DM_TARGET_ZONED_HM		0x00000040
++#define dm_target_supports_zoned_hm(type) ((type)->features & DM_TARGET_ZONED_HM)
++
+ struct dm_target {
+ 	struct dm_table *table;
+ 	struct target_type *type;
+-- 
+2.13.1
+
