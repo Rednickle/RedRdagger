@@ -1,0 +1,731 @@
+From: "Michael J. Ruhl" <michael.j.ruhl@intel.com>
+Date: Fri, 4 Aug 2017 13:52:38 -0700
+Subject: IB/hfi1: Protect context array set/clear with spinlock
+Patch-mainline: v4.14-rc1
+Git-commit: f2a3bc00a03c2cc9caa40c8867de973fd4e48c6a
+References: bsc#1060463 FATE#323043
+
+The rcd array can be accessed from user context or during interrupts.
+Protecting this with a mutex isn't a good idea because the mutex should
+not be used from an IRQ.
+
+Protect the allocation and freeing of rcd array elements with a
+spinlock.
+
+Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Reviewed-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hfi1/chip.c      |   10 +
+ drivers/infiniband/hw/hfi1/file_ops.c  |  171 ++++++++++++----------------
+ drivers/infiniband/hw/hfi1/hfi.h       |    8 -
+ drivers/infiniband/hw/hfi1/init.c      |  199 ++++++++++++++++++++++-----------
+ drivers/infiniband/hw/hfi1/vnic_main.c |   22 ---
+ 5 files changed, 229 insertions(+), 181 deletions(-)
+
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -15054,10 +15054,16 @@ struct hfi1_devdata *hfi1_init_dd(struct
+ 	if (ret)
+ 		goto bail_cleanup;
+ 
+-	ret = hfi1_create_ctxts(dd);
++	ret = hfi1_create_kctxts(dd);
+ 	if (ret)
+ 		goto bail_cleanup;
+ 
++	/*
++	 * Initialize aspm, to be done after gen3 transition and setting up
++	 * contexts and before enabling interrupts
++	 */
++	aspm_init(dd);
++
+ 	dd->rcvhdrsize = DEFAULT_RCVHDRSIZE;
+ 	/*
+ 	 * rcd[0] is guaranteed to be valid by this point. Also, all
+@@ -15076,7 +15082,7 @@ struct hfi1_devdata *hfi1_init_dd(struct
+ 			goto bail_cleanup;
+ 	}
+ 
+-	/* use contexts created by hfi1_create_ctxts */
++	/* use contexts created by hfi1_create_kctxts */
+ 	ret = set_up_interrupts(dd);
+ 	if (ret)
+ 		goto bail_cleanup;
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@ -79,8 +79,8 @@ static int hfi1_file_mmap(struct file *f
+ 
+ static u64 kvirt_to_phys(void *addr);
+ static int assign_ctxt(struct hfi1_filedata *fd, struct hfi1_user_info *uinfo);
+-static int init_subctxts(struct hfi1_ctxtdata *uctxt,
+-			 const struct hfi1_user_info *uinfo);
++static void init_subctxts(struct hfi1_ctxtdata *uctxt,
++			  const struct hfi1_user_info *uinfo);
+ static int init_user_ctxt(struct hfi1_filedata *fd,
+ 			  struct hfi1_ctxtdata *uctxt);
+ static void user_init(struct hfi1_ctxtdata *uctxt);
+@@ -758,7 +758,6 @@ static int hfi1_file_close(struct inode
+ 		goto done;
+ 
+ 	hfi1_cdbg(PROC, "freeing ctxt %u:%u", uctxt->ctxt, fdata->subctxt);
+-	mutex_lock(&hfi1_mutex);
+ 
+ 	flush_wc();
+ 	/* drain user sdma queue */
+@@ -778,6 +777,7 @@ static int hfi1_file_close(struct inode
+ 			   HFI1_MAX_SHARED_CTXTS) + fdata->subctxt;
+ 	*ev = 0;
+ 
++	mutex_lock(&hfi1_mutex);
+ 	__clear_bit(fdata->subctxt, uctxt->in_use_ctxts);
+ 	fdata->uctxt = NULL;
+ 	hfi1_rcd_put(uctxt); /* fdata reference */
+@@ -844,6 +844,38 @@ static u64 kvirt_to_phys(void *addr)
+ 	return paddr;
+ }
+ 
++static int complete_subctxt(struct hfi1_filedata *fd)
++{
++	int ret;
++
++	/*
++	 * sub-context info can only be set up after the base context
++	 * has been completed.
++	 */
++	ret = wait_event_interruptible(
++		fd->uctxt->wait,
++		!test_bit(HFI1_CTXT_BASE_UNINIT, &fd->uctxt->event_flags));
++
++	if (test_bit(HFI1_CTXT_BASE_FAILED, &fd->uctxt->event_flags))
++		ret = -ENOMEM;
++
++	/* The only thing a sub context needs is the user_xxx stuff */
++	if (!ret) {
++		fd->rec_cpu_num = hfi1_get_proc_affinity(fd->uctxt->numa_id);
++		ret = init_user_ctxt(fd, fd->uctxt);
++	}
++
++	if (ret) {
++		hfi1_rcd_put(fd->uctxt);
++		fd->uctxt = NULL;
++		mutex_lock(&hfi1_mutex);
++		__clear_bit(fd->subctxt, fd->uctxt->in_use_ctxts);
++		mutex_unlock(&hfi1_mutex);
++	}
++
++	return ret;
++}
++
+ static int assign_ctxt(struct hfi1_filedata *fd, struct hfi1_user_info *uinfo)
+ {
+ 	int ret;
+@@ -854,24 +886,25 @@ static int assign_ctxt(struct hfi1_filed
+ 	if (swmajor != HFI1_USER_SWMAJOR)
+ 		return -ENODEV;
+ 
++	if (uinfo->subctxt_cnt > HFI1_MAX_SHARED_CTXTS)
++		return -EINVAL;
++
+ 	swminor = uinfo->userversion & 0xffff;
+ 
++	/*
++	 * Acquire the mutex to protect against multiple creations of what
++	 * could be a shared base context.
++	 */
+ 	mutex_lock(&hfi1_mutex);
+ 	/*
+-	 * Get a sub context if necessary.
++	 * Get a sub context if available  (fd->uctxt will be set).
+ 	 * ret < 0 error, 0 no context, 1 sub-context found
+ 	 */
+-	ret = 0;
+-	if (uinfo->subctxt_cnt) {
+-		ret = find_sub_ctxt(fd, uinfo);
+-		if (ret > 0)
+-			fd->rec_cpu_num =
+-				hfi1_get_proc_affinity(fd->uctxt->numa_id);
+-	}
++	ret = find_sub_ctxt(fd, uinfo);
+ 
+ 	/*
+-	 * Allocate a base context if context sharing is not required or we
+-	 * couldn't find a sub context.
++	 * Allocate a base context if context sharing is not required or a
++	 * sub context wasn't found.
+ 	 */
+ 	if (!ret)
+ 		ret = allocate_ctxt(fd, fd->dd, uinfo, &uctxt);
+@@ -879,31 +912,10 @@ static int assign_ctxt(struct hfi1_filed
+ 	mutex_unlock(&hfi1_mutex);
+ 
+ 	/* Depending on the context type, do the appropriate init */
+-	if (ret > 0) {
+-		/*
+-		 * sub-context info can only be set up after the base
+-		 * context has been completed.
+-		 */
+-		ret = wait_event_interruptible(fd->uctxt->wait, !test_bit(
+-					       HFI1_CTXT_BASE_UNINIT,
+-					       &fd->uctxt->event_flags));
+-		if (test_bit(HFI1_CTXT_BASE_FAILED, &fd->uctxt->event_flags))
+-			ret = -ENOMEM;
+-
+-		/* The only thing a sub context needs is the user_xxx stuff */
+-		if (!ret)
+-			ret = init_user_ctxt(fd, fd->uctxt);
+-
+-		if (ret)
+-			clear_bit(fd->subctxt, fd->uctxt->in_use_ctxts);
+-
+-	} else if (!ret) {
++	switch (ret) {
++	case 0:
+ 		ret = setup_base_ctxt(fd, uctxt);
+ 		if (uctxt->subctxt_cnt) {
+-			/* If there is an error, set the failed bit. */
+-			if (ret)
+-				set_bit(HFI1_CTXT_BASE_FAILED,
+-					&uctxt->event_flags);
+ 			/*
+ 			 * Base context is done, notify anybody using a
+ 			 * sub-context that is waiting for this completion
+@@ -911,14 +923,12 @@ static int assign_ctxt(struct hfi1_filed
+ 			clear_bit(HFI1_CTXT_BASE_UNINIT, &uctxt->event_flags);
+ 			wake_up(&uctxt->wait);
+ 		}
+-		if (ret)
+-			deallocate_ctxt(uctxt);
+-	}
+-
+-	/* If an error occurred, clear the reference */
+-	if (ret && fd->uctxt) {
+-		hfi1_rcd_put(fd->uctxt);
+-		fd->uctxt = NULL;
++		break;
++	case 1:
++		ret = complete_subctxt(fd);
++		break;
++	default:
++		break;
+ 	}
+ 
+ 	return ret;
+@@ -926,7 +936,7 @@ static int assign_ctxt(struct hfi1_filed
+ 
+ /*
+  * The hfi1_mutex must be held when this function is called.  It is
+- * necessary to ensure serialized access to the bitmask in_use_ctxts.
++ * necessary to ensure serialized creation of shared contexts.
+  */
+ static int find_sub_ctxt(struct hfi1_filedata *fd,
+ 			 const struct hfi1_user_info *uinfo)
+@@ -935,6 +945,9 @@ static int find_sub_ctxt(struct hfi1_fil
+ 	struct hfi1_devdata *dd = fd->dd;
+ 	u16 subctxt;
+ 
++	if (!uinfo->subctxt_cnt)
++		return 0;
++
+ 	for (i = dd->first_dyn_alloc_ctxt; i < dd->num_rcv_contexts; i++) {
+ 		struct hfi1_ctxtdata *uctxt = dd->rcd[i];
+ 
+@@ -983,7 +996,6 @@ static int allocate_ctxt(struct hfi1_fil
+ 			 struct hfi1_ctxtdata **cd)
+ {
+ 	struct hfi1_ctxtdata *uctxt;
+-	u16 ctxt;
+ 	int ret, numa;
+ 
+ 	if (dd->flags & HFI1_FROZEN) {
+@@ -997,22 +1009,9 @@ static int allocate_ctxt(struct hfi1_fil
+ 		return -EIO;
+ 	}
+ 
+-	/*
+-	 * This check is sort of redundant to the next EBUSY error. It would
+-	 * also indicate an inconsistancy in the driver if this value was
+-	 * zero, but there were still contexts available.
+-	 */
+ 	if (!dd->freectxts)
+ 		return -EBUSY;
+ 
+-	for (ctxt = dd->first_dyn_alloc_ctxt;
+-	     ctxt < dd->num_rcv_contexts; ctxt++)
+-		if (!dd->rcd[ctxt])
+-			break;
+-
+-	if (ctxt == dd->num_rcv_contexts)
+-		return -EBUSY;
+-
+ 	/*
+ 	 * If we don't have a NUMA node requested, preference is towards
+ 	 * device NUMA node.
+@@ -1022,11 +1021,10 @@ static int allocate_ctxt(struct hfi1_fil
+ 		numa = cpu_to_node(fd->rec_cpu_num);
+ 	else
+ 		numa = numa_node_id();
+-	uctxt = hfi1_create_ctxtdata(dd->pport, ctxt, numa);
+-	if (!uctxt) {
+-		dd_dev_err(dd,
+-			   "Unable to allocate ctxtdata memory, failing open\n");
+-		return -ENOMEM;
++	ret = hfi1_create_ctxtdata(dd->pport, numa, &uctxt);
++	if (ret < 0) {
++		dd_dev_err(dd, "user ctxtdata allocation failed\n");
++		return ret;
+ 	}
+ 	hfi1_cdbg(PROC, "[%u:%u] pid %u assigned to CPU %d (NUMA %u)",
+ 		  uctxt->ctxt, fd->subctxt, current->pid, fd->rec_cpu_num,
+@@ -1035,8 +1033,7 @@ static int allocate_ctxt(struct hfi1_fil
+ 	/*
+ 	 * Allocate and enable a PIO send context.
+ 	 */
+-	uctxt->sc = sc_alloc(dd, SC_USER, uctxt->rcvhdrqentsize,
+-			     uctxt->dd->node);
++	uctxt->sc = sc_alloc(dd, SC_USER, uctxt->rcvhdrqentsize, dd->node);
+ 	if (!uctxt->sc) {
+ 		ret = -ENOMEM;
+ 		goto ctxdata_free;
+@@ -1048,20 +1045,13 @@ static int allocate_ctxt(struct hfi1_fil
+ 		goto ctxdata_free;
+ 
+ 	/*
+-	 * Setup sub context resources if the user-level has requested
++	 * Setup sub context information if the user-level has requested
+ 	 * sub contexts.
+ 	 * This has to be done here so the rest of the sub-contexts find the
+-	 * proper master.
++	 * proper base context.
+ 	 */
+-	if (uinfo->subctxt_cnt) {
+-		ret = init_subctxts(uctxt, uinfo);
+-		/*
+-		 * On error, we don't need to disable and de-allocate the
+-		 * send context because it will be done during file close
+-		 */
+-		if (ret)
+-			goto ctxdata_free;
+-	}
++	if (uinfo->subctxt_cnt)
++		init_subctxts(uctxt, uinfo);
+ 	uctxt->userversion = uinfo->userversion;
+ 	uctxt->flags = hfi1_cap_mask; /* save current flag state */
+ 	init_waitqueue_head(&uctxt->wait);
+@@ -1081,9 +1071,7 @@ static int allocate_ctxt(struct hfi1_fil
+ 	return 0;
+ 
+ ctxdata_free:
+-	*cd = NULL;
+-	dd->rcd[ctxt] = NULL;
+-	hfi1_rcd_put(uctxt);
++	hfi1_free_ctxt(dd, uctxt);
+ 	return ret;
+ }
+ 
+@@ -1093,28 +1081,17 @@ static void deallocate_ctxt(struct hfi1_
+ 	hfi1_stats.sps_ctxts--;
+ 	if (++uctxt->dd->freectxts == uctxt->dd->num_user_contexts)
+ 		aspm_enable_all(uctxt->dd);
+-
+-	/* _rcd_put() should be done after releasing mutex */
+-	uctxt->dd->rcd[uctxt->ctxt] = NULL;
+ 	mutex_unlock(&hfi1_mutex);
+-	hfi1_rcd_put(uctxt);  /* dd reference */
++
++	hfi1_free_ctxt(uctxt->dd, uctxt);
+ }
+ 
+-static int init_subctxts(struct hfi1_ctxtdata *uctxt,
+-			 const struct hfi1_user_info *uinfo)
++static void init_subctxts(struct hfi1_ctxtdata *uctxt,
++			  const struct hfi1_user_info *uinfo)
+ {
+-	u16 num_subctxts;
+-
+-	num_subctxts = uinfo->subctxt_cnt;
+-	if (num_subctxts > HFI1_MAX_SHARED_CTXTS)
+-		return -EINVAL;
+-
+ 	uctxt->subctxt_cnt = uinfo->subctxt_cnt;
+ 	uctxt->subctxt_id = uinfo->subctxt_id;
+-	uctxt->redirect_seq_cnt = 1;
+ 	set_bit(HFI1_CTXT_BASE_UNINIT, &uctxt->event_flags);
+-
+-	return 0;
+ }
+ 
+ static int setup_subctxt(struct hfi1_ctxtdata *uctxt)
+@@ -1302,8 +1279,8 @@ static int setup_base_ctxt(struct hfi1_f
+ 	return 0;
+ 
+ setup_failed:
+-	/* Call _free_ctxtdata, not _rcd_put().  We still need the context. */
+-	hfi1_free_ctxtdata(dd, uctxt);
++	set_bit(HFI1_CTXT_BASE_FAILED, &uctxt->event_flags);
++	deallocate_ctxt(uctxt);
+ 	return ret;
+ }
+ 
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -273,7 +273,6 @@ struct hfi1_ctxtdata {
+ 	u16 poll_type;
+ 	/* receive packet sequence counter */
+ 	u8 seq_cnt;
+-	u8 redirect_seq_cnt;
+ 	/* ctxt rcvhdrq head offset */
+ 	u32 head;
+ 	/* QPs waiting for context processing */
+@@ -1263,9 +1262,10 @@ void handle_user_interrupt(struct hfi1_c
+ 
+ int hfi1_create_rcvhdrq(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
+ int hfi1_setup_eagerbufs(struct hfi1_ctxtdata *rcd);
+-int hfi1_create_ctxts(struct hfi1_devdata *dd);
+-struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u16 ctxt,
+-					   int numa);
++int hfi1_create_kctxts(struct hfi1_devdata *dd);
++int hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, int numa,
++			 struct hfi1_ctxtdata **rcd);
++void hfi1_free_ctxt(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
+ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
+ 			 struct hfi1_devdata *dd, u8 hw_pidx, u8 port);
+ void hfi1_free_ctxtdata(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd);
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -126,71 +126,67 @@ static struct idr hfi1_unit_table;
+ u32 hfi1_cpulist_count;
+ unsigned long *hfi1_cpulist;
+ 
+-/*
+- * Common code for creating the receive context array.
+- */
+-int hfi1_create_ctxts(struct hfi1_devdata *dd)
++static int hfi1_create_kctxt(struct hfi1_devdata *dd,
++			     struct hfi1_pportdata *ppd)
+ {
+-	u16 i;
++	struct hfi1_ctxtdata *rcd;
+ 	int ret;
+ 
+ 	/* Control context has to be always 0 */
+ 	BUILD_BUG_ON(HFI1_CTRL_CTXT != 0);
+ 
++	ret = hfi1_create_ctxtdata(ppd, dd->node, &rcd);
++	if (ret < 0) {
++		dd_dev_err(dd, "Kernel receive context allocation failed\n");
++		return ret;
++	}
++
++	/*
++	 * Set up the kernel context flags here and now because they use
++	 * default values for all receive side memories.  User contexts will
++	 * be handled as they are created.
++	 */
++	rcd->flags = HFI1_CAP_KGET(MULTI_PKT_EGR) |
++		HFI1_CAP_KGET(NODROP_RHQ_FULL) |
++		HFI1_CAP_KGET(NODROP_EGR_FULL) |
++		HFI1_CAP_KGET(DMA_RTAIL);
++
++	/* Control context must use DMA_RTAIL */
++	if (rcd->ctxt == HFI1_CTRL_CTXT)
++		rcd->flags |= HFI1_CAP_DMA_RTAIL;
++	rcd->seq_cnt = 1;
++
++	rcd->sc = sc_alloc(dd, SC_ACK, rcd->rcvhdrqentsize, dd->node);
++	if (!rcd->sc) {
++		dd_dev_err(dd, "Kernel send context allocation failed\n");
++		return -ENOMEM;
++	}
++	hfi1_init_ctxt(rcd->sc);
++
++	return 0;
++}
++
++/*
++ * Create the receive context array and one or more kernel contexts
++ */
++int hfi1_create_kctxts(struct hfi1_devdata *dd)
++{
++	u16 i;
++	int ret;
++
+ 	dd->rcd = kzalloc_node(dd->num_rcv_contexts * sizeof(*dd->rcd),
+ 			       GFP_KERNEL, dd->node);
+ 	if (!dd->rcd)
+-		goto nomem;
++		return -ENOMEM;
+ 
+-	/* create one or more kernel contexts */
+ 	for (i = 0; i < dd->first_dyn_alloc_ctxt; ++i) {
+-		struct hfi1_pportdata *ppd;
+-		struct hfi1_ctxtdata *rcd;
+-
+-		ppd = dd->pport + (i % dd->num_pports);
+-
+-		/* dd->rcd[i] gets assigned inside the callee */
+-		rcd = hfi1_create_ctxtdata(ppd, i, dd->node);
+-		if (!rcd) {
+-			dd_dev_err(dd,
+-				   "Unable to allocate kernel receive context, failing\n");
+-			goto nomem;
+-		}
+-		/*
+-		 * Set up the kernel context flags here and now because they
+-		 * use default values for all receive side memories.  User
+-		 * contexts will be handled as they are created.
+-		 */
+-		rcd->flags = HFI1_CAP_KGET(MULTI_PKT_EGR) |
+-			HFI1_CAP_KGET(NODROP_RHQ_FULL) |
+-			HFI1_CAP_KGET(NODROP_EGR_FULL) |
+-			HFI1_CAP_KGET(DMA_RTAIL);
+-
+-		/* Control context must use DMA_RTAIL */
+-		if (rcd->ctxt == HFI1_CTRL_CTXT)
+-			rcd->flags |= HFI1_CAP_DMA_RTAIL;
+-		rcd->seq_cnt = 1;
+-
+-		rcd->sc = sc_alloc(dd, SC_ACK, rcd->rcvhdrqentsize, dd->node);
+-		if (!rcd->sc) {
+-			dd_dev_err(dd,
+-				   "Unable to allocate kernel send context, failing\n");
+-			goto nomem;
+-		}
+-
+-		hfi1_init_ctxt(rcd->sc);
++		ret = hfi1_create_kctxt(dd, dd->pport);
++		if (ret)
++			goto bail;
+ 	}
+ 
+-	/*
+-	 * Initialize aspm, to be done after gen3 transition and setting up
+-	 * contexts and before enabling interrupts
+-	 */
+-	aspm_init(dd);
+-
+ 	return 0;
+-nomem:
+-	ret = -ENOMEM;
+-
++bail:
+ 	for (i = 0; dd->rcd && i < dd->first_dyn_alloc_ctxt; ++i)
+ 		hfi1_rcd_put(dd->rcd[i]);
+ 
+@@ -208,6 +204,11 @@ static void hfi1_rcd_init(struct hfi1_ct
+ 	kref_init(&rcd->kref);
+ }
+ 
++/**
++ * hfi1_rcd_free - When reference is zero clean up.
++ * @kref: pointer to an initialized rcd data structure
++ *
++ */
+ static void hfi1_rcd_free(struct kref *kref)
+ {
+ 	struct hfi1_ctxtdata *rcd =
+@@ -217,6 +218,12 @@ static void hfi1_rcd_free(struct kref *k
+ 	kfree(rcd);
+ }
+ 
++/**
++ * hfi1_rcd_put - decrement reference for rcd
++ * @rcd: pointer to an initialized rcd data structure
++ *
++ * Use this to put a reference after the init.
++ */
+ int hfi1_rcd_put(struct hfi1_ctxtdata *rcd)
+ {
+ 	if (rcd)
+@@ -225,16 +232,58 @@ int hfi1_rcd_put(struct hfi1_ctxtdata *r
+ 	return 0;
+ }
+ 
++/**
++ * hfi1_rcd_get - increment reference for rcd
++ * @rcd: pointer to an initialized rcd data structure
++ *
++ * Use this to get a reference after the init.
++ */
+ void hfi1_rcd_get(struct hfi1_ctxtdata *rcd)
+ {
+ 	kref_get(&rcd->kref);
+ }
+ 
++/**
++ * allocate_rcd_index - allocate an rcd index from the rcd array
++ * @dd: pointer to a valid devdata structure
++ * @rcd: rcd data structure to assign
++ * @index: pointer to index that is allocated
++ *
++ * Find an empty index in the rcd array, and assign the given rcd to it.
++ * If the array is full, we are EBUSY.
++ *
++ */
++static u16 allocate_rcd_index(struct hfi1_devdata *dd,
++			      struct hfi1_ctxtdata *rcd, u16 *index)
++{
++	unsigned long flags;
++	u16 ctxt;
++
++	spin_lock_irqsave(&dd->uctxt_lock, flags);
++	for (ctxt = 0; ctxt < dd->num_rcv_contexts; ctxt++)
++		if (!dd->rcd[ctxt])
++			break;
++
++	if (ctxt < dd->num_rcv_contexts) {
++		rcd->ctxt = ctxt;
++		dd->rcd[ctxt] = rcd;
++		hfi1_rcd_init(rcd);
++	}
++	spin_unlock_irqrestore(&dd->uctxt_lock, flags);
++
++	if (ctxt >= dd->num_rcv_contexts)
++		return -EBUSY;
++
++	*index = ctxt;
++
++	return 0;
++}
++
+ /*
+  * Common code for user and kernel context setup.
+  */
+-struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u16 ctxt,
+-					   int numa)
++int hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, int numa,
++			 struct hfi1_ctxtdata **context)
+ {
+ 	struct hfi1_devdata *dd = ppd->dd;
+ 	struct hfi1_ctxtdata *rcd;
+@@ -248,9 +297,18 @@ struct hfi1_ctxtdata *hfi1_create_ctxtda
+ 	rcd = kzalloc_node(sizeof(*rcd), GFP_KERNEL, numa);
+ 	if (rcd) {
+ 		u32 rcvtids, max_entries;
++		u16 ctxt;
++		int ret;
+ 
+ 		hfi1_cdbg(PROC, "setting up context %u\n", ctxt);
+ 
++		ret = allocate_rcd_index(dd, rcd, &ctxt);
++		if (ret) {
++			*context = NULL;
++			kfree(rcd);
++			return ret;
++		}
++
+ 		INIT_LIST_HEAD(&rcd->qp_wait_list);
+ 		hfi1_exp_tid_group_init(&rcd->tid_group_list);
+ 		hfi1_exp_tid_group_init(&rcd->tid_used_list);
+@@ -258,8 +316,6 @@ struct hfi1_ctxtdata *hfi1_create_ctxtda
+ 		rcd->ppd = ppd;
+ 		rcd->dd = dd;
+ 		__set_bit(0, rcd->in_use_ctxts);
+-		rcd->ctxt = ctxt;
+-		dd->rcd[ctxt] = rcd;
+ 		rcd->numa_id = numa;
+ 		rcd->rcv_array_groups = dd->rcv_entries.ngroups;
+ 
+@@ -363,15 +419,34 @@ struct hfi1_ctxtdata *hfi1_create_ctxtda
+ 				goto bail;
+ 		}
+ 
+-		hfi1_rcd_init(rcd);
++		*context = rcd;
++		return 0;
+ 	}
+-	return rcd;
++
+ bail:
+-	dd->rcd[ctxt] = NULL;
+-	kfree(rcd->egrbufs.rcvtids);
+-	kfree(rcd->egrbufs.buffers);
+-	kfree(rcd);
+-	return NULL;
++	*context = NULL;
++	hfi1_free_ctxt(dd, rcd);
++	return -ENOMEM;
++}
++
++/**
++ * hfi1_free_ctxt
++ * @dd: Pointer to a valid device
++ * @rcd: pointer to an initialized rcd data structure
++ *
++ * This is the "free" to match the _create_ctxtdata (alloc) function.
++ * This is the final "put" for the kref.
++ */
++void hfi1_free_ctxt(struct hfi1_devdata *dd, struct hfi1_ctxtdata *rcd)
++{
++	unsigned long flags;
++
++	if (rcd) {
++		spin_lock_irqsave(&dd->uctxt_lock, flags);
++		dd->rcd[rcd->ctxt] = NULL;
++		spin_unlock_irqrestore(&dd->uctxt_lock, flags);
++		hfi1_rcd_put(rcd);
++	}
+ }
+ 
+ /*
+--- a/drivers/infiniband/hw/hfi1/vnic_main.c
++++ b/drivers/infiniband/hw/hfi1/vnic_main.c
+@@ -106,22 +106,13 @@ static int allocate_vnic_ctxt(struct hfi
+ 			      struct hfi1_ctxtdata **vnic_ctxt)
+ {
+ 	struct hfi1_ctxtdata *uctxt;
+-	u16 ctxt;
+ 	int ret;
+ 
+ 	if (dd->flags & HFI1_FROZEN)
+ 		return -EIO;
+ 
+-	for (ctxt = dd->first_dyn_alloc_ctxt;
+-	     ctxt < dd->num_rcv_contexts; ctxt++)
+-		if (!dd->rcd[ctxt])
+-			break;
+-
+-	if (ctxt == dd->num_rcv_contexts)
+-		return -EBUSY;
+-
+-	uctxt = hfi1_create_ctxtdata(dd->pport, ctxt, dd->node);
+-	if (!uctxt) {
++	ret = hfi1_create_ctxtdata(dd->pport, dd->node, &uctxt);
++	if (ret < 0) {
+ 		dd_dev_err(dd, "Unable to create ctxtdata, failing open\n");
+ 		return -ENOMEM;
+ 	}
+@@ -156,11 +147,10 @@ static int allocate_vnic_ctxt(struct hfi
+ 	return ret;
+ bail:
+ 	/*
+-	 * hfi1_rcd_put() will call hfi1_free_ctxtdata(), which will
++	 * hfi1_free_ctxt() will call hfi1_free_ctxtdata(), which will
+ 	 * release send_context structure if uctxt->sc is not null
+ 	 */
+-	dd->rcd[uctxt->ctxt] = NULL;
+-	hfi1_rcd_put(uctxt);
++	hfi1_free_ctxt(dd, uctxt);
+ 	dd_dev_dbg(dd, "vnic allocation failed. rc %d\n", ret);
+ 	return ret;
+ }
+@@ -201,14 +191,14 @@ static void deallocate_vnic_ctxt(struct
+ 	dd->send_contexts[uctxt->sc->sw_index].type = SC_USER;
+ 	spin_unlock_irqrestore(&dd->uctxt_lock, flags);
+ 
+-	dd->rcd[uctxt->ctxt] = NULL;
+ 	uctxt->event_flags = 0;
+ 
+ 	hfi1_clear_tids(uctxt);
+ 	hfi1_clear_ctxt_pkey(dd, uctxt);
+ 
+ 	hfi1_stats.sps_ctxts--;
+-	hfi1_rcd_put(uctxt);
++
++	hfi1_free_ctxt(dd, uctxt);
+ }
+ 
+ void hfi1_vnic_setup(struct hfi1_devdata *dd)
