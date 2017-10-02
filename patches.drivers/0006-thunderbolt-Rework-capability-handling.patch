@@ -1,0 +1,394 @@
+From b353746285402c78d9c2a899c54ca9fa3b3e3dd7 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 6 Jun 2017 15:24:58 +0300
+Subject: [PATCH 06/34] thunderbolt: Rework capability handling
+Git-commit: da2da04b8d4476a411feb2a12b47792aebbc142f
+Patch-mainline: v4.13
+References: FATE#323948
+
+Organization of the capabilities in switches and ports is not so random
+after all. Rework the capability handling functionality so that it
+follows how capabilities are organized and provide two new functions
+(tb_switch_find_vse_cap() and tb_port_find_cap()) which can be used to
+extract capabilities for ports and switches. Then convert the current
+users over these.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Reviewed-by: Yehezkel Bernat <yehezkel.bernat@intel.com>
+Reviewed-by: Michael Jamet <michael.jamet@intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Andreas Noever <andreas.noever@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/thunderbolt/cap.c        | 169 +++++++++++++++++++++------------------
+ drivers/thunderbolt/switch.c     |   6 +-
+ drivers/thunderbolt/tb.c         |   8 +-
+ drivers/thunderbolt/tb.h         |   3 +-
+ drivers/thunderbolt/tb_regs.h    |  50 +++++++++---
+ drivers/thunderbolt/tunnel_pci.c |   8 +-
+ 6 files changed, 142 insertions(+), 102 deletions(-)
+
+diff --git a/drivers/thunderbolt/cap.c b/drivers/thunderbolt/cap.c
+index a7b47e7cddbd..38bc27a5ce4f 100644
+--- a/drivers/thunderbolt/cap.c
++++ b/drivers/thunderbolt/cap.c
+@@ -9,6 +9,8 @@
+ 
+ #include "tb.h"
+ 
++#define CAP_OFFSET_MAX		0xff
++#define VSE_CAP_OFFSET_MAX	0xffff
+ 
+ struct tb_cap_any {
+ 	union {
+@@ -18,99 +20,110 @@ struct tb_cap_any {
+ 	};
+ } __packed;
+ 
+-static bool tb_cap_is_basic(struct tb_cap_any *cap)
+-{
+-	/* basic.cap is u8. This checks only the lower 8 bit of cap. */
+-	return cap->basic.cap != 5;
+-}
+-
+-static bool tb_cap_is_long(struct tb_cap_any *cap)
++/**
++ * tb_port_find_cap() - Find port capability
++ * @port: Port to find the capability for
++ * @cap: Capability to look
++ *
++ * Returns offset to start of capability or %-ENOENT if no such
++ * capability was found. Negative errno is returned if there was an
++ * error.
++ */
++int tb_port_find_cap(struct tb_port *port, enum tb_port_cap cap)
+ {
+-	return !tb_cap_is_basic(cap)
+-	       && cap->extended_short.next == 0
+-	       && cap->extended_short.length == 0;
+-}
++	u32 offset;
+ 
+-static enum tb_cap tb_cap(struct tb_cap_any *cap)
+-{
+-	if (tb_cap_is_basic(cap))
+-		return cap->basic.cap;
++	/*
++	 * DP out adapters claim to implement TMU capability but in
++	 * reality they do not so we hard code the adapter specific
++	 * capability offset here.
++	 */
++	if (port->config.type == TB_TYPE_DP_HDMI_OUT)
++		offset = 0x39;
+ 	else
+-		/* extended_short/long have cap at the same offset. */
+-		return cap->extended_short.cap;
++		offset = 0x1;
++
++	do {
++		struct tb_cap_any header;
++		int ret;
++
++		ret = tb_port_read(port, &header, TB_CFG_PORT, offset, 1);
++		if (ret)
++			return ret;
++
++		if (header.basic.cap == cap)
++			return offset;
++
++		offset = header.basic.next;
++	} while (offset);
++
++	return -ENOENT;
+ }
+ 
+-static u32 tb_cap_next(struct tb_cap_any *cap, u32 offset)
++static int tb_switch_find_cap(struct tb_switch *sw, enum tb_switch_cap cap)
+ {
+-	int next;
+-	if (offset == 1) {
+-		/*
+-		 * The first pointer is part of the switch header and always
+-		 * a simple pointer.
+-		 */
+-		next = cap->basic.next;
+-	} else {
+-		/*
+-		 * Somehow Intel decided to use 3 different types of capability
+-		 * headers. It is not like anyone could have predicted that
+-		 * single byte offsets are not enough...
+-		 */
+-		if (tb_cap_is_basic(cap))
+-			next = cap->basic.next;
+-		else if (!tb_cap_is_long(cap))
+-			next = cap->extended_short.next;
+-		else
+-			next = cap->extended_long.next;
++	int offset = sw->config.first_cap_offset;
++
++	while (offset > 0 && offset < CAP_OFFSET_MAX) {
++		struct tb_cap_any header;
++		int ret;
++
++		ret = tb_sw_read(sw, &header, TB_CFG_SWITCH, offset, 1);
++		if (ret)
++			return ret;
++
++		if (header.basic.cap == cap)
++			return offset;
++
++		offset = header.basic.next;
+ 	}
+-	/*
+-	 * "Hey, we could terminate some capability lists with a null offset
+-	 *  and others with a pointer to the last element." - "Great idea!"
+-	 */
+-	if (next == offset)
+-		return 0;
+-	return next;
++
++	return -ENOENT;
+ }
+ 
+ /**
+- * tb_find_cap() - find a capability
++ * tb_switch_find_vse_cap() - Find switch vendor specific capability
++ * @sw: Switch to find the capability for
++ * @vsec: Vendor specific capability to look
+  *
+- * Return: Returns a positive offset if the capability was found and 0 if not.
+- * Returns an error code on failure.
++ * Functions enumerates vendor specific capabilities (VSEC) of a switch
++ * and returns offset when capability matching @vsec is found. If no
++ * such capability is found returns %-ENOENT. In case of error returns
++ * negative errno.
+  */
+-int tb_find_cap(struct tb_port *port, enum tb_cfg_space space, enum tb_cap cap)
++int tb_switch_find_vse_cap(struct tb_switch *sw, enum tb_switch_vse_cap vsec)
+ {
+-	u32 offset = 1;
+ 	struct tb_cap_any header;
+-	int res;
+-	int retries = 10;
+-	while (retries--) {
+-		res = tb_port_read(port, &header, space, offset, 1);
+-		if (res) {
+-			/* Intel needs some help with linked lists. */
+-			if (space == TB_CFG_PORT && offset == 0xa
+-			    && port->config.type == TB_TYPE_DP_HDMI_OUT) {
+-				offset = 0x39;
+-				continue;
+-			}
+-			return res;
+-		}
+-		if (offset != 1) {
+-			if (tb_cap(&header) == cap)
++	int offset;
++
++	offset = tb_switch_find_cap(sw, TB_SWITCH_CAP_VSE);
++	if (offset < 0)
++		return offset;
++
++	while (offset > 0 && offset < VSE_CAP_OFFSET_MAX) {
++		int ret;
++
++		ret = tb_sw_read(sw, &header, TB_CFG_SWITCH, offset, 2);
++		if (ret)
++			return ret;
++
++		/*
++		 * Extended vendor specific capabilities come in two
++		 * flavors: short and long. The latter is used when
++		 * offset is over 0xff.
++		 */
++		if (offset >= CAP_OFFSET_MAX) {
++			if (header.extended_long.vsec_id == vsec)
+ 				return offset;
+-			if (tb_cap_is_long(&header)) {
+-				/* tb_cap_extended_long is 2 dwords */
+-				res = tb_port_read(port, &header, space,
+-						   offset, 2);
+-				if (res)
+-					return res;
+-			}
++			offset = header.extended_long.next;
++		} else {
++			if (header.extended_short.vsec_id == vsec)
++				return offset;
++			if (!header.extended_short.length)
++				return -ENOENT;
++			offset = header.extended_short.next;
+ 		}
+-		offset = tb_cap_next(&header, offset);
+-		if (!offset)
+-			return 0;
+ 	}
+-	tb_port_WARN(port,
+-		     "run out of retries while looking for cap %#x in config space %d, last offset: %#x\n",
+-		     cap, space, offset);
+-	return -EIO;
++
++	return -ENOENT;
+ }
+diff --git a/drivers/thunderbolt/switch.c b/drivers/thunderbolt/switch.c
+index 81f5164a6364..b379b4183bac 100644
+--- a/drivers/thunderbolt/switch.c
++++ b/drivers/thunderbolt/switch.c
+@@ -192,7 +192,7 @@ static int tb_init_port(struct tb_port *port)
+ 
+ 	/* Port 0 is the switch itself and has no PHY. */
+ 	if (port->config.type == TB_TYPE_PORT && port->port != 0) {
+-		cap = tb_find_cap(port, TB_CFG_PORT, TB_CAP_PHY);
++		cap = tb_port_find_cap(port, TB_PORT_CAP_PHY);
+ 
+ 		if (cap > 0)
+ 			port->cap_phy = cap;
+@@ -394,9 +394,9 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route)
+ 		sw->ports[i].port = i;
+ 	}
+ 
+-	cap = tb_find_cap(&sw->ports[0], TB_CFG_SWITCH, TB_CAP_PLUG_EVENTS);
++	cap = tb_switch_find_vse_cap(sw, TB_VSE_CAP_PLUG_EVENTS);
+ 	if (cap < 0) {
+-		tb_sw_warn(sw, "cannot find TB_CAP_PLUG_EVENTS aborting\n");
++		tb_sw_warn(sw, "cannot find TB_VSE_CAP_PLUG_EVENTS aborting\n");
+ 		goto err;
+ 	}
+ 	sw->cap_plug_events = cap;
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 24b6d30c3c86..6b44076e1380 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -121,8 +121,8 @@ static struct tb_port *tb_find_unused_down_port(struct tb_switch *sw)
+ 			continue;
+ 		if (sw->ports[i].config.type != TB_TYPE_PCIE_DOWN)
+ 			continue;
+-		cap = tb_find_cap(&sw->ports[i], TB_CFG_PORT, TB_CAP_PCIE);
+-		if (cap <= 0)
++		cap = tb_port_find_cap(&sw->ports[i], TB_PORT_CAP_ADAP);
++		if (cap < 0)
+ 			continue;
+ 		res = tb_port_read(&sw->ports[i], &data, TB_CFG_PORT, cap, 1);
+ 		if (res < 0)
+@@ -165,8 +165,8 @@ static void tb_activate_pcie_devices(struct tb *tb)
+ 		}
+ 
+ 		/* check whether port is already activated */
+-		cap = tb_find_cap(up_port, TB_CFG_PORT, TB_CAP_PCIE);
+-		if (cap <= 0)
++		cap = tb_port_find_cap(up_port, TB_PORT_CAP_ADAP);
++		if (cap < 0)
+ 			continue;
+ 		if (tb_port_read(up_port, &data, TB_CFG_PORT, cap, 1))
+ 			continue;
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index ba2b85750335..0b78bc4fbe61 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -233,7 +233,8 @@ int tb_wait_for_port(struct tb_port *port, bool wait_if_unplugged);
+ int tb_port_add_nfc_credits(struct tb_port *port, int credits);
+ int tb_port_clear_counter(struct tb_port *port, int counter);
+ 
+-int tb_find_cap(struct tb_port *port, enum tb_cfg_space space, enum tb_cap cap);
++int tb_switch_find_vse_cap(struct tb_switch *sw, enum tb_switch_vse_cap vsec);
++int tb_port_find_cap(struct tb_port *port, enum tb_port_cap cap);
+ 
+ struct tb_path *tb_path_alloc(struct tb *tb, int num_hops);
+ void tb_path_free(struct tb_path *path);
+diff --git a/drivers/thunderbolt/tb_regs.h b/drivers/thunderbolt/tb_regs.h
+index 1e2a4a8046be..582bd1f156dc 100644
+--- a/drivers/thunderbolt/tb_regs.h
++++ b/drivers/thunderbolt/tb_regs.h
+@@ -23,15 +23,22 @@
+  */
+ #define TB_MAX_CONFIG_RW_LENGTH 60
+ 
+-enum tb_cap {
+-	TB_CAP_PHY		= 0x0001,
+-	TB_CAP_TIME1		= 0x0003,
+-	TB_CAP_PCIE		= 0x0004,
+-	TB_CAP_I2C		= 0x0005,
+-	TB_CAP_PLUG_EVENTS	= 0x0105, /* also EEPROM */
+-	TB_CAP_TIME2		= 0x0305,
+-	TB_CAP_IECS		= 0x0405,
+-	TB_CAP_LINK_CONTROLLER	= 0x0605, /* also IECS */
++enum tb_switch_cap {
++	TB_SWITCH_CAP_VSE		= 0x05,
++};
++
++enum tb_switch_vse_cap {
++	TB_VSE_CAP_PLUG_EVENTS		= 0x01, /* also EEPROM */
++	TB_VSE_CAP_TIME2		= 0x03,
++	TB_VSE_CAP_IECS			= 0x04,
++	TB_VSE_CAP_LINK_CONTROLLER	= 0x06, /* also IECS */
++};
++
++enum tb_port_cap {
++	TB_PORT_CAP_PHY			= 0x01,
++	TB_PORT_CAP_TIME1		= 0x03,
++	TB_PORT_CAP_ADAP		= 0x04,
++	TB_PORT_CAP_VSE			= 0x05,
+ };
+ 
+ enum tb_port_state {
+@@ -49,15 +56,34 @@ struct tb_cap_basic {
+ 	u8 cap; /* if cap == 0x05 then we have a extended capability */
+ } __packed;
+ 
++/**
++ * struct tb_cap_extended_short - Switch extended short capability
++ * @next: Pointer to the next capability. If @next and @length are zero
++ *	  then we have a long cap.
++ * @cap: Base capability ID (see &enum tb_switch_cap)
++ * @vsec_id: Vendor specific capability ID (see &enum switch_vse_cap)
++ * @length: Length of this capability
++ */
+ struct tb_cap_extended_short {
+-	u8 next; /* if next and length are zero then we have a long cap */
+-	enum tb_cap cap:16;
++	u8 next;
++	u8 cap;
++	u8 vsec_id;
+ 	u8 length;
+ } __packed;
+ 
++/**
++ * struct tb_cap_extended_long - Switch extended long capability
++ * @zero1: This field should be zero
++ * @cap: Base capability ID (see &enum tb_switch_cap)
++ * @vsec_id: Vendor specific capability ID (see &enum switch_vse_cap)
++ * @zero2: This field should be zero
++ * @next: Pointer to the next capability
++ * @length: Length of this capability
++ */
+ struct tb_cap_extended_long {
+ 	u8 zero1;
+-	enum tb_cap cap:16;
++	u8 cap;
++	u8 vsec_id;
+ 	u8 zero2;
+ 	u16 next;
+ 	u16 length;
+diff --git a/drivers/thunderbolt/tunnel_pci.c b/drivers/thunderbolt/tunnel_pci.c
+index baf1cd370446..f4ce9845e42a 100644
+--- a/drivers/thunderbolt/tunnel_pci.c
++++ b/drivers/thunderbolt/tunnel_pci.c
+@@ -147,10 +147,10 @@ bool tb_pci_is_invalid(struct tb_pci_tunnel *tunnel)
+ static int tb_pci_port_active(struct tb_port *port, bool active)
+ {
+ 	u32 word = active ? 0x80000000 : 0x0;
+-	int cap = tb_find_cap(port, TB_CFG_PORT, TB_CAP_PCIE);
+-	if (cap <= 0) {
+-		tb_port_warn(port, "TB_CAP_PCIE not found: %d\n", cap);
+-		return cap ? cap : -ENXIO;
++	int cap = tb_port_find_cap(port, TB_PORT_CAP_ADAP);
++	if (cap < 0) {
++		tb_port_warn(port, "TB_PORT_CAP_ADAP not found: %d\n", cap);
++		return cap;
+ 	}
+ 	return tb_port_write(port, &word, TB_CFG_PORT, cap, 1);
+ }
+-- 
+2.12.3
+

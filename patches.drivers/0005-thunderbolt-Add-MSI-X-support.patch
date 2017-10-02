@@ -1,0 +1,433 @@
+From 66b4fad9a961314ffc8fb10a7ac4163dba4ff73e Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 6 Jun 2017 15:24:57 +0300
+Subject: [PATCH 05/34] thunderbolt: Add MSI-X support
+Git-commit: 046bee1f9ab83b4549c185804ae9cbfbb8f9641f
+Patch-mainline: v4.13
+References: FATE#323948
+
+Intel Thunderbolt controllers support up to 16 MSI-X vectors. Using
+MSI-X is preferred over MSI or legacy interrupt and may bring additional
+performance because there is no need to check the status registers which
+interrupt was triggered.
+
+While there we convert comments in structs tb_ring and tb_nhi to follow
+kernel-doc format more closely.
+
+This code is based on the work done by Amir Levy and Michael Jamet.
+
+Signed-off-by: Michael Jamet <michael.jamet@intel.com>
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Reviewed-by: Yehezkel Bernat <yehezkel.bernat@intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Andreas Noever <andreas.noever@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/thunderbolt/ctl.c      |   4 +-
+ drivers/thunderbolt/nhi.c      | 165 +++++++++++++++++++++++++++++++++++------
+ drivers/thunderbolt/nhi.h      |  56 +++++++++++---
+ drivers/thunderbolt/nhi_regs.h |   9 +++
+ 4 files changed, 198 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/thunderbolt/ctl.c b/drivers/thunderbolt/ctl.c
+index 1031d97407a8..889a32dd21e7 100644
+--- a/drivers/thunderbolt/ctl.c
++++ b/drivers/thunderbolt/ctl.c
+@@ -488,11 +488,11 @@ struct tb_ctl *tb_ctl_alloc(struct tb_nhi *nhi, hotplug_cb cb, void *cb_data)
+ 	if (!ctl->frame_pool)
+ 		goto err;
+ 
+-	ctl->tx = ring_alloc_tx(nhi, 0, 10);
++	ctl->tx = ring_alloc_tx(nhi, 0, 10, RING_FLAG_NO_SUSPEND);
+ 	if (!ctl->tx)
+ 		goto err;
+ 
+-	ctl->rx = ring_alloc_rx(nhi, 0, 10);
++	ctl->rx = ring_alloc_rx(nhi, 0, 10, RING_FLAG_NO_SUSPEND);
+ 	if (!ctl->rx)
+ 		goto err;
+ 
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index a8c20413dbda..ed75c49748f5 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -21,6 +21,12 @@
+ 
+ #define RING_TYPE(ring) ((ring)->is_tx ? "TX ring" : "RX ring")
+ 
++/*
++ * Minimal number of vectors when we use MSI-X. Two for control channel
++ * Rx/Tx and the rest four are for cross domain DMA paths.
++ */
++#define MSIX_MIN_VECS		6
++#define MSIX_MAX_VECS		16
+ 
+ static int ring_interrupt_index(struct tb_ring *ring)
+ {
+@@ -42,6 +48,37 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
+ 	int bit = ring_interrupt_index(ring) & 31;
+ 	int mask = 1 << bit;
+ 	u32 old, new;
++
++	if (ring->irq > 0) {
++		u32 step, shift, ivr, misc;
++		void __iomem *ivr_base;
++		int index;
++
++		if (ring->is_tx)
++			index = ring->hop;
++		else
++			index = ring->hop + ring->nhi->hop_count;
++
++		/*
++		 * Ask the hardware to clear interrupt status bits automatically
++		 * since we already know which interrupt was triggered.
++		 */
++		misc = ioread32(ring->nhi->iobase + REG_DMA_MISC);
++		if (!(misc & REG_DMA_MISC_INT_AUTO_CLEAR)) {
++			misc |= REG_DMA_MISC_INT_AUTO_CLEAR;
++			iowrite32(misc, ring->nhi->iobase + REG_DMA_MISC);
++		}
++
++		ivr_base = ring->nhi->iobase + REG_INT_VEC_ALLOC_BASE;
++		step = index / REG_INT_VEC_ALLOC_REGS * REG_INT_VEC_ALLOC_BITS;
++		shift = index % REG_INT_VEC_ALLOC_REGS * REG_INT_VEC_ALLOC_BITS;
++		ivr = ioread32(ivr_base + step);
++		ivr &= ~(REG_INT_VEC_ALLOC_MASK << shift);
++		if (active)
++			ivr |= ring->vector << shift;
++		iowrite32(ivr, ivr_base + step);
++	}
++
+ 	old = ioread32(ring->nhi->iobase + reg);
+ 	if (active)
+ 		new = old | mask;
+@@ -239,8 +276,50 @@ int __ring_enqueue(struct tb_ring *ring, struct ring_frame *frame)
+ 	return ret;
+ }
+ 
++static irqreturn_t ring_msix(int irq, void *data)
++{
++	struct tb_ring *ring = data;
++
++	schedule_work(&ring->work);
++	return IRQ_HANDLED;
++}
++
++static int ring_request_msix(struct tb_ring *ring, bool no_suspend)
++{
++	struct tb_nhi *nhi = ring->nhi;
++	unsigned long irqflags;
++	int ret;
++
++	if (!nhi->pdev->msix_enabled)
++		return 0;
++
++	ret = ida_simple_get(&nhi->msix_ida, 0, MSIX_MAX_VECS, GFP_KERNEL);
++	if (ret < 0)
++		return ret;
++
++	ring->vector = ret;
++
++	ring->irq = pci_irq_vector(ring->nhi->pdev, ring->vector);
++	if (ring->irq < 0)
++		return ring->irq;
++
++	irqflags = no_suspend ? IRQF_NO_SUSPEND : 0;
++	return request_irq(ring->irq, ring_msix, irqflags, "thunderbolt", ring);
++}
++
++static void ring_release_msix(struct tb_ring *ring)
++{
++	if (ring->irq <= 0)
++		return;
++
++	free_irq(ring->irq, ring);
++	ida_simple_remove(&ring->nhi->msix_ida, ring->vector);
++	ring->vector = 0;
++	ring->irq = 0;
++}
++
+ static struct tb_ring *ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+-				  bool transmit)
++				  bool transmit, unsigned int flags)
+ {
+ 	struct tb_ring *ring = NULL;
+ 	dev_info(&nhi->pdev->dev, "allocating %s ring %d of size %d\n",
+@@ -271,9 +350,14 @@ static struct tb_ring *ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 	ring->hop = hop;
+ 	ring->is_tx = transmit;
+ 	ring->size = size;
++	ring->flags = flags;
+ 	ring->head = 0;
+ 	ring->tail = 0;
+ 	ring->running = false;
++
++	if (ring_request_msix(ring, flags & RING_FLAG_NO_SUSPEND))
++		goto err;
++
+ 	ring->descriptors = dma_alloc_coherent(&ring->nhi->pdev->dev,
+ 			size * sizeof(*ring->descriptors),
+ 			&ring->descriptors_dma, GFP_KERNEL | __GFP_ZERO);
+@@ -295,14 +379,16 @@ static struct tb_ring *ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 	return NULL;
+ }
+ 
+-struct tb_ring *ring_alloc_tx(struct tb_nhi *nhi, int hop, int size)
++struct tb_ring *ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
++			      unsigned int flags)
+ {
+-	return ring_alloc(nhi, hop, size, true);
++	return ring_alloc(nhi, hop, size, true, flags);
+ }
+ 
+-struct tb_ring *ring_alloc_rx(struct tb_nhi *nhi, int hop, int size)
++struct tb_ring *ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
++			      unsigned int flags)
+ {
+-	return ring_alloc(nhi, hop, size, false);
++	return ring_alloc(nhi, hop, size, false, flags);
+ }
+ 
+ /**
+@@ -413,6 +499,8 @@ void ring_free(struct tb_ring *ring)
+ 			 RING_TYPE(ring), ring->hop);
+ 	}
+ 
++	ring_release_msix(ring);
++
+ 	dma_free_coherent(&ring->nhi->pdev->dev,
+ 			  ring->size * sizeof(*ring->descriptors),
+ 			  ring->descriptors, ring->descriptors_dma);
+@@ -428,9 +516,9 @@ void ring_free(struct tb_ring *ring)
+ 
+ 	mutex_unlock(&ring->nhi->lock);
+ 	/**
+-	 * ring->work can no longer be scheduled (it is scheduled only by
+-	 * nhi_interrupt_work and ring_stop). Wait for it to finish before
+-	 * freeing the ring.
++	 * ring->work can no longer be scheduled (it is scheduled only
++	 * by nhi_interrupt_work, ring_stop and ring_msix). Wait for it
++	 * to finish before freeing the ring.
+ 	 */
+ 	flush_work(&ring->work);
+ 	mutex_destroy(&ring->lock);
+@@ -528,9 +616,52 @@ static void nhi_shutdown(struct tb_nhi *nhi)
+ 	 * We have to release the irq before calling flush_work. Otherwise an
+ 	 * already executing IRQ handler could call schedule_work again.
+ 	 */
+-	devm_free_irq(&nhi->pdev->dev, nhi->pdev->irq, nhi);
+-	flush_work(&nhi->interrupt_work);
++	if (!nhi->pdev->msix_enabled) {
++		devm_free_irq(&nhi->pdev->dev, nhi->pdev->irq, nhi);
++		flush_work(&nhi->interrupt_work);
++	}
+ 	mutex_destroy(&nhi->lock);
++	ida_destroy(&nhi->msix_ida);
++}
++
++static int nhi_init_msi(struct tb_nhi *nhi)
++{
++	struct pci_dev *pdev = nhi->pdev;
++	int res, irq, nvec;
++
++	/* In case someone left them on. */
++	nhi_disable_interrupts(nhi);
++
++	ida_init(&nhi->msix_ida);
++
++	/*
++	 * The NHI has 16 MSI-X vectors or a single MSI. We first try to
++	 * get all MSI-X vectors and if we succeed, each ring will have
++	 * one MSI-X. If for some reason that does not work out, we
++	 * fallback to a single MSI.
++	 */
++	nvec = pci_alloc_irq_vectors(pdev, MSIX_MIN_VECS, MSIX_MAX_VECS,
++				     PCI_IRQ_MSIX);
++	if (nvec < 0) {
++		nvec = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
++		if (nvec < 0)
++			return nvec;
++
++		INIT_WORK(&nhi->interrupt_work, nhi_interrupt_work);
++
++		irq = pci_irq_vector(nhi->pdev, 0);
++		if (irq < 0)
++			return irq;
++
++		res = devm_request_irq(&pdev->dev, irq, nhi_msi,
++				       IRQF_NO_SUSPEND, "thunderbolt", nhi);
++		if (res) {
++			dev_err(&pdev->dev, "request_irq failed, aborting\n");
++			return res;
++		}
++	}
++
++	return 0;
+ }
+ 
+ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -545,12 +676,6 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		return res;
+ 	}
+ 
+-	res = pci_enable_msi(pdev);
+-	if (res) {
+-		dev_err(&pdev->dev, "cannot enable MSI, aborting\n");
+-		return res;
+-	}
+-
+ 	res = pcim_iomap_regions(pdev, 1 << 0, "thunderbolt");
+ 	if (res) {
+ 		dev_err(&pdev->dev, "cannot obtain PCI resources, aborting\n");
+@@ -568,7 +693,6 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (nhi->hop_count != 12 && nhi->hop_count != 32)
+ 		dev_warn(&pdev->dev, "unexpected hop count: %d\n",
+ 			 nhi->hop_count);
+-	INIT_WORK(&nhi->interrupt_work, nhi_interrupt_work);
+ 
+ 	nhi->tx_rings = devm_kcalloc(&pdev->dev, nhi->hop_count,
+ 				     sizeof(*nhi->tx_rings), GFP_KERNEL);
+@@ -577,12 +701,9 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (!nhi->tx_rings || !nhi->rx_rings)
+ 		return -ENOMEM;
+ 
+-	nhi_disable_interrupts(nhi); /* In case someone left them on. */
+-	res = devm_request_irq(&pdev->dev, pdev->irq, nhi_msi,
+-			       IRQF_NO_SUSPEND, /* must work during _noirq */
+-			       "thunderbolt", nhi);
++	res = nhi_init_msi(nhi);
+ 	if (res) {
+-		dev_err(&pdev->dev, "request_irq failed, aborting\n");
++		dev_err(&pdev->dev, "cannot enable MSI, aborting\n");
+ 		return res;
+ 	}
+ 
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+index 317242939b31..630f44140530 100644
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -7,45 +7,75 @@
+ #ifndef DSL3510_H_
+ #define DSL3510_H_
+ 
++#include <linux/idr.h>
+ #include <linux/mutex.h>
+ #include <linux/workqueue.h>
+ 
+ /**
+  * struct tb_nhi - thunderbolt native host interface
++ * @lock: Must be held during ring creation/destruction. Is acquired by
++ *	  interrupt_work when dispatching interrupts to individual rings.
++ * @pdev: Pointer to the PCI device
++ * @iobase: MMIO space of the NHI
++ * @tx_rings: All Tx rings available on this host controller
++ * @rx_rings: All Rx rings available on this host controller
++ * @msix_ida: Used to allocate MSI-X vectors for rings
++ * @interrupt_work: Work scheduled to handle ring interrupt when no
++ *		    MSI-X is used.
++ * @hop_count: Number of rings (end point hops) supported by NHI.
+  */
+ struct tb_nhi {
+-	struct mutex lock; /*
+-			    * Must be held during ring creation/destruction.
+-			    * Is acquired by interrupt_work when dispatching
+-			    * interrupts to individual rings.
+-			    **/
++	struct mutex lock;
+ 	struct pci_dev *pdev;
+ 	void __iomem *iobase;
+ 	struct tb_ring **tx_rings;
+ 	struct tb_ring **rx_rings;
++	struct ida msix_ida;
+ 	struct work_struct interrupt_work;
+-	u32 hop_count; /* Number of rings (end point hops) supported by NHI. */
++	u32 hop_count;
+ };
+ 
+ /**
+  * struct tb_ring - thunderbolt TX or RX ring associated with a NHI
++ * @lock: Lock serializing actions to this ring. Must be acquired after
++ *	  nhi->lock.
++ * @nhi: Pointer to the native host controller interface
++ * @size: Size of the ring
++ * @hop: Hop (DMA channel) associated with this ring
++ * @head: Head of the ring (write next descriptor here)
++ * @tail: Tail of the ring (complete next descriptor here)
++ * @descriptors: Allocated descriptors for this ring
++ * @queue: Queue holding frames to be transferred over this ring
++ * @in_flight: Queue holding frames that are currently in flight
++ * @work: Interrupt work structure
++ * @is_tx: Is the ring Tx or Rx
++ * @running: Is the ring running
++ * @irq: MSI-X irq number if the ring uses MSI-X. %0 otherwise.
++ * @vector: MSI-X vector number the ring uses (only set if @irq is > 0)
++ * @flags: Ring specific flags
+  */
+ struct tb_ring {
+-	struct mutex lock; /* must be acquired after nhi->lock */
++	struct mutex lock;
+ 	struct tb_nhi *nhi;
+ 	int size;
+ 	int hop;
+-	int head; /* write next descriptor here */
+-	int tail; /* complete next descriptor here */
++	int head;
++	int tail;
+ 	struct ring_desc *descriptors;
+ 	dma_addr_t descriptors_dma;
+ 	struct list_head queue;
+ 	struct list_head in_flight;
+ 	struct work_struct work;
+-	bool is_tx:1; /* rx otherwise */
++	bool is_tx:1;
+ 	bool running:1;
++	int irq;
++	u8 vector;
++	unsigned int flags;
+ };
+ 
++/* Leave ring interrupt enabled on suspend */
++#define RING_FLAG_NO_SUSPEND	BIT(0)
++
+ struct ring_frame;
+ typedef void (*ring_cb)(struct tb_ring*, struct ring_frame*, bool canceled);
+ 
+@@ -64,8 +94,10 @@ struct ring_frame {
+ 
+ #define TB_FRAME_SIZE 0x100    /* minimum size for ring_rx */
+ 
+-struct tb_ring *ring_alloc_tx(struct tb_nhi *nhi, int hop, int size);
+-struct tb_ring *ring_alloc_rx(struct tb_nhi *nhi, int hop, int size);
++struct tb_ring *ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
++			      unsigned int flags);
++struct tb_ring *ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
++			      unsigned int flags);
+ void ring_start(struct tb_ring *ring);
+ void ring_stop(struct tb_ring *ring);
+ void ring_free(struct tb_ring *ring);
+diff --git a/drivers/thunderbolt/nhi_regs.h b/drivers/thunderbolt/nhi_regs.h
+index 75cf0691e6c5..48b98d3c7e6a 100644
+--- a/drivers/thunderbolt/nhi_regs.h
++++ b/drivers/thunderbolt/nhi_regs.h
+@@ -95,7 +95,16 @@ struct ring_desc {
+ #define REG_RING_INTERRUPT_BASE	0x38200
+ #define RING_INTERRUPT_REG_COUNT(nhi) ((31 + 2 * nhi->hop_count) / 32)
+ 
++/* Interrupt Vector Allocation */
++#define REG_INT_VEC_ALLOC_BASE	0x38c40
++#define REG_INT_VEC_ALLOC_BITS	4
++#define REG_INT_VEC_ALLOC_MASK	GENMASK(3, 0)
++#define REG_INT_VEC_ALLOC_REGS	(32 / REG_INT_VEC_ALLOC_BITS)
++
+ /* The last 11 bits contain the number of hops supported by the NHI port. */
+ #define REG_HOP_COUNT		0x39640
+ 
++#define REG_DMA_MISC			0x39864
++#define REG_DMA_MISC_INT_AUTO_CLEAR     BIT(2)
++
+ #endif
+-- 
+2.12.3
+
