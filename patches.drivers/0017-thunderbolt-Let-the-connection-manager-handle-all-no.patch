@@ -1,0 +1,307 @@
+From d0522f3a2f805f677791f9fbff3fa882ef71f906 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 6 Jun 2017 15:25:09 +0300
+Subject: [PATCH 17/34] thunderbolt: Let the connection manager handle all
+ notifications
+Git-commit: 81a54b5e1986d02da33c59133556ce9fe2032049
+Patch-mainline: v4.13
+References: FATE#323948
+
+Currently the control channel (ctl.c) handles the one supported
+notification (PLUG_EVENT) and sends back ACK accordingly. However, we
+are going to add support for the internal connection manager (ICM) that
+needs to handle a different notifications. So instead of dealing
+everything in the control channel, we change the callback to take an
+arbitrary thunderbolt packet and convert the native connection manager
+to handle the event itself.
+
+In addition we only push replies we know of to the response FIFO.
+Everything else is treated as notification (or request) and is expected
+to be dealt by the connection manager implementation.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Reviewed-by: Yehezkel Bernat <yehezkel.bernat@intel.com>
+Reviewed-by: Michael Jamet <michael.jamet@intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Andreas Noever <andreas.noever@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/thunderbolt/ctl.c    | 86 ++++++++++++++++++++++++++++++--------------
+ drivers/thunderbolt/ctl.h    |  5 +--
+ drivers/thunderbolt/domain.c | 15 +++++++-
+ drivers/thunderbolt/tb.c     | 30 ++++++++++++----
+ drivers/thunderbolt/tb.h     |  5 +--
+ 5 files changed, 103 insertions(+), 38 deletions(-)
+
+diff --git a/drivers/thunderbolt/ctl.c b/drivers/thunderbolt/ctl.c
+index c6633da582b8..5417ed244edc 100644
+--- a/drivers/thunderbolt/ctl.c
++++ b/drivers/thunderbolt/ctl.c
+@@ -35,7 +35,7 @@ struct tb_ctl {
+ 	DECLARE_KFIFO(response_fifo, struct ctl_pkg*, 16);
+ 	struct completion response_ready;
+ 
+-	hotplug_cb callback;
++	event_cb callback;
+ 	void *callback_data;
+ };
+ 
+@@ -52,6 +52,9 @@ struct tb_ctl {
+ #define tb_ctl_info(ctl, format, arg...) \
+ 	dev_info(&(ctl)->nhi->pdev->dev, format, ## arg)
+ 
++#define tb_ctl_dbg(ctl, format, arg...) \
++	dev_dbg(&(ctl)->nhi->pdev->dev, format, ## arg)
++
+ /* utility functions */
+ 
+ static int check_header(struct ctl_pkg *pkg, u32 len, enum tb_cfg_pkg_type type,
+@@ -272,24 +275,12 @@ static int tb_ctl_tx(struct tb_ctl *ctl, const void *data, size_t len,
+ }
+ 
+ /**
+- * tb_ctl_handle_plug_event() - acknowledge a plug event, invoke ctl->callback
++ * tb_ctl_handle_event() - acknowledge a plug event, invoke ctl->callback
+  */
+-static void tb_ctl_handle_plug_event(struct tb_ctl *ctl,
+-				     struct ctl_pkg *response)
++static void tb_ctl_handle_event(struct tb_ctl *ctl, enum tb_cfg_pkg_type type,
++				struct ctl_pkg *pkg, size_t size)
+ {
+-	struct cfg_event_pkg *pkg = response->buffer;
+-	u64 route = tb_cfg_get_route(&pkg->header);
+-
+-	if (check_header(response, sizeof(*pkg), TB_CFG_PKG_EVENT, route)) {
+-		tb_ctl_warn(ctl, "malformed TB_CFG_PKG_EVENT\n");
+-		return;
+-	}
+-
+-	if (tb_cfg_error(ctl, route, pkg->port, TB_CFG_ERROR_ACK_PLUG_EVENT))
+-		tb_ctl_warn(ctl, "could not ack plug event on %llx:%x\n",
+-			    route, pkg->port);
+-	WARN(pkg->zero, "pkg->zero is %#x\n", pkg->zero);
+-	ctl->callback(ctl->callback_data, route, pkg->port, pkg->unplug);
++	ctl->callback(ctl->callback_data, type, pkg->buffer, size);
+ }
+ 
+ static void tb_ctl_rx_submit(struct ctl_pkg *pkg)
+@@ -302,10 +293,29 @@ static void tb_ctl_rx_submit(struct ctl_pkg *pkg)
+ 					     */
+ }
+ 
++static int tb_async_error(const struct ctl_pkg *pkg)
++{
++	const struct cfg_error_pkg *error = (const struct cfg_error_pkg *)pkg;
++
++	if (pkg->frame.eof != TB_CFG_PKG_ERROR)
++		return false;
++
++	switch (error->error) {
++	case TB_CFG_ERROR_LINK_ERROR:
++	case TB_CFG_ERROR_HEC_ERROR_DETECTED:
++	case TB_CFG_ERROR_FLOW_CONTROL_ERROR:
++		return true;
++
++	default:
++		return false;
++	}
++}
++
+ static void tb_ctl_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 			       bool canceled)
+ {
+ 	struct ctl_pkg *pkg = container_of(frame, typeof(*pkg), frame);
++	__be32 crc32;
+ 
+ 	if (canceled)
+ 		return; /*
+@@ -320,18 +330,42 @@ static void tb_ctl_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 	}
+ 
+ 	frame->size -= 4; /* remove checksum */
+-	if (*(__be32 *) (pkg->buffer + frame->size)
+-			!= tb_crc(pkg->buffer, frame->size)) {
+-		tb_ctl_err(pkg->ctl,
+-			   "RX: checksum mismatch, dropping packet\n");
+-		goto rx;
+-	}
++	crc32 = tb_crc(pkg->buffer, frame->size);
+ 	be32_to_cpu_array(pkg->buffer, pkg->buffer, frame->size / 4);
+ 
+-	if (frame->eof == TB_CFG_PKG_EVENT) {
+-		tb_ctl_handle_plug_event(pkg->ctl, pkg);
++	switch (frame->eof) {
++	case TB_CFG_PKG_READ:
++	case TB_CFG_PKG_WRITE:
++	case TB_CFG_PKG_ERROR:
++	case TB_CFG_PKG_OVERRIDE:
++	case TB_CFG_PKG_RESET:
++		if (*(__be32 *)(pkg->buffer + frame->size) != crc32) {
++			tb_ctl_err(pkg->ctl,
++				   "RX: checksum mismatch, dropping packet\n");
++			goto rx;
++		}
++		if (tb_async_error(pkg)) {
++			tb_ctl_handle_event(pkg->ctl, frame->eof,
++					    pkg, frame->size);
++			goto rx;
++		}
++		break;
++
++	case TB_CFG_PKG_EVENT:
++		if (*(__be32 *)(pkg->buffer + frame->size) != crc32) {
++			tb_ctl_err(pkg->ctl,
++				   "RX: checksum mismatch, dropping packet\n");
++			goto rx;
++		}
++		tb_ctl_handle_event(pkg->ctl, frame->eof, pkg, frame->size);
++		goto rx;
++
++	default:
++		tb_ctl_dbg(pkg->ctl, "RX: unknown package %#x, dropping\n",
++			   frame->eof);
+ 		goto rx;
+ 	}
++
+ 	if (!kfifo_put(&pkg->ctl->response_fifo, pkg)) {
+ 		tb_ctl_err(pkg->ctl, "RX: fifo is full\n");
+ 		goto rx;
+@@ -379,7 +413,7 @@ static struct tb_cfg_result tb_ctl_rx(struct tb_ctl *ctl, void *buffer,
+  *
+  * Return: Returns a pointer on success or NULL on failure.
+  */
+-struct tb_ctl *tb_ctl_alloc(struct tb_nhi *nhi, hotplug_cb cb, void *cb_data)
++struct tb_ctl *tb_ctl_alloc(struct tb_nhi *nhi, event_cb cb, void *cb_data)
+ {
+ 	int i;
+ 	struct tb_ctl *ctl = kzalloc(sizeof(*ctl), GFP_KERNEL);
+diff --git a/drivers/thunderbolt/ctl.h b/drivers/thunderbolt/ctl.h
+index 914da86ec77d..2b23e030a85b 100644
+--- a/drivers/thunderbolt/ctl.h
++++ b/drivers/thunderbolt/ctl.h
+@@ -13,9 +13,10 @@
+ /* control channel */
+ struct tb_ctl;
+ 
+-typedef void (*hotplug_cb)(void *data, u64 route, u8 port, bool unplug);
++typedef void (*event_cb)(void *data, enum tb_cfg_pkg_type type,
++			 const void *buf, size_t size);
+ 
+-struct tb_ctl *tb_ctl_alloc(struct tb_nhi *nhi, hotplug_cb cb, void *cb_data);
++struct tb_ctl *tb_ctl_alloc(struct tb_nhi *nhi, event_cb cb, void *cb_data);
+ void tb_ctl_start(struct tb_ctl *ctl);
+ void tb_ctl_stop(struct tb_ctl *ctl);
+ void tb_ctl_free(struct tb_ctl *ctl);
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+index 3302f4c59638..54bc15f9bf6b 100644
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -95,6 +95,19 @@ struct tb *tb_domain_alloc(struct tb_nhi *nhi, size_t privsize)
+ 	return NULL;
+ }
+ 
++static void tb_domain_event_cb(void *data, enum tb_cfg_pkg_type type,
++			       const void *buf, size_t size)
++{
++	struct tb *tb = data;
++
++	if (!tb->cm_ops->handle_event) {
++		tb_warn(tb, "domain does not have event handler\n");
++		return;
++	}
++
++	tb->cm_ops->handle_event(tb, type, buf, size);
++}
++
+ /**
+  * tb_domain_add() - Add domain to the system
+  * @tb: Domain to add
+@@ -115,7 +128,7 @@ int tb_domain_add(struct tb *tb)
+ 
+ 	mutex_lock(&tb->lock);
+ 
+-	tb->ctl = tb_ctl_alloc(tb->nhi, tb->cm_ops->hotplug, tb);
++	tb->ctl = tb_ctl_alloc(tb->nhi, tb_domain_event_cb, tb);
+ 	if (!tb->ctl) {
+ 		ret = -ENOMEM;
+ 		goto err_unlock;
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 94ecac012428..ea9de49b5e10 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -311,18 +311,34 @@ static void tb_handle_hotplug(struct work_struct *work)
+  *
+  * Delegates to tb_handle_hotplug.
+  */
+-static void tb_schedule_hotplug_handler(void *data, u64 route, u8 port,
+-					bool unplug)
++static void tb_handle_event(struct tb *tb, enum tb_cfg_pkg_type type,
++			    const void *buf, size_t size)
+ {
+-	struct tb *tb = data;
+-	struct tb_hotplug_event *ev = kmalloc(sizeof(*ev), GFP_KERNEL);
++	const struct cfg_event_pkg *pkg = buf;
++	struct tb_hotplug_event *ev;
++	u64 route;
++
++	if (type != TB_CFG_PKG_EVENT) {
++		tb_warn(tb, "unexpected event %#x, ignoring\n", type);
++		return;
++	}
++
++	route = tb_cfg_get_route(&pkg->header);
++
++	if (tb_cfg_error(tb->ctl, route, pkg->port,
++			 TB_CFG_ERROR_ACK_PLUG_EVENT)) {
++		tb_warn(tb, "could not ack plug event on %llx:%x\n", route,
++			pkg->port);
++	}
++
++	ev = kmalloc(sizeof(*ev), GFP_KERNEL);
+ 	if (!ev)
+ 		return;
+ 	INIT_WORK(&ev->work, tb_handle_hotplug);
+ 	ev->tb = tb;
+ 	ev->route = route;
+-	ev->port = port;
+-	ev->unplug = unplug;
++	ev->port = pkg->port;
++	ev->unplug = pkg->unplug;
+ 	queue_work(tb->wq, &ev->work);
+ }
+ 
+@@ -419,7 +435,7 @@ static const struct tb_cm_ops tb_cm_ops = {
+ 	.stop = tb_stop,
+ 	.suspend_noirq = tb_suspend_noirq,
+ 	.resume_noirq = tb_resume_noirq,
+-	.hotplug = tb_schedule_hotplug_handler,
++	.handle_event = tb_handle_event,
+ };
+ 
+ struct tb *tb_probe(struct tb_nhi *nhi)
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 6d4910ef2eb9..5bb9a5d60d2c 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -118,14 +118,15 @@ struct tb_path {
+  * @stop: Stops the domain
+  * @suspend_noirq: Connection manager specific suspend_noirq
+  * @resume_noirq: Connection manager specific resume_noirq
+- * @hotplug: Handle hotplug event
++ * @handle_event: Handle thunderbolt event
+  */
+ struct tb_cm_ops {
+ 	int (*start)(struct tb *tb);
+ 	void (*stop)(struct tb *tb);
+ 	int (*suspend_noirq)(struct tb *tb);
+ 	int (*resume_noirq)(struct tb *tb);
+-	hotplug_cb hotplug;
++	void (*handle_event)(struct tb *tb, enum tb_cfg_pkg_type,
++			     const void *buf, size_t size);
+ };
+ 
+ /**
+-- 
+2.12.3
+

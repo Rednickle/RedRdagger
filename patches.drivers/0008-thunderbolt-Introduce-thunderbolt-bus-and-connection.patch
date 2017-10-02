@@ -1,0 +1,759 @@
+From 42293d79e098b50acc58d7e1406687ee2e991395 Mon Sep 17 00:00:00 2001
+From: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date: Tue, 6 Jun 2017 15:25:00 +0300
+Subject: [PATCH 08/34] thunderbolt: Introduce thunderbolt bus and connection
+ manager
+Git-commit: 9d3cce0b613689ee849a505ffac179af0ae9fff2
+Patch-mainline: v4.13
+References: FATE#323948
+
+Thunderbolt fabric consists of one or more switches. This fabric is
+called domain and it is controlled by an entity called connection
+manager. The connection manager can be either internal (driven by a
+firmware running on the host controller) or external (software driver).
+This driver currently implements support for the latter.
+
+In order to manage switches and their properties more easily we model
+this domain structure as a Linux bus. Each host controller adds a domain
+device to this bus, and these devices are named as domainN where N
+stands for index or id of the current domain.
+
+We then abstract connection manager specific operations into a new
+structure tb_cm_ops and convert the existing tb.c to fill those
+accordingly. This makes it easier to add support for the internal
+connection manager in subsequent patches.
+
+Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+Reviewed-by: Yehezkel Bernat <yehezkel.bernat@intel.com>
+Reviewed-by: Michael Jamet <michael.jamet@intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Andreas Noever <andreas.noever@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/thunderbolt/Makefile     |   2 +-
+ drivers/thunderbolt/domain.c     | 230 +++++++++++++++++++++++++++++++++++++++
+ drivers/thunderbolt/nhi.c        |  31 ++++--
+ drivers/thunderbolt/tb.c         | 156 ++++++++++++--------------
+ drivers/thunderbolt/tb.h         |  70 +++++++++---
+ drivers/thunderbolt/tunnel_pci.c |   9 +-
+ 6 files changed, 377 insertions(+), 121 deletions(-)
+ create mode 100644 drivers/thunderbolt/domain.c
+
+diff --git a/drivers/thunderbolt/Makefile b/drivers/thunderbolt/Makefile
+index 5d1053cdfa54..e276a9a62261 100644
+--- a/drivers/thunderbolt/Makefile
++++ b/drivers/thunderbolt/Makefile
+@@ -1,3 +1,3 @@
+ obj-${CONFIG_THUNDERBOLT} := thunderbolt.o
+ thunderbolt-objs := nhi.o ctl.o tb.o switch.o cap.o path.o tunnel_pci.o eeprom.o
+-
++thunderbolt-objs += domain.o
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+new file mode 100644
+index 000000000000..3302f4c59638
+--- /dev/null
++++ b/drivers/thunderbolt/domain.c
+@@ -0,0 +1,230 @@
++/*
++ * Thunderbolt bus support
++ *
++ * Copyright (C) 2017, Intel Corporation
++ * Author:  Mika Westerberg <mika.westerberg@linux.intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/device.h>
++#include <linux/idr.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++
++#include "tb.h"
++
++static DEFINE_IDA(tb_domain_ida);
++
++struct bus_type tb_bus_type = {
++	.name = "thunderbolt",
++};
++
++static void tb_domain_release(struct device *dev)
++{
++	struct tb *tb = container_of(dev, struct tb, dev);
++
++	tb_ctl_free(tb->ctl);
++	destroy_workqueue(tb->wq);
++	ida_simple_remove(&tb_domain_ida, tb->index);
++	mutex_destroy(&tb->lock);
++	kfree(tb);
++}
++
++struct device_type tb_domain_type = {
++	.name = "thunderbolt_domain",
++	.release = tb_domain_release,
++};
++
++/**
++ * tb_domain_alloc() - Allocate a domain
++ * @nhi: Pointer to the host controller
++ * @privsize: Size of the connection manager private data
++ *
++ * Allocates and initializes a new Thunderbolt domain. Connection
++ * managers are expected to call this and then fill in @cm_ops
++ * accordingly.
++ *
++ * Call tb_domain_put() to release the domain before it has been added
++ * to the system.
++ *
++ * Return: allocated domain structure on %NULL in case of error
++ */
++struct tb *tb_domain_alloc(struct tb_nhi *nhi, size_t privsize)
++{
++	struct tb *tb;
++
++	/*
++	 * Make sure the structure sizes map with that the hardware
++	 * expects because bit-fields are being used.
++	 */
++	BUILD_BUG_ON(sizeof(struct tb_regs_switch_header) != 5 * 4);
++	BUILD_BUG_ON(sizeof(struct tb_regs_port_header) != 8 * 4);
++	BUILD_BUG_ON(sizeof(struct tb_regs_hop) != 2 * 4);
++
++	tb = kzalloc(sizeof(*tb) + privsize, GFP_KERNEL);
++	if (!tb)
++		return NULL;
++
++	tb->nhi = nhi;
++	mutex_init(&tb->lock);
++
++	tb->index = ida_simple_get(&tb_domain_ida, 0, 0, GFP_KERNEL);
++	if (tb->index < 0)
++		goto err_free;
++
++	tb->wq = alloc_ordered_workqueue("thunderbolt%d", 0, tb->index);
++	if (!tb->wq)
++		goto err_remove_ida;
++
++	tb->dev.parent = &nhi->pdev->dev;
++	tb->dev.bus = &tb_bus_type;
++	tb->dev.type = &tb_domain_type;
++	dev_set_name(&tb->dev, "domain%d", tb->index);
++	device_initialize(&tb->dev);
++
++	return tb;
++
++err_remove_ida:
++	ida_simple_remove(&tb_domain_ida, tb->index);
++err_free:
++	kfree(tb);
++
++	return NULL;
++}
++
++/**
++ * tb_domain_add() - Add domain to the system
++ * @tb: Domain to add
++ *
++ * Starts the domain and adds it to the system. Hotplugging devices will
++ * work after this has been returned successfully. In order to remove
++ * and release the domain after this function has been called, call
++ * tb_domain_remove().
++ *
++ * Return: %0 in case of success and negative errno in case of error
++ */
++int tb_domain_add(struct tb *tb)
++{
++	int ret;
++
++	if (WARN_ON(!tb->cm_ops))
++		return -EINVAL;
++
++	mutex_lock(&tb->lock);
++
++	tb->ctl = tb_ctl_alloc(tb->nhi, tb->cm_ops->hotplug, tb);
++	if (!tb->ctl) {
++		ret = -ENOMEM;
++		goto err_unlock;
++	}
++
++	/*
++	 * tb_schedule_hotplug_handler may be called as soon as the config
++	 * channel is started. Thats why we have to hold the lock here.
++	 */
++	tb_ctl_start(tb->ctl);
++
++	ret = device_add(&tb->dev);
++	if (ret)
++		goto err_ctl_stop;
++
++	/* Start the domain */
++	if (tb->cm_ops->start) {
++		ret = tb->cm_ops->start(tb);
++		if (ret)
++			goto err_domain_del;
++	}
++
++	/* This starts event processing */
++	mutex_unlock(&tb->lock);
++
++	return 0;
++
++err_domain_del:
++	device_del(&tb->dev);
++err_ctl_stop:
++	tb_ctl_stop(tb->ctl);
++err_unlock:
++	mutex_unlock(&tb->lock);
++
++	return ret;
++}
++
++/**
++ * tb_domain_remove() - Removes and releases a domain
++ * @tb: Domain to remove
++ *
++ * Stops the domain, removes it from the system and releases all
++ * resources once the last reference has been released.
++ */
++void tb_domain_remove(struct tb *tb)
++{
++	mutex_lock(&tb->lock);
++	if (tb->cm_ops->stop)
++		tb->cm_ops->stop(tb);
++	/* Stop the domain control traffic */
++	tb_ctl_stop(tb->ctl);
++	mutex_unlock(&tb->lock);
++
++	flush_workqueue(tb->wq);
++	device_unregister(&tb->dev);
++}
++
++/**
++ * tb_domain_suspend_noirq() - Suspend a domain
++ * @tb: Domain to suspend
++ *
++ * Suspends all devices in the domain and stops the control channel.
++ */
++int tb_domain_suspend_noirq(struct tb *tb)
++{
++	int ret = 0;
++
++	/*
++	 * The control channel interrupt is left enabled during suspend
++	 * and taking the lock here prevents any events happening before
++	 * we actually have stopped the domain and the control channel.
++	 */
++	mutex_lock(&tb->lock);
++	if (tb->cm_ops->suspend_noirq)
++		ret = tb->cm_ops->suspend_noirq(tb);
++	if (!ret)
++		tb_ctl_stop(tb->ctl);
++	mutex_unlock(&tb->lock);
++
++	return ret;
++}
++
++/**
++ * tb_domain_resume_noirq() - Resume a domain
++ * @tb: Domain to resume
++ *
++ * Re-starts the control channel, and resumes all devices connected to
++ * the domain.
++ */
++int tb_domain_resume_noirq(struct tb *tb)
++{
++	int ret = 0;
++
++	mutex_lock(&tb->lock);
++	tb_ctl_start(tb->ctl);
++	if (tb->cm_ops->resume_noirq)
++		ret = tb->cm_ops->resume_noirq(tb);
++	mutex_unlock(&tb->lock);
++
++	return ret;
++}
++
++int tb_domain_init(void)
++{
++	return bus_register(&tb_bus_type);
++}
++
++void tb_domain_exit(void)
++{
++	bus_unregister(&tb_bus_type);
++	ida_destroy(&tb_domain_ida);
++}
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index ed75c49748f5..c1113a3c4128 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -586,16 +586,16 @@ static int nhi_suspend_noirq(struct device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct tb *tb = pci_get_drvdata(pdev);
+-	thunderbolt_suspend(tb);
+-	return 0;
++
++	return tb_domain_suspend_noirq(tb);
+ }
+ 
+ static int nhi_resume_noirq(struct device *dev)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct tb *tb = pci_get_drvdata(pdev);
+-	thunderbolt_resume(tb);
+-	return 0;
++
++	return tb_domain_resume_noirq(tb);
+ }
+ 
+ static void nhi_shutdown(struct tb_nhi *nhi)
+@@ -715,12 +715,17 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	iowrite32(3906250 / 10000, nhi->iobase + 0x38c00);
+ 
+ 	dev_info(&nhi->pdev->dev, "NHI initialized, starting thunderbolt\n");
+-	tb = thunderbolt_alloc_and_start(nhi);
+-	if (!tb) {
++	tb = tb_probe(nhi);
++	if (!tb)
++		return -ENODEV;
++
++	res = tb_domain_add(tb);
++	if (res) {
+ 		/*
+ 		 * At this point the RX/TX rings might already have been
+ 		 * activated. Do a proper shutdown.
+ 		 */
++		tb_domain_put(tb);
+ 		nhi_shutdown(nhi);
+ 		return -EIO;
+ 	}
+@@ -733,7 +738,8 @@ static void nhi_remove(struct pci_dev *pdev)
+ {
+ 	struct tb *tb = pci_get_drvdata(pdev);
+ 	struct tb_nhi *nhi = tb->nhi;
+-	thunderbolt_shutdown_and_free(tb);
++
++	tb_domain_remove(tb);
+ 	nhi_shutdown(nhi);
+ }
+ 
+@@ -797,14 +803,23 @@ static struct pci_driver nhi_driver = {
+ 
+ static int __init nhi_init(void)
+ {
++	int ret;
++
+ 	if (!dmi_match(DMI_BOARD_VENDOR, "Apple Inc."))
+ 		return -ENOSYS;
+-	return pci_register_driver(&nhi_driver);
++	ret = tb_domain_init();
++	if (ret)
++		return ret;
++	ret = pci_register_driver(&nhi_driver);
++	if (ret)
++		tb_domain_exit();
++	return ret;
+ }
+ 
+ static void __exit nhi_unload(void)
+ {
+ 	pci_unregister_driver(&nhi_driver);
++	tb_domain_exit();
+ }
+ 
+ module_init(nhi_init);
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+index 6b44076e1380..9f00a0f28d53 100644
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -12,6 +12,18 @@
+ #include "tb_regs.h"
+ #include "tunnel_pci.h"
+ 
++/**
++ * struct tb_cm - Simple Thunderbolt connection manager
++ * @tunnel_list: List of active tunnels
++ * @hotplug_active: tb_handle_hotplug will stop progressing plug
++ *		    events and exit if this is not set (it needs to
++ *		    acquire the lock one more time). Used to drain wq
++ *		    after cfg has been paused.
++ */
++struct tb_cm {
++	struct list_head tunnel_list;
++	bool hotplug_active;
++};
+ 
+ /* enumeration & hot plug handling */
+ 
+@@ -62,12 +74,14 @@ static void tb_scan_port(struct tb_port *port)
+  */
+ static void tb_free_invalid_tunnels(struct tb *tb)
+ {
++	struct tb_cm *tcm = tb_priv(tb);
+ 	struct tb_pci_tunnel *tunnel;
+ 	struct tb_pci_tunnel *n;
+-	list_for_each_entry_safe(tunnel, n, &tb->tunnel_list, list)
+-	{
++
++	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
+ 		if (tb_pci_is_invalid(tunnel)) {
+ 			tb_pci_deactivate(tunnel);
++			list_del(&tunnel->list);
+ 			tb_pci_free(tunnel);
+ 		}
+ 	}
+@@ -149,6 +163,8 @@ static void tb_activate_pcie_devices(struct tb *tb)
+ 	struct tb_port *up_port;
+ 	struct tb_port *down_port;
+ 	struct tb_pci_tunnel *tunnel;
++	struct tb_cm *tcm = tb_priv(tb);
++
+ 	/* scan for pcie devices at depth 1*/
+ 	for (i = 1; i <= tb->root_switch->config.max_port_number; i++) {
+ 		if (tb_is_upstream_port(&tb->root_switch->ports[i]))
+@@ -195,6 +211,7 @@ static void tb_activate_pcie_devices(struct tb *tb)
+ 			tb_pci_free(tunnel);
+ 		}
+ 
++		list_add(&tunnel->list, &tcm->tunnel_list);
+ 	}
+ }
+ 
+@@ -217,10 +234,11 @@ static void tb_handle_hotplug(struct work_struct *work)
+ {
+ 	struct tb_hotplug_event *ev = container_of(work, typeof(*ev), work);
+ 	struct tb *tb = ev->tb;
++	struct tb_cm *tcm = tb_priv(tb);
+ 	struct tb_switch *sw;
+ 	struct tb_port *port;
+ 	mutex_lock(&tb->lock);
+-	if (!tb->hotplug_active)
++	if (!tcm->hotplug_active)
+ 		goto out; /* during init, suspend or shutdown */
+ 
+ 	sw = get_switch_at_route(tb->root_switch, ev->route);
+@@ -296,22 +314,14 @@ static void tb_schedule_hotplug_handler(void *data, u64 route, u8 port,
+ 	queue_work(tb->wq, &ev->work);
+ }
+ 
+-/**
+- * thunderbolt_shutdown_and_free() - shutdown everything
+- *
+- * Free all switches and the config channel.
+- *
+- * Used in the error path of thunderbolt_alloc_and_start.
+- */
+-void thunderbolt_shutdown_and_free(struct tb *tb)
++static void tb_stop(struct tb *tb)
+ {
++	struct tb_cm *tcm = tb_priv(tb);
+ 	struct tb_pci_tunnel *tunnel;
+ 	struct tb_pci_tunnel *n;
+ 
+-	mutex_lock(&tb->lock);
+-
+ 	/* tunnels are only present after everything has been initialized */
+-	list_for_each_entry_safe(tunnel, n, &tb->tunnel_list, list) {
++	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
+ 		tb_pci_deactivate(tunnel);
+ 		tb_pci_free(tunnel);
+ 	}
+@@ -320,98 +330,44 @@ void thunderbolt_shutdown_and_free(struct tb *tb)
+ 		tb_switch_free(tb->root_switch);
+ 	tb->root_switch = NULL;
+ 
+-	if (tb->ctl) {
+-		tb_ctl_stop(tb->ctl);
+-		tb_ctl_free(tb->ctl);
+-	}
+-	tb->ctl = NULL;
+-	tb->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+-
+-	/* allow tb_handle_hotplug to acquire the lock */
+-	mutex_unlock(&tb->lock);
+-	if (tb->wq) {
+-		flush_workqueue(tb->wq);
+-		destroy_workqueue(tb->wq);
+-		tb->wq = NULL;
+-	}
+-	mutex_destroy(&tb->lock);
+-	kfree(tb);
++	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+ }
+ 
+-/**
+- * thunderbolt_alloc_and_start() - setup the thunderbolt bus
+- *
+- * Allocates a tb_cfg control channel, initializes the root switch, enables
+- * plug events and activates pci devices.
+- *
+- * Return: Returns NULL on error.
+- */
+-struct tb *thunderbolt_alloc_and_start(struct tb_nhi *nhi)
++static int tb_start(struct tb *tb)
+ {
+-	struct tb *tb;
+-
+-	BUILD_BUG_ON(sizeof(struct tb_regs_switch_header) != 5 * 4);
+-	BUILD_BUG_ON(sizeof(struct tb_regs_port_header) != 8 * 4);
+-	BUILD_BUG_ON(sizeof(struct tb_regs_hop) != 2 * 4);
+-
+-	tb = kzalloc(sizeof(*tb), GFP_KERNEL);
+-	if (!tb)
+-		return NULL;
+-
+-	tb->nhi = nhi;
+-	mutex_init(&tb->lock);
+-	mutex_lock(&tb->lock);
+-	INIT_LIST_HEAD(&tb->tunnel_list);
+-
+-	tb->wq = alloc_ordered_workqueue("thunderbolt", 0);
+-	if (!tb->wq)
+-		goto err_locked;
+-
+-	tb->ctl = tb_ctl_alloc(tb->nhi, tb_schedule_hotplug_handler, tb);
+-	if (!tb->ctl)
+-		goto err_locked;
+-	/*
+-	 * tb_schedule_hotplug_handler may be called as soon as the config
+-	 * channel is started. Thats why we have to hold the lock here.
+-	 */
+-	tb_ctl_start(tb->ctl);
++	struct tb_cm *tcm = tb_priv(tb);
+ 
+ 	tb->root_switch = tb_switch_alloc(tb, 0);
+ 	if (!tb->root_switch)
+-		goto err_locked;
++		return -ENOMEM;
+ 
+ 	/* Full scan to discover devices added before the driver was loaded. */
+ 	tb_scan_switch(tb->root_switch);
+ 	tb_activate_pcie_devices(tb);
+ 
+ 	/* Allow tb_handle_hotplug to progress events */
+-	tb->hotplug_active = true;
+-	mutex_unlock(&tb->lock);
+-	return tb;
+-
+-err_locked:
+-	mutex_unlock(&tb->lock);
+-	thunderbolt_shutdown_and_free(tb);
+-	return NULL;
++	tcm->hotplug_active = true;
++	return 0;
+ }
+ 
+-void thunderbolt_suspend(struct tb *tb)
++static int tb_suspend_noirq(struct tb *tb)
+ {
++	struct tb_cm *tcm = tb_priv(tb);
++
+ 	tb_info(tb, "suspending...\n");
+-	mutex_lock(&tb->lock);
+ 	tb_switch_suspend(tb->root_switch);
+-	tb_ctl_stop(tb->ctl);
+-	tb->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+-	mutex_unlock(&tb->lock);
++	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+ 	tb_info(tb, "suspend finished\n");
++
++	return 0;
+ }
+ 
+-void thunderbolt_resume(struct tb *tb)
++static int tb_resume_noirq(struct tb *tb)
+ {
++	struct tb_cm *tcm = tb_priv(tb);
+ 	struct tb_pci_tunnel *tunnel, *n;
++
+ 	tb_info(tb, "resuming...\n");
+-	mutex_lock(&tb->lock);
+-	tb_ctl_start(tb->ctl);
+ 
+ 	/* remove any pci devices the firmware might have setup */
+ 	tb_switch_reset(tb, 0);
+@@ -419,9 +375,9 @@ void thunderbolt_resume(struct tb *tb)
+ 	tb_switch_resume(tb->root_switch);
+ 	tb_free_invalid_tunnels(tb);
+ 	tb_free_unplugged_children(tb->root_switch);
+-	list_for_each_entry_safe(tunnel, n, &tb->tunnel_list, list)
++	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list)
+ 		tb_pci_restart(tunnel);
+-	if (!list_empty(&tb->tunnel_list)) {
++	if (!list_empty(&tcm->tunnel_list)) {
+ 		/*
+ 		 * the pcie links need some time to get going.
+ 		 * 100ms works for me...
+@@ -430,7 +386,33 @@ void thunderbolt_resume(struct tb *tb)
+ 		msleep(100);
+ 	}
+ 	 /* Allow tb_handle_hotplug to progress events */
+-	tb->hotplug_active = true;
+-	mutex_unlock(&tb->lock);
++	tcm->hotplug_active = true;
+ 	tb_info(tb, "resume finished\n");
++
++	return 0;
++}
++
++static const struct tb_cm_ops tb_cm_ops = {
++	.start = tb_start,
++	.stop = tb_stop,
++	.suspend_noirq = tb_suspend_noirq,
++	.resume_noirq = tb_resume_noirq,
++	.hotplug = tb_schedule_hotplug_handler,
++};
++
++struct tb *tb_probe(struct tb_nhi *nhi)
++{
++	struct tb_cm *tcm;
++	struct tb *tb;
++
++	tb = tb_domain_alloc(nhi, sizeof(*tcm));
++	if (!tb)
++		return NULL;
++
++	tb->cm_ops = &tb_cm_ops;
++
++	tcm = tb_priv(tb);
++	INIT_LIST_HEAD(&tcm->tunnel_list);
++
++	return tb;
+ }
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+index 0b78bc4fbe61..5fab4c44f124 100644
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -92,29 +92,52 @@ struct tb_path {
+ 	int path_length; /* number of hops */
+ };
+ 
++/**
++ * struct tb_cm_ops - Connection manager specific operations vector
++ * @start: Starts the domain
++ * @stop: Stops the domain
++ * @suspend_noirq: Connection manager specific suspend_noirq
++ * @resume_noirq: Connection manager specific resume_noirq
++ * @hotplug: Handle hotplug event
++ */
++struct tb_cm_ops {
++	int (*start)(struct tb *tb);
++	void (*stop)(struct tb *tb);
++	int (*suspend_noirq)(struct tb *tb);
++	int (*resume_noirq)(struct tb *tb);
++	hotplug_cb hotplug;
++};
+ 
+ /**
+  * struct tb - main thunderbolt bus structure
++ * @dev: Domain device
++ * @lock: Big lock. Must be held when accessing cfg or any struct
++ *	  tb_switch / struct tb_port.
++ * @nhi: Pointer to the NHI structure
++ * @ctl: Control channel for this domain
++ * @wq: Ordered workqueue for all domain specific work
++ * @root_switch: Root switch of this domain
++ * @cm_ops: Connection manager specific operations vector
++ * @index: Linux assigned domain number
++ * @privdata: Private connection manager specific data
+  */
+ struct tb {
+-	struct mutex lock;	/*
+-				 * Big lock. Must be held when accessing cfg or
+-				 * any struct tb_switch / struct tb_port.
+-				 */
++	struct device dev;
++	struct mutex lock;
+ 	struct tb_nhi *nhi;
+ 	struct tb_ctl *ctl;
+-	struct workqueue_struct *wq; /* ordered workqueue for plug events */
++	struct workqueue_struct *wq;
+ 	struct tb_switch *root_switch;
+-	struct list_head tunnel_list; /* list of active PCIe tunnels */
+-	bool hotplug_active; /*
+-			      * tb_handle_hotplug will stop progressing plug
+-			      * events and exit if this is not set (it needs to
+-			      * acquire the lock one more time). Used to drain
+-			      * wq after cfg has been paused.
+-			      */
+-
++	const struct tb_cm_ops *cm_ops;
++	int index;
++	unsigned long privdata[0];
+ };
+ 
++static inline void *tb_priv(struct tb *tb)
++{
++	return (void *)tb->privdata;
++}
++
+ /* helper functions & macros */
+ 
+ /**
+@@ -215,11 +238,24 @@ static inline int tb_port_write(struct tb_port *port, const void *buffer,
+ #define tb_port_info(port, fmt, arg...) \
+ 	__TB_PORT_PRINT(tb_info, port, fmt, ##arg)
+ 
++struct tb *tb_probe(struct tb_nhi *nhi);
++
++extern struct bus_type tb_bus_type;
++extern struct device_type tb_domain_type;
++
++int tb_domain_init(void);
++void tb_domain_exit(void);
+ 
+-struct tb *thunderbolt_alloc_and_start(struct tb_nhi *nhi);
+-void thunderbolt_shutdown_and_free(struct tb *tb);
+-void thunderbolt_suspend(struct tb *tb);
+-void thunderbolt_resume(struct tb *tb);
++struct tb *tb_domain_alloc(struct tb_nhi *nhi, size_t privsize);
++int tb_domain_add(struct tb *tb);
++void tb_domain_remove(struct tb *tb);
++int tb_domain_suspend_noirq(struct tb *tb);
++int tb_domain_resume_noirq(struct tb *tb);
++
++static inline void tb_domain_put(struct tb *tb)
++{
++	put_device(&tb->dev);
++}
+ 
+ struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route);
+ void tb_switch_free(struct tb_switch *sw);
+diff --git a/drivers/thunderbolt/tunnel_pci.c b/drivers/thunderbolt/tunnel_pci.c
+index f4ce9845e42a..ca4475907d7a 100644
+--- a/drivers/thunderbolt/tunnel_pci.c
++++ b/drivers/thunderbolt/tunnel_pci.c
+@@ -194,19 +194,13 @@ int tb_pci_restart(struct tb_pci_tunnel *tunnel)
+  */
+ int tb_pci_activate(struct tb_pci_tunnel *tunnel)
+ {
+-	int res;
+ 	if (tunnel->path_to_up->activated || tunnel->path_to_down->activated) {
+ 		tb_tunnel_WARN(tunnel,
+ 			       "trying to activate an already activated tunnel\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	res = tb_pci_restart(tunnel);
+-	if (res)
+-		return res;
+-
+-	list_add(&tunnel->list, &tunnel->tb->tunnel_list);
+-	return 0;
++	return tb_pci_restart(tunnel);
+ }
+ 
+ 
+@@ -227,6 +221,5 @@ void tb_pci_deactivate(struct tb_pci_tunnel *tunnel)
+ 		tb_path_deactivate(tunnel->path_to_down);
+ 	if (tunnel->path_to_up->activated)
+ 		tb_path_deactivate(tunnel->path_to_up);
+-	list_del_init(&tunnel->list);
+ }
+ 
+-- 
+2.12.3
+
