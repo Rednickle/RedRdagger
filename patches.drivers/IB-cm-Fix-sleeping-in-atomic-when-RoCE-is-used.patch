@@ -1,0 +1,160 @@
+From: Roland Dreier <roland@purestorage.com>
+Date: Tue, 29 Aug 2017 10:34:43 -0700
+Subject: IB/cm: Fix sleeping in atomic when RoCE is used
+Patch-mainline: v4.14-rc1
+Git-commit: c76161181193985087cd716fdf69b5cb6cf9ee85
+References: bsc#1046306 FATE#322942
+
+A couple of places in the CM do
+
+    spin_lock_irq(&cm_id_priv->lock);
+    ...
+    if (cm_alloc_response_msg(work->port, work->mad_recv_wc, &msg))
+
+However when the underlying transport is RoCE, this leads to a sleeping function
+being called with the lock held - the callchain is
+
+    cm_alloc_response_msg() ->
+      ib_create_ah_from_wc() ->
+        ib_init_ah_from_wc() ->
+          rdma_addr_find_l2_eth_by_grh() ->
+            rdma_resolve_ip()
+
+and rdma_resolve_ip() starts out by doing
+
+    req = kzalloc(sizeof *req, GFP_KERNEL);
+
+not to mention rdma_addr_find_l2_eth_by_grh() doing
+
+    wait_for_completion(&ctx.comp);
+
+to wait for the task that rdma_resolve_ip() queues up.
+
+Fix this by moving the AH creation out of the lock.
+
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Reviewed-by: Sean Hefty <sean.hefty@intel.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/cm.c |   63 ++++++++++++++++++++++++++++++-------------
+ 1 file changed, 44 insertions(+), 19 deletions(-)
+
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -373,11 +373,19 @@ out:
+ 	return ret;
+ }
+ 
+-static int cm_alloc_response_msg(struct cm_port *port,
+-				 struct ib_mad_recv_wc *mad_recv_wc,
+-				 struct ib_mad_send_buf **msg)
++static struct ib_mad_send_buf *cm_alloc_response_msg_no_ah(struct cm_port *port,
++							   struct ib_mad_recv_wc *mad_recv_wc)
++{
++	return ib_create_send_mad(port->mad_agent, 1, mad_recv_wc->wc->pkey_index,
++				  0, IB_MGMT_MAD_HDR, IB_MGMT_MAD_DATA,
++				  GFP_ATOMIC,
++				  IB_MGMT_BASE_VERSION);
++}
++
++static int cm_create_response_msg_ah(struct cm_port *port,
++				     struct ib_mad_recv_wc *mad_recv_wc,
++				     struct ib_mad_send_buf *msg)
+ {
+-	struct ib_mad_send_buf *m;
+ 	struct ib_ah *ah;
+ 
+ 	ah = ib_create_ah_from_wc(port->mad_agent->qp->pd, mad_recv_wc->wc,
+@@ -385,27 +393,40 @@ static int cm_alloc_response_msg(struct
+ 	if (IS_ERR(ah))
+ 		return PTR_ERR(ah);
+ 
+-	m = ib_create_send_mad(port->mad_agent, 1, mad_recv_wc->wc->pkey_index,
+-			       0, IB_MGMT_MAD_HDR, IB_MGMT_MAD_DATA,
+-			       GFP_ATOMIC,
+-			       IB_MGMT_BASE_VERSION);
+-	if (IS_ERR(m)) {
+-		rdma_destroy_ah(ah);
+-		return PTR_ERR(m);
+-	}
+-	m->ah = ah;
+-	*msg = m;
++	msg->ah = ah;
+ 	return 0;
+ }
+ 
+ static void cm_free_msg(struct ib_mad_send_buf *msg)
+ {
+-	rdma_destroy_ah(msg->ah);
++	if (msg->ah)
++		rdma_destroy_ah(msg->ah);
+ 	if (msg->context[0])
+ 		cm_deref_id(msg->context[0]);
+ 	ib_free_send_mad(msg);
+ }
+ 
++static int cm_alloc_response_msg(struct cm_port *port,
++				 struct ib_mad_recv_wc *mad_recv_wc,
++				 struct ib_mad_send_buf **msg)
++{
++	struct ib_mad_send_buf *m;
++	int ret;
++
++	m = cm_alloc_response_msg_no_ah(port, mad_recv_wc);
++	if (IS_ERR(m))
++		return PTR_ERR(m);
++
++	ret = cm_create_response_msg_ah(port, mad_recv_wc, m);
++	if (ret) {
++		cm_free_msg(m);
++		return ret;
++	}
++
++	*msg = m;
++	return 0;
++}
++
+ static void * cm_copy_private_data(const void *private_data,
+ 				   u8 private_data_len)
+ {
+@@ -2497,7 +2518,8 @@ static int cm_dreq_handler(struct cm_wor
+ 	case IB_CM_TIMEWAIT:
+ 		atomic_long_inc(&work->port->counter_group[CM_RECV_DUPLICATES].
+ 				counter[CM_DREQ_COUNTER]);
+-		if (cm_alloc_response_msg(work->port, work->mad_recv_wc, &msg))
++		msg = cm_alloc_response_msg_no_ah(work->port, work->mad_recv_wc);
++		if (IS_ERR(msg))
+ 			goto unlock;
+ 
+ 		cm_format_drep((struct cm_drep_msg *) msg->mad, cm_id_priv,
+@@ -2505,7 +2527,8 @@ static int cm_dreq_handler(struct cm_wor
+ 			       cm_id_priv->private_data_len);
+ 		spin_unlock_irq(&cm_id_priv->lock);
+ 
+-		if (ib_post_send_mad(msg, NULL))
++		if (cm_create_response_msg_ah(work->port, work->mad_recv_wc, msg) ||
++		    ib_post_send_mad(msg, NULL))
+ 			cm_free_msg(msg);
+ 		goto deref;
+ 	case IB_CM_DREQ_RCVD:
+@@ -3083,7 +3106,8 @@ static int cm_lap_handler(struct cm_work
+ 	case IB_CM_MRA_LAP_SENT:
+ 		atomic_long_inc(&work->port->counter_group[CM_RECV_DUPLICATES].
+ 				counter[CM_LAP_COUNTER]);
+-		if (cm_alloc_response_msg(work->port, work->mad_recv_wc, &msg))
++		msg = cm_alloc_response_msg_no_ah(work->port, work->mad_recv_wc);
++		if (IS_ERR(msg))
+ 			goto unlock;
+ 
+ 		cm_format_mra((struct cm_mra_msg *) msg->mad, cm_id_priv,
+@@ -3093,7 +3117,8 @@ static int cm_lap_handler(struct cm_work
+ 			      cm_id_priv->private_data_len);
+ 		spin_unlock_irq(&cm_id_priv->lock);
+ 
+-		if (ib_post_send_mad(msg, NULL))
++		if (cm_create_response_msg_ah(work->port, work->mad_recv_wc, msg) ||
++		    ib_post_send_mad(msg, NULL))
+ 			cm_free_msg(msg);
+ 		goto deref;
+ 	case IB_CM_LAP_RCVD:
