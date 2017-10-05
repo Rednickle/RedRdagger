@@ -1,0 +1,464 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Thu, 1 Jun 2017 21:07:10 -0700
+Subject: scsi: lpfc: Add auto EQ delay logic
+Patch-mainline: v4.13-rc1
+Git-commit: 0cf07f84dd32639394084b9d6794424587a38789
+References: bsc#1050239,FATE#322918
+
+Administrator intervention is currently required to get good numbers
+when switching from running latency tests to IOPS tests.
+
+The configured interrupt coalescing values will greatly effect the
+results of these tests.  Currently, the driver has a single coalescing
+value set by values of the module attribute.  This patch changes the
+driver to support auto-configuration of the coalescing value based on
+the total number of outstanding IOs and average number of CQEs processed
+per interrupt for an EQ.  Values are checked every 5 seconds.
+
+The driver defaults to the automatic selection. Automatic selection can
+be disabled by the new lpfc_auto_imax module_parameter.
+
+Older hardware can only change interrupt coalescing by mailbox
+command. Newer hardware supports change via a register. The patch
+support both.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <james.smart@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/scsi/lpfc/lpfc.h         |    3 +
+ drivers/scsi/lpfc/lpfc_attr.c    |   20 +++++++
+ drivers/scsi/lpfc/lpfc_debugfs.c |    4 -
+ drivers/scsi/lpfc/lpfc_hw4.h     |   14 +++++
+ drivers/scsi/lpfc/lpfc_init.c    |  104 ++++++++++++++++++++++++++++++++++++++-
+ drivers/scsi/lpfc/lpfc_sli.c     |   36 +++++++++++--
+ drivers/scsi/lpfc/lpfc_sli.h     |    1 
+ drivers/scsi/lpfc/lpfc_sli4.h    |    8 +--
+ 8 files changed, 177 insertions(+), 13 deletions(-)
+
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -756,6 +756,7 @@ struct lpfc_hba {
+ 	uint8_t  nvmet_support;	/* driver supports NVMET */
+ #define LPFC_NVMET_MAX_PORTS	32
+ 	uint8_t  mds_diags_support;
++	uint32_t initial_imax;
+ 
+ 	/* HBA Config Parameters */
+ 	uint32_t cfg_ack0;
+@@ -777,6 +778,7 @@ struct lpfc_hba {
+ 	uint32_t cfg_poll_tmo;
+ 	uint32_t cfg_task_mgmt_tmo;
+ 	uint32_t cfg_use_msi;
++	uint32_t cfg_auto_imax;
+ 	uint32_t cfg_fcp_imax;
+ 	uint32_t cfg_fcp_cpu_map;
+ 	uint32_t cfg_fcp_io_channel;
+@@ -1050,6 +1052,7 @@ struct lpfc_hba {
+ 
+ 	uint8_t temp_sensor_support;
+ 	/* Fields used for heart beat. */
++	unsigned long last_eqdelay_time;
+ 	unsigned long last_completion_time;
+ 	unsigned long skipped_hb;
+ 	struct timer_list hb_tmofunc;
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -4481,9 +4481,11 @@ lpfc_fcp_imax_store(struct device *dev,
+ 		return -EINVAL;
+ 
+ 	phba->cfg_fcp_imax = (uint32_t)val;
++	phba->initial_imax = phba->cfg_fcp_imax;
+ 
+ 	for (i = 0; i < phba->io_channel_irqs; i += LPFC_MAX_EQ_DELAY_EQID_CNT)
+-		lpfc_modify_hba_eq_delay(phba, i);
++		lpfc_modify_hba_eq_delay(phba, i, LPFC_MAX_EQ_DELAY_EQID_CNT,
++					 val);
+ 
+ 	return strlen(buf);
+ }
+@@ -4538,6 +4540,16 @@ lpfc_fcp_imax_init(struct lpfc_hba *phba
+ static DEVICE_ATTR(lpfc_fcp_imax, S_IRUGO | S_IWUSR,
+ 		   lpfc_fcp_imax_show, lpfc_fcp_imax_store);
+ 
++/*
++ * lpfc_auto_imax: Controls Auto-interrupt coalescing values support.
++ *       0       No auto_imax support
++ *       1       auto imax on
++ * Auto imax will change the value of fcp_imax on a per EQ basis, using
++ * the EQ Delay Multiplier, depending on the activity for that EQ.
++ * Value range [0,1]. Default value is 1.
++ */
++LPFC_ATTR_RW(auto_imax, 1, 0, 1, "Enable Auto imax");
++
+ /**
+  * lpfc_state_show - Display current driver CPU affinity
+  * @dev: class converted to a Scsi_host structure.
+@@ -5164,6 +5176,7 @@ struct device_attribute *lpfc_hba_attrs[
+ 	&dev_attr_lpfc_task_mgmt_tmo,
+ 	&dev_attr_lpfc_use_msi,
+ 	&dev_attr_lpfc_nvme_oas,
++	&dev_attr_lpfc_auto_imax,
+ 	&dev_attr_lpfc_fcp_imax,
+ 	&dev_attr_lpfc_fcp_cpu_map,
+ 	&dev_attr_lpfc_fcp_io_channel,
+@@ -6182,6 +6195,7 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
+ 	lpfc_enable_SmartSAN_init(phba, lpfc_enable_SmartSAN);
+ 	lpfc_use_msi_init(phba, lpfc_use_msi);
+ 	lpfc_nvme_oas_init(phba, lpfc_nvme_oas);
++	lpfc_auto_imax_init(phba, lpfc_auto_imax);
+ 	lpfc_fcp_imax_init(phba, lpfc_fcp_imax);
+ 	lpfc_fcp_cpu_map_init(phba, lpfc_fcp_cpu_map);
+ 	lpfc_enable_hba_reset_init(phba, lpfc_enable_hba_reset);
+@@ -6226,6 +6240,10 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
+ 			phba->cfg_enable_fc4_type |= LPFC_ENABLE_FCP;
+ 	}
+ 
++	if (phba->cfg_auto_imax && !phba->cfg_fcp_imax)
++		phba->cfg_auto_imax = 0;
++	phba->initial_imax = phba->cfg_fcp_imax;
++
+ 	/* A value of 0 means use the number of CPUs found in the system */
+ 	if (phba->cfg_fcp_io_channel == 0)
+ 		phba->cfg_fcp_io_channel = phba->sli4_hba.num_present_cpu;
+--- a/drivers/scsi/lpfc/lpfc_debugfs.c
++++ b/drivers/scsi/lpfc/lpfc_debugfs.c
+@@ -3245,9 +3245,9 @@ __lpfc_idiag_print_eq(struct lpfc_queue
+ 
+ 	len += snprintf(pbuffer + len, LPFC_QUE_INFO_GET_BUF_SIZE - len,
+ 			"\n%s EQ info: EQ-STAT[max:x%x noE:x%x "
+-			"bs:x%x proc:x%llx]\n",
++			"bs:x%x proc:x%llx eqd %d]\n",
+ 			eqtype, qp->q_cnt_1, qp->q_cnt_2, qp->q_cnt_3,
+-			(unsigned long long)qp->q_cnt_4);
++			(unsigned long long)qp->q_cnt_4, qp->q_mode);
+ 	len += snprintf(pbuffer + len, LPFC_QUE_INFO_GET_BUF_SIZE - len,
+ 			"EQID[%02d], QE-CNT[%04d], QE-SZ[%04d], "
+ 			"HST-IDX[%04d], PRT-IDX[%04d], PST[%03d]",
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -197,6 +197,7 @@ struct lpfc_sli_intf {
+ 
+ /* Delay Multiplier constant */
+ #define LPFC_DMULT_CONST       651042
++#define LPFC_DMULT_MAX         1023
+ 
+ /* Configuration of Interrupts / sec for entire HBA port */
+ #define LPFC_MIN_IMAX          5000
+@@ -657,6 +658,15 @@ struct lpfc_register {
+ #define LPFC_CTL_PORT_ER1_OFFSET	0x40C
+ #define LPFC_CTL_PORT_ER2_OFFSET	0x410
+ 
++#define LPFC_CTL_PORT_EQ_DELAY_OFFSET	0x418
++#define lpfc_sliport_eqdelay_delay_SHIFT 16
++#define lpfc_sliport_eqdelay_delay_MASK	0xffff
++#define lpfc_sliport_eqdelay_delay_WORD	word0
++#define lpfc_sliport_eqdelay_id_SHIFT	0
++#define lpfc_sliport_eqdelay_id_MASK	0xfff
++#define lpfc_sliport_eqdelay_id_WORD	word0
++#define LPFC_SEC_TO_USEC		1000000
++
+ /* The following Registers apply to SLI4 if_type 0 UCNAs. They typically
+  * reside in BAR 2.
+  */
+@@ -3258,6 +3268,10 @@ struct lpfc_sli4_parameters {
+ #define cfg_xib_SHIFT				4
+ #define cfg_xib_MASK				0x00000001
+ #define cfg_xib_WORD				word19
++#define cfg_eqdr_SHIFT				8
++#define cfg_eqdr_MASK				0x00000001
++#define cfg_eqdr_WORD				word19
++#define LPFC_NODELAY_MAX_IO		32
+ };
+ 
+ #define LPFC_SET_UE_RECOVERY		0x10
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -1249,6 +1249,12 @@ lpfc_hb_timeout_handler(struct lpfc_hba
+ 	int retval, i;
+ 	struct lpfc_sli *psli = &phba->sli;
+ 	LIST_HEAD(completions);
++	struct lpfc_queue *qp;
++	unsigned long time_elapsed;
++	uint32_t tick_cqe, max_cqe, val;
++	uint64_t tot, data1, data2, data3;
++	struct lpfc_register reg_data;
++	void __iomem *eqdreg = phba->sli4_hba.u.if_type2.EQDregaddr;
+ 
+ 	vports = lpfc_create_vport_work_array(phba);
+ 	if (vports != NULL)
+@@ -1263,6 +1269,95 @@ lpfc_hb_timeout_handler(struct lpfc_hba
+ 		(phba->pport->fc_flag & FC_OFFLINE_MODE))
+ 		return;
+ 
++	if (phba->cfg_auto_imax) {
++		if (!phba->last_eqdelay_time) {
++			phba->last_eqdelay_time = jiffies;
++			goto skip_eqdelay;
++		}
++		time_elapsed = jiffies - phba->last_eqdelay_time;
++		phba->last_eqdelay_time = jiffies;
++
++		tot = 0xffff;
++		/* Check outstanding IO count */
++		if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
++			if (phba->nvmet_support) {
++				spin_lock(&phba->sli4_hba.nvmet_io_lock);
++				tot = phba->sli4_hba.nvmet_xri_cnt -
++					phba->sli4_hba.nvmet_ctx_cnt;
++				spin_unlock(&phba->sli4_hba.nvmet_io_lock);
++			} else {
++				tot = atomic_read(&phba->fc4NvmeIoCmpls);
++				data1 = atomic_read(
++					&phba->fc4NvmeInputRequests);
++				data2 = atomic_read(
++					&phba->fc4NvmeOutputRequests);
++				data3 = atomic_read(
++					&phba->fc4NvmeControlRequests);
++				tot =  (data1 + data2 + data3) - tot;
++			}
++		}
++
++		/* Interrupts per sec per EQ */
++		val = phba->cfg_fcp_imax / phba->io_channel_irqs;
++		tick_cqe = val / CONFIG_HZ; /* Per tick per EQ */
++
++		/* Assume 1 CQE/ISR, calc max CQEs allowed for time duration */
++		max_cqe = time_elapsed * tick_cqe;
++
++		for (i = 0; i < phba->io_channel_irqs; i++) {
++			/* Fast-path EQ */
++			qp = phba->sli4_hba.hba_eq[i];
++			if (!qp)
++				continue;
++
++			/* Use no EQ delay if we don't have many outstanding
++			 * IOs, or if we are only processing 1 CQE/ISR or less.
++			 * Otherwise, assume we can process up to lpfc_fcp_imax
++			 * interrupts per HBA.
++			 */
++			if (tot < LPFC_NODELAY_MAX_IO ||
++			    qp->EQ_cqe_cnt <= max_cqe)
++				val = 0;
++			else
++				val = phba->cfg_fcp_imax;
++
++			if (phba->sli.sli_flag & LPFC_SLI_USE_EQDR) {
++				/* Use EQ Delay Register method */
++
++				/* Convert for EQ Delay register */
++				if (val) {
++					/* First, interrupts per sec per EQ */
++					val = phba->cfg_fcp_imax /
++						phba->io_channel_irqs;
++
++					/* us delay between each interrupt */
++					val = LPFC_SEC_TO_USEC / val;
++				}
++				if (val != qp->q_mode) {
++					reg_data.word0 = 0;
++					bf_set(lpfc_sliport_eqdelay_id,
++					       &reg_data, qp->queue_id);
++					bf_set(lpfc_sliport_eqdelay_delay,
++					       &reg_data, val);
++					writel(reg_data.word0, eqdreg);
++				}
++			} else {
++				/* Use mbox command method */
++				if (val != qp->q_mode)
++					lpfc_modify_hba_eq_delay(phba, i,
++								 1, val);
++			}
++
++			/*
++			 * val is cfg_fcp_imax or 0 for mbox delay or us delay
++			 * between interrupts for EQDR.
++			 */
++			qp->q_mode = val;
++			qp->EQ_cqe_cnt = 0;
++		}
++	}
++
++skip_eqdelay:
+ 	spin_lock_irq(&phba->pport->work_port_lock);
+ 
+ 	if (time_after(phba->last_completion_time +
+@@ -7257,6 +7352,9 @@ lpfc_sli4_bar0_register_memmap(struct lp
+ 			phba->sli4_hba.conf_regs_memmap_p + LPFC_SLI_INTF;
+ 		break;
+ 	case LPFC_SLI_INTF_IF_TYPE_2:
++		phba->sli4_hba.u.if_type2.EQDregaddr =
++			phba->sli4_hba.conf_regs_memmap_p +
++						LPFC_CTL_PORT_EQ_DELAY_OFFSET;
+ 		phba->sli4_hba.u.if_type2.ERR1regaddr =
+ 			phba->sli4_hba.conf_regs_memmap_p +
+ 						LPFC_CTL_PORT_ER1_OFFSET;
+@@ -8783,7 +8881,8 @@ lpfc_sli4_queue_setup(struct lpfc_hba *p
+ 	}
+ 
+ 	for (qidx = 0; qidx < io_channel; qidx += LPFC_MAX_EQ_DELAY_EQID_CNT)
+-		lpfc_modify_hba_eq_delay(phba, qidx);
++		lpfc_modify_hba_eq_delay(phba, qidx, LPFC_MAX_EQ_DELAY_EQID_CNT,
++					 phba->cfg_fcp_imax);
+ 
+ 	return 0;
+ 
+@@ -10252,6 +10351,9 @@ lpfc_get_sli4_parameters(struct lpfc_hba
+ 	if (bf_get(cfg_xib, mbx_sli4_parameters) && phba->cfg_suppress_rsp)
+ 		phba->sli.sli_flag |= LPFC_SLI_SUPPRESS_RSP;
+ 
++	if (bf_get(cfg_eqdr, mbx_sli4_parameters))
++		phba->sli.sli_flag |= LPFC_SLI_USE_EQDR;
++
+ 	/* Make sure that sge_supp_len can be handled by the driver */
+ 	if (sli4_params->sge_supp_len > LPFC_MAX_SGE_SIZE)
+ 		sli4_params->sge_supp_len = LPFC_MAX_SGE_SIZE;
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -13478,6 +13478,7 @@ process_cq:
+ 	/* Track the max number of CQEs processed in 1 EQ */
+ 	if (ecount > cq->CQ_max_cqe)
+ 		cq->CQ_max_cqe = ecount;
++	cq->assoc_qp->EQ_cqe_cnt += ecount;
+ 
+ 	/* Catch the no cq entry condition */
+ 	if (unlikely(ecount == 0))
+@@ -13569,6 +13570,7 @@ lpfc_sli4_fof_handle_eqe(struct lpfc_hba
+ 	/* Track the max number of CQEs processed in 1 EQ */
+ 	if (ecount > cq->CQ_max_cqe)
+ 		cq->CQ_max_cqe = ecount;
++	cq->assoc_qp->EQ_cqe_cnt += ecount;
+ 
+ 	/* Catch the no cq entry condition */
+ 	if (unlikely(ecount == 0))
+@@ -13629,7 +13631,6 @@ lpfc_sli4_fof_intr_handler(int irq, void
+ 
+ 	/* Check device state for handling interrupt */
+ 	if (unlikely(lpfc_intr_state_check(phba))) {
+-		eq->EQ_badstate++;
+ 		/* Check again for link_state with lock held */
+ 		spin_lock_irqsave(&phba->hbalock, iflag);
+ 		if (phba->link_state < LPFC_LINK_DOWN)
+@@ -13741,7 +13742,6 @@ lpfc_sli4_hba_intr_handler(int irq, void
+ 
+ 	/* Check device state for handling interrupt */
+ 	if (unlikely(lpfc_intr_state_check(phba))) {
+-		fpeq->EQ_badstate++;
+ 		/* Check again for link_state with lock held */
+ 		spin_lock_irqsave(&phba->hbalock, iflag);
+ 		if (phba->link_state < LPFC_LINK_DOWN)
+@@ -14000,14 +14000,15 @@ lpfc_dual_chute_pci_bar_map(struct lpfc_
+  * fails this function will return -ENXIO.
+  **/
+ int
+-lpfc_modify_hba_eq_delay(struct lpfc_hba *phba, uint32_t startq)
++lpfc_modify_hba_eq_delay(struct lpfc_hba *phba, uint32_t startq,
++			 uint32_t numq, uint32_t imax)
+ {
+ 	struct lpfc_mbx_modify_eq_delay *eq_delay;
+ 	LPFC_MBOXQ_t *mbox;
+ 	struct lpfc_queue *eq;
+ 	int cnt, rc, length, status = 0;
+ 	uint32_t shdr_status, shdr_add_status;
+-	uint32_t result;
++	uint32_t result, val;
+ 	int qidx;
+ 	union lpfc_sli4_cfg_shdr *shdr;
+ 	uint16_t dmult;
+@@ -14026,22 +14027,45 @@ lpfc_modify_hba_eq_delay(struct lpfc_hba
+ 	eq_delay = &mbox->u.mqe.un.eq_delay;
+ 
+ 	/* Calculate delay multiper from maximum interrupt per second */
+-	result = phba->cfg_fcp_imax / phba->io_channel_irqs;
++	result = imax / phba->io_channel_irqs;
+ 	if (result > LPFC_DMULT_CONST || result == 0)
+ 		dmult = 0;
+ 	else
+ 		dmult = LPFC_DMULT_CONST/result - 1;
++	if (dmult > LPFC_DMULT_MAX)
++		dmult = LPFC_DMULT_MAX;
+ 
+ 	cnt = 0;
+ 	for (qidx = startq; qidx < phba->io_channel_irqs; qidx++) {
+ 		eq = phba->sli4_hba.hba_eq[qidx];
+ 		if (!eq)
+ 			continue;
++		eq->q_mode = imax;
+ 		eq_delay->u.request.eq[cnt].eq_id = eq->queue_id;
+ 		eq_delay->u.request.eq[cnt].phase = 0;
+ 		eq_delay->u.request.eq[cnt].delay_multi = dmult;
+ 		cnt++;
+-		if (cnt >= LPFC_MAX_EQ_DELAY_EQID_CNT)
++
++		/* q_mode is only used for auto_imax */
++		if (phba->sli.sli_flag & LPFC_SLI_USE_EQDR) {
++			/* Use EQ Delay Register method for q_mode */
++
++			/* Convert for EQ Delay register */
++			val =  phba->cfg_fcp_imax;
++			if (val) {
++				/* First, interrupts per sec per EQ */
++				val = phba->cfg_fcp_imax /
++					phba->io_channel_irqs;
++
++				/* us delay between each interrupt */
++				val = LPFC_SEC_TO_USEC / val;
++			}
++			eq->q_mode = val;
++		} else {
++			eq->q_mode = imax;
++		}
++
++		if (cnt >= numq)
+ 			break;
+ 	}
+ 	eq_delay->u.request.num_eq = cnt;
+--- a/drivers/scsi/lpfc/lpfc_sli.h
++++ b/drivers/scsi/lpfc/lpfc_sli.h
+@@ -321,6 +321,7 @@ struct lpfc_sli {
+ #define LPFC_MENLO_MAINT          0x1000 /* need for menl fw download */
+ #define LPFC_SLI_ASYNC_MBX_BLK    0x2000 /* Async mailbox is blocked */
+ #define LPFC_SLI_SUPPRESS_RSP     0x4000 /* Suppress RSP feature is supported */
++#define LPFC_SLI_USE_EQDR         0x8000 /* EQ Delay Register is supported */
+ 
+ 	struct lpfc_sli_ring *sli3_ring;
+ 
+--- a/drivers/scsi/lpfc/lpfc_sli4.h
++++ b/drivers/scsi/lpfc/lpfc_sli4.h
+@@ -168,7 +168,7 @@ struct lpfc_queue {
+ 	struct lpfc_sli_ring *pring; /* ptr to io ring associated with q */
+ 	struct lpfc_rqb *rqbp;	/* ptr to RQ buffers */
+ 
+-	uint16_t sgl_list_cnt;
++	uint32_t q_mode;
+ 	uint16_t db_format;
+ #define LPFC_DB_RING_FORMAT	0x01
+ #define LPFC_DB_LIST_FORMAT	0x02
+@@ -181,7 +181,7 @@ struct lpfc_queue {
+ /* defines for EQ stats */
+ #define	EQ_max_eqe		q_cnt_1
+ #define	EQ_no_entry		q_cnt_2
+-#define	EQ_badstate		q_cnt_3
++#define	EQ_cqe_cnt		q_cnt_3
+ #define	EQ_processed		q_cnt_4
+ 
+ /* defines for CQ stats */
+@@ -523,6 +523,7 @@ struct lpfc_sli4_hba {
+ #define SLIPORT_ERR2_REG_FAILURE_CQ		0x4
+ #define SLIPORT_ERR2_REG_FAILURE_BUS		0x5
+ #define SLIPORT_ERR2_REG_FAILURE_RQ		0x6
++			void __iomem *EQDregaddr;
+ 		} if_type2;
+ 	} u;
+ 
+@@ -755,7 +756,8 @@ struct lpfc_queue *lpfc_sli4_queue_alloc
+ 			uint32_t);
+ void lpfc_sli4_queue_free(struct lpfc_queue *);
+ int lpfc_eq_create(struct lpfc_hba *, struct lpfc_queue *, uint32_t);
+-int lpfc_modify_hba_eq_delay(struct lpfc_hba *phba, uint32_t startq);
++int lpfc_modify_hba_eq_delay(struct lpfc_hba *phba, uint32_t startq,
++			     uint32_t numq, uint32_t imax);
+ int lpfc_cq_create(struct lpfc_hba *, struct lpfc_queue *,
+ 			struct lpfc_queue *, uint32_t, uint32_t);
+ int lpfc_cq_create_set(struct lpfc_hba *phba, struct lpfc_queue **cqp,

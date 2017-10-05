@@ -1,0 +1,125 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Tue, 1 Aug 2017 15:12:40 -0700
+Subject: lpfc: support nvmet_fc defer_rcv callback
+Patch-mainline: v4.13-rc5
+Git-commit: 507384209371fc25cab203b95e7bdf50e58b47d5
+References: bsc#1050239,FATE#322918
+
+Currently, calls to nvmet_fc_rcv_fcp_req() always copied the
+FC-NVME cmd iu to a temporary buffer before returning, allowing
+the driver to immediately repost the buffer to the hardware.
+
+To address timing conditions on queue element structures vs async
+command reception, the nvmet_fc transport occasionally may need to
+hold on to the command iu buffer for a short period. In these cases,
+the nvmet_fc_rcv_fcp_req() will return a special return code
+(-EOVERFLOW). In these cases, the LLDD must delay until the new
+defer_rcv lldd callback is called before recycling the buffer back
+to the hw.
+
+This patch adds support for the new nvmet_fc transport defer_rcv
+callback and recognition of the new error code when passing commands
+to the transport.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <james.smart@broadcom.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/scsi/lpfc/lpfc_attr.c    |    4 +++-
+ drivers/scsi/lpfc/lpfc_debugfs.c |    5 ++++-
+ drivers/scsi/lpfc/lpfc_nvmet.c   |   30 ++++++++++++++++++++++++++++++
+ drivers/scsi/lpfc/lpfc_nvmet.h   |    1 +
+ 4 files changed, 38 insertions(+), 2 deletions(-)
+
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -205,8 +205,10 @@ lpfc_nvme_info_show(struct device *dev,
+ 				atomic_read(&tgtp->xmt_ls_rsp_error));
+ 
+ 		len += snprintf(buf+len, PAGE_SIZE-len,
+-				"FCP: Rcv %08x Release %08x Drop %08x\n",
++				"FCP: Rcv %08x Defer %08x Release %08x "
++				"Drop %08x\n",
+ 				atomic_read(&tgtp->rcv_fcp_cmd_in),
++				atomic_read(&tgtp->rcv_fcp_cmd_defer),
+ 				atomic_read(&tgtp->xmt_fcp_release),
+ 				atomic_read(&tgtp->rcv_fcp_cmd_drop));
+ 
+--- a/drivers/scsi/lpfc/lpfc_debugfs.c
++++ b/drivers/scsi/lpfc/lpfc_debugfs.c
+@@ -782,8 +782,11 @@ lpfc_debugfs_nvmestat_data(struct lpfc_v
+ 				atomic_read(&tgtp->xmt_ls_rsp_error));
+ 
+ 		len += snprintf(buf + len, size - len,
+-				"FCP: Rcv %08x Drop %08x\n",
++				"FCP: Rcv %08x Defer %08x Release %08x "
++				"Drop %08x\n",
+ 				atomic_read(&tgtp->rcv_fcp_cmd_in),
++				atomic_read(&tgtp->rcv_fcp_cmd_defer),
++				atomic_read(&tgtp->xmt_fcp_release),
+ 				atomic_read(&tgtp->rcv_fcp_cmd_drop));
+ 
+ 		if (atomic_read(&tgtp->rcv_fcp_cmd_in) !=
+--- a/drivers/scsi/lpfc/lpfc_nvmet.c
++++ b/drivers/scsi/lpfc/lpfc_nvmet.c
+@@ -841,12 +841,31 @@ lpfc_nvmet_xmt_fcp_release(struct nvmet_
+ 	lpfc_nvmet_ctxbuf_post(phba, ctxp->ctxbuf);
+ }
+ 
++static void
++lpfc_nvmet_defer_rcv(struct nvmet_fc_target_port *tgtport,
++		     struct nvmefc_tgt_fcp_req *rsp)
++{
++	struct lpfc_nvmet_tgtport *tgtp;
++	struct lpfc_nvmet_rcv_ctx *ctxp =
++		container_of(rsp, struct lpfc_nvmet_rcv_ctx, ctx.fcp_req);
++	struct rqb_dmabuf *nvmebuf = ctxp->rqb_buffer;
++	struct lpfc_hba *phba = ctxp->phba;
++
++	lpfc_nvmeio_data(phba, "NVMET DEFERRCV: xri x%x sz %d CPU %02x\n",
++			 ctxp->oxid, ctxp->size, smp_processor_id());
++
++	tgtp = phba->targetport->private;
++	atomic_inc(&tgtp->rcv_fcp_cmd_defer);
++	lpfc_rq_buf_free(phba, &nvmebuf->hbuf); /* repost */
++}
++
+ static struct nvmet_fc_target_template lpfc_tgttemplate = {
+ 	.targetport_delete = lpfc_nvmet_targetport_delete,
+ 	.xmt_ls_rsp     = lpfc_nvmet_xmt_ls_rsp,
+ 	.fcp_op         = lpfc_nvmet_xmt_fcp_op,
+ 	.fcp_abort      = lpfc_nvmet_xmt_fcp_abort,
+ 	.fcp_req_release = lpfc_nvmet_xmt_fcp_release,
++	.defer_rcv	= lpfc_nvmet_defer_rcv,
+ 
+ 	.max_hw_queues  = 1,
+ 	.max_sgl_segments = LPFC_NVMET_DEFAULT_SEGS,
+@@ -1504,6 +1523,17 @@ lpfc_nvmet_unsol_fcp_buffer(struct lpfc_
+ 		return;
+ 	}
+ 
++	/* Processing of FCP command is deferred */
++	if (rc == -EOVERFLOW) {
++		lpfc_nvmeio_data(phba,
++				 "NVMET RCV BUSY: xri x%x sz %d from %06x\n",
++				 oxid, size, sid);
++		/* defer reposting rcv buffer till .defer_rcv callback */
++		ctxp->rqb_buffer = nvmebuf;
++		atomic_inc(&tgtp->rcv_fcp_cmd_out);
++		return;
++	}
++
+ 	atomic_inc(&tgtp->rcv_fcp_cmd_drop);
+ 	lpfc_printf_log(phba, KERN_ERR, LOG_NVME_IOERR,
+ 			"6159 FCP Drop IO x%x: err x%x: x%x x%x x%x\n",
+--- a/drivers/scsi/lpfc/lpfc_nvmet.h
++++ b/drivers/scsi/lpfc/lpfc_nvmet.h
+@@ -49,6 +49,7 @@ struct lpfc_nvmet_tgtport {
+ 	atomic_t rcv_fcp_cmd_in;
+ 	atomic_t rcv_fcp_cmd_out;
+ 	atomic_t rcv_fcp_cmd_drop;
++	atomic_t rcv_fcp_cmd_defer;
+ 	atomic_t xmt_fcp_release;
+ 
+ 	/* Stats counters - lpfc_nvmet_xmt_fcp_op */
