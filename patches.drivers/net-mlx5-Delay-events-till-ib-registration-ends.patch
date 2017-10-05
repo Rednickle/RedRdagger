@@ -1,0 +1,179 @@
+From: Erez Shitrit <erezsh@mellanox.com>
+Date: Wed, 7 Jun 2017 12:14:24 +0300
+Subject: net/mlx5: Delay events till ib registration ends
+Patch-mainline: v4.14-rc1
+Git-commit: 97834eba7c194659a72c5bb0f8c19c7055bb69ea
+References: bsc#1046305 FATE#322943
+
+When mlx5_ib registers itself to mlx5_core as an interface, it will
+call mlx5_add_device which will call mlx5_ib interface add callback,
+in case the latter successfully returns, only then mlx5_core will add
+it to the interface list and async events will be forwarded to mlx5_ib.
+Between mlx5_ib interface add callback and mlx5_core adding the mlx5_ib
+interface to its devices list, arriving mlx5_core events can be missed
+by the new mlx5_ib registering interface.
+
+In other words:
+thread 1: mlx5_ib: mlx5_register_interface(dev)
+thread 1: mlx5_core: mlx5_add_device(dev)
+thread 1: mlx5_core: ctx = dev->add => (mlx5_ib)->mlx5_ib_add
+thread 2: mlx5_core_event: **new event arrives, forward to dev_list
+thread 1: mlx5_core: add_ctx_to_dev_list(ctx)
+/* previous event was missed by the new interface.*/
+It is ok to miss events before dev->add (mlx5_ib)->mlx5_ib_add_device
+but not after.
+
+We fix this race by accumulating the events that come between the
+ib_register_device (inside mlx5_add_device->(dev->add)) till the adding
+to the list completes and fire them to the new registering interface
+after that.
+
+Fixes: f1ee87fe55c8 ("net/mlx5: Organize device list API in one place")
+Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/dev.c  |   73 +++++++++++++++++++++++++
+ drivers/net/ethernet/mellanox/mlx5/core/main.c |    3 +
+ include/linux/mlx5/driver.h                    |    3 +
+ 3 files changed, 79 insertions(+)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/dev.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/dev.c
+@@ -45,11 +45,70 @@ struct mlx5_device_context {
+ 	unsigned long		state;
+ };
+ 
++struct mlx5_delayed_event {
++	struct list_head	list;
++	struct mlx5_core_dev	*dev;
++	enum mlx5_dev_event	event;
++	unsigned long		param;
++};
++
+ enum {
+ 	MLX5_INTERFACE_ADDED,
+ 	MLX5_INTERFACE_ATTACHED,
+ };
+ 
++static void add_delayed_event(struct mlx5_priv *priv,
++			      struct mlx5_core_dev *dev,
++			      enum mlx5_dev_event event,
++			      unsigned long param)
++{
++	struct mlx5_delayed_event *delayed_event;
++
++	delayed_event = kzalloc(sizeof(*delayed_event), GFP_ATOMIC);
++	if (!delayed_event) {
++		mlx5_core_err(dev, "event %d is missed\n", event);
++		return;
++	}
++
++	mlx5_core_dbg(dev, "Accumulating event %d\n", event);
++	delayed_event->dev = dev;
++	delayed_event->event = event;
++	delayed_event->param = param;
++	list_add_tail(&delayed_event->list, &priv->waiting_events_list);
++}
++
++static void fire_delayed_event_locked(struct mlx5_device_context *dev_ctx,
++				      struct mlx5_core_dev *dev,
++				      struct mlx5_priv *priv)
++{
++	struct mlx5_delayed_event *de;
++	struct mlx5_delayed_event *n;
++
++	/* stop delaying events */
++	priv->is_accum_events = false;
++
++	/* fire all accumulated events before new event comes */
++	list_for_each_entry_safe(de, n, &priv->waiting_events_list, list) {
++		dev_ctx->intf->event(dev, dev_ctx->context, de->event, de->param);
++		list_del(&de->list);
++		kfree(de);
++	}
++}
++
++static void cleanup_delayed_evets(struct mlx5_priv *priv)
++{
++	struct mlx5_delayed_event *de;
++	struct mlx5_delayed_event *n;
++
++	spin_lock_irq(&priv->ctx_lock);
++	priv->is_accum_events = false;
++	list_for_each_entry_safe(de, n, &priv->waiting_events_list, list) {
++		list_del(&de->list);
++		kfree(de);
++	}
++	spin_unlock_irq(&priv->ctx_lock);
++}
++
+ void mlx5_add_device(struct mlx5_interface *intf, struct mlx5_priv *priv)
+ {
+ 	struct mlx5_device_context *dev_ctx;
+@@ -63,6 +122,12 @@ void mlx5_add_device(struct mlx5_interfa
+ 		return;
+ 
+ 	dev_ctx->intf = intf;
++	/* accumulating events that can come after mlx5_ib calls to
++	 * ib_register_device, till adding that interface to the events list.
++	 */
++
++	priv->is_accum_events = true;
++
+ 	dev_ctx->context = intf->add(dev);
+ 	set_bit(MLX5_INTERFACE_ADDED, &dev_ctx->state);
+ 	if (intf->attach)
+@@ -71,6 +136,9 @@ void mlx5_add_device(struct mlx5_interfa
+ 	if (dev_ctx->context) {
+ 		spin_lock_irq(&priv->ctx_lock);
+ 		list_add_tail(&dev_ctx->list, &priv->ctx_list);
++
++		fire_delayed_event_locked(dev_ctx, dev, priv);
++
+ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ 		if (dev_ctx->intf->pfault) {
+ 			if (priv->pfault) {
+@@ -84,6 +152,8 @@ void mlx5_add_device(struct mlx5_interfa
+ 		spin_unlock_irq(&priv->ctx_lock);
+ 	} else {
+ 		kfree(dev_ctx);
++		 /* delete all accumulated events */
++		cleanup_delayed_evets(priv);
+ 	}
+ }
+ 
+@@ -341,6 +411,9 @@ void mlx5_core_event(struct mlx5_core_de
+ 
+ 	spin_lock_irqsave(&priv->ctx_lock, flags);
+ 
++	if (priv->is_accum_events)
++		add_delayed_event(priv, dev, event, param);
++
+ 	list_for_each_entry(dev_ctx, &priv->ctx_list, list)
+ 		if (dev_ctx->intf->event)
+ 			dev_ctx->intf->event(dev, dev_ctx->context, event, param);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -1288,6 +1288,9 @@ static int init_one(struct pci_dev *pdev
+ 	mutex_init(&dev->pci_status_mutex);
+ 	mutex_init(&dev->intf_state_mutex);
+ 
++	INIT_LIST_HEAD(&priv->waiting_events_list);
++	priv->is_accum_events = false;
++
+ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ 	err = init_srcu_struct(&priv->pfault_srcu);
+ 	if (err) {
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -657,6 +657,9 @@ struct mlx5_priv {
+ 	struct list_head        ctx_list;
+ 	spinlock_t              ctx_lock;
+ 
++	struct list_head	waiting_events_list;
++	bool			is_accum_events;
++
+ 	struct mlx5_flow_steering *steering;
+ 	struct mlx5_mpfs        *mpfs;
+ 	struct mlx5_eswitch     *eswitch;
