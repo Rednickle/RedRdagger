@@ -1,0 +1,271 @@
+From: "Kalderon, Michal" <Michal.Kalderon@cavium.com>
+Date: Wed, 26 Jul 2017 14:41:55 +0300
+Subject: RDMA/qedr: Add iWARP connection management qp related callbacks
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/dledford/rdma.git
+Git-commit: de0089e692a92ce5180eec6a79f1f79153e3c669
+References: bsc#1050545 FATE#322893
+
+This patch implements the following iWARP callbacks:
+qp_add_ref
+qp_rem_ref
+get_qp
+
+Signed-off-by: Michal Kalderon <Michal.Kalderon@cavium.com>
+Signed-off-by: Ram Amrani <Ram.Amrani@cavium.com>
+Signed-off-by: Ariel Elior <Ariel.Elior@cavium.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/qedr/Makefile     |    2 -
+ drivers/infiniband/hw/qedr/main.c       |   10 +++++
+ drivers/infiniband/hw/qedr/qedr.h       |    5 ++
+ drivers/infiniband/hw/qedr/qedr_iw_cm.c |   57 ++++++++++++++++++++++++++++++++
+ drivers/infiniband/hw/qedr/qedr_iw_cm.h |   37 ++++++++++++++++++++
+ drivers/infiniband/hw/qedr/verbs.c      |   38 ++++++++++++++++++++-
+ 6 files changed, 145 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/infiniband/hw/qedr/qedr_iw_cm.c
+ create mode 100644 drivers/infiniband/hw/qedr/qedr_iw_cm.h
+
+--- a/drivers/infiniband/hw/qedr/Makefile
++++ b/drivers/infiniband/hw/qedr/Makefile
+@@ -1,3 +1,3 @@
+ obj-$(CONFIG_INFINIBAND_QEDR) := qedr.o
+ 
+-qedr-y := main.o verbs.o qedr_roce_cm.o
++qedr-y := main.o verbs.o qedr_roce_cm.o qedr_iw_cm.o
+--- a/drivers/infiniband/hw/qedr/main.c
++++ b/drivers/infiniband/hw/qedr/main.c
+@@ -39,12 +39,14 @@
+ #include <linux/iommu.h>
+ #include <linux/pci.h>
+ #include <net/addrconf.h>
++#include <linux/idr.h>
+ 
+ #include <linux/qed/qed_chain.h>
+ #include <linux/qed/qed_if.h>
+ #include "qedr.h"
+ #include "verbs.h"
+ #include <rdma/qedr-abi.h>
++#include "qedr_iw_cm.h"
+ 
+ MODULE_DESCRIPTION("QLogic 40G/100G ROCE Driver");
+ MODULE_AUTHOR("QLogic Corporation");
+@@ -141,6 +143,9 @@ int qedr_iw_register_device(struct qedr_
+ 	dev->ibdev.iwcm = kzalloc(sizeof(*dev->ibdev.iwcm), GFP_KERNEL);
+ 	if (!dev->ibdev.iwcm)
+ 		return -ENOMEM;
++	dev->ibdev.iwcm->add_ref = qedr_iw_qp_add_ref;
++	dev->ibdev.iwcm->rem_ref = qedr_iw_qp_rem_ref;
++	dev->ibdev.iwcm->get_qp = qedr_iw_get_qp;
+ 
+ 	memcpy(dev->ibdev.iwcm->ifname,
+ 	       dev->ndev->name, sizeof(dev->ibdev.iwcm->ifname));
+@@ -313,6 +318,11 @@ static int qedr_alloc_resources(struct q
+ 
+ 	spin_lock_init(&dev->sgid_lock);
+ 
++	if (IS_IWARP(dev)) {
++		spin_lock_init(&dev->idr_lock);
++		idr_init(&dev->qpidr);
++	}
++
+ 	/* Allocate Status blocks for CNQ */
+ 	dev->sb_array = kcalloc(dev->num_cnq, sizeof(*dev->sb_array),
+ 				GFP_KERNEL);
+--- a/drivers/infiniband/hw/qedr/qedr.h
++++ b/drivers/infiniband/hw/qedr/qedr.h
+@@ -33,6 +33,7 @@
+ #define __QEDR_H__
+ 
+ #include <linux/pci.h>
++#include <linux/idr.h>
+ #include <rdma/ib_addr.h>
+ #include <linux/qed/qed_if.h>
+ #include <linux/qed/qed_chain.h>
+@@ -163,7 +164,8 @@ struct qedr_dev {
+ 	struct qedr_cq		*gsi_rqcq;
+ 	struct qedr_qp		*gsi_qp;
+ 	enum qed_rdma_type	rdma_type;
+-
++	spinlock_t		idr_lock; /* Protect qpidr data-structure */
++	struct idr		qpidr;
+ 	unsigned long enet_state;
+ 
+ 	u8 user_dpm_enabled;
+@@ -400,6 +402,7 @@ struct qedr_qp {
+ 	/* Relevant to qps created from user space only (applications) */
+ 	struct qedr_userq usq;
+ 	struct qedr_userq urq;
++	atomic_t refcnt;
+ };
+ 
+ struct qedr_ah {
+--- /dev/null
++++ b/drivers/infiniband/hw/qedr/qedr_iw_cm.c
+@@ -0,0 +1,57 @@
++/* QLogic qedr NIC Driver
++ * Copyright (c) 2015-2017  QLogic Corporation
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and /or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#include "qedr.h"
++void qedr_iw_qp_add_ref(struct ib_qp *ibqp)
++{
++	struct qedr_qp *qp = get_qedr_qp(ibqp);
++
++	atomic_inc(&qp->refcnt);
++}
++
++void qedr_iw_qp_rem_ref(struct ib_qp *ibqp)
++{
++	struct qedr_qp *qp = get_qedr_qp(ibqp);
++
++	if (atomic_dec_and_test(&qp->refcnt)) {
++		spin_lock_irq(&qp->dev->idr_lock);
++		idr_remove(&qp->dev->qpidr, qp->qp_id);
++		spin_unlock_irq(&qp->dev->idr_lock);
++		kfree(qp);
++	}
++}
++
++struct ib_qp *qedr_iw_get_qp(struct ib_device *ibdev, int qpn)
++{
++	struct qedr_dev *dev = get_qedr_dev(ibdev);
++
++	return idr_find(&dev->qpidr, qpn);
++}
+--- /dev/null
++++ b/drivers/infiniband/hw/qedr/qedr_iw_cm.h
+@@ -0,0 +1,37 @@
++/* QLogic qed NIC Driver
++ * Copyright (c) 2015-2017  QLogic Corporation
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and /or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#include <rdma/iw_cm.h>
++void qedr_iw_qp_add_ref(struct ib_qp *qp);
++
++void qedr_iw_qp_rem_ref(struct ib_qp *qp);
++
++struct ib_qp *qedr_iw_get_qp(struct ib_device *dev, int qpn);
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@ -1283,6 +1283,7 @@ static void qedr_set_common_qp_params(st
+ 				      struct ib_qp_init_attr *attrs)
+ {
+ 	spin_lock_init(&qp->q_lock);
++	atomic_set(&qp->refcnt, 1);
+ 	qp->pd = pd;
+ 	qp->qp_type = attrs->qp_type;
+ 	qp->max_inline_data = attrs->cap.max_inline_data;
+@@ -1353,6 +1354,33 @@ static inline void qedr_qp_user_print(st
+ 		 qp->usq.buf_len, qp->urq.buf_addr, qp->urq.buf_len);
+ }
+ 
++static int qedr_idr_add(struct qedr_dev *dev, void *ptr, u32 id)
++{
++	int rc;
++
++	if (!rdma_protocol_iwarp(&dev->ibdev, 1))
++		return 0;
++
++	idr_preload(GFP_KERNEL);
++	spin_lock_irq(&dev->idr_lock);
++
++	rc = idr_alloc(&dev->qpidr, ptr, id, id + 1, GFP_ATOMIC);
++
++	spin_unlock_irq(&dev->idr_lock);
++	idr_preload_end();
++
++	return rc < 0 ? rc : 0;
++}
++
++static void qedr_idr_remove(struct qedr_dev *dev, u32 id)
++{
++	if (!rdma_protocol_iwarp(&dev->ibdev, 1))
++		return;
++
++	spin_lock_irq(&dev->idr_lock);
++	idr_remove(&dev->qpidr, id);
++	spin_unlock_irq(&dev->idr_lock);
++}
+ static void qedr_cleanup_user(struct qedr_dev *dev, struct qedr_qp *qp)
+ {
+ 	if (qp->usq.umem)
+@@ -1703,6 +1731,10 @@ struct ib_qp *qedr_create_qp(struct ib_p
+ 
+ 	qp->ibqp.qp_num = qp->qp_id;
+ 
++	rc = qedr_idr_add(dev, qp, qp->qp_id);
++	if (rc)
++		goto err;
++
+ 	return &qp->ibqp;
+ 
+ err:
+@@ -2235,8 +2267,10 @@ int qedr_destroy_qp(struct ib_qp *ibqp)
+ 
+ 	qedr_free_qp_resources(dev, qp);
+ 
+-	kfree(qp);
+-
++	if (atomic_dec_and_test(&qp->refcnt)) {
++		qedr_idr_remove(dev, qp->qp_id);
++		kfree(qp);
++	}
+ 	return rc;
+ }
+ 
