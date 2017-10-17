@@ -1,0 +1,165 @@
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 21 Sep 2017 09:15:46 -0700
+Subject: net: prevent dst uses after free
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v4.14-rc2
+Git-commit: 222d7dbd258dad4cd5241c43ef818141fad5a87a
+References: bsc#1061739
+
+In linux-4.13, Wei worked hard to convert dst to a traditional
+refcounted model, removing GC.
+
+We now want to make sure a dst refcount can not transition from 0 back
+to 1.
+
+The problem here is that input path attached a not refcounted dst to an
+skb. Then later, because packet is forwarded and hits skb_dst_force()
+before exiting RCU section, we might try to take a refcount on one dst
+that is about to be freed, if another cpu saw 1 -> 0 transition in
+dst_release() and queued the dst for freeing after one RCU grace period.
+
+Lets unify skb_dst_force() and skb_dst_force_safe(), since we should
+always perform the complete check against dst refcount, and not assume
+it is not zero.
+
+Bugzilla : https://bugzilla.kernel.org/show_bug.cgi?id=197005
+
+[  989.919496]  skb_dst_force+0x32/0x34
+[  989.919498]  __dev_queue_xmit+0x1ad/0x482
+[  989.919501]  ? eth_header+0x28/0xc6
+[  989.919502]  dev_queue_xmit+0xb/0xd
+[  989.919504]  neigh_connected_output+0x9b/0xb4
+[  989.919507]  ip_finish_output2+0x234/0x294
+[  989.919509]  ? ipt_do_table+0x369/0x388
+[  989.919510]  ip_finish_output+0x12c/0x13f
+[  989.919512]  ip_output+0x53/0x87
+[  989.919513]  ip_forward_finish+0x53/0x5a
+[  989.919515]  ip_forward+0x2cb/0x3e6
+[  989.919516]  ? pskb_trim_rcsum.part.9+0x4b/0x4b
+[  989.919518]  ip_rcv_finish+0x2e2/0x321
+[  989.919519]  ip_rcv+0x26f/0x2eb
+[  989.919522]  ? vlan_do_receive+0x4f/0x289
+[  989.919523]  __netif_receive_skb_core+0x467/0x50b
+[  989.919526]  ? tcp_gro_receive+0x239/0x239
+[  989.919529]  ? inet_gro_receive+0x226/0x238
+[  989.919530]  __netif_receive_skb+0x4d/0x5f
+[  989.919532]  netif_receive_skb_internal+0x5c/0xaf
+[  989.919533]  napi_gro_receive+0x45/0x81
+[  989.919536]  ixgbe_poll+0xc8a/0xf09
+[  989.919539]  ? kmem_cache_free_bulk+0x1b6/0x1f7
+[  989.919540]  net_rx_action+0xf4/0x266
+[  989.919543]  __do_softirq+0xa8/0x19d
+[  989.919545]  irq_exit+0x5d/0x6b
+[  989.919546]  do_IRQ+0x9c/0xb5
+[  989.919548]  common_interrupt+0x93/0x93
+[  989.919548]  </IRQ>
+
+Similarly dst_clone() can use dst_hold() helper to have additional
+debugging, as a follow up to commit 44ebe79149ff ("net: add debug
+atomic_inc_not_zero() in dst_hold()")
+
+In net-next we will convert dst atomic_t to refcount_t for peace of
+mind.
+
+Fixes: a4c2fd7f7891 ("net: remove DST_NOCACHE flag")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Wei Wang <weiwan@google.com>
+Reported-by: Paweł Staszewski <pstaszewski@itcare.pl>
+Bisected-by: Paweł Staszewski <pstaszewski@itcare.pl>
+Acked-by: Wei Wang <weiwan@google.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ include/net/dst.h   | 22 ++++------------------
+ include/net/route.h |  2 +-
+ include/net/sock.h  |  2 +-
+ 3 files changed, 6 insertions(+), 20 deletions(-)
+
+diff --git a/include/net/dst.h b/include/net/dst.h
+index fdb5cb225f6d..ecad9582bd75 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -270,7 +270,7 @@ static inline void dst_use_noref(struct dst_entry *dst, unsigned long time)
+ static inline struct dst_entry *dst_clone(struct dst_entry *dst)
+ {
+ 	if (dst)
+-		atomic_inc(&dst->__refcnt);
++		dst_hold(dst);
+ 	return dst;
+ }
+ 
+@@ -310,21 +310,6 @@ static inline void skb_dst_copy(struct sk_buff *nskb, const struct sk_buff *oskb
+ 	__skb_dst_copy(nskb, oskb->_skb_refdst);
+ }
+ 
+-/**
+- * skb_dst_force - makes sure skb dst is refcounted
+- * @skb: buffer
+- *
+- * If dst is not yet refcounted, let's do it
+- */
+-static inline void skb_dst_force(struct sk_buff *skb)
+-{
+-	if (skb_dst_is_noref(skb)) {
+-		WARN_ON(!rcu_read_lock_held());
+-		skb->_skb_refdst &= ~SKB_DST_NOREF;
+-		dst_clone(skb_dst(skb));
+-	}
+-}
+-
+ /**
+  * dst_hold_safe - Take a reference on a dst if possible
+  * @dst: pointer to dst entry
+@@ -338,16 +323,17 @@ static inline bool dst_hold_safe(struct dst_entry *dst)
+ }
+ 
+ /**
+- * skb_dst_force_safe - makes sure skb dst is refcounted
++ * skb_dst_force - makes sure skb dst is refcounted
+  * @skb: buffer
+  *
+  * If dst is not yet refcounted and not destroyed, grab a ref on it.
+  */
+-static inline void skb_dst_force_safe(struct sk_buff *skb)
++static inline void skb_dst_force(struct sk_buff *skb)
+ {
+ 	if (skb_dst_is_noref(skb)) {
+ 		struct dst_entry *dst = skb_dst(skb);
+ 
++		WARN_ON(!rcu_read_lock_held());
+ 		if (!dst_hold_safe(dst))
+ 			dst = NULL;
+ 
+diff --git a/include/net/route.h b/include/net/route.h
+index 374a3140a61f..b4ce75e0cb6f 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -184,7 +184,7 @@ static inline int ip_route_input(struct sk_buff *skb, __be32 dst, __be32 src,
+ 	rcu_read_lock();
+ 	err = ip_route_input_noref(skb, dst, src, tos, devin);
+ 	if (!err) {
+-		skb_dst_force_safe(skb);
++		skb_dst_force(skb);
+ 		if (!skb_dst(skb))
+ 			err = -EINVAL;
+ 	}
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 8976fc0e9f08..cbc6d96ea4c9 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -853,7 +853,7 @@ void sk_stream_write_space(struct sock *sk);
+ static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
+ {
+ 	/* dont let skb dst not refcounted, we are going to leave rcu lock */
+-	skb_dst_force_safe(skb);
++	skb_dst_force(skb);
+ 
+ 	if (!sk->sk_backlog.tail)
+ 		sk->sk_backlog.head = skb;
+-- 
+2.14.2
+
