@@ -1,0 +1,118 @@
+From: Quinn Tran <quinn.tran@qlogic.com>
+Date: Wed, 30 Aug 2017 10:16:49 -0700
+Subject: scsi: qla2xxx: Fix slow mem alloc behind lock
+Patch-mainline: v4.14-rc1
+Git-commit: b5d1531260b9e5819edcaed8b549859e582e4ca4
+References: FATE#322910
+
+Call Trace:
+ [<ffffffff81341687>] dump_stack+0x6b/0xa4
+ [<ffffffff810c3e30>] ? print_irqtrace_events+0xd0/0xe0
+ [<ffffffff8109e3c3>] ___might_sleep+0x183/0x240
+ [<ffffffff8109e4d2>] __might_sleep+0x52/0x90
+ [<ffffffff811fe17b>] kmem_cache_alloc_trace+0x5b/0x300
+ [<ffffffff810c666b>] ? __lock_acquired+0x30b/0x420
+ [<ffffffffa0733c28>] qla2x00_alloc_fcport+0x38/0x2a0 [qla2xxx]
+ [<ffffffffa07217f4>] ? qla2x00_do_work+0x34/0x2b0 [qla2xxx]
+ [<ffffffff816cc82b>] ? _raw_spin_lock_irqsave+0x7b/0x90
+ [<ffffffffa072169a>] ? qla24xx_create_new_sess+0x3a/0x160 [qla2xxx]
+ [<ffffffffa0721723>] qla24xx_create_new_sess+0xc3/0x160 [qla2xxx]
+ [<ffffffff810c91ed>] ? trace_hardirqs_on+0xd/0x10
+ [<ffffffffa07218f8>] qla2x00_do_work+0x138/0x2b0 [qla2xxx]
+
+Signed-off-by: Quinn Tran <quinn.tran@qlogic.com>
+Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/scsi/qla2xxx/qla_gbl.h    |    1 +
+ drivers/scsi/qla2xxx/qla_os.c     |   33 ++++++++++++++++++++++++++++++++-
+ drivers/scsi/qla2xxx/qla_target.c |    2 +-
+ 3 files changed, 34 insertions(+), 2 deletions(-)
+
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -113,6 +113,7 @@ int qla24xx_post_gpdb_work(struct scsi_q
+ extern char qla2x00_version_str[];
+ 
+ extern struct kmem_cache *srb_cachep;
++extern struct kmem_cache *qla_tgt_plogi_cachep;
+ 
+ extern int ql2xlogintimeout;
+ extern int qlport_down_retry;
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -4677,9 +4677,10 @@ static
+ void qla24xx_create_new_sess(struct scsi_qla_host *vha, struct qla_work_evt *e)
+ {
+ 	unsigned long flags;
+-	fc_port_t *fcport =  NULL;
++	fc_port_t *fcport =  NULL, *tfcp;
+ 	struct qlt_plogi_ack_t *pla =
+ 	    (struct qlt_plogi_ack_t *)e->u.new_sess.pla;
++	uint8_t free_fcport = 0;
+ 
+ 	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+ 	fcport = qla2x00_find_fcport_by_wwpn(vha, e->u.new_sess.port_name, 1);
+@@ -4694,6 +4695,7 @@ void qla24xx_create_new_sess(struct scsi
+ 			pla->ref_count--;
+ 		}
+ 	} else {
++		spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+ 		fcport = qla2x00_alloc_fcport(vha, GFP_KERNEL);
+ 		if (fcport) {
+ 			fcport->d_id = e->u.new_sess.id;
+@@ -4703,6 +4705,29 @@ void qla24xx_create_new_sess(struct scsi
+ 
+ 			memcpy(fcport->port_name, e->u.new_sess.port_name,
+ 			    WWN_SIZE);
++		} else {
++			ql_dbg(ql_dbg_disc, vha, 0xffff,
++				   "%s %8phC mem alloc fail.\n",
++				   __func__, e->u.new_sess.port_name);
++
++			if (pla)
++				kmem_cache_free(qla_tgt_plogi_cachep, pla);
++			return;
++		}
++
++		spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
++		/* search again to make sure one else got ahead */
++		tfcp = qla2x00_find_fcport_by_wwpn(vha,
++		    e->u.new_sess.port_name, 1);
++		if (tfcp) {
++			/* should rarily happen */
++			ql_dbg(ql_dbg_disc, vha, 0xffff,
++			    "%s %8phC found existing fcport b4 add. DS %d LS %d\n",
++			    __func__, tfcp->port_name, tfcp->disc_state,
++			    tfcp->fw_login_state);
++
++			free_fcport = 1;
++		} else {
+ 			list_add_tail(&fcport->list, &vha->vp_fcports);
+ 
+ 			if (pla) {
+@@ -4720,6 +4745,12 @@ void qla24xx_create_new_sess(struct scsi
+ 		else
+ 			qla24xx_async_gnl(vha, fcport);
+ 	}
++
++	if (free_fcport) {
++		qla2x00_free_fcport(fcport);
++		if (pla)
++			kmem_cache_free(qla_tgt_plogi_cachep, pla);
++	}
+ }
+ 
+ void
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -145,7 +145,7 @@ static void qlt_send_busy(struct qla_qpa
+  * Global Variables
+  */
+ static struct kmem_cache *qla_tgt_mgmt_cmd_cachep;
+-static struct kmem_cache *qla_tgt_plogi_cachep;
++struct kmem_cache *qla_tgt_plogi_cachep;
+ static mempool_t *qla_tgt_mgmt_cmd_mempool;
+ static struct workqueue_struct *qla_tgt_wq;
+ static DEFINE_MUTEX(qla_tgt_mutex);
