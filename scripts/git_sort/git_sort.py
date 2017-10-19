@@ -118,6 +118,7 @@ remotes = (
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git")),
     Head(RepoURL("mkp/scsi.git")),
+    Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("next/linux-next.git")),
 )
 
