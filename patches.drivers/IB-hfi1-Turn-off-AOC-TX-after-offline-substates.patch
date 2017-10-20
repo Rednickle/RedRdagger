@@ -1,0 +1,158 @@
+From: Sebastian Sanchez <sebastian.sanchez@intel.com>
+Date: Tue, 26 Sep 2017 06:05:57 -0700
+Subject: IB/hfi1: Turn off AOC TX after offline substates
+Patch-mainline: v4.14-rc3
+Git-commit: df5efdd97029f2cff7e5c91ea1c9f2b94d009b0f
+References: bsc#1060463 FATE#323043
+
+Offline.quietDuration was added in the 8051 firmware, and the driver
+only turns off the AOC transmitters when offline.quiet is reached.
+However, the AOC transmitters need to be turned off at the new state.
+Therefore, turn off the AOC transmitters at any offline substates
+including offline.quiet and offline.quietDuration, then recheck we
+reached offline.quiet to support backwards compatibility.
+
+Reviewed-by: Jakub Byczkowski <jakub.byczkowski@intel.com>
+Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Signed-off-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hfi1/chip.c |   85 ++++++++++++++++++++++++++++----------
+ drivers/infiniband/hw/hfi1/chip.h |    1 
+ 2 files changed, 65 insertions(+), 21 deletions(-)
+
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -1066,6 +1066,8 @@ static int read_idle_sma(struct hfi1_dev
+ static int thermal_init(struct hfi1_devdata *dd);
+ 
+ static void update_statusp(struct hfi1_pportdata *ppd, u32 state);
++static int wait_phys_link_offline_substates(struct hfi1_pportdata *ppd,
++					    int msecs);
+ static int wait_logical_linkstate(struct hfi1_pportdata *ppd, u32 state,
+ 				  int msecs);
+ static void log_state_transition(struct hfi1_pportdata *ppd, u32 state);
+@@ -10305,6 +10307,7 @@ static int goto_offline(struct hfi1_ppor
+ {
+ 	struct hfi1_devdata *dd = ppd->dd;
+ 	u32 previous_state;
++	int offline_state_ret;
+ 	int ret;
+ 
+ 	update_lcb_cache(dd);
+@@ -10326,28 +10329,11 @@ static int goto_offline(struct hfi1_ppor
+ 		ppd->offline_disabled_reason =
+ 		HFI1_ODR_MASK(OPA_LINKDOWN_REASON_TRANSIENT);
+ 
+-	/*
+-	 * Wait for offline transition. It can take a while for
+-	 * the link to go down.
+-	 */
+-	ret = wait_physical_linkstate(ppd, PLS_OFFLINE, 10000);
+-	if (ret < 0)
+-		return ret;
+-
+-	/*
+-	 * Now in charge of LCB - must be after the physical state is
+-	 * offline.quiet and before host_link_state is changed.
+-	 */
+-	set_host_lcb_access(dd);
+-	write_csr(dd, DC_LCB_ERR_EN, ~0ull); /* watch LCB errors */
+-
+-	/* make sure the logical state is also down */
+-	ret = wait_logical_linkstate(ppd, IB_PORT_DOWN, 1000);
+-	if (ret)
+-		force_logical_link_state_down(ppd);
+-
+-	ppd->host_link_state = HLS_LINK_COOLDOWN; /* LCB access allowed */
++	offline_state_ret = wait_phys_link_offline_substates(ppd, 10000);
++	if (offline_state_ret < 0)
++		return offline_state_ret;
+ 
++	/* Disabling AOC transmitters */
+ 	if (ppd->port_type == PORT_TYPE_QSFP &&
+ 	    ppd->qsfp_info.limiting_active &&
+ 	    qsfp_mod_present(ppd)) {
+@@ -10365,6 +10351,30 @@ static int goto_offline(struct hfi1_ppor
+ 	}
+ 
+ 	/*
++	 * Wait for the offline.Quiet transition if it hasn't happened yet. It
++	 * can take a while for the link to go down.
++	 */
++	if (offline_state_ret != PLS_OFFLINE_QUIET) {
++		ret = wait_physical_linkstate(ppd, PLS_OFFLINE, 30000);
++		if (ret < 0)
++			return ret;
++	}
++
++	/*
++	 * Now in charge of LCB - must be after the physical state is
++	 * offline.quiet and before host_link_state is changed.
++	 */
++	set_host_lcb_access(dd);
++	write_csr(dd, DC_LCB_ERR_EN, ~0ull); /* watch LCB errors */
++
++	/* make sure the logical state is also down */
++	ret = wait_logical_linkstate(ppd, IB_PORT_DOWN, 1000);
++	if (ret)
++		force_logical_link_state_down(ppd);
++
++	ppd->host_link_state = HLS_LINK_COOLDOWN; /* LCB access allowed */
++
++	/*
+ 	 * The LNI has a mandatory wait time after the physical state
+ 	 * moves to Offline.Quiet.  The wait time may be different
+ 	 * depending on how the link went down.  The 8051 firmware
+@@ -12804,6 +12814,39 @@ static int wait_physical_linkstate(struc
+ 	return 0;
+ }
+ 
++/*
++ * wait_phys_link_offline_quiet_substates - wait for any offline substate
++ * @ppd: port device
++ * @msecs: the number of milliseconds to wait
++ *
++ * Wait up to msecs milliseconds for any offline physical link
++ * state change to occur.
++ * Returns 0 if at least one state is reached, otherwise -ETIMEDOUT.
++ */
++static int wait_phys_link_offline_substates(struct hfi1_pportdata *ppd,
++					    int msecs)
++{
++	u32 read_state;
++	unsigned long timeout;
++
++	timeout = jiffies + msecs_to_jiffies(msecs);
++	while (1) {
++		read_state = read_physical_state(ppd->dd);
++		if ((read_state & 0xF0) == PLS_OFFLINE)
++			break;
++		if (time_after(jiffies, timeout)) {
++			dd_dev_err(ppd->dd,
++				   "timeout waiting for phy link offline.quiet substates. Read state 0x%x, %dms\n",
++				   read_state, msecs);
++			return -ETIMEDOUT;
++		}
++		usleep_range(1950, 2050); /* sleep 2ms-ish */
++	}
++
++	log_state_transition(ppd, read_state);
++	return read_state;
++}
++
+ #define CLEAR_STATIC_RATE_CONTROL_SMASK(r) \
+ (r &= ~SEND_CTXT_CHECK_ENABLE_DISALLOW_PBC_STATIC_RATE_CONTROL_SMASK)
+ 
+--- a/drivers/infiniband/hw/hfi1/chip.h
++++ b/drivers/infiniband/hw/hfi1/chip.h
+@@ -204,6 +204,7 @@
+ #define PLS_OFFLINE_READY_TO_QUIET_LT	   0x92
+ #define PLS_OFFLINE_REPORT_FAILURE		   0x93
+ #define PLS_OFFLINE_READY_TO_QUIET_BCC	   0x94
++#define PLS_OFFLINE_QUIET_DURATION	   0x95
+ #define PLS_POLLING				   0x20
+ #define PLS_POLLING_QUIET			   0x20
+ #define PLS_POLLING_ACTIVE			   0x21
