@@ -120,6 +120,7 @@ remotes = (
     Head(RepoURL("mkp/scsi.git")),
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("next/linux-next.git")),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
 )
 
 
