@@ -1,0 +1,388 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390/mm: tag normal pages vs pages used in page tables
+Patch-mainline: v4.14-rc1
+Git-commit: c9b5ad546e7d486465a3dd8c89245ac3707a4384
+References: FATE#321512, bsc#1061009
+
+Summary:     kernel: guest TLB purge enhancements
+Description: Add support for the KVM guest TLB purge enhancements
+             introduced with IBM z14.
+
+Upstream-Description:
+
+             s390/mm: tag normal pages vs pages used in page tables
+
+             The ESSA instruction has a new option that allows to tag pages that
+             are not used as a page table. Without the tag the hypervisor has to
+             assume that any guest page could be used in a page table inside the
+             guest. This forces the hypervisor to flush all guest TLB entries
+             whenever a host page table entry is invalidated. With the tag
+             the host can skip the TLB flush if the page is tagged as normal page.
+
+             Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ arch/s390/include/asm/page-states.h |    1 
+ arch/s390/include/asm/page.h        |    3 
+ arch/s390/include/asm/setup.h       |    3 
+ arch/s390/kernel/suspend.c          |   22 +++-
+ arch/s390/kernel/vdso.c             |    2 
+ arch/s390/mm/init.c                 |    2 
+ arch/s390/mm/page-states.c          |  173 ++++++++++++++++++++++++++++++++----
+ arch/s390/mm/pgalloc.c              |    2 
+ 8 files changed, 188 insertions(+), 20 deletions(-)
+
+--- a/arch/s390/include/asm/page-states.h
++++ b/arch/s390/include/asm/page-states.h
+@@ -13,6 +13,7 @@
+ #define ESSA_SET_POT_VOLATILE		4
+ #define ESSA_SET_STABLE_RESIDENT	5
+ #define ESSA_SET_STABLE_IF_RESIDENT	6
++#define ESSA_SET_STABLE_NODAT		7
+ 
+ #define ESSA_MAX	ESSA_SET_STABLE_IF_RESIDENT
+ 
+--- a/arch/s390/include/asm/page.h
++++ b/arch/s390/include/asm/page.h
+@@ -130,6 +130,9 @@ static inline int page_reset_referenced(
+ struct page;
+ void arch_free_page(struct page *page, int order);
+ void arch_alloc_page(struct page *page, int order);
++void arch_set_page_dat(struct page *page, int order);
++void arch_set_page_nodat(struct page *page, int order);
++int arch_test_page_nodat(struct page *page);
+ void arch_set_page_states(int make_stable);
+ 
+ static inline int devmem_is_allowed(unsigned long pfn)
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -106,7 +106,8 @@ extern void pfault_fini(void);
+ 
+ void report_user_fault(struct pt_regs *regs, long signr, int is_mm_fault);
+ 
+-extern void cmma_init(void);
++void cmma_init(void);
++void cmma_init_nodat(void);
+ 
+ extern void (*_machine_restart)(char *command);
+ extern void (*_machine_halt)(void);
+--- a/arch/s390/kernel/suspend.c
++++ b/arch/s390/kernel/suspend.c
+@@ -98,10 +98,16 @@ int page_key_alloc(unsigned long pages)
+  */
+ void page_key_read(unsigned long *pfn)
+ {
++	struct page *page;
+ 	unsigned long addr;
++	unsigned char key;
+ 
+-	addr = (unsigned long) page_address(pfn_to_page(*pfn));
+-	*(unsigned char *) pfn = (unsigned char) page_get_storage_key(addr);
++	page = pfn_to_page(*pfn);
++	addr = (unsigned long) page_address(page);
++	key = (unsigned char) page_get_storage_key(addr) & 0x7f;
++	if (arch_test_page_nodat(page))
++		key |= 0x80;
++	*(unsigned char *) pfn = key;
+ }
+ 
+ /*
+@@ -126,8 +132,16 @@ void page_key_memorize(unsigned long *pf
+  */
+ void page_key_write(void *address)
+ {
+-	page_set_storage_key((unsigned long) address,
+-			     page_key_rp->data[page_key_rx], 0);
++	struct page *page;
++	unsigned char key;
++
++	key = page_key_rp->data[page_key_rx];
++	page_set_storage_key((unsigned long) address, key & 0x7f, 0);
++	page = virt_to_page(address);
++	if (key & 0x80)
++		arch_set_page_nodat(page, 0);
++	else
++		arch_set_page_dat(page, 0);
+ 	if (++page_key_rx >= PAGE_KEY_DATA_SIZE)
+ 		return;
+ 	page_key_rp = page_key_rp->next;
+--- a/arch/s390/kernel/vdso.c
++++ b/arch/s390/kernel/vdso.c
+@@ -107,6 +107,8 @@ int vdso_alloc_per_cpu(struct lowcore *l
+ 	page_frame = get_zeroed_page(GFP_KERNEL);
+ 	if (!segment_table || !page_table || !page_frame)
+ 		goto out;
++	arch_set_page_dat(virt_to_page(segment_table), SEGMENT_ORDER);
++	arch_set_page_dat(virt_to_page(page_table), 0);
+ 
+ 	/* Initialize per-cpu vdso data page */
+ 	vd = (struct vdso_per_cpu_data *) page_frame;
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@ -133,6 +133,8 @@ void __init mem_init(void)
+ 	free_all_bootmem();
+ 	setup_zero_pages();	/* Setup zeroed pages. */
+ 
++	cmma_init_nodat();
++
+ 	mem_init_print_info(NULL);
+ }
+ 
+--- a/arch/s390/mm/page-states.c
++++ b/arch/s390/mm/page-states.c
+@@ -10,9 +10,10 @@
+ #include <linux/errno.h>
+ #include <linux/types.h>
+ #include <linux/mm.h>
++#include <linux/memblock.h>
+ #include <linux/gfp.h>
+ #include <linux/init.h>
+-
++#include <asm/facility.h>
+ #include <asm/page-states.h>
+ 
+ static int cmma_flag = 1;
+@@ -36,14 +37,16 @@ __setup("cmma=", cmma);
+ static inline int cmma_test_essa(void)
+ {
+ 	register unsigned long tmp asm("0") = 0;
+-	register int rc asm("1") = -EOPNOTSUPP;
++	register int rc asm("1");
+ 
++	/* test ESSA_GET_STATE */
+ 	asm volatile(
+-		"       .insn rrf,0xb9ab0000,%1,%1,0,0\n"
++		"	.insn	rrf,0xb9ab0000,%1,%1,%2,0\n"
+ 		"0:     la      %0,0\n"
+ 		"1:\n"
+ 		EX_TABLE(0b,1b)
+-		: "+&d" (rc), "+&d" (tmp));
++		: "=&d" (rc), "+&d" (tmp)
++		: "i" (ESSA_GET_STATE), "0" (-EOPNOTSUPP));
+ 	return rc;
+ }
+ 
+@@ -51,11 +54,26 @@ void __init cmma_init(void)
+ {
+ 	if (!cmma_flag)
+ 		return;
+-	if (cmma_test_essa())
++	if (cmma_test_essa()) {
+ 		cmma_flag = 0;
++		return;
++	}
++	if (test_facility(147))
++		cmma_flag = 2;
++}
++
++static inline unsigned char get_page_state(struct page *page)
++{
++	unsigned char state;
++
++	asm volatile("	.insn	rrf,0xb9ab0000,%0,%1,%2,0"
++		     : "=&d" (state)
++		     : "a" (page_to_phys(page)),
++		       "i" (ESSA_GET_STATE));
++	return state & 0x3f;
+ }
+ 
+-static inline void set_page_unstable(struct page *page, int order)
++static inline void set_page_unused(struct page *page, int order)
+ {
+ 	int i, rc;
+ 
+@@ -66,14 +84,18 @@ static inline void set_page_unstable(str
+ 			       "i" (ESSA_SET_UNUSED));
+ }
+ 
+-void arch_free_page(struct page *page, int order)
++static inline void set_page_stable_dat(struct page *page, int order)
+ {
+-	if (!cmma_flag)
+-		return;
+-	set_page_unstable(page, order);
++	int i, rc;
++
++	for (i = 0; i < (1 << order); i++)
++		asm volatile(".insn rrf,0xb9ab0000,%0,%1,%2,0"
++			     : "=&d" (rc)
++			     : "a" (page_to_phys(page + i)),
++			       "i" (ESSA_SET_STABLE));
+ }
+ 
+-static inline void set_page_stable(struct page *page, int order)
++static inline void set_page_stable_nodat(struct page *page, int order)
+ {
+ 	int i, rc;
+ 
+@@ -81,14 +103,135 @@ static inline void set_page_stable(struc
+ 		asm volatile(".insn rrf,0xb9ab0000,%0,%1,%2,0"
+ 			     : "=&d" (rc)
+ 			     : "a" (page_to_phys(page + i)),
+-			       "i" (ESSA_SET_STABLE));
++			       "i" (ESSA_SET_STABLE_NODAT));
++}
++
++static void mark_kernel_pmd(pud_t *pud, unsigned long addr, unsigned long end)
++{
++	unsigned long next;
++	struct page *page;
++	pmd_t *pmd;
++
++	pmd = pmd_offset(pud, addr);
++	do {
++		next = pmd_addr_end(addr, end);
++		if (pmd_none(*pmd) || pmd_large(*pmd))
++			continue;
++		page = virt_to_page(pmd_val(*pmd));
++		set_bit(PG_arch_1, &page->flags);
++	} while (pmd++, addr = next, addr != end);
++}
++
++static void mark_kernel_pud(p4d_t *p4d, unsigned long addr, unsigned long end)
++{
++	unsigned long next;
++	struct page *page;
++	pud_t *pud;
++	int i;
++
++	pud = pud_offset(p4d, addr);
++	do {
++		next = pud_addr_end(addr, end);
++		if (pud_none(*pud) || pud_large(*pud))
++			continue;
++		if ((pud_val(*pud) & _REGION_ENTRY_TYPE_MASK) >=
++		    _REGION_ENTRY_TYPE_R3) {
++			page = virt_to_page(pud_val(*pud));
++			for (i = 0; i < 3; i++)
++				set_bit(PG_arch_1, &page[i].flags);
++		}
++		mark_kernel_pmd(pud, addr, next);
++	} while (pud++, addr = next, addr != end);
++}
++
++static void mark_kernel_pgd(void)
++{
++	unsigned long addr, next;
++	struct page *page;
++	pgd_t *pgd;
++	int i;
++
++	addr = 0;
++	pgd = pgd_offset_k(addr);
++	do {
++		next = pgd_addr_end(addr, MODULES_END);
++		if (pgd_none(*pgd))
++			continue;
++		if ((pgd_val(*pgd) & _REGION_ENTRY_TYPE_MASK) >=
++		    _REGION_ENTRY_TYPE_R2) {
++			page = virt_to_page(pgd_val(*pgd));
++			for (i = 0; i < 3; i++)
++				set_bit(PG_arch_1, &page[i].flags);
++		}
++		mark_kernel_pud(pgd, addr, next);
++	} while (pgd++, addr = next, addr != MODULES_END);
++}
++
++void __init cmma_init_nodat(void)
++{
++	struct memblock_region *reg;
++	struct page *page;
++	unsigned long start, end, ix;
++
++	if (cmma_flag < 2)
++		return;
++	/* Mark pages used in kernel page tables */
++	mark_kernel_pgd();
++
++	/* Set all kernel pages not used for page tables to stable/no-dat */
++	for_each_memblock(memory, reg) {
++		start = memblock_region_memory_base_pfn(reg);
++		end = memblock_region_memory_end_pfn(reg);
++		page = pfn_to_page(start);
++		for (ix = start; ix < end; ix++, page++) {
++			if (__test_and_clear_bit(PG_arch_1, &page->flags))
++				continue;	/* skip page table pages */
++			if (!list_empty(&page->lru))
++				continue;	/* skip free pages */
++			set_page_stable_nodat(page, 0);
++		}
++	}
++}
++
++void arch_free_page(struct page *page, int order)
++{
++	if (!cmma_flag)
++		return;
++	set_page_unused(page, order);
+ }
+ 
+ void arch_alloc_page(struct page *page, int order)
+ {
+ 	if (!cmma_flag)
+ 		return;
+-	set_page_stable(page, order);
++	if (cmma_flag < 2)
++		set_page_stable_dat(page, order);
++	else
++		set_page_stable_nodat(page, order);
++}
++
++void arch_set_page_dat(struct page *page, int order)
++{
++	if (!cmma_flag)
++		return;
++	set_page_stable_dat(page, order);
++}
++
++void arch_set_page_nodat(struct page *page, int order)
++{
++	if (cmma_flag < 2)
++		return;
++	set_page_stable_nodat(page, order);
++}
++
++int arch_test_page_nodat(struct page *page)
++{
++	unsigned char state;
++
++	if (cmma_flag < 2)
++		return 0;
++	state = get_page_state(page);
++	return !!(state & 0x20);
+ }
+ 
+ void arch_set_page_states(int make_stable)
+@@ -108,9 +251,9 @@ void arch_set_page_states(int make_stabl
+ 			list_for_each(l, &zone->free_area[order].free_list[t]) {
+ 				page = list_entry(l, struct page, lru);
+ 				if (make_stable)
+-					set_page_stable(page, order);
++					set_page_stable_dat(page, 0);
+ 				else
+-					set_page_unstable(page, order);
++					set_page_unused(page, order);
+ 			}
+ 		}
+ 		spin_unlock_irqrestore(&zone->lock, flags);
+--- a/arch/s390/mm/pgalloc.c
++++ b/arch/s390/mm/pgalloc.c
+@@ -57,6 +57,7 @@ unsigned long *crst_table_alloc(struct m
+ 
+ 	if (!page)
+ 		return NULL;
++	arch_set_page_dat(page, 2);
+ 	return (unsigned long *) page_to_phys(page);
+ }
+ 
+@@ -197,6 +198,7 @@ unsigned long *page_table_alloc(struct m
+ 		__free_page(page);
+ 		return NULL;
+ 	}
++	arch_set_page_dat(page, 0);
+ 	/* Initialize page table */
+ 	table = (unsigned long *) page_to_phys(page);
+ 	if (mm_alloc_pgste(mm)) {
