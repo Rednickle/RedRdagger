@@ -141,6 +141,9 @@ class Head(object):
 # up from repositories at the end of the list to repositories higher up. For
 # example, network commits usually follow "net-next" -> "net" -> "linux.git".
 #
+# linux-next is not a good reference because it gets rebased. If a commit is in
+# linux-next, it comes from some other tree. Please tag the patch accordingly.
+#
 # Head(RepoURL(remote url), remote branch name)[]
 # Note that "remote url" can be abbreviated if it starts with one of the usual
 # kernel.org prefixes and "remote branch name" can be omitted if it is "master".
@@ -156,9 +159,12 @@ remotes = (
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
-    Head(RepoURL("next/linux-next.git")),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
+    Head(RepoURL("s390/linux.git"), "for-linus"),
+    Head(RepoURL("tj/libata.git"), "for-next"),
+    Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
+    Head(RepoURL("gregkh/tty.git"), "tty-next"),
 )
 
 
