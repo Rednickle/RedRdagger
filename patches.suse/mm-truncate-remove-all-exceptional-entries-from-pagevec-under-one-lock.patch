@@ -5,18 +5,19 @@ Subject: [PATCH] mm, truncate: remove all exceptional entries from pagevec
  under one lock
 
 References: bsc#1060256
-Patch-mainline: not yet, accepted to mm tree
+Patch-mainline: v4.15
+Git-commit: f2187599189d94aeeee2fa5d9806186c7732ed37
 
 During truncate each entry in a pagevec is checked to see if it is an
 exceptional entry and if so, the shadow entry is cleaned up.  This is
-potentially expensive as multiple entries for a mapping locks/unlocks the
-tree lock.  This batches the operation such that any exceptional entries
-removed from a pagevec only acquire the mapping tree lock once.  The
-corner case where this is more expensive is where there is only one
-exceptional entry but this is unlikely due to temporal locality and how it
-affects LRU ordering.  Note that for truncations of small files created
-recently, this patch should show no gain because it only batches the
-handling of exceptional entries.
+potentially expensive as multiple entries for a mapping locks/unlocks
+the tree lock.  This batches the operation such that any exceptional
+entries removed from a pagevec only acquire the mapping tree lock once.
+The corner case where this is more expensive is where there is only one
+exceptional entry but this is unlikely due to temporal locality and how
+it affects LRU ordering.  Note that for truncations of small files
+created recently, this patch should show no gain because it only batches
+the handling of exceptional entries.
 
 sparsetruncate (large)
                               4.14.0-rc4             4.14.0-rc4
@@ -46,11 +47,15 @@ Hmean     RandCreate ops        71.92 (   0.00%)       76.95 (   7.00%)
 Hmean     RandCreate read       44.44 (   0.00%)       49.23 (  10.78%)
 Hmean     RandCreate del     24948.62 (   0.00%)    24764.97 (  -0.74%)
 
-Truncation of a large number of files shows a substantial gain with 99% of
-files being truncated 6.46% faster.  bonnie shows a modest gain of 2.53%
+Truncation of a large number of files shows a substantial gain with 99%
+of files being truncated 6.46% faster.  bonnie shows a modest gain of
+2.53%
 
+[jack@suse.cz: fix truncate_exceptional_pvec_entries()]
+  Link: http://lkml.kernel.org/r/20171108164226.26788-1-jack@suse.cz
 Link: http://lkml.kernel.org/r/20171018075952.10627-4-mgorman@techsingularity.net
-Signed-off-by: Mel Gorman <mgorman@suse.de>
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Jan Kara <jack@suse.cz>
 Reviewed-by: Jan Kara <jack@suse.cz>
 Acked-by: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Andi Kleen <ak@linux.intel.com>
@@ -58,15 +63,13 @@ Cc: Dave Chinner <david@fromorbit.com>
 Cc: Dave Hansen <dave.hansen@intel.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
----
- mm/truncate.c | 86 ++++++++++++++++++++++++++++++++++++++++++-----------------
- 1 file changed, 61 insertions(+), 25 deletions(-)
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
 
 diff --git a/mm/truncate.c b/mm/truncate.c
-index 0f7c90855768..ba6ca3291685 100644
+index 02a0c0466c78..c30e8fa3d063 100644
 --- a/mm/truncate.c
 +++ b/mm/truncate.c
-@@ -25,44 +25,77 @@
+@@ -25,44 +25,85 @@
  #include <linux/rmap.h>
  #include "internal.h"
  
@@ -118,14 +121,11 @@ index 0f7c90855768..ba6ca3291685 100644
 -static void truncate_exceptional_entry(struct address_space *mapping,
 -				       pgoff_t index, void *entry)
 +static void truncate_exceptional_pvec_entries(struct address_space *mapping,
-+				struct pagevec *pvec, pgoff_t *indices, int ei)
++				struct pagevec *pvec, pgoff_t *indices,
++				pgoff_t end)
  {
 +	int i, j;
-+	bool dax;
-+
-+	/* Return immediately if caller indicates there are no entries */
-+	if (ei == PAGEVEC_SIZE)
-+		return;
++	bool dax, lock;
 +
  	/* Handled by shmem itself */
  	if (shmem_mapping(mapping))
@@ -133,12 +133,19 @@ index 0f7c90855768..ba6ca3291685 100644
  
 -	if (dax_mapping(mapping)) {
 -		dax_delete_mapping_entry(mapping, index);
--		return;
++	for (j = 0; j < pagevec_count(pvec); j++)
++		if (radix_tree_exceptional_entry(pvec->pages[j]))
++			break;
++
++	if (j == pagevec_count(pvec))
+ 		return;
++
 +	dax = dax_mapping(mapping);
-+	if (!dax)
++	lock = !dax && indices[j] < end;
++	if (lock)
 +		spin_lock_irq(&mapping->tree_lock);
 +
-+	for (i = ei, j = ei; i < pagevec_count(pvec); i++) {
++	for (i = j; i < pagevec_count(pvec); i++) {
 +		struct page *page = pvec->pages[i];
 +		pgoff_t index = indices[i];
 +
@@ -146,6 +153,9 @@ index 0f7c90855768..ba6ca3291685 100644
 +			pvec->pages[j++] = page;
 +			continue;
 +		}
++
++		if (index >= end)
++			continue;
 +
 +		if (unlikely(dax)) {
 +			dax_delete_mapping_entry(mapping, index);
@@ -156,37 +166,31 @@ index 0f7c90855768..ba6ca3291685 100644
  	}
 -	clear_shadow_entry(mapping, index, entry);
 +
-+	if (!dax)
++	if (lock)
 +		spin_unlock_irq(&mapping->tree_lock);
 +	pvec->nr = j;
  }
  
  /*
-@@ -300,6 +333,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
- 		 * in a new pagevec.
- 		 */
- 		struct pagevec locked_pvec;
-+		int ei = PAGEVEC_SIZE;
- 
- 		pagevec_init(&locked_pvec, 0);
- 		for (i = 0; i < pagevec_count(&pvec); i++) {
-@@ -311,8 +345,8 @@ void truncate_inode_pages_range(struct address_space *mapping,
+@@ -310,11 +351,8 @@ void truncate_inode_pages_range(struct address_space *mapping,
+ 			if (index >= end)
  				break;
  
- 			if (radix_tree_exceptional_entry(page)) {
+-			if (radix_tree_exceptional_entry(page)) {
 -				truncate_exceptional_entry(mapping, index,
 -							   page);
-+				if (ei == PAGEVEC_SIZE)
-+					ei = i;
++			if (radix_tree_exceptional_entry(page))
  				continue;
- 			}
+-			}
  
-@@ -334,12 +368,11 @@ void truncate_inode_pages_range(struct address_space *mapping,
+ 			if (!trylock_page(page))
+ 				continue;
+@@ -334,12 +372,11 @@ void truncate_inode_pages_range(struct address_space *mapping,
  		delete_from_page_cache_batch(mapping, &locked_pvec);
  		for (i = 0; i < pagevec_count(&locked_pvec); i++)
  			unlock_page(locked_pvec.pages[i]);
 -		pagevec_remove_exceptionals(&pvec);
-+		truncate_exceptional_pvec_entries(mapping, &pvec, indices, ei);
++		truncate_exceptional_pvec_entries(mapping, &pvec, indices, end);
  		pagevec_release(&pvec);
  		cond_resched();
  		index++;
@@ -195,16 +199,7 @@ index 0f7c90855768..ba6ca3291685 100644
  	if (partial_start) {
  		struct page *page = find_lock_page(mapping, start - 1);
  		if (page) {
-@@ -381,6 +414,8 @@ void truncate_inode_pages_range(struct address_space *mapping,
- 
- 	index = start;
- 	for ( ; ; ) {
-+		int ei = PAGEVEC_SIZE;
-+
- 		cond_resched();
- 		if (!pagevec_lookup_entries(&pvec, mapping, index,
- 			min(end - index, (pgoff_t)PAGEVEC_SIZE), indices)) {
-@@ -397,6 +432,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
+@@ -397,6 +434,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
  			pagevec_release(&pvec);
  			break;
  		}
@@ -212,23 +207,25 @@ index 0f7c90855768..ba6ca3291685 100644
  		for (i = 0; i < pagevec_count(&pvec); i++) {
  			struct page *page = pvec.pages[i];
  
-@@ -409,8 +445,8 @@ void truncate_inode_pages_range(struct address_space *mapping,
+@@ -408,11 +446,8 @@ void truncate_inode_pages_range(struct address_space *mapping,
+ 				break;
  			}
  
- 			if (radix_tree_exceptional_entry(page)) {
+-			if (radix_tree_exceptional_entry(page)) {
 -				truncate_exceptional_entry(mapping, index,
 -							   page);
-+				if (ei == PAGEVEC_SIZE)
-+					ei = i;
++			if (radix_tree_exceptional_entry(page))
  				continue;
- 			}
+-			}
  
-@@ -420,7 +456,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
+ 			lock_page(page);
+ 			WARN_ON(page_to_index(page) != index);
+@@ -420,7 +455,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
  			truncate_inode_page(mapping, page);
  			unlock_page(page);
  		}
 -		pagevec_remove_exceptionals(&pvec);
-+		truncate_exceptional_pvec_entries(mapping, &pvec, indices, ei);
++		truncate_exceptional_pvec_entries(mapping, &pvec, indices, end);
  		pagevec_release(&pvec);
  		index++;
  	}
