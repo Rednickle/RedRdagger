@@ -1,0 +1,189 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390/spinlock: add niai spinlock hints
+Patch-mainline: v4.14-rc1
+Git-commit: 7f7e6e28cd3285ce5d5a3d88b334eda428dd7d66
+References: FATE#322614,LTC#160173,bsc#1066354
+
+Summary:     kernel: add niai spinlock optimization
+Description: Exploit the semaphore-assist facility introduced with IBM z14
+             to improve the system behaviour in case of congested spinlocks.
+
+Upstream-Description:
+
+             s390/spinlock: add niai spinlock hints
+
+             The z14 machine introduces new mode of the next-instruction-access-intent
+             NIAI instruction. With NIAI-8 it is possible to pin a cache-line on a
+             CPU for a small amount of time, NIAI-7 releases the cache-line again.
+             Finally NIAI-4 can be used to prevent the CPU to speculatively access
+             memory beyond the compare-and-swap instruction to get the lock.
+
+             Use these instruction in the spinlock code.
+
+             Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ arch/s390/include/asm/spinlock.h |    9 ++--
+ arch/s390/lib/spinlock.c         |   87 ++++++++++++++++++++++-----------------
+ 2 files changed, 56 insertions(+), 40 deletions(-)
+
+--- a/arch/s390/include/asm/spinlock.h
++++ b/arch/s390/include/asm/spinlock.h
+@@ -92,10 +92,11 @@ static inline void arch_spin_unlock(arch
+ {
+ 	typecheck(int, lp->lock);
+ 	asm volatile(
+-		"st	%1,%0\n"
+-		: "+Q" (lp->lock)
+-		: "d" (0)
+-		: "cc", "memory");
++#ifdef CONFIG_HAVE_MARCH_ZEC12_FEATURES
++		"	.long	0xb2fa0070\n"	/* NIAI 7 */
++#endif
++		"	st	%1,%0\n"
++		: "=Q" (lp->lock) : "d" (0) : "cc", "memory");
+ }
+ 
+ static inline void arch_spin_unlock_wait(arch_spinlock_t *lock)
+--- a/arch/s390/lib/spinlock.c
++++ b/arch/s390/lib/spinlock.c
+@@ -32,42 +32,63 @@ static int __init spin_retry_setup(char
+ }
+ __setup("spin_retry=", spin_retry_setup);
+ 
++static inline int arch_load_niai4(int *lock)
++{
++	int owner;
++
++	asm volatile(
++#ifdef CONFIG_HAVE_MARCH_ZEC12_FEATURES
++		"	.long	0xb2fa0040\n"	/* NIAI 4 */
++#endif
++		"	l	%0,%1\n"
++		: "=d" (owner) : "Q" (*lock) : "memory");
++       return owner;
++}
++
++static inline int arch_cmpxchg_niai8(int *lock, int old, int new)
++{
++	int expected = old;
++
++	asm volatile(
++#ifdef CONFIG_HAVE_MARCH_ZEC12_FEATURES
++		"	.long	0xb2fa0080\n"	/* NIAI 8 */
++#endif
++		"	cs	%0,%3,%1\n"
++		: "=d" (old), "=Q" (*lock)
++		: "0" (old), "d" (new), "Q" (*lock)
++		: "cc", "memory");
++	return expected == old;
++}
++
+ void arch_spin_lock_wait(arch_spinlock_t *lp)
+ {
+ 	int cpu = SPINLOCK_LOCKVAL;
+-	int owner, count, first_diag;
++	int owner, count;
+ 
+-	first_diag = 1;
++	/* Pass the virtual CPU to the lock holder if it is not running */
++	owner = arch_load_niai4(&lp->lock);
++	if (owner && arch_vcpu_is_preempted(~owner))
++		smp_yield_cpu(~owner);
++
++	count = spin_retry;
+ 	while (1) {
+-		owner = ACCESS_ONCE(lp->lock);
++		owner = arch_load_niai4(&lp->lock);
+ 		/* Try to get the lock if it is free. */
+ 		if (!owner) {
+-			if (__atomic_cmpxchg_bool(&lp->lock, 0, cpu))
++			if (arch_cmpxchg_niai8(&lp->lock, 0, cpu))
+ 				return;
+ 			continue;
+ 		}
+-		/* First iteration: check if the lock owner is running. */
+-		if (first_diag && arch_vcpu_is_preempted(~owner)) {
+-			smp_yield_cpu(~owner);
+-			first_diag = 0;
++		if (count-- >= 0)
+ 			continue;
+-		}
+-		/* Loop for a while on the lock value. */
+ 		count = spin_retry;
+-		do {
+-			owner = ACCESS_ONCE(lp->lock);
+-		} while (owner && count-- > 0);
+-		if (!owner)
+-			continue;
+ 		/*
+ 		 * For multiple layers of hypervisors, e.g. z/VM + LPAR
+ 		 * yield the CPU unconditionally. For LPAR rely on the
+ 		 * sense running status.
+ 		 */
+-		if (!MACHINE_IS_LPAR || arch_vcpu_is_preempted(~owner)) {
++		if (!MACHINE_IS_LPAR || arch_vcpu_is_preempted(~owner))
+ 			smp_yield_cpu(~owner);
+-			first_diag = 0;
+-		}
+ 	}
+ }
+ EXPORT_SYMBOL(arch_spin_lock_wait);
+@@ -75,42 +96,36 @@ EXPORT_SYMBOL(arch_spin_lock_wait);
+ void arch_spin_lock_wait_flags(arch_spinlock_t *lp, unsigned long flags)
+ {
+ 	int cpu = SPINLOCK_LOCKVAL;
+-	int owner, count, first_diag;
++	int owner, count;
+ 
+ 	local_irq_restore(flags);
+-	first_diag = 1;
++
++	/* Pass the virtual CPU to the lock holder if it is not running */
++	owner = arch_load_niai4(&lp->lock);
++	if (owner && arch_vcpu_is_preempted(~owner))
++		smp_yield_cpu(~owner);
++
++	count = spin_retry;
+ 	while (1) {
+-		owner = ACCESS_ONCE(lp->lock);
++		owner = arch_load_niai4(&lp->lock);
+ 		/* Try to get the lock if it is free. */
+ 		if (!owner) {
+ 			local_irq_disable();
+-			if (__atomic_cmpxchg_bool(&lp->lock, 0, cpu))
++			if (arch_cmpxchg_niai8(&lp->lock, 0, cpu))
+ 				return;
+ 			local_irq_restore(flags);
+ 			continue;
+ 		}
+-		/* Check if the lock owner is running. */
+-		if (first_diag && arch_vcpu_is_preempted(~owner)) {
+-			smp_yield_cpu(~owner);
+-			first_diag = 0;
++		if (count-- >= 0)
+ 			continue;
+-		}
+-		/* Loop for a while on the lock value. */
+ 		count = spin_retry;
+-		do {
+-			owner = ACCESS_ONCE(lp->lock);
+-		} while (owner && count-- > 0);
+-		if (!owner)
+-			continue;
+ 		/*
+ 		 * For multiple layers of hypervisors, e.g. z/VM + LPAR
+ 		 * yield the CPU unconditionally. For LPAR rely on the
+ 		 * sense running status.
+ 		 */
+-		if (!MACHINE_IS_LPAR || arch_vcpu_is_preempted(~owner)) {
++		if (!MACHINE_IS_LPAR || arch_vcpu_is_preempted(~owner))
+ 			smp_yield_cpu(~owner);
+-			first_diag = 0;
+-		}
+ 	}
+ }
+ EXPORT_SYMBOL(arch_spin_lock_wait_flags);
