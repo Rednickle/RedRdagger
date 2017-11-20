@@ -1,0 +1,239 @@
+From: Heiko Carstens <heiko.carstens@de.ibm.com>
+Subject: s390/vmcp: make use of contiguous memory allocator
+Patch-mainline: v4.14-rc1
+Git-commit: 3f4298427ad521fdc74fb991b17d84959513218a
+References: bnc#1066983, LTC#159171
+
+Description:  vmcp: make use of contiguous memory allocator
+Symptom:      The vmcp tool fails to execute a cp command because the kernel
+              was unable to allocate memory.
+Problem:      Allocation of memory for the response area of the diagnose 8
+              command may require the kernel to allocate large contiguous
+              memory areas. If memory is fragmented, large order allocations
+              can likely fail and this causes vmcp to fail.
+Solution:     Make use of the contiguous memory allocator. This should make
+              sure that allocation of large response buffers will almost
+              always succeed.
+Reproduction: -
+
+Upstream-Description:
+
+              s390/vmcp: make use of contiguous memory allocator
+
+              If memory is fragmented it is unlikely that large order memory
+              allocations succeed. This has been an issue with the vmcp device
+              driver since a long time, since it requires large physical contiguous
+              memory ares for large responses.
+
+              To hopefully resolve this issue make use of the contiguous memory
+              allocator (cma). This patch adds a vmcp specific vmcp cma area with a
+              default size of 4MB. The size can be changed either via the
+              VMCP_CMA_SIZE config option at compile time or with the "vmcp_cma"
+              kernel parameter (e.g. "vmcp_cma=16m").
+
+              For any vmcp response buffers larger than 16k memory from the cma area
+              will be allocated. If such an allocation fails, there is a fallback to
+              the buddy allocator.
+
+              Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+              Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ Documentation/admin-guide/kernel-parameters.txt |    4 +
+ arch/s390/include/asm/setup.h                   |    6 +
+ arch/s390/kernel/setup.c                        |    1 
+ drivers/s390/char/Kconfig                       |   11 +++
+ drivers/s390/char/vmcp.c                        |   74 +++++++++++++++++++++---
+ drivers/s390/char/vmcp.h                        |    3 
+ 6 files changed, 90 insertions(+), 9 deletions(-)
+
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -106,6 +106,12 @@ extern void pfault_fini(void);
+ #define pfault_fini()		do { } while (0)
+ #endif /* CONFIG_PFAULT */
+ 
++#ifdef CONFIG_VMCP
++void vmcp_cma_reserve(void);
++#else
++static inline void vmcp_cma_reserve(void) { }
++#endif
++
+ void report_user_fault(struct pt_regs *regs, long signr, int is_mm_fault);
+ 
+ void cmma_init(void);
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -922,6 +922,7 @@ void __init setup_arch(char **cmdline_p)
+ 	setup_memory_end();
+ 	setup_memory();
+ 	dma_contiguous_reserve(memory_end);
++	vmcp_cma_reserve();
+ 
+ 	check_initrd();
+ 	reserve_crashkernel();
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -4325,6 +4325,10 @@
+ 			decrease the size and leave more room for directly
+ 			mapped kernel RAM.
+ 
++	vmcp_cma=nn[MG]	[KNL,S390]
++			Sets the memory size reserved for contiguous memory
++			allocations for the vmcp device driver.
++
+ 	vmhalt=		[KNL,S390] Perform z/VM CP command after system halt.
+ 			Format: <command>
+ 
+--- a/drivers/s390/char/Kconfig
++++ b/drivers/s390/char/Kconfig
+@@ -169,10 +169,21 @@ config VMCP
+ 	def_bool y
+ 	prompt "Support for the z/VM CP interface"
+ 	depends on S390
++	select CMA
+ 	help
+ 	  Select this option if you want to be able to interact with the control
+ 	  program on z/VM
+ 
++config VMCP_CMA_SIZE
++	int "Memory in MiB reserved for z/VM CP interface"
++	default "4"
++	depends on VMCP
++	help
++	  Specify the default amount of memory in MiB reserved for the z/VM CP
++	  interface. If needed this memory is used for large contiguous memory
++	  allocations. The default can be changed with the kernel command line
++	  parameter "vmcp_cma".
++
+ config MONREADER
+ 	def_tristate m
+ 	prompt "API for reading z/VM monitor service records"
+--- a/drivers/s390/char/vmcp.c
++++ b/drivers/s390/char/vmcp.c
+@@ -17,15 +17,77 @@
+ #include <linux/kernel.h>
+ #include <linux/miscdevice.h>
+ #include <linux/slab.h>
++#include <linux/uaccess.h>
+ #include <linux/export.h>
++#include <linux/mutex.h>
++#include <linux/cma.h>
++#include <linux/mm.h>
+ #include <asm/compat.h>
+ #include <asm/cpcmd.h>
+ #include <asm/debug.h>
+-#include <linux/uaccess.h>
+ #include "vmcp.h"
+ 
+ static debug_info_t *vmcp_debug;
+ 
++static unsigned long vmcp_cma_size __initdata = CONFIG_VMCP_CMA_SIZE * 1024 * 1024;
++static struct cma *vmcp_cma;
++
++static int __init early_parse_vmcp_cma(char *p)
++{
++	vmcp_cma_size = ALIGN(memparse(p, NULL), PAGE_SIZE);
++	return 0;
++}
++early_param("vmcp_cma", early_parse_vmcp_cma);
++
++void __init vmcp_cma_reserve(void)
++{
++	if (!MACHINE_IS_VM)
++		return;
++	cma_declare_contiguous(0, vmcp_cma_size, 0, 0, 0, false, "vmcp", &vmcp_cma);
++}
++
++static void vmcp_response_alloc(struct vmcp_session *session)
++{
++	struct page *page = NULL;
++	int nr_pages, order;
++
++	order = get_order(session->bufsize);
++	nr_pages = ALIGN(session->bufsize, PAGE_SIZE) >> PAGE_SHIFT;
++	/*
++	 * For anything below order 3 allocations rely on the buddy
++	 * allocator. If such low-order allocations can't be handled
++	 * anymore the system won't work anyway.
++	 */
++	if (order > 2)
++		page = cma_alloc(vmcp_cma, nr_pages, 0, GFP_KERNEL);
++	if (page) {
++		session->response = (char *)page_to_phys(page);
++		session->cma_alloc = 1;
++		return;
++	}
++	session->response = (char *)__get_free_pages(GFP_KERNEL | __GFP_REPEAT, order);
++}
++
++static void vmcp_response_free(struct vmcp_session *session)
++{
++	int nr_pages, order;
++	struct page *page;
++
++	if (!session->response)
++		return;
++	order = get_order(session->bufsize);
++	nr_pages = ALIGN(session->bufsize, PAGE_SIZE) >> PAGE_SHIFT;
++	if (session->cma_alloc) {
++		page = phys_to_page((unsigned long)session->response);
++		cma_release(vmcp_cma, page, nr_pages);
++		session->cma_alloc = 0;
++		goto out;
++	}
++	free_pages((unsigned long)session->response, order);
++out:
++	session->response = NULL;
++}
++
+ static int vmcp_open(struct inode *inode, struct file *file)
+ {
+ 	struct vmcp_session *session;
+@@ -51,7 +113,7 @@ static int vmcp_release(struct inode *in
+ 
+ 	session = file->private_data;
+ 	file->private_data = NULL;
+-	free_pages((unsigned long)session->response, get_order(session->bufsize));
++	vmcp_response_free(session);
+ 	kfree(session);
+ 	return 0;
+ }
+@@ -97,9 +159,7 @@ vmcp_write(struct file *file, const char
+ 		return -ERESTARTSYS;
+ 	}
+ 	if (!session->response)
+-		session->response = (char *)__get_free_pages(GFP_KERNEL
+-						| __GFP_REPEAT,
+-						get_order(session->bufsize));
++		vmcp_response_alloc(session);
+ 	if (!session->response) {
+ 		mutex_unlock(&session->mutex);
+ 		kfree(cmd);
+@@ -146,9 +206,7 @@ static long vmcp_ioctl(struct file *file
+ 		mutex_unlock(&session->mutex);
+ 		return put_user(temp, argp);
+ 	case VMCP_SETBUF:
+-		free_pages((unsigned long)session->response,
+-				get_order(session->bufsize));
+-		session->response=NULL;
++		vmcp_response_free(session);
+ 		temp = get_user(session->bufsize, argp);
+ 		if (get_order(session->bufsize) > 8) {
+ 			session->bufsize = PAGE_SIZE;
+--- a/drivers/s390/char/vmcp.h
++++ b/drivers/s390/char/vmcp.h
+@@ -20,8 +20,9 @@
+ #define VMCP_GETSIZE _IOR(0x10, 3, int)
+ 
+ struct vmcp_session {
+-	unsigned int bufsize;
+ 	char *response;
++	unsigned int bufsize;
++	unsigned int cma_alloc : 1;
+ 	int resp_size;
+ 	int resp_code;
+ 	/* As we use copy_from/to_user, which might     *
