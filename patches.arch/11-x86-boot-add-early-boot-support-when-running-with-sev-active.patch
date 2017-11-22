@@ -1,0 +1,375 @@
+From: Tom Lendacky <thomas.lendacky@amd.com>
+Date: Fri, 20 Oct 2017 09:30:54 -0500
+Subject: x86/boot: Add early boot support when running with SEV active
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 1958b5fc401067662ec11a6fcbe0daa26c813603
+Patch-mainline: v4.15-rc1
+References: bsc#1063068
+
+Early in the boot process, add checks to determine if the kernel is
+running with Secure Encrypted Virtualization (SEV) active.
+
+Checking for SEV requires checking that the kernel is running under a
+hypervisor (CPUID 0x00000001, bit 31), that the SEV feature is available
+(CPUID 0x8000001f, bit 1) and then checking a non-interceptable SEV MSR
+(0xc0010131, bit 0).
+
+This check is required so that during early compressed kernel booting the
+pagetables (both the boot pagetables and KASLR pagetables (if enabled) are
+updated to include the encryption mask so that when the kernel is
+decompressed into encrypted memory, it can boot properly.
+
+After the kernel is decompressed and continues booting the same logic is
+used to check if SEV is active and set a flag indicating so.  This allows
+to distinguish between SME and SEV, each of which have unique differences
+in how certain things are handled: e.g. DMA (always bounce buffered with
+SEV) or EFI tables (always access decrypted with SME).
+
+Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+Signed-off-by: Brijesh Singh <brijesh.singh@amd.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Tested-by: Borislav Petkov <bp@suse.de>
+Cc: Laura Abbott <labbott@redhat.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: kvm@vger.kernel.org
+Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Link: https://lkml.kernel.org/r/20171020143059.3291-13-brijesh.singh@amd.com
+
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/boot/compressed/Makefile      |    1 
+ arch/x86/boot/compressed/head_64.S     |   16 ++++
+ arch/x86/boot/compressed/mem_encrypt.S |  120 +++++++++++++++++++++++++++++++++
+ arch/x86/boot/compressed/misc.h        |    2 
+ arch/x86/boot/compressed/pagetable.c   |    8 +-
+ arch/x86/include/asm/msr-index.h       |    3 
+ arch/x86/include/uapi/asm/kvm_para.h   |    1 
+ arch/x86/mm/mem_encrypt.c              |   50 ++++++++++---
+ 8 files changed, 186 insertions(+), 15 deletions(-)
+
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -130,6 +130,19 @@ ENTRY(startup_32)
+  /*
+   * Build early 4G boot pagetable
+   */
++	/*
++	 * If SEV is active then set the encryption mask in the page tables.
++	 * This will insure that when the kernel is copied and decompressed
++	 * it will be done so encrypted.
++	 */
++	call	get_sev_encryption_bit
++	xorl	%edx, %edx
++	testl	%eax, %eax
++	jz	1f
++	subl	$32, %eax	/* Encryption bit is always above bit 31 */
++	bts	%eax, %edx	/* Set encryption mask for page tables */
++1:
++
+ 	/* Initialize Page tables to 0 */
+ 	leal	pgtable(%ebx), %edi
+ 	xorl	%eax, %eax
+@@ -140,12 +153,14 @@ ENTRY(startup_32)
+ 	leal	pgtable + 0(%ebx), %edi
+ 	leal	0x1007 (%edi), %eax
+ 	movl	%eax, 0(%edi)
++	addl	%edx, 4(%edi)
+ 
+ 	/* Build Level 3 */
+ 	leal	pgtable + 0x1000(%ebx), %edi
+ 	leal	0x1007(%edi), %eax
+ 	movl	$4, %ecx
+ 1:	movl	%eax, 0x00(%edi)
++	addl	%edx, 0x04(%edi)
+ 	addl	$0x00001000, %eax
+ 	addl	$8, %edi
+ 	decl	%ecx
+@@ -156,6 +171,7 @@ ENTRY(startup_32)
+ 	movl	$0x00000183, %eax
+ 	movl	$2048, %ecx
+ 1:	movl	%eax, 0(%edi)
++	addl	%edx, 4(%edi)
+ 	addl	$0x00200000, %eax
+ 	addl	$8, %edi
+ 	decl	%ecx
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -76,6 +76,7 @@ vmlinux-objs-$(CONFIG_EARLY_PRINTK) += $
+ vmlinux-objs-$(CONFIG_RANDOMIZE_BASE) += $(obj)/kaslr.o
+ ifdef CONFIG_X86_64
+ 	vmlinux-objs-$(CONFIG_RANDOMIZE_BASE) += $(obj)/pagetable.o
++	vmlinux-objs-y += $(obj)/mem_encrypt.o
+ endif
+ 
+ $(obj)/eboot.o: KBUILD_CFLAGS += -fshort-wchar -mno-red-zone
+--- /dev/null
++++ b/arch/x86/boot/compressed/mem_encrypt.S
+@@ -0,0 +1,120 @@
++/*
++ * AMD Memory Encryption Support
++ *
++ * Copyright (C) 2017 Advanced Micro Devices, Inc.
++ *
++ * Author: Tom Lendacky <thomas.lendacky@amd.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/linkage.h>
++
++#include <asm/processor-flags.h>
++#include <asm/msr.h>
++#include <asm/asm-offsets.h>
++
++	.text
++	.code32
++ENTRY(get_sev_encryption_bit)
++	xor	%eax, %eax
++
++#ifdef CONFIG_AMD_MEM_ENCRYPT
++	push	%ebx
++	push	%ecx
++	push	%edx
++	push	%edi
++
++	/*
++	 * RIP-relative addressing is needed to access the encryption bit
++	 * variable. Since we are running in 32-bit mode we need this call/pop
++	 * sequence to get the proper relative addressing.
++	 */
++	call	1f
++1:	popl	%edi
++	subl	$1b, %edi
++
++	movl	enc_bit(%edi), %eax
++	cmpl	$0, %eax
++	jge	.Lsev_exit
++
++	/* Check if running under a hypervisor */
++	movl	$1, %eax
++	cpuid
++	bt	$31, %ecx		/* Check the hypervisor bit */
++	jnc	.Lno_sev
++
++	movl	$0x80000000, %eax	/* CPUID to check the highest leaf */
++	cpuid
++	cmpl	$0x8000001f, %eax	/* See if 0x8000001f is available */
++	jb	.Lno_sev
++
++	/*
++	 * Check for the SEV feature:
++	 *   CPUID Fn8000_001F[EAX] - Bit 1
++	 *   CPUID Fn8000_001F[EBX] - Bits 5:0
++	 *     Pagetable bit position used to indicate encryption
++	 */
++	movl	$0x8000001f, %eax
++	cpuid
++	bt	$1, %eax		/* Check if SEV is available */
++	jnc	.Lno_sev
++
++	movl	$MSR_AMD64_SEV, %ecx	/* Read the SEV MSR */
++	rdmsr
++	bt	$MSR_AMD64_SEV_ENABLED_BIT, %eax	/* Check if SEV is active */
++	jnc	.Lno_sev
++
++	movl	%ebx, %eax
++	andl	$0x3f, %eax		/* Return the encryption bit location */
++	movl	%eax, enc_bit(%edi)
++	jmp	.Lsev_exit
++
++.Lno_sev:
++	xor	%eax, %eax
++	movl	%eax, enc_bit(%edi)
++
++.Lsev_exit:
++	pop	%edi
++	pop	%edx
++	pop	%ecx
++	pop	%ebx
++
++#endif	/* CONFIG_AMD_MEM_ENCRYPT */
++
++	ret
++ENDPROC(get_sev_encryption_bit)
++
++	.code64
++ENTRY(get_sev_encryption_mask)
++	xor	%rax, %rax
++
++#ifdef CONFIG_AMD_MEM_ENCRYPT
++	push	%rbp
++	push	%rdx
++
++	movq	%rsp, %rbp		/* Save current stack pointer */
++
++	call	get_sev_encryption_bit	/* Get the encryption bit position */
++	testl	%eax, %eax
++	jz	.Lno_sev_mask
++
++	xor	%rdx, %rdx
++	bts	%rax, %rdx		/* Create the encryption mask */
++	mov	%rdx, %rax		/* ... and return it */
++
++.Lno_sev_mask:
++	movq	%rbp, %rsp		/* Restore original stack pointer */
++
++	pop	%rdx
++	pop	%rbp
++#endif
++
++	ret
++ENDPROC(get_sev_encryption_mask)
++
++	.data
++enc_bit:
++	.int	0xffffffff
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@ -108,4 +108,6 @@ static inline void console_init(void)
+ { }
+ #endif
+ 
++unsigned long get_sev_encryption_mask(void);
++
+ #endif
+--- a/arch/x86/boot/compressed/pagetable.c
++++ b/arch/x86/boot/compressed/pagetable.c
+@@ -76,16 +76,18 @@ static unsigned long level4p;
+  * Mapping information structure passed to kernel_ident_mapping_init().
+  * Due to relocation, pointers must be assigned at run time not build time.
+  */
+-static struct x86_mapping_info mapping_info = {
+-	.page_flag       = __PAGE_KERNEL_LARGE_EXEC,
+-};
++static struct x86_mapping_info mapping_info;
+ 
+ /* Locates and clears a region for a new top level page table. */
+ void initialize_identity_maps(void)
+ {
++	unsigned long sev_me_mask = get_sev_encryption_mask();
++
+ 	/* Init mapping_info with run-time function/buffer pointers. */
+ 	mapping_info.alloc_pgt_page = alloc_pgt_page;
+ 	mapping_info.context = &pgt_data;
++	mapping_info.page_flag = __PAGE_KERNEL_LARGE_EXEC | sev_me_mask;
++	mapping_info.kernpg_flag = _KERNPG_TABLE | sev_me_mask;
+ 
+ 	/*
+ 	 * It should be impossible for this not to already be true,
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -317,6 +317,9 @@
+ #define MSR_AMD64_IBSBRTARGET		0xc001103b
+ #define MSR_AMD64_IBSOPDATA4		0xc001103d
+ #define MSR_AMD64_IBS_REG_COUNT_MAX	8 /* includes MSR_AMD64_IBSBRTARGET */
++#define MSR_AMD64_SEV			0xc0010131
++#define MSR_AMD64_SEV_ENABLED_BIT	0
++#define MSR_AMD64_SEV_ENABLED		BIT_ULL(MSR_AMD64_SEV_ENABLED_BIT)
+ 
+ /* Fam 17h MSRs */
+ #define MSR_F17H_IRPERF			0xc00000e9
+--- a/arch/x86/include/uapi/asm/kvm_para.h
++++ b/arch/x86/include/uapi/asm/kvm_para.h
+@@ -108,5 +108,4 @@ struct kvm_vcpu_pv_apf_data {
+ #define KVM_PV_EOI_ENABLED KVM_PV_EOI_MASK
+ #define KVM_PV_EOI_DISABLED 0x0
+ 
+-
+ #endif /* _UAPI_ASM_X86_KVM_PARA_H */
+--- a/arch/x86/mm/mem_encrypt.c
++++ b/arch/x86/mm/mem_encrypt.c
+@@ -311,7 +311,9 @@ void __init mem_encrypt_init(void)
+ 	if (sev_active())
+ 		dma_ops = &sev_dma_ops;
+ 
+-	pr_info("AMD Secure Memory Encryption (SME) active\n");
++	pr_info("AMD %s active\n",
++		sev_active() ? "Secure Encrypted Virtualization (SEV)"
++			     : "Secure Memory Encryption (SME)");
+ }
+ 
+ void swiotlb_set_mem_attributes(void *vaddr, unsigned long size)
+@@ -639,37 +641,63 @@ void __init __nostackprotector sme_enabl
+ {
+ 	const char *cmdline_ptr, *cmdline_arg, *cmdline_on, *cmdline_off;
+ 	unsigned int eax, ebx, ecx, edx;
++	unsigned long feature_mask;
+ 	bool active_by_default;
+ 	unsigned long me_mask;
+ 	char buffer[16];
+ 	u64 msr;
+ 
+-	/* Check for the SME support leaf */
++	/* Check for the SME/SEV support leaf */
+ 	eax = 0x80000000;
+ 	ecx = 0;
+ 	native_cpuid(&eax, &ebx, &ecx, &edx);
+ 	if (eax < 0x8000001f)
+ 		return;
+ 
++#define AMD_SME_BIT	BIT(0)
++#define AMD_SEV_BIT	BIT(1)
+ 	/*
+-	 * Check for the SME feature:
+-	 *   CPUID Fn8000_001F[EAX] - Bit 0
+-	 *     Secure Memory Encryption support
+-	 *   CPUID Fn8000_001F[EBX] - Bits 5:0
+-	 *     Pagetable bit position used to indicate encryption
++	 * Set the feature mask (SME or SEV) based on whether we are
++	 * running under a hypervisor.
++	 */
++	eax = 1;
++	ecx = 0;
++	native_cpuid(&eax, &ebx, &ecx, &edx);
++	feature_mask = (ecx & BIT(31)) ? AMD_SEV_BIT : AMD_SME_BIT;
++
++	/*
++	 * Check for the SME/SEV feature:
++	 *   CPUID Fn8000_001F[EAX]
++	 *   - Bit 0 - Secure Memory Encryption support
++	 *   - Bit 1 - Secure Encrypted Virtualization support
++	 *   CPUID Fn8000_001F[EBX]
++	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
+ 	 */
+ 	eax = 0x8000001f;
+ 	ecx = 0;
+ 	native_cpuid(&eax, &ebx, &ecx, &edx);
+-	if (!(eax & 1))
++	if (!(eax & feature_mask))
+ 		return;
+ 
+ 	me_mask = 1UL << (ebx & 0x3f);
+ 
+-	/* Check if SME is enabled */
+-	msr = __rdmsr(MSR_K8_SYSCFG);
+-	if (!(msr & MSR_K8_SYSCFG_MEM_ENCRYPT))
++	/* Check if memory encryption is enabled */
++	if (feature_mask == AMD_SME_BIT) {
++		/* For SME, check the SYSCFG MSR */
++		msr = __rdmsr(MSR_K8_SYSCFG);
++		if (!(msr & MSR_K8_SYSCFG_MEM_ENCRYPT))
++			return;
++	} else {
++		/* For SEV, check the SEV MSR */
++		msr = __rdmsr(MSR_AMD64_SEV);
++		if (!(msr & MSR_AMD64_SEV_ENABLED))
++			return;
++
++		/* SEV state cannot be controlled by a command line option */
++		sme_me_mask = me_mask;
++		sev_enabled = true;
+ 		return;
++	}
+ 
+ 	/*
+ 	 * Fixups have not been applied to phys_base yet and we're running
