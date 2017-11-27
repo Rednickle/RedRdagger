@@ -1,0 +1,241 @@
+From: Rick Farrington <ricardo.farrington@cavium.com>
+Date: Tue, 16 May 2017 11:14:50 -0700
+Subject: liquidio: fix insmod failure when multiple NICs are plugged in
+Patch-mainline: v4.13-rc1
+Git-commit: e1e3ce623699d0cd594fa69f69371a9dbc55aa9a
+References: bsc#1067126
+
+When multiple liquidio NICs are plugged in, the first insmod of the PF
+driver succeeds.  But after an rmmod, a subsequent insmod fails.  Reason is
+during rmmod, the PF driver resets the Octeon of only one of the NICs; it
+neglects to reset the Octeons of the other NICs.
+
+Fix the insmod failure by adding the missing Octeon resets at rmmod.  Keep
+a per-NIC refcount that indicates the number of active PFs in a given NIC.
+When the refcount goes to zero, then reset the Octeon of that NIC.
+
+Signed-off-by: Rick Farrington <ricardo.farrington@cavium.com>
+Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/cavium/liquidio/lio_main.c      |   21 +++-
+ drivers/net/ethernet/cavium/liquidio/octeon_device.c |   87 +++++++++++++++++--
+ drivers/net/ethernet/cavium/liquidio/octeon_device.h |   25 +++++
+ 3 files changed, 123 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -1421,7 +1421,7 @@ static bool fw_type_is_none(void)
+  */
+ static void octeon_destroy_resources(struct octeon_device *oct)
+ {
+-	int i;
++	int i, refcount;
+ 	struct msix_entry *msix_entries;
+ 	struct octeon_device_priv *oct_priv =
+ 		(struct octeon_device_priv *)oct->priv;
+@@ -1556,10 +1556,14 @@ static void octeon_destroy_resources(str
+ 
+ 		/* fallthrough */
+ 	case OCT_DEV_PCI_MAP_DONE:
++		refcount = octeon_deregister_device(oct);
++
+ 		if (!fw_type_is_none()) {
+-			/* Soft reset the octeon device before exiting */
+-			if (!OCTEON_CN23XX_PF(oct) ||
+-			    (OCTEON_CN23XX_PF(oct) && !oct->octeon_id))
++			/* Soft reset the octeon device before exiting.
++			 * Implementation note: here, we reset the device
++			 * if it is a CN6XXX OR the last CN23XX device.
++			 */
++			if (OCTEON_CN6XXX(oct) || !refcount)
+ 				oct->fn_list.soft_reset(oct);
+ 		}
+ 
+@@ -4511,6 +4515,15 @@ static int octeon_device_init(struct oct
+ 
+ 	atomic_set(&octeon_dev->status, OCT_DEV_PCI_MAP_DONE);
+ 
++	/* Only add a reference after setting status 'OCT_DEV_PCI_MAP_DONE',
++	 * since that is what is required for the reference to be removed
++	 * during de-initialization (see 'octeon_destroy_resources').
++	 */
++	octeon_register_device(octeon_dev, octeon_dev->pci_dev->bus->number,
++			       PCI_SLOT(octeon_dev->pci_dev->devfn),
++			       PCI_FUNC(octeon_dev->pci_dev->devfn),
++			       true);
++
+ 	octeon_dev->app_mode = CVM_DRV_INVALID_APP;
+ 
+ 	if (OCTEON_CN23XX_PF(octeon_dev)) {
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_device.c
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_device.c
+@@ -543,7 +543,11 @@ static char oct_dev_app_str[CVM_DRV_APP_
+ 	"BASE", "NIC", "UNKNOWN"};
+ 
+ static struct octeon_device *octeon_device[MAX_OCTEON_DEVICES];
++static atomic_t adapter_refcounts[MAX_OCTEON_DEVICES];
++
+ static u32 octeon_device_count;
++/* locks device array (i.e. octeon_device[]) */
++spinlock_t octeon_devices_lock;
+ 
+ static struct octeon_core_setup core_setup[MAX_OCTEON_DEVICES];
+ 
+@@ -561,6 +565,7 @@ void octeon_init_device_list(int conf_ty
+ 	memset(octeon_device, 0, (sizeof(void *) * MAX_OCTEON_DEVICES));
+ 	for (i = 0; i <  MAX_OCTEON_DEVICES; i++)
+ 		oct_set_config_info(i, conf_type);
++	spin_lock_init(&octeon_devices_lock);
+ }
+ 
+ static void *__retrieve_octeon_config_info(struct octeon_device *oct,
+@@ -720,23 +725,27 @@ struct octeon_device *octeon_allocate_de
+ 	u32 oct_idx = 0;
+ 	struct octeon_device *oct = NULL;
+ 
++	spin_lock(&octeon_devices_lock);
++
+ 	for (oct_idx = 0; oct_idx < MAX_OCTEON_DEVICES; oct_idx++)
+ 		if (!octeon_device[oct_idx])
+ 			break;
+ 
+-	if (oct_idx == MAX_OCTEON_DEVICES)
+-		return NULL;
++	if (oct_idx < MAX_OCTEON_DEVICES) {
++		oct = octeon_allocate_device_mem(pci_id, priv_size);
++		if (oct) {
++			octeon_device_count++;
++			octeon_device[oct_idx] = oct;
++		}
++	}
+ 
+-	oct = octeon_allocate_device_mem(pci_id, priv_size);
++	spin_unlock(&octeon_devices_lock);
+ 	if (!oct)
+ 		return NULL;
+ 
+ 	spin_lock_init(&oct->pci_win_lock);
+ 	spin_lock_init(&oct->mem_access_lock);
+ 
+-	octeon_device_count++;
+-	octeon_device[oct_idx] = oct;
+-
+ 	oct->octeon_id = oct_idx;
+ 	snprintf(oct->device_name, sizeof(oct->device_name),
+ 		 "LiquidIO%d", (oct->octeon_id));
+@@ -744,6 +753,72 @@ struct octeon_device *octeon_allocate_de
+ 	return oct;
+ }
+ 
++/** Register a device's bus location at initialization time.
++ *  @param octeon_dev - pointer to the octeon device structure.
++ *  @param bus        - PCIe bus #
++ *  @param dev        - PCIe device #
++ *  @param func       - PCIe function #
++ *  @param is_pf      - TRUE for PF, FALSE for VF
++ *  @return reference count of device's adapter
++ */
++int octeon_register_device(struct octeon_device *oct,
++			   int bus, int dev, int func, int is_pf)
++{
++	int idx, refcount;
++
++	oct->loc.bus = bus;
++	oct->loc.dev = dev;
++	oct->loc.func = func;
++
++	oct->adapter_refcount = &adapter_refcounts[oct->octeon_id];
++	atomic_set(oct->adapter_refcount, 0);
++
++	spin_lock(&octeon_devices_lock);
++	for (idx = (int)oct->octeon_id - 1; idx >= 0; idx--) {
++		if (!octeon_device[idx]) {
++			dev_err(&oct->pci_dev->dev,
++				"%s: Internal driver error, missing dev",
++				__func__);
++			spin_unlock(&octeon_devices_lock);
++			atomic_inc(oct->adapter_refcount);
++			return 1; /* here, refcount is guaranteed to be 1 */
++		}
++		/* if another device is at same bus/dev, use its refcounter */
++		if ((octeon_device[idx]->loc.bus == bus) &&
++		    (octeon_device[idx]->loc.dev == dev)) {
++			oct->adapter_refcount =
++				octeon_device[idx]->adapter_refcount;
++			break;
++		}
++	}
++	spin_unlock(&octeon_devices_lock);
++
++	atomic_inc(oct->adapter_refcount);
++	refcount = atomic_read(oct->adapter_refcount);
++
++	dev_dbg(&oct->pci_dev->dev, "%s: %02x:%02x:%d refcount %u", __func__,
++		oct->loc.bus, oct->loc.dev, oct->loc.func, refcount);
++
++	return refcount;
++}
++
++/** Deregister a device at de-initialization time.
++ *  @param octeon_dev - pointer to the octeon device structure.
++ *  @return reference count of device's adapter
++ */
++int octeon_deregister_device(struct octeon_device *oct)
++{
++	int refcount;
++
++	atomic_dec(oct->adapter_refcount);
++	refcount = atomic_read(oct->adapter_refcount);
++
++	dev_dbg(&oct->pci_dev->dev, "%s: %04d:%02d:%d refcount %u", __func__,
++		oct->loc.bus, oct->loc.dev, oct->loc.func, refcount);
++
++	return refcount;
++}
++
+ int
+ octeon_allocate_ioq_vector(struct octeon_device  *oct)
+ {
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_device.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_device.h
+@@ -544,6 +544,14 @@ struct octeon_device {
+ 	u32 tx_max_coalesced_frames;
+ 
+ 	bool cores_crashed;
++
++	struct {
++		int bus;
++		int dev;
++		int func;
++	} loc;
++
++	atomic_t *adapter_refcount; /* reference count of adapter */
+ };
+ 
+ #define  OCT_DRV_ONLINE 1
+@@ -572,6 +580,23 @@ void octeon_free_device_mem(struct octeo
+ struct octeon_device *octeon_allocate_device(u32 pci_id,
+ 					     u32 priv_size);
+ 
++/** Register a device's bus location at initialization time.
++ *  @param octeon_dev - pointer to the octeon device structure.
++ *  @param bus        - PCIe bus #
++ *  @param dev        - PCIe device #
++ *  @param func       - PCIe function #
++ *  @param is_pf      - TRUE for PF, FALSE for VF
++ *  @return reference count of device's adapter
++ */
++int octeon_register_device(struct octeon_device *oct,
++			   int bus, int dev, int func, int is_pf);
++
++/** Deregister a device at de-initialization time.
++ *  @param octeon_dev - pointer to the octeon device structure.
++ *  @return reference count of device's adapter
++ */
++int octeon_deregister_device(struct octeon_device *oct);
++
+ /**  Initialize the driver's dispatch list which is a mix of a hash table
+  *  and a linked list. This is done at driver load time.
+  *  @param octeon_dev - pointer to the octeon device structure.
