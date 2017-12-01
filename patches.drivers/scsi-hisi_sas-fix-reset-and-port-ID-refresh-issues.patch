@@ -1,0 +1,335 @@
+From: Xiaofei Tan <tanxiaofei@huawei.com>
+Date: Fri, 11 Aug 2017 00:09:26 +0800
+Subject: scsi: hisi_sas: fix reset and port ID refresh issues
+Git-commit: 917d3bdaf8f2ab3bace2bd60b78d83a2b3096d98
+Patch-mainline: v4.14-rc1
+References: bsc#1068693
+
+This patch provides fixes for the following issues:
+
+1. Fix issue of controller reset required to send commands. For reset
+   process, it may be required to send commands to the controller, but
+   not during soft reset.  So add HISI_SAS_NOT_ACCEPT_CMD_BIT to prevent
+   executing a task during this period.
+
+2. Send a broadcast event in rescan topology to detect any topology
+   changes during reset.
+
+3. Previously it was not ensured that libsas has processed the PHY up
+   and down events after reset. Potentially this could cause an issue
+   that we still process the PHY event after reset. So resolve this by
+   flushing shot workqueue in LLDD reset.
+
+4. Port ID requires refresh after reset. The port ID generated after
+   reset is not guaranteed to be the same as before reset, so it needs
+   to be refreshed for each device's ITCT.
+
+Signed-off-by: Xiaofei Tan <tanxiaofei@huawei.com>
+Signed-off-by: John Garry <john.garry@huawei.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Matthias Brugger <mbrugger@suse.com>
+---
+ drivers/scsi/hisi_sas/hisi_sas.h       |   4 +-
+ drivers/scsi/hisi_sas/hisi_sas_main.c  | 152 ++++++++++++++++++++++-----------
+ drivers/scsi/hisi_sas/hisi_sas_v2_hw.c |  36 ++++----
+ 3 files changed, 118 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/scsi/hisi_sas/hisi_sas.h b/drivers/scsi/hisi_sas/hisi_sas.h
+index a722f2bd72ab..3c4defad8c18 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas.h
++++ b/drivers/scsi/hisi_sas/hisi_sas.h
+@@ -33,6 +33,7 @@
+ #define HISI_SAS_MAX_ITCT_ENTRIES 2048
+ #define HISI_SAS_MAX_DEVICES HISI_SAS_MAX_ITCT_ENTRIES
+ #define HISI_SAS_RESET_BIT	0
++#define HISI_SAS_REJECT_CMD_BIT	1
+ 
+ #define HISI_SAS_STATUS_BUF_SZ (sizeof(struct hisi_sas_status_buffer))
+ #define HISI_SAS_COMMAND_TABLE_SZ (sizeof(union hisi_sas_command_table))
+@@ -201,6 +202,7 @@ struct hisi_sas_hw {
+ 	void (*dereg_device)(struct hisi_hba *hisi_hba,
+ 				struct domain_device *device);
+ 	int (*soft_reset)(struct hisi_hba *hisi_hba);
++	u32 (*get_phys_state)(struct hisi_hba *hisi_hba);
+ 	int max_command_entries;
+ 	int complete_hdr_size;
+ };
+@@ -408,6 +410,4 @@ extern void hisi_sas_slot_task_free(struct hisi_hba *hisi_hba,
+ 				    struct sas_task *task,
+ 				    struct hisi_sas_slot *slot);
+ extern void hisi_sas_init_mem(struct hisi_hba *hisi_hba);
+-extern void hisi_sas_rescan_topology(struct hisi_hba *hisi_hba, u32 old_state,
+-				     u32 state);
+ #endif
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_main.c b/drivers/scsi/hisi_sas/hisi_sas_main.c
+index 4022c3f8295f..bd1d61958e10 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_main.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_main.c
+@@ -433,7 +433,7 @@ static int hisi_sas_task_exec(struct sas_task *task, gfp_t gfp_flags,
+ 	struct hisi_sas_device *sas_dev = device->lldd_dev;
+ 	struct hisi_sas_dq *dq = sas_dev->dq;
+ 
+-	if (unlikely(test_bit(HISI_SAS_RESET_BIT, &hisi_hba->flags)))
++	if (unlikely(test_bit(HISI_SAS_REJECT_CMD_BIT, &hisi_hba->flags)))
+ 		return -EINVAL;
+ 
+ 	/* protect task_prep and start_delivery sequence */
+@@ -967,37 +967,117 @@ static int hisi_sas_debug_issue_ssp_tmf(struct domain_device *device,
+ 				sizeof(ssp_task), tmf);
+ }
+ 
++static void hisi_sas_refresh_port_id(struct hisi_hba *hisi_hba,
++		struct asd_sas_port *sas_port, enum sas_linkrate linkrate)
++{
++	struct hisi_sas_device	*sas_dev;
++	struct domain_device *device;
++	int i;
++
++	for (i = 0; i < HISI_SAS_MAX_DEVICES; i++) {
++		sas_dev = &hisi_hba->devices[i];
++		device = sas_dev->sas_device;
++		if ((sas_dev->dev_type == SAS_PHY_UNUSED)
++				|| !device || (device->port != sas_port))
++			continue;
++
++		hisi_hba->hw->free_device(hisi_hba, sas_dev);
++
++		/* Update linkrate of directly attached device. */
++		if (!device->parent)
++			device->linkrate = linkrate;
++
++		hisi_hba->hw->setup_itct(hisi_hba, sas_dev);
++	}
++}
++
++static void hisi_sas_rescan_topology(struct hisi_hba *hisi_hba, u32 old_state,
++			      u32 state)
++{
++	struct sas_ha_struct *sas_ha = &hisi_hba->sha;
++	struct asd_sas_port *_sas_port = NULL;
++	int phy_no;
++
++	for (phy_no = 0; phy_no < hisi_hba->n_phy; phy_no++) {
++		struct hisi_sas_phy *phy = &hisi_hba->phy[phy_no];
++		struct asd_sas_phy *sas_phy = &phy->sas_phy;
++		struct asd_sas_port *sas_port = sas_phy->port;
++		struct hisi_sas_port *port = to_hisi_sas_port(sas_port);
++		bool do_port_check = !!(_sas_port != sas_port);
++
++		if (!sas_phy->phy->enabled)
++			continue;
++
++		/* Report PHY state change to libsas */
++		if (state & (1 << phy_no)) {
++			if (do_port_check && sas_port) {
++				struct domain_device *dev = sas_port->port_dev;
++
++				_sas_port = sas_port;
++				port->id = phy->port_id;
++				hisi_sas_refresh_port_id(hisi_hba,
++						sas_port, sas_phy->linkrate);
++
++				if (DEV_IS_EXPANDER(dev->dev_type))
++					sas_ha->notify_port_event(sas_phy,
++							PORTE_BROADCAST_RCVD);
++			}
++		} else if (old_state & (1 << phy_no))
++			/* PHY down but was up before */
++			hisi_sas_phy_down(hisi_hba, phy_no, 0);
++
++	}
++
++	drain_workqueue(hisi_hba->shost->work_q);
++}
++
+ static int hisi_sas_controller_reset(struct hisi_hba *hisi_hba)
+ {
++	struct sas_ha_struct *sas_ha = &hisi_hba->sha;
++	struct device *dev = hisi_hba->dev;
++	struct Scsi_Host *shost = hisi_hba->shost;
++	u32 old_state, state;
++	unsigned long flags;
+ 	int rc;
+ 
+ 	if (!hisi_hba->hw->soft_reset)
+ 		return -1;
+ 
+-	if (!test_and_set_bit(HISI_SAS_RESET_BIT, &hisi_hba->flags)) {
+-		struct device *dev = hisi_hba->dev;
+-		struct sas_ha_struct *sas_ha = &hisi_hba->sha;
+-		unsigned long flags;
++	if (test_and_set_bit(HISI_SAS_RESET_BIT, &hisi_hba->flags))
++		return -1;
+ 
+-		dev_dbg(dev, "controller reset begins!\n");
+-		scsi_block_requests(hisi_hba->shost);
+-		rc = hisi_hba->hw->soft_reset(hisi_hba);
+-		if (rc) {
+-			dev_warn(dev, "controller reset failed (%d)\n", rc);
+-			goto out;
+-		}
+-		spin_lock_irqsave(&hisi_hba->lock, flags);
+-		hisi_sas_release_tasks(hisi_hba);
+-		spin_unlock_irqrestore(&hisi_hba->lock, flags);
++	dev_dbg(dev, "controller resetting...\n");
++	old_state = hisi_hba->hw->get_phys_state(hisi_hba);
+ 
+-		sas_ha->notify_ha_event(sas_ha, HAE_RESET);
+-		dev_dbg(dev, "controller reset successful!\n");
+-	} else
+-		return -1;
++	scsi_block_requests(shost);
++	set_bit(HISI_SAS_REJECT_CMD_BIT, &hisi_hba->flags);
++	rc = hisi_hba->hw->soft_reset(hisi_hba);
++	if (rc) {
++		dev_warn(dev, "controller reset failed (%d)\n", rc);
++		clear_bit(HISI_SAS_REJECT_CMD_BIT, &hisi_hba->flags);
++		goto out;
++	}
++	spin_lock_irqsave(&hisi_hba->lock, flags);
++	hisi_sas_release_tasks(hisi_hba);
++	spin_unlock_irqrestore(&hisi_hba->lock, flags);
++
++	sas_ha->notify_ha_event(sas_ha, HAE_RESET);
++	clear_bit(HISI_SAS_REJECT_CMD_BIT, &hisi_hba->flags);
++
++	/* Init and wait for PHYs to come up and all libsas event finished. */
++	hisi_hba->hw->phys_init(hisi_hba);
++	msleep(1000);
++	drain_workqueue(hisi_hba->wq);
++	drain_workqueue(shost->work_q);
++
++	state = hisi_hba->hw->get_phys_state(hisi_hba);
++	hisi_sas_rescan_topology(hisi_hba, old_state, state);
++	dev_dbg(dev, "controller reset complete\n");
+ 
+ out:
+-	scsi_unblock_requests(hisi_hba->shost);
++	scsi_unblock_requests(shost);
+ 	clear_bit(HISI_SAS_RESET_BIT, &hisi_hba->flags);
++
+ 	return rc;
+ }
+ 
+@@ -1241,7 +1321,7 @@ hisi_sas_internal_abort_task_exec(struct hisi_hba *hisi_hba, int device_id,
+ 	int dlvry_queue_slot, dlvry_queue, n_elem = 0, rc, slot_idx;
+ 	unsigned long flags, flags_dq;
+ 
+-	if (unlikely(test_bit(HISI_SAS_RESET_BIT, &hisi_hba->flags)))
++	if (unlikely(test_bit(HISI_SAS_REJECT_CMD_BIT, &hisi_hba->flags)))
+ 		return -EINVAL;
+ 
+ 	if (!device->port)
+@@ -1437,36 +1517,6 @@ void hisi_sas_phy_down(struct hisi_hba *hisi_hba, int phy_no, int rdy)
+ }
+ EXPORT_SYMBOL_GPL(hisi_sas_phy_down);
+ 
+-void hisi_sas_rescan_topology(struct hisi_hba *hisi_hba, u32 old_state,
+-			      u32 state)
+-{
+-	struct sas_ha_struct *sas_ha = &hisi_hba->sha;
+-	int phy_no;
+-
+-	for (phy_no = 0; phy_no < hisi_hba->n_phy; phy_no++) {
+-		struct hisi_sas_phy *phy = &hisi_hba->phy[phy_no];
+-		struct asd_sas_phy *sas_phy = &phy->sas_phy;
+-		struct asd_sas_port *sas_port = sas_phy->port;
+-		struct domain_device *dev;
+-
+-		if (sas_phy->enabled) {
+-			/* Report PHY state change to libsas */
+-			if (state & (1 << phy_no))
+-				continue;
+-
+-			if (old_state & (1 << phy_no))
+-				/* PHY down but was up before */
+-				hisi_sas_phy_down(hisi_hba, phy_no, 0);
+-		}
+-		if (!sas_port)
+-			continue;
+-		dev = sas_port->port_dev;
+-
+-		if (DEV_IS_EXPANDER(dev->dev_type))
+-			sas_ha->notify_phy_event(sas_phy, PORTE_BROADCAST_RCVD);
+-	}
+-}
+-EXPORT_SYMBOL_GPL(hisi_sas_rescan_topology);
+ 
+ struct scsi_transport_template *hisi_sas_stt;
+ EXPORT_SYMBOL_GPL(hisi_sas_stt);
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c b/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c
+index 2bfea7082e3a..a6be33c36e86 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_v2_hw.c
+@@ -1364,8 +1364,15 @@ static void start_phys_v2_hw(struct hisi_hba *hisi_hba)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < hisi_hba->n_phy; i++)
++	for (i = 0; i < hisi_hba->n_phy; i++) {
++		struct hisi_sas_phy *phy = &hisi_hba->phy[i];
++		struct asd_sas_phy *sas_phy = &phy->sas_phy;
++
++		if (!sas_phy->phy->enabled)
++			continue;
++
+ 		start_phy_v2_hw(hisi_hba, i);
++	}
+ }
+ 
+ static void phys_init_v2_hw(struct hisi_hba *hisi_hba)
+@@ -3383,14 +3390,16 @@ static void interrupt_disable_v2_hw(struct hisi_hba *hisi_hba)
+ 		synchronize_irq(platform_get_irq(pdev, i));
+ }
+ 
++
++static u32 get_phys_state_v2_hw(struct hisi_hba *hisi_hba)
++{
++	return hisi_sas_read32(hisi_hba, PHY_STATE);
++}
++
+ static int soft_reset_v2_hw(struct hisi_hba *hisi_hba)
+ {
+ 	struct device *dev = hisi_hba->dev;
+-	u32 old_state, state;
+ 	int rc, cnt;
+-	int phy_no;
+-
+-	old_state = hisi_sas_read32(hisi_hba, PHY_STATE);
+ 
+ 	interrupt_disable_v2_hw(hisi_hba);
+ 	hisi_sas_write32(hisi_hba, DLVRY_QUEUE_ENABLE, 0x0);
+@@ -3425,22 +3434,6 @@ static int soft_reset_v2_hw(struct hisi_hba *hisi_hba)
+ 
+ 	phys_reject_stp_links_v2_hw(hisi_hba);
+ 
+-	/* Re-enable the PHYs */
+-	for (phy_no = 0; phy_no < hisi_hba->n_phy; phy_no++) {
+-		struct hisi_sas_phy *phy = &hisi_hba->phy[phy_no];
+-		struct asd_sas_phy *sas_phy = &phy->sas_phy;
+-
+-		if (sas_phy->enabled)
+-			start_phy_v2_hw(hisi_hba, phy_no);
+-	}
+-
+-	/* Wait for the PHYs to come up and read the PHY state */
+-	msleep(1000);
+-
+-	state = hisi_sas_read32(hisi_hba, PHY_STATE);
+-
+-	hisi_sas_rescan_topology(hisi_hba, old_state, state);
+-
+ 	return 0;
+ }
+ 
+@@ -3468,6 +3461,7 @@ static const struct hisi_sas_hw hisi_sas_v2_hw = {
+ 	.max_command_entries = HISI_SAS_COMMAND_ENTRIES_V2_HW,
+ 	.complete_hdr_size = sizeof(struct hisi_sas_complete_v2_hdr),
+ 	.soft_reset = soft_reset_v2_hw,
++	.get_phys_state = get_phys_state_v2_hw,
+ };
+ 
+ static int hisi_sas_v2_probe(struct platform_device *pdev)
+-- 
+2.14.2
+
