@@ -1,0 +1,214 @@
+From: Kumar Sanghvi <kumaras@chelsio.com>
+Date: Wed, 18 Oct 2017 20:49:10 +0530
+Subject: cxgb4: add tc flower support for ETH-DMAC rewrite
+Patch-mainline: v4.15-rc1
+Git-commit: 27ece1f357b71c63e6e35c645b9c344835d4a129
+References: bsc#1064802 bsc#1066129
+
+Add support for ETH-DMAC Rewrite via TC-PEDIT action. Also, add
+check to assert that vlan/eth-dmac rewrite actions are valid only
+in combination with action egress redirect.
+
+Signed-off-by: Kumar Sanghvi <kumaras@chelsio.com>
+Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c |  108 ++++++++++++++++++-
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.h |   19 +++
+ 2 files changed, 126 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+@@ -32,8 +32,9 @@
+  * SOFTWARE.
+  */
+ 
+-#include <net/tc_act/tc_gact.h>
+ #include <net/tc_act/tc_mirred.h>
++#include <net/tc_act/tc_pedit.h>
++#include <net/tc_act/tc_gact.h>
+ #include <net/tc_act/tc_vlan.h>
+ 
+ #include "cxgb4.h"
+@@ -41,6 +42,11 @@
+ 
+ #define STATS_CHECK_PERIOD (HZ / 2)
+ 
++struct ch_tc_pedit_fields pedits[] = {
++	PEDIT_FIELDS(ETH_, DMAC_31_0, 4, dmac, 0),
++	PEDIT_FIELDS(ETH_, DMAC_47_32, 2, dmac, 4),
++};
++
+ static struct ch_tc_flower_entry *allocate_flower_entry(void)
+ {
+ 	struct ch_tc_flower_entry *new = kzalloc(sizeof(*new), GFP_KERNEL);
+@@ -254,6 +260,41 @@ static int cxgb4_validate_flow_match(str
+ 	return 0;
+ }
+ 
++static void offload_pedit(struct ch_filter_specification *fs, u32 val, u32 mask,
++			  u8 field)
++{
++	u32 set_val = val & ~mask;
++	u32 offset;
++	u8 size;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(pedits); i++) {
++		if (pedits[i].field == field) {
++			offset = pedits[i].offset;
++			size = pedits[i].size;
++			break;
++		}
++	}
++	memcpy((u8 *)fs + offset, &set_val, size);
++}
++
++static void process_pedit_field(struct ch_filter_specification *fs, u32 val,
++				u32 mask, u32 offset, u8 htype)
++{
++	switch (htype) {
++	case TCA_PEDIT_KEY_EX_HDR_TYPE_ETH:
++		switch (offset) {
++		case PEDIT_ETH_DMAC_31_0:
++			fs->newdmac = 1;
++			offload_pedit(fs, val, mask, ETH_DMAC_31_0);
++			break;
++		case PEDIT_ETH_DMAC_47_32_SMAC_15_0:
++			if (~mask & PEDIT_ETH_DMAC_MASK)
++				offload_pedit(fs, val, mask, ETH_DMAC_47_32);
++		}
++	}
++}
++
+ static void cxgb4_process_flow_actions(struct net_device *in,
+ 				       struct tc_cls_flower_offload *cls,
+ 				       struct ch_filter_specification *fs)
+@@ -296,6 +337,21 @@ static void cxgb4_process_flow_actions(s
+ 			default:
+ 				break;
+ 			}
++		} else if (is_tcf_pedit(a)) {
++			u32 mask, val, offset;
++			int nkeys, i;
++			u8 htype;
++
++			nkeys = tcf_pedit_nkeys(a);
++			for (i = 0; i < nkeys; i++) {
++				htype = tcf_pedit_htype(a, i);
++				mask = tcf_pedit_mask(a, i);
++				val = tcf_pedit_val(a, i);
++				offset = tcf_pedit_offset(a, i);
++
++				process_pedit_field(fs, val, mask, offset,
++						    htype);
++			}
+ 		}
+ 	}
+ }
+@@ -304,6 +360,9 @@ static int cxgb4_validate_flow_actions(s
+ 				       struct tc_cls_flower_offload *cls)
+ {
+ 	const struct tc_action *a;
++	bool act_redir = false;
++	bool act_pedit = false;
++	bool act_vlan = false;
+ 	LIST_HEAD(actions);
+ 
+ 	tcf_exts_to_list(cls->exts, &actions);
+@@ -335,6 +394,7 @@ static int cxgb4_validate_flow_actions(s
+ 					   __func__);
+ 				return -EINVAL;
+ 			}
++			act_redir = true;
+ 		} else if (is_tcf_vlan(a)) {
+ 			u16 proto = be16_to_cpu(tcf_vlan_push_proto(a));
+ 			u32 vlan_action = tcf_vlan_action(a);
+@@ -355,11 +415,57 @@ static int cxgb4_validate_flow_actions(s
+ 					   __func__);
+ 				return -EOPNOTSUPP;
+ 			}
++			act_vlan = true;
++		} else if (is_tcf_pedit(a)) {
++			u32 mask, val, offset;
++			u8 cmd, htype;
++			int nkeys, i;
++
++			nkeys = tcf_pedit_nkeys(a);
++			for (i = 0; i < nkeys; i++) {
++				htype = tcf_pedit_htype(a, i);
++				cmd = tcf_pedit_cmd(a, i);
++				mask = tcf_pedit_mask(a, i);
++				val = tcf_pedit_val(a, i);
++				offset = tcf_pedit_offset(a, i);
++
++				if (cmd != TCA_PEDIT_KEY_EX_CMD_SET) {
++					netdev_err(dev, "%s: Unsupported pedit cmd\n",
++						   __func__);
++					return -EOPNOTSUPP;
++				}
++
++				switch (htype) {
++				case TCA_PEDIT_KEY_EX_HDR_TYPE_ETH:
++					switch (offset) {
++					case PEDIT_ETH_DMAC_31_0:
++					case PEDIT_ETH_DMAC_47_32_SMAC_15_0:
++						break;
++					default:
++						netdev_err(dev, "%s: Unsupported pedit field\n",
++							   __func__);
++						return -EOPNOTSUPP;
++					}
++					break;
++				default:
++					netdev_err(dev, "%s: Unsupported pedit type\n",
++						   __func__);
++					return -EOPNOTSUPP;
++				}
++			}
++			act_pedit = true;
+ 		} else {
+ 			netdev_err(dev, "%s: Unsupported action\n", __func__);
+ 			return -EOPNOTSUPP;
+ 		}
+ 	}
++
++	if ((act_pedit || act_vlan) && !act_redir) {
++		netdev_err(dev, "%s: pedit/vlan rewrite invalid without egress redirect\n",
++			   __func__);
++		return -EINVAL;
++	}
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.h
+@@ -54,6 +54,25 @@ struct ch_tc_flower_entry {
+ 	u32 filter_id;
+ };
+ 
++enum {
++	ETH_DMAC_31_0,	/* dmac bits 0.. 31 */
++	ETH_DMAC_47_32,	/* dmac bits 32..47 */
++};
++
++struct ch_tc_pedit_fields {
++	u8 field;
++	u8 size;
++	u32 offset;
++};
++
++#define PEDIT_FIELDS(type, field, size, fs_field, offset) \
++	{ type## field, size, \
++		offsetof(struct ch_filter_specification, fs_field) + (offset) }
++
++#define PEDIT_ETH_DMAC_MASK		0xffff
++#define PEDIT_ETH_DMAC_31_0		0x0
++#define PEDIT_ETH_DMAC_47_32_SMAC_15_0	0x4
++
+ int cxgb4_tc_flower_replace(struct net_device *dev,
+ 			    struct tc_cls_flower_offload *cls);
+ int cxgb4_tc_flower_destroy(struct net_device *dev,
