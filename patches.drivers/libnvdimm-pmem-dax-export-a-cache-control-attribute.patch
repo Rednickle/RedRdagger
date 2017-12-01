@@ -1,0 +1,195 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Mon, 26 Jun 2017 21:28:41 -0700
+Subject: libnvdimm, pmem, dax: export a cache control attribute
+Patch-mainline: v4.13-rc1
+Git-commit: 6e0c90d691cd5d90569f5918ab03eb76c81f9c6e
+References: FATE#323717
+
+The dax_flush() operation can be turned into a nop on platforms where
+firmware arranges for cpu caches to be flushed on a power-fail event.
+The ACPI 6.2 specification defines a mechanism for the platform to
+indicate this capability so the kernel can select the proper default.
+However, for other platforms, the administrator must toggle this setting
+manually.
+
+Given this flush setting is a dax-specific mechanism we advertise it
+through a 'dax' attribute group hanging off a host device. For example,
+a 'pmem0' block-device gets a 'dax' sysfs-subdirectory with a
+'write_cache' attribute to control response to dax cache flush requests.
+This is similar to the 'queue/write_cache' attribute that appears under
+block devices.
+
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jeff Moyer <jmoyer@redhat.com>
+Cc: Matthew Wilcox <mawilcox@microsoft.com>
+Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+Suggested-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/dax/super.c   |   79 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/nvdimm/pmem.c |   10 ++++++
+ include/linux/dax.h   |    3 +
+ 3 files changed, 92 insertions(+)
+
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@ -119,6 +119,8 @@ EXPORT_SYMBOL_GPL(__bdev_dax_supported);
+ enum dax_device_flags {
+ 	/* !alive + rcu grace period == no new operations / mappings */
+ 	DAXDEV_ALIVE,
++	/* gate whether dax_flush() calls the low level flush routine */
++	DAXDEV_WRITE_CACHE,
+ };
+ 
+ /**
+@@ -139,6 +141,71 @@ struct dax_device {
+ 	const struct dax_operations *ops;
+ };
+ 
++static ssize_t write_cache_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct dax_device *dax_dev = dax_get_by_host(dev_name(dev));
++	ssize_t rc;
++
++	WARN_ON_ONCE(!dax_dev);
++	if (!dax_dev)
++		return -ENXIO;
++
++	rc = sprintf(buf, "%d\n", !!test_bit(DAXDEV_WRITE_CACHE,
++				&dax_dev->flags));
++	put_dax(dax_dev);
++	return rc;
++}
++
++static ssize_t write_cache_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t len)
++{
++	bool write_cache;
++	int rc = strtobool(buf, &write_cache);
++	struct dax_device *dax_dev = dax_get_by_host(dev_name(dev));
++
++	WARN_ON_ONCE(!dax_dev);
++	if (!dax_dev)
++		return -ENXIO;
++
++	if (rc)
++		len = rc;
++	else if (write_cache)
++		set_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
++	else
++		clear_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
++
++	put_dax(dax_dev);
++	return len;
++}
++static DEVICE_ATTR_RW(write_cache);
++
++static umode_t dax_visible(struct kobject *kobj, struct attribute *a, int n)
++{
++	struct device *dev = container_of(kobj, typeof(*dev), kobj);
++	struct dax_device *dax_dev = dax_get_by_host(dev_name(dev));
++
++	WARN_ON_ONCE(!dax_dev);
++	if (!dax_dev)
++		return 0;
++
++	if (a == &dev_attr_write_cache.attr && !dax_dev->ops->flush)
++		return 0;
++	return a->mode;
++}
++
++static struct attribute *dax_attributes[] = {
++	&dev_attr_write_cache.attr,
++	NULL,
++};
++
++struct attribute_group dax_attribute_group = {
++	.name = "dax",
++	.attrs = dax_attributes,
++	.is_visible = dax_visible,
++};
++EXPORT_SYMBOL_GPL(dax_attribute_group);
++
+ /**
+  * dax_direct_access() - translate a device pgoff to an absolute pfn
+  * @dax_dev: a dax_device instance representing the logical memory range
+@@ -196,11 +263,23 @@ void dax_flush(struct dax_device *dax_de
+ 	if (!dax_alive(dax_dev))
+ 		return;
+ 
++	if (!test_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags))
++		return;
++
+ 	if (dax_dev->ops->flush)
+ 		dax_dev->ops->flush(dax_dev, pgoff, addr, size);
+ }
+ EXPORT_SYMBOL_GPL(dax_flush);
+ 
++void dax_write_cache(struct dax_device *dax_dev, bool wc)
++{
++	if (wc)
++		set_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
++	else
++		clear_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
++}
++EXPORT_SYMBOL_GPL(dax_write_cache);
++
+ bool dax_alive(struct dax_device *dax_dev)
+ {
+ 	lockdep_assert_held(&dax_srcu);
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -254,6 +254,11 @@ static const struct dax_operations pmem_
+ 	.flush = pmem_dax_flush,
+ };
+ 
++static const struct attribute_group *pmem_attribute_groups[] = {
++	&dax_attribute_group,
++	NULL,
++};
++
+ static void pmem_release_queue(void *q)
+ {
+ 	blk_cleanup_queue(q);
+@@ -288,6 +293,7 @@ static int pmem_attach_disk(struct devic
+ 	struct pmem_device *pmem;
+ 	struct resource pfn_res;
+ 	struct request_queue *q;
++	struct device *gendev;
+ 	struct gendisk *disk;
+ 	void *addr;
+ 
+@@ -385,8 +391,12 @@ static int pmem_attach_disk(struct devic
+ 		put_disk(disk);
+ 		return -ENOMEM;
+ 	}
++	dax_write_cache(dax_dev, true);
+ 	pmem->dax_dev = dax_dev;
+ 
++	gendev = disk_to_dev(disk);
++	gendev->groups = pmem_attribute_groups;
++
+ 	device_add_disk(dev, disk);
+ 	if (devm_add_action_or_reset(dev, pmem_release_disk, pmem))
+ 		return -ENOMEM;
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -23,6 +23,8 @@ struct dax_operations {
+ 	void (*flush)(struct dax_device *, pgoff_t, void *, size_t);
+ };
+ 
++extern struct attribute_group dax_attribute_group;
++
+ #if IS_ENABLED(CONFIG_DAX)
+ struct dax_device *dax_get_by_host(const char *host);
+ void put_dax(struct dax_device *dax_dev);
+@@ -84,6 +86,7 @@ size_t dax_copy_from_iter(struct dax_dev
+ 		size_t bytes, struct iov_iter *i);
+ void dax_flush(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
+ 		size_t size);
++void dax_write_cache(struct dax_device *dax_dev, bool wc);
+ 
+ /*
+  * We use lowest available bit in exceptional entry for locking, one bit for
