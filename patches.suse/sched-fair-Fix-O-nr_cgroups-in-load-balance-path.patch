@@ -1,0 +1,134 @@
+From 319e352e69a50b9ecf51371f7cbe8236199c8ee8 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 25 Apr 2017 17:43:50 -0700
+Subject: [PATCH] sched/fair: Fix O(nr_cgroups) in load balance path
+
+References: bnc#1066110 Scheduler utilisation tracking
+Patch-mainline: v4.13
+Git-commit: a9e7f6544b9cebdae54d29f87a7ba2a83c0471b5
+
+Currently, rq->leaf_cfs_rq_list is a traversal ordered list of all
+live cfs_rqs which have ever been active on the CPU; unfortunately,
+this makes update_blocked_averages() O(# total cgroups) which isn't
+scalable at all.
+
+This shows up as a small CPU consumption and scheduling latency
+increase in the load balancing path in systems with CPU controller
+enabled across most cgroups.  In an edge case where temporary cgroups
+were leaking, this caused the kernel to consume good several tens of
+percents of CPU cycles running update_blocked_averages(), each run
+taking multiple millisecs.
+
+This patch fixes the issue by taking empty and fully decayed cfs_rqs
+off the rq->leaf_cfs_rq_list.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+[ Added cfs_rq_is_decayed() ]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Vincent Guittot <vincent.guittot@linaro.org>
+Cc: Chris Mason <clm@fb.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Paul Turner <pjt@google.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170426004350.GB3222@wtj.duckdns.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/fair.c | 42 ++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 852fb85e143e..e9a677fe9675 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -369,8 +369,9 @@ static inline void list_del_leaf_cfs_rq(struct cfs_rq *cfs_rq)
+ }
+ 
+ /* Iterate thr' all leaf cfs_rq's on a runqueue */
+-#define for_each_leaf_cfs_rq(rq, cfs_rq) \
+-	list_for_each_entry_rcu(cfs_rq, &rq->leaf_cfs_rq_list, leaf_cfs_rq_list)
++#define for_each_leaf_cfs_rq_safe(rq, cfs_rq, pos)			\
++	list_for_each_entry_safe(cfs_rq, pos, &rq->leaf_cfs_rq_list,	\
++				 leaf_cfs_rq_list)
+ 
+ /* Do the two (enqueued) entities belong to the same group ? */
+ static inline struct cfs_rq *
+@@ -463,8 +464,8 @@ static inline void list_del_leaf_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ }
+ 
+-#define for_each_leaf_cfs_rq(rq, cfs_rq) \
+-		for (cfs_rq = &rq->cfs; cfs_rq; cfs_rq = NULL)
++#define for_each_leaf_cfs_rq_safe(rq, cfs_rq, pos)	\
++		for (cfs_rq = &rq->cfs, pos = NULL; cfs_rq; cfs_rq = pos)
+ 
+ static inline struct sched_entity *parent_entity(struct sched_entity *se)
+ {
+@@ -6920,10 +6921,28 @@ static void attach_tasks(struct lb_env *env)
+ }
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
++
++static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
++{
++	if (cfs_rq->load.weight)
++		return false;
++
++	if (cfs_rq->avg.load_sum)
++		return false;
++
++	if (cfs_rq->avg.util_sum)
++		return false;
++
++	if (cfs_rq->runnable_load_sum)
++		return false;
++
++	return true;
++}
++
+ static void update_blocked_averages(int cpu)
+ {
+ 	struct rq *rq = cpu_rq(cpu);
+-	struct cfs_rq *cfs_rq;
++	struct cfs_rq *cfs_rq, *pos;
+ 	struct rq_flags rf;
+ 
+ 	rq_lock_irqsave(rq, &rf);
+@@ -6933,7 +6952,7 @@ static void update_blocked_averages(int cpu)
+ 	 * Iterates the task_group tree in a bottom up fashion, see
+ 	 * list_add_leaf_cfs_rq() for details.
+ 	 */
+-	for_each_leaf_cfs_rq(rq, cfs_rq) {
++	for_each_leaf_cfs_rq_safe(rq, cfs_rq, pos) {
+ 		struct sched_entity *se;
+ 
+ 		/* throttled entities do not contribute to load */
+@@ -6947,6 +6966,13 @@ static void update_blocked_averages(int cpu)
+ 		se = cfs_rq->tg->se[cpu];
+ 		if (se && !skip_blocked_update(se))
+ 			update_load_avg(se, 0);
++
++		/*
++		 * There can be a lot of idle CPU cgroups.  Don't let fully
++		 * decayed cfs_rqs linger on the list.
++		 */
++		if (cfs_rq_is_decayed(cfs_rq))
++			list_del_leaf_cfs_rq(cfs_rq);
+ 	}
+ 	rq_unlock_irqrestore(rq, &rf);
+ }
+@@ -9481,10 +9507,10 @@ const struct sched_class fair_sched_class = {
+ #ifdef CONFIG_SCHED_DEBUG
+ void print_cfs_stats(struct seq_file *m, int cpu)
+ {
+-	struct cfs_rq *cfs_rq;
++	struct cfs_rq *cfs_rq, *pos;
+ 
+ 	rcu_read_lock();
+-	for_each_leaf_cfs_rq(cpu_rq(cpu), cfs_rq)
++	for_each_leaf_cfs_rq_safe(cpu_rq(cpu), cfs_rq, pos)
+ 		print_cfs_rq(m, cpu, cfs_rq);
+ 	rcu_read_unlock();
+ }
