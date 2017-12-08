@@ -1,0 +1,192 @@
+From a718ffc3f049d304acdfb4f142d87c46315bd07e Mon Sep 17 00:00:00 2001
+From: Vincent Guittot <vincent.guittot@linaro.org>
+Date: Wed, 17 May 2017 11:50:45 +0200
+Subject: [PATCH] sched/fair: Use reweight_entity() for set_user_nice()
+
+References: bnc#1066110 Scheduler utilisation tracking
+Patch-mainline: v4.15
+Git-commit: 9059393e4ec1c8c6623a120b405ef2c90b968d80
+
+Now that we directly change load_avg and propagate that change into
+the sums, sys_nice() and co should do the same, otherwise its possible
+to confuse load accounting when we migrate near the weight change.
+
+Fixes-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+[ Added changelog, fixed the call condition. ]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/r/20170517095045.GA8420@linaro.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ kernel/sched/core.c  | 22 ++++++++++++------
+ kernel/sched/fair.c  | 63 ++++++++++++++++++++++++++++++----------------------
+ kernel/sched/sched.h |  2 ++
+ 3 files changed, 54 insertions(+), 33 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0bf14a77dbc6..a93336882476 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -740,7 +740,7 @@ int tg_nop(struct task_group *tg, void *data)
+ }
+ #endif
+ 
+-static void set_load_weight(struct task_struct *p)
++static void set_load_weight(struct task_struct *p, bool update_load)
+ {
+ 	int prio = p->static_prio - MAX_RT_PRIO;
+ 	struct load_weight *load = &p->se.load;
+@@ -754,8 +754,16 @@ static void set_load_weight(struct task_struct *p)
+ 		return;
+ 	}
+ 
+-	load->weight = scale_load(sched_prio_to_weight[prio]);
+-	load->inv_weight = sched_prio_to_wmult[prio];
++	/*
++	 * SCHED_OTHER tasks have to update their load when changing their
++	 * weight
++	 */
++	if (update_load && p->sched_class == &fair_sched_class) {
++		reweight_task(p, prio);
++	} else {
++		load->weight = scale_load(sched_prio_to_weight[prio]);
++		load->inv_weight = sched_prio_to_wmult[prio];
++	}
+ }
+ 
+ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+@@ -2381,7 +2389,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 			p->static_prio = NICE_TO_PRIO(0);
+ 
+ 		p->prio = p->normal_prio = __normal_prio(p);
+-		set_load_weight(p);
++		set_load_weight(p, false);
+ 
+ 		/*
+ 		 * We don't need the reset flag anymore after the fork. It has
+@@ -3887,7 +3895,7 @@ void set_user_nice(struct task_struct *p, long nice)
+ 		put_prev_task(rq, p);
+ 
+ 	p->static_prio = NICE_TO_PRIO(nice);
+-	set_load_weight(p);
++	set_load_weight(p, true);
+ 	old_prio = p->prio;
+ 	p->prio = effective_prio(p);
+ 	delta = p->prio - old_prio;
+@@ -4084,7 +4092,7 @@ static void __setscheduler_params(struct task_struct *p,
+ 	 */
+ 	p->rt_priority = attr->sched_priority;
+ 	p->normal_prio = normal_prio(p);
+-	set_load_weight(p);
++	set_load_weight(p, true);
+ }
+ 
+ /* Actually do priority change: must hold pi & rq lock. */
+@@ -6184,7 +6192,7 @@ void __init sched_init(void)
+ 		atomic_set(&rq->nr_iowait, 0);
+ 	}
+ 
+-	set_load_weight(&init_task);
++	set_load_weight(&init_task, false);
+ 
+ 	/*
+ 	 * The boot idle thread does lazy MMU switching as well:
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 837efd4bc9f8..0c02e7683811 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2789,6 +2789,43 @@ static inline void
+ dequeue_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) { }
+ #endif
+ 
++static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
++			    unsigned long weight)
++{
++	if (se->on_rq) {
++		/* commit outstanding execution time */
++		if (cfs_rq->curr == se)
++			update_curr(cfs_rq);
++		account_entity_dequeue(cfs_rq, se);
++		dequeue_runnable_load_avg(cfs_rq, se);
++	}
++	dequeue_load_avg(cfs_rq, se);
++
++	update_load_set(&se->load, weight);
++
++#ifdef CONFIG_SMP
++	se->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum,
++				   LOAD_AVG_MAX - 1024 + se->avg.period_contrib);
++#endif
++
++	enqueue_load_avg(cfs_rq, se);
++	if (se->on_rq) {
++		account_entity_enqueue(cfs_rq, se);
++		enqueue_runnable_load_avg(cfs_rq, se);
++	}
++}
++
++void reweight_task(struct task_struct *p, int prio)
++{
++	struct sched_entity *se = &p->se;
++	struct cfs_rq *cfs_rq = cfs_rq_of(se);
++	struct load_weight *load = &se->load;
++	unsigned long weight = scale_load(sched_prio_to_weight[prio]);
++
++	reweight_entity(cfs_rq, se, weight);
++	load->inv_weight = sched_prio_to_wmult[prio];
++}
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ # ifdef CONFIG_SMP
+ /*
+@@ -2891,32 +2928,6 @@ static long calc_cfs_shares(struct cfs_rq *cfs_rq)
+ }
+ # endif /* CONFIG_SMP */
+ 
+-static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
+-			    unsigned long weight)
+-{
+-	if (se->on_rq) {
+-		/* commit outstanding execution time */
+-		if (cfs_rq->curr == se)
+-			update_curr(cfs_rq);
+-		account_entity_dequeue(cfs_rq, se);
+-		dequeue_runnable_load_avg(cfs_rq, se);
+-	}
+-	dequeue_load_avg(cfs_rq, se);
+-
+-	update_load_set(&se->load, weight);
+-
+-#ifdef CONFIG_SMP
+-	se->avg.load_avg = div_u64(se_weight(se) * se->avg.load_sum,
+-				   LOAD_AVG_MAX - 1024 + se->avg.period_contrib);
+-#endif
+-
+-	enqueue_load_avg(cfs_rq, se);
+-	if (se->on_rq) {
+-		account_entity_enqueue(cfs_rq, se);
+-		enqueue_runnable_load_avg(cfs_rq, se);
+-	}
+-}
+-
+ static inline int throttled_hierarchy(struct cfs_rq *cfs_rq);
+ 
+ static void update_cfs_shares(struct sched_entity *se)
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 5fa916c4d0ad..d88bb4dcc3ca 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1476,6 +1476,8 @@ extern void init_sched_dl_class(void);
+ extern void init_sched_rt_class(void);
+ extern void init_sched_fair_class(void);
+ 
++extern void reweight_task(struct task_struct *p, int prio);
++
+ extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
+ 
