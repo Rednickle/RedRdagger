@@ -1,0 +1,340 @@
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Glisse?= <jglisse@redhat.com>
+Date: Fri, 8 Sep 2017 16:12:06 -0700
+Subject: mm/migrate: new migrate mode MIGRATE_SYNC_NO_COPY
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 2916ecc0f9d435d849c98f4da50e453124c87531
+Patch-mainline: v4.14-rc1
+References: VM Functionality, FATE#323338, bsc#1047814
+
+Introduce a new migration mode that allow to offload the copy to a device
+DMA engine.  This changes the workflow of migration and not all
+address_space migratepage callback can support this.
+
+This is intended to be use by migrate_vma() which itself is use for thing
+like HMM (see include/linux/hmm.h).
+
+No additional per-filesystem migratepage testing is needed.  I disables
+MIGRATE_SYNC_NO_COPY in all problematic migratepage() callback and i
+added comment in those to explain why (part of this patch).  The commit
+message is unclear it should say that any callback that wish to support
+this new mode need to be aware of the difference in the migration flow
+from other mode.
+
+Some of these callbacks do extra locking while copying (aio, zsmalloc,
+balloon, ...) and for DMA to be effective you want to copy multiple
+pages in one DMA operations.  But in the problematic case you can not
+easily hold the extra lock accross multiple call to this callback.
+
+Usual flow is:
+
+For each page {
+ 1 - lock page
+ 2 - call migratepage() callback
+ 3 - (extra locking in some migratepage() callback)
+ 4 - migrate page state (freeze refcount, update page cache, buffer
+     head, ...)
+ 5 - copy page
+ 6 - (unlock any extra lock of migratepage() callback)
+ 7 - return from migratepage() callback
+ 8 - unlock page
+}
+
+The new mode MIGRATE_SYNC_NO_COPY:
+ 1 - lock multiple pages
+For each page {
+ 2 - call migratepage() callback
+ 3 - abort in all problematic migratepage() callback
+ 4 - migrate page state (freeze refcount, update page cache, buffer
+     head, ...)
+} // finished all calls to migratepage() callback
+ 5 - DMA copy multiple pages
+ 6 - unlock all the pages
+
+To support MIGRATE_SYNC_NO_COPY in the problematic case we would need a
+new callback migratepages() (for instance) that deals with multiple
+pages in one transaction.
+
+Because the problematic cases are not important for current usage I did
+not wanted to complexify this patchset even more for no good reason.
+
+Link: http://lkml.kernel.org/r/20170817000548.32038-14-jglisse@redhat.com
+Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+Cc: Balbir Singh <bsingharora@gmail.com>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: David Nellans <dnellans@nvidia.com>
+Cc: Evgeny Baskakov <ebaskakov@nvidia.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Mark Hairgrove <mhairgrove@nvidia.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+Cc: Sherry Cheung <SCheung@nvidia.com>
+Cc: Subhash Gutti <sgutti@nvidia.com>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Cc: Bob Liu <liubo95@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ fs/aio.c                     |    8 ++++++
+ fs/f2fs/data.c               |    5 +++-
+ fs/hugetlbfs/inode.c         |    5 +++-
+ fs/ubifs/file.c              |    5 +++-
+ include/linux/migrate.h      |    5 ++++
+ include/linux/migrate_mode.h |    5 ++++
+ mm/balloon_compaction.c      |    8 ++++++
+ mm/migrate.c                 |   52 +++++++++++++++++++++++++++++++++----------
+ mm/zsmalloc.c                |    8 ++++++
+ 9 files changed, 86 insertions(+), 15 deletions(-)
+
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -373,6 +373,14 @@ static int aio_migratepage(struct addres
+ 	pgoff_t idx;
+ 	int rc;
+ 
++	/*
++	 * We cannot support the _NO_COPY case here, because copy needs to
++	 * happen under the ctx->completion_lock. That does not work with the
++	 * migration workflow of MIGRATE_SYNC_NO_COPY.
++	 */
++	if (mode == MIGRATE_SYNC_NO_COPY)
++		return -EINVAL;
++
+ 	rc = 0;
+ 
+ 	/* mapping->private_lock here protects against the kioctx teardown.  */
+--- a/fs/f2fs/data.c
++++ b/fs/f2fs/data.c
+@@ -2186,7 +2186,10 @@ int f2fs_migrate_page(struct address_spa
+ 		SetPagePrivate(newpage);
+ 	set_page_private(newpage, page_private(page));
+ 
+-	migrate_page_copy(newpage, page);
++	if (mode != MIGRATE_SYNC_NO_COPY)
++		migrate_page_copy(newpage, page);
++	else
++		migrate_page_states(newpage, page);
+ 
+ 	return MIGRATEPAGE_SUCCESS;
+ }
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -846,7 +846,10 @@ static int hugetlbfs_migrate_page(struct
+ 	rc = migrate_huge_page_move_mapping(mapping, newpage, page);
+ 	if (rc != MIGRATEPAGE_SUCCESS)
+ 		return rc;
+-	migrate_page_copy(newpage, page);
++	if (mode != MIGRATE_SYNC_NO_COPY)
++		migrate_page_copy(newpage, page);
++	else
++		migrate_page_states(newpage, page);
+ 
+ 	return MIGRATEPAGE_SUCCESS;
+ }
+--- a/fs/ubifs/file.c
++++ b/fs/ubifs/file.c
+@@ -1482,7 +1482,10 @@ static int ubifs_migrate_page(struct add
+ 		SetPagePrivate(newpage);
+ 	}
+ 
+-	migrate_page_copy(newpage, page);
++	if (mode != MIGRATE_SYNC_NO_COPY)
++		migrate_page_copy(newpage, page);
++	else
++		migrate_page_states(newpage, page);
+ 	return MIGRATEPAGE_SUCCESS;
+ }
+ #endif
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -61,6 +61,7 @@ extern void putback_movable_page(struct
+ 
+ extern int migrate_prep(void);
+ extern int migrate_prep_local(void);
++extern void migrate_page_states(struct page *newpage, struct page *page);
+ extern void migrate_page_copy(struct page *newpage, struct page *page);
+ extern int migrate_huge_page_move_mapping(struct address_space *mapping,
+ 				  struct page *newpage, struct page *page);
+@@ -81,6 +82,10 @@ static inline int isolate_movable_page(s
+ static inline int migrate_prep(void) { return -ENOSYS; }
+ static inline int migrate_prep_local(void) { return -ENOSYS; }
+ 
++static inline void migrate_page_states(struct page *newpage, struct page *page)
++{
++}
++
+ static inline void migrate_page_copy(struct page *newpage,
+ 				     struct page *page) {}
+ 
+--- a/include/linux/migrate_mode.h
++++ b/include/linux/migrate_mode.h
+@@ -6,11 +6,16 @@
+  *	on most operations but not ->writepage as the potential stall time
+  *	is too significant
+  * MIGRATE_SYNC will block when migrating pages
++ * MIGRATE_SYNC_NO_COPY will block when migrating pages but will not copy pages
++ *	with the CPU. Instead, page copy happens outside the migratepage()
++ *	callback and is likely using a DMA engine. See migrate_vma() and HMM
++ *	(mm/hmm.c) for users of this mode.
+  */
+ enum migrate_mode {
+ 	MIGRATE_ASYNC,
+ 	MIGRATE_SYNC_LIGHT,
+ 	MIGRATE_SYNC,
++	MIGRATE_SYNC_NO_COPY,
+ };
+ 
+ #endif		/* MIGRATE_MODE_H_INCLUDED */
+--- a/mm/balloon_compaction.c
++++ b/mm/balloon_compaction.c
+@@ -139,6 +139,14 @@ int balloon_page_migrate(struct address_
+ {
+ 	struct balloon_dev_info *balloon = balloon_page_device(page);
+ 
++	/*
++	 * We can not easily support the no copy case here so ignore it as it
++	 * is unlikely to be use with ballon pages. See include/linux/hmm.h for
++	 * user of the MIGRATE_SYNC_NO_COPY mode.
++	 */
++	if (mode == MIGRATE_SYNC_NO_COPY)
++		return -EINVAL;
++
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	VM_BUG_ON_PAGE(!PageLocked(newpage), newpage);
+ 
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -603,15 +603,10 @@ static void copy_huge_page(struct page *
+ /*
+  * Copy the page to its new location
+  */
+-void migrate_page_copy(struct page *newpage, struct page *page)
++void migrate_page_states(struct page *newpage, struct page *page)
+ {
+ 	int cpupid;
+ 
+-	if (PageHuge(page) || PageTransHuge(page))
+-		copy_huge_page(newpage, page);
+-	else
+-		copy_highpage(newpage, page);
+-
+ 	if (PageError(page))
+ 		SetPageError(newpage);
+ 	if (PageReferenced(page))
+@@ -665,6 +660,17 @@ void migrate_page_copy(struct page *newp
+ 
+ 	mem_cgroup_migrate(page, newpage);
+ }
++EXPORT_SYMBOL(migrate_page_states);
++
++void migrate_page_copy(struct page *newpage, struct page *page)
++{
++	if (PageHuge(page) || PageTransHuge(page))
++		copy_huge_page(newpage, page);
++	else
++		copy_highpage(newpage, page);
++
++	migrate_page_states(newpage, page);
++}
+ EXPORT_SYMBOL(migrate_page_copy);
+ 
+ /************************************************************
+@@ -690,7 +696,10 @@ int migrate_page(struct address_space *m
+ 	if (rc != MIGRATEPAGE_SUCCESS)
+ 		return rc;
+ 
+-	migrate_page_copy(newpage, page);
++	if (mode != MIGRATE_SYNC_NO_COPY)
++		migrate_page_copy(newpage, page);
++	else
++		migrate_page_states(newpage, page);
+ 	return MIGRATEPAGE_SUCCESS;
+ }
+ EXPORT_SYMBOL(migrate_page);
+@@ -740,12 +749,15 @@ int buffer_migrate_page(struct address_s
+ 
+ 	SetPagePrivate(newpage);
+ 
+-	migrate_page_copy(newpage, page);
++	if (mode != MIGRATE_SYNC_NO_COPY)
++		migrate_page_copy(newpage, page);
++	else
++		migrate_page_states(newpage, page);
+ 
+ 	bh = head;
+ 	do {
+ 		unlock_buffer(bh);
+- 		put_bh(bh);
++		put_bh(bh);
+ 		bh = bh->b_this_page;
+ 
+ 	} while (bh != head);
+@@ -804,8 +816,13 @@ static int fallback_migrate_page(struct
+ {
+ 	if (PageDirty(page)) {
+ 		/* Only writeback pages in full synchronous migration */
+-		if (mode != MIGRATE_SYNC)
++		switch (mode) {
++		case MIGRATE_SYNC:
++		case MIGRATE_SYNC_NO_COPY:
++			break;
++		default:
+ 			return -EBUSY;
++		}
+ 		return writeout(mapping, page);
+ 	}
+ 
+@@ -942,7 +959,11 @@ static int __unmap_and_move(struct page
+ 		 * the retry loop is too short and in the sync-light case,
+ 		 * the overhead of stalling is too much
+ 		 */
+-		if (mode != MIGRATE_SYNC) {
++		switch (mode) {
++		case MIGRATE_SYNC:
++		case MIGRATE_SYNC_NO_COPY:
++			break;
++		default:
+ 			rc = -EBUSY;
+ 			goto out_unlock;
+ 		}
+@@ -1212,8 +1233,15 @@ static int unmap_and_move_huge_page(new_
+ 		return -ENOMEM;
+ 
+ 	if (!trylock_page(hpage)) {
+-		if (!force || mode != MIGRATE_SYNC)
++		if (!force)
+ 			goto out;
++		switch (mode) {
++		case MIGRATE_SYNC:
++		case MIGRATE_SYNC_NO_COPY:
++			break;
++		default:
++			goto out;
++		}
+ 		lock_page(hpage);
+ 	}
+ 
+--- a/mm/zsmalloc.c
++++ b/mm/zsmalloc.c
+@@ -1983,6 +1983,14 @@ int zs_page_migrate(struct address_space
+ 	unsigned int obj_idx;
+ 	int ret = -EAGAIN;
+ 
++	/*
++	 * We cannot support the _NO_COPY case here, because copy needs to
++	 * happen under the zs lock, which does not work with
++	 * MIGRATE_SYNC_NO_COPY workflow.
++	 */
++	if (mode == MIGRATE_SYNC_NO_COPY)
++		return -EINVAL;
++
+ 	VM_BUG_ON_PAGE(!PageMovable(page), page);
+ 	VM_BUG_ON_PAGE(!PageIsolated(page), page);
+ 
