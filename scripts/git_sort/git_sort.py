@@ -168,6 +168,7 @@ remotes = (
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
+    Head(RepoURL("mkp/scsi.git"), "4.15/scsi-fixes"),
 )
 
 
