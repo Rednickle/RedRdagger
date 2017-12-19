@@ -1,0 +1,513 @@
+From e641a317830b6bd26e6dc2ef5fe2c1c181dd5cc2 Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Thu, 26 Oct 2017 16:39:19 +1100
+Subject: [PATCH] KVM: PPC: Book3S HV: Unify dirty page map between HPT and
+ radix
+
+References: bsc#1061840
+Patch-mainline: v4.15-rc1
+Git-commit: e641a317830b6bd26e6dc2ef5fe2c1c181dd5cc2
+
+Currently, the HPT code in HV KVM maintains a dirty bit per guest page
+in the rmap array, whether or not dirty page tracking has been enabled
+for the memory slot.  In contrast, the radix code maintains a dirty
+bit per guest page in memslot->dirty_bitmap, and only does so when
+dirty page tracking has been enabled.
+
+This changes the HPT code to maintain the dirty bits in the memslot
+dirty_bitmap like radix does.  This results in slightly less code
+overall, and will mean that we do not lose the dirty bits when
+transitioning between HPT and radix mode in future.
+
+There is one minor change to behaviour as a result.  With HPT, when
+dirty tracking was enabled for a memslot, we would previously clear
+all the dirty bits at that point (both in the HPT entries and in the
+rmap arrays), meaning that a KVM_GET_DIRTY_LOG ioctl immediately
+following would show no pages as dirty (assuming no vcpus have run
+in the meantime).  With this change, the dirty bits on HPT entries
+are not cleared at the point where dirty tracking is enabled, so
+KVM_GET_DIRTY_LOG would show as dirty any guest pages that are
+resident in the HPT and dirty.  This is consistent with what happens
+on radix.
+
+This also fixes a bug in the mark_pages_dirty() function for radix
+(in the sense that the function no longer exists).  In the case where
+a large page of 64 normal pages or more is marked dirty, the
+addressing of the dirty bitmap was incorrect and could write past
+the end of the bitmap.  Fortunately this case was never hit in
+practice because a 2MB large page is only 32 x 64kB pages, and we
+don't support backing the guest with 1GB huge pages at this point.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/kvm_book3s.h    |  3 +-
+ arch/powerpc/include/asm/kvm_book3s_64.h | 24 +++++++++++++
+ arch/powerpc/include/asm/kvm_host.h      |  3 --
+ arch/powerpc/kvm/book3s_64_mmu_hv.c      | 39 ++++++---------------
+ arch/powerpc/kvm/book3s_64_mmu_radix.c   | 50 +++++---------------------
+ arch/powerpc/kvm/book3s_hv.c             | 30 +++++++---------
+ arch/powerpc/kvm/book3s_hv_rm_mmu.c      | 60 ++++++++++++++++++++------------
+ 7 files changed, 96 insertions(+), 113 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index b8d5b8e35244..9a667007bff8 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -216,7 +216,8 @@ extern kvm_pfn_t kvmppc_gpa_to_pfn(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 			bool writing, bool *writable);
+ extern void kvmppc_add_revmap_chain(struct kvm *kvm, struct revmap_entry *rev,
+ 			unsigned long *rmap, long pte_index, int realmode);
+-extern void kvmppc_update_rmap_change(unsigned long *rmap, unsigned long psize);
++extern void kvmppc_update_dirty_map(struct kvm_memory_slot *memslot,
++			unsigned long gfn, unsigned long psize);
+ extern void kvmppc_invalidate_hpte(struct kvm *kvm, __be64 *hptep,
+ 			unsigned long pte_index);
+ void kvmppc_clear_ref_hpte(struct kvm *kvm, __be64 *hptep,
+diff --git a/arch/powerpc/include/asm/kvm_book3s_64.h b/arch/powerpc/include/asm/kvm_book3s_64.h
+index b21936c7b190..735cfa35298a 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@ -20,6 +20,8 @@
+ #ifndef __ASM_KVM_BOOK3S_64_H__
+ #define __ASM_KVM_BOOK3S_64_H__
+ 
++#include <linux/string.h>
++#include <asm/bitops.h>
+ #include <asm/book3s/64/mmu-hash.h>
+ 
+ /* Power architecture requires HPT is at least 256kiB, at most 64TiB */
+@@ -444,6 +446,28 @@ static inline unsigned long kvmppc_hpt_mask(struct kvm_hpt_info *hpt)
+ 	return (1UL << (hpt->order - 7)) - 1;
+ }
+ 
++/* Set bits in a dirty bitmap, which is in LE format */
++static inline void set_dirty_bits(unsigned long *map, unsigned long i,
++				  unsigned long npages)
++{
++
++	if (npages >= 8)
++		memset((char *)map + i / 8, 0xff, npages / 8);
++	else
++		for (; npages; ++i, --npages)
++			__set_bit_le(i, map);
++}
++
++static inline void set_dirty_bits_atomic(unsigned long *map, unsigned long i,
++					 unsigned long npages)
++{
++	if (npages >= 8)
++		memset((char *)map + i / 8, 0xff, npages / 8);
++	else
++		for (; npages; ++i, --npages)
++			set_bit_le(i, map);
++}
++
+ #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+ 
+ #endif /* __ASM_KVM_BOOK3S_64_H__ */
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 49493ea5520b..d831a3883175 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -235,10 +235,7 @@ struct revmap_entry {
+  */
+ #define KVMPPC_RMAP_LOCK_BIT	63
+ #define KVMPPC_RMAP_RC_SHIFT	32
+-#define KVMPPC_RMAP_CHG_SHIFT	48
+ #define KVMPPC_RMAP_REFERENCED	(HPTE_R_R << KVMPPC_RMAP_RC_SHIFT)
+-#define KVMPPC_RMAP_CHANGED	(HPTE_R_C << KVMPPC_RMAP_RC_SHIFT)
+-#define KVMPPC_RMAP_CHG_ORDER	(0x3ful << KVMPPC_RMAP_CHG_SHIFT)
+ #define KVMPPC_RMAP_PRESENT	0x100000000ul
+ #define KVMPPC_RMAP_INDEX	0xfffffffful
+ 
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 84728038e943..944f7a532879 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -776,6 +776,7 @@ static int kvm_handle_hva(struct kvm *kvm, unsigned long hva,
+ 
+ /* Must be called with both HPTE and rmap locked */
+ static void kvmppc_unmap_hpte(struct kvm *kvm, unsigned long i,
++			      struct kvm_memory_slot *memslot,
+ 			      unsigned long *rmapp, unsigned long gfn)
+ {
+ 	__be64 *hptep = (__be64 *) (kvm->arch.hpt.virt + (i << 4));
+@@ -807,8 +808,8 @@ static void kvmppc_unmap_hpte(struct kvm *kvm, unsigned long i,
+ 		/* Harvest R and C */
+ 		rcbits = be64_to_cpu(hptep[1]) & (HPTE_R_R | HPTE_R_C);
+ 		*rmapp |= rcbits << KVMPPC_RMAP_RC_SHIFT;
+-		if (rcbits & HPTE_R_C)
+-			kvmppc_update_rmap_change(rmapp, psize);
++		if ((rcbits & HPTE_R_C) && memslot->dirty_bitmap)
++			kvmppc_update_dirty_map(memslot, gfn, psize);
+ 		if (rcbits & ~rev[i].guest_rpte) {
+ 			rev[i].guest_rpte = ptel | rcbits;
+ 			note_hpte_modification(kvm, &rev[i]);
+@@ -846,7 +847,7 @@ static int kvm_unmap_rmapp(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 			continue;
+ 		}
+ 
+-		kvmppc_unmap_hpte(kvm, i, rmapp, gfn);
++		kvmppc_unmap_hpte(kvm, i, memslot, rmapp, gfn);
+ 		unlock_rmap(rmapp);
+ 		__unlock_hpte(hptep, be64_to_cpu(hptep[0]));
+ 	}
+@@ -1029,14 +1030,6 @@ static int kvm_test_clear_dirty_npages(struct kvm *kvm, unsigned long *rmapp)
+ 
+  retry:
+ 	lock_rmap(rmapp);
+-	if (*rmapp & KVMPPC_RMAP_CHANGED) {
+-		long change_order = (*rmapp & KVMPPC_RMAP_CHG_ORDER)
+-			>> KVMPPC_RMAP_CHG_SHIFT;
+-		*rmapp &= ~(KVMPPC_RMAP_CHANGED | KVMPPC_RMAP_CHG_ORDER);
+-		npages_dirty = 1;
+-		if (change_order > PAGE_SHIFT)
+-			npages_dirty = 1ul << (change_order - PAGE_SHIFT);
+-	}
+ 	if (!(*rmapp & KVMPPC_RMAP_PRESENT)) {
+ 		unlock_rmap(rmapp);
+ 		return npages_dirty;
+@@ -1128,7 +1121,7 @@ void kvmppc_harvest_vpa_dirty(struct kvmppc_vpa *vpa,
+ long kvmppc_hv_get_dirty_log_hpt(struct kvm *kvm,
+ 			struct kvm_memory_slot *memslot, unsigned long *map)
+ {
+-	unsigned long i, j;
++	unsigned long i;
+ 	unsigned long *rmapp;
+ 
+ 	preempt_disable();
+@@ -1140,9 +1133,8 @@ long kvmppc_hv_get_dirty_log_hpt(struct kvm *kvm,
+ 		 * since we always put huge-page HPTEs in the rmap chain
+ 		 * corresponding to their page base address.
+ 		 */
+-		if (npages && map)
+-			for (j = i; npages; ++j, --npages)
+-				__set_bit_le(j, map);
++		if (npages)
++			set_dirty_bits(map, i, npages);
+ 		++rmapp;
+ 	}
+ 	preempt_enable();
+@@ -1186,7 +1178,6 @@ void kvmppc_unpin_guest_page(struct kvm *kvm, void *va, unsigned long gpa,
+ 	struct page *page = virt_to_page(va);
+ 	struct kvm_memory_slot *memslot;
+ 	unsigned long gfn;
+-	unsigned long *rmap;
+ 	int srcu_idx;
+ 
+ 	put_page(page);
+@@ -1194,20 +1185,12 @@ void kvmppc_unpin_guest_page(struct kvm *kvm, void *va, unsigned long gpa,
+ 	if (!dirty)
+ 		return;
+ 
+-	/* We need to mark this page dirty in the rmap chain */
++	/* We need to mark this page dirty in the memslot dirty_bitmap, if any */
+ 	gfn = gpa >> PAGE_SHIFT;
+ 	srcu_idx = srcu_read_lock(&kvm->srcu);
+ 	memslot = gfn_to_memslot(kvm, gfn);
+-	if (memslot) {
+-		if (!kvm_is_radix(kvm)) {
+-			rmap = &memslot->arch.rmap[gfn - memslot->base_gfn];
+-			lock_rmap(rmap);
+-			*rmap |= KVMPPC_RMAP_CHANGED;
+-			unlock_rmap(rmap);
+-		} else if (memslot->dirty_bitmap) {
+-			mark_page_dirty(kvm, gfn);
+-		}
+-	}
++	if (memslot && memslot->dirty_bitmap)
++		set_bit_le(gfn - memslot->base_gfn, memslot->dirty_bitmap);
+ 	srcu_read_unlock(&kvm->srcu, srcu_idx);
+ }
+ 
+@@ -1282,7 +1265,7 @@ static unsigned long resize_hpt_rehash_hpte(struct kvm_resize_hpt *resize,
+ 			rmapp = &memslot->arch.rmap[gfn - memslot->base_gfn];
+ 
+ 			lock_rmap(rmapp);
+-			kvmppc_unmap_hpte(kvm, idx, rmapp, gfn);
++			kvmppc_unmap_hpte(kvm, idx, memslot, rmapp, gfn);
+ 			unlock_rmap(rmapp);
+ 		}
+ 
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_radix.c b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+index c5d7435455f1..6336b13ed233 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@ -474,26 +474,6 @@ int kvmppc_book3s_radix_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	return ret;
+ }
+ 
+-static void mark_pages_dirty(struct kvm *kvm, struct kvm_memory_slot *memslot,
+-			     unsigned long gfn, unsigned int order)
+-{
+-	unsigned long i, limit;
+-	unsigned long *dp;
+-
+-	if (!memslot->dirty_bitmap)
+-		return;
+-	limit = 1ul << order;
+-	if (limit < BITS_PER_LONG) {
+-		for (i = 0; i < limit; ++i)
+-			mark_page_dirty(kvm, gfn + i);
+-		return;
+-	}
+-	dp = memslot->dirty_bitmap + (gfn - memslot->base_gfn);
+-	limit /= BITS_PER_LONG;
+-	for (i = 0; i < limit; ++i)
+-		*dp++ = ~0ul;
+-}
+-
+ /* Called with kvm->lock held */
+ int kvm_unmap_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 		    unsigned long gfn)
+@@ -508,12 +488,11 @@ int kvm_unmap_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 		old = kvmppc_radix_update_pte(kvm, ptep, _PAGE_PRESENT, 0,
+ 					      gpa, shift);
+ 		kvmppc_radix_tlbie_page(kvm, gpa, shift);
+-		if (old & _PAGE_DIRTY) {
+-			if (!shift)
+-				mark_page_dirty(kvm, gfn);
+-			else
+-				mark_pages_dirty(kvm, memslot,
+-						 gfn, shift - PAGE_SHIFT);
++		if ((old & _PAGE_DIRTY) && memslot->dirty_bitmap) {
++			unsigned long npages = 1;
++			if (shift)
++				npages = 1ul << (shift - PAGE_SHIFT);
++			kvmppc_update_dirty_map(memslot, gfn, npages);
+ 		}
+ 	}
+ 	return 0;				
+@@ -579,20 +558,8 @@ long kvmppc_hv_get_dirty_log_radix(struct kvm *kvm,
+ 			struct kvm_memory_slot *memslot, unsigned long *map)
+ {
+ 	unsigned long i, j;
+-	unsigned long n, *p;
+ 	int npages;
+ 
+-	/*
+-	 * Radix accumulates dirty bits in the first half of the
+-	 * memslot's dirty_bitmap area, for when pages are paged
+-	 * out or modified by the host directly.  Pick up these
+-	 * bits and add them to the map.
+-	 */
+-	n = kvm_dirty_bitmap_bytes(memslot) / sizeof(long);
+-	p = memslot->dirty_bitmap;
+-	for (i = 0; i < n; ++i)
+-		map[i] |= xchg(&p[i], 0);
+-
+ 	for (i = 0; i < memslot->npages; i = j) {
+ 		npages = kvm_radix_test_clear_dirty(kvm, memslot, i);
+ 
+@@ -604,9 +571,10 @@ long kvmppc_hv_get_dirty_log_radix(struct kvm *kvm,
+ 		 * real address, if npages > 1 we can skip to i + npages.
+ 		 */
+ 		j = i + 1;
+-		if (npages)
+-			for (j = i; npages; ++j, --npages)
+-				__set_bit_le(j, map);
++		if (npages) {
++			set_dirty_bits(map, i, npages);
++			i = j + npages;
++		}
+ 	}
+ 	return 0;
+ }
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index f6522075edbe..96b92d4adb87 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -3376,7 +3376,7 @@ static int kvm_vm_ioctl_get_dirty_log_hv(struct kvm *kvm,
+ 	struct kvm_memory_slot *memslot;
+ 	int i, r;
+ 	unsigned long n;
+-	unsigned long *buf;
++	unsigned long *buf, *p;
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	mutex_lock(&kvm->slots_lock);
+@@ -3392,8 +3392,8 @@ static int kvm_vm_ioctl_get_dirty_log_hv(struct kvm *kvm,
+ 		goto out;
+ 
+ 	/*
+-	 * Use second half of bitmap area because radix accumulates
+-	 * bits in the first half.
++	 * Use second half of bitmap area because both HPT and radix
++	 * accumulate bits in the first half.
+ 	 */
+ 	n = kvm_dirty_bitmap_bytes(memslot);
+ 	buf = memslot->dirty_bitmap + n / sizeof(long);
+@@ -3406,6 +3406,16 @@ static int kvm_vm_ioctl_get_dirty_log_hv(struct kvm *kvm,
+ 	if (r)
+ 		goto out;
+ 
++	/*
++	 * We accumulate dirty bits in the first half of the
++	 * memslot's dirty_bitmap area, for when pages are paged
++	 * out or modified by the host directly.  Pick up these
++	 * bits and add them to the map.
++	 */
++	p = memslot->dirty_bitmap;
++	for (i = 0; i < n / sizeof(long); ++i)
++		buf[i] |= xchg(&p[i], 0);
++
+ 	/* Harvest dirty bits from VPA and DTL updates */
+ 	/* Note: we never modify the SLB shadow buffer areas */
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+@@ -3466,8 +3476,6 @@ static void kvmppc_core_commit_memory_region_hv(struct kvm *kvm,
+ 				const struct kvm_memory_slot *new)
+ {
+ 	unsigned long npages = mem->memory_size >> PAGE_SHIFT;
+-	struct kvm_memslots *slots;
+-	struct kvm_memory_slot *memslot;
+ 
+ 	/*
+ 	 * If we are making a new memslot, it might make
+@@ -3477,18 +3485,6 @@ static void kvmppc_core_commit_memory_region_hv(struct kvm *kvm,
+ 	 */
+ 	if (npages)
+ 		atomic64_inc(&kvm->arch.mmio_update);
+-
+-	if (npages && old->npages && !kvm_is_radix(kvm)) {
+-		/*
+-		 * If modifying a memslot, reset all the rmap dirty bits.
+-		 * If this is a new memslot, we don't need to do anything
+-		 * since the rmap array starts out as all zeroes,
+-		 * i.e. no pages are dirty.
+-		 */
+-		slots = kvm_memslots(kvm);
+-		memslot = id_to_memslot(slots, mem->slot);
+-		kvmppc_hv_get_dirty_log_hpt(kvm, memslot, NULL);
+-	}
+ }
+ 
+ /*
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index cf98f17c1aa6..26c11f678fbf 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -107,23 +107,39 @@ void kvmppc_add_revmap_chain(struct kvm *kvm, struct revmap_entry *rev,
+ }
+ EXPORT_SYMBOL_GPL(kvmppc_add_revmap_chain);
+ 
+-/* Update the changed page order field of an rmap entry */
+-void kvmppc_update_rmap_change(unsigned long *rmap, unsigned long psize)
++/* Update the dirty bitmap of a memslot */
++void kvmppc_update_dirty_map(struct kvm_memory_slot *memslot,
++			     unsigned long gfn, unsigned long psize)
+ {
+-	unsigned long order;
++	unsigned long npages;
+ 
+-	if (!psize)
++	if (!psize || !memslot->dirty_bitmap)
+ 		return;
+-	order = ilog2(psize);
+-	order <<= KVMPPC_RMAP_CHG_SHIFT;
+-	if (order > (*rmap & KVMPPC_RMAP_CHG_ORDER))
+-		*rmap = (*rmap & ~KVMPPC_RMAP_CHG_ORDER) | order;
++	npages = (psize + PAGE_SIZE - 1) / PAGE_SIZE;
++	gfn -= memslot->base_gfn;
++	set_dirty_bits_atomic(memslot->dirty_bitmap, gfn, npages);
++}
++EXPORT_SYMBOL_GPL(kvmppc_update_dirty_map);
++
++static void kvmppc_set_dirty_from_hpte(struct kvm *kvm,
++				unsigned long hpte_v, unsigned long hpte_gr)
++{
++	struct kvm_memory_slot *memslot;
++	unsigned long gfn;
++	unsigned long psize;
++
++	psize = kvmppc_actual_pgsz(hpte_v, hpte_gr);
++	gfn = hpte_rpn(hpte_gr, psize);
++	memslot = __gfn_to_memslot(kvm_memslots_raw(kvm), gfn);
++	if (memslot && memslot->dirty_bitmap)
++		kvmppc_update_dirty_map(memslot, gfn, psize);
+ }
+-EXPORT_SYMBOL_GPL(kvmppc_update_rmap_change);
+ 
+ /* Returns a pointer to the revmap entry for the page mapped by a HPTE */
+ static unsigned long *revmap_for_hpte(struct kvm *kvm, unsigned long hpte_v,
+-				      unsigned long hpte_gr)
++				      unsigned long hpte_gr,
++				      struct kvm_memory_slot **memslotp,
++				      unsigned long *gfnp)
+ {
+ 	struct kvm_memory_slot *memslot;
+ 	unsigned long *rmap;
+@@ -131,6 +147,10 @@ static unsigned long *revmap_for_hpte(struct kvm *kvm, unsigned long hpte_v,
+ 
+ 	gfn = hpte_rpn(hpte_gr, kvmppc_actual_pgsz(hpte_v, hpte_gr));
+ 	memslot = __gfn_to_memslot(kvm_memslots_raw(kvm), gfn);
++	if (memslotp)
++		*memslotp = memslot;
++	if (gfnp)
++		*gfnp = gfn;
+ 	if (!memslot)
+ 		return NULL;
+ 
+@@ -147,10 +167,12 @@ static void remove_revmap_chain(struct kvm *kvm, long pte_index,
+ 	unsigned long ptel, head;
+ 	unsigned long *rmap;
+ 	unsigned long rcbits;
++	struct kvm_memory_slot *memslot;
++	unsigned long gfn;
+ 
+ 	rcbits = hpte_r & (HPTE_R_R | HPTE_R_C);
+ 	ptel = rev->guest_rpte |= rcbits;
+-	rmap = revmap_for_hpte(kvm, hpte_v, ptel);
++	rmap = revmap_for_hpte(kvm, hpte_v, ptel, &memslot, &gfn);
+ 	if (!rmap)
+ 		return;
+ 	lock_rmap(rmap);
+@@ -169,8 +191,8 @@ static void remove_revmap_chain(struct kvm *kvm, long pte_index,
+ 	}
+ 	*rmap |= rcbits << KVMPPC_RMAP_RC_SHIFT;
+ 	if (rcbits & HPTE_R_C)
+-		kvmppc_update_rmap_change(rmap,
+-					  kvmppc_actual_pgsz(hpte_v, hpte_r));
++		kvmppc_update_dirty_map(memslot, gfn,
++					kvmppc_actual_pgsz(hpte_v, hpte_r));
+ 	unlock_rmap(rmap);
+ }
+ 
+@@ -798,7 +820,7 @@ long kvmppc_h_clear_ref(struct kvm_vcpu *vcpu, unsigned long flags,
+ 		gr |= r & (HPTE_R_R | HPTE_R_C);
+ 		if (r & HPTE_R_R) {
+ 			kvmppc_clear_ref_hpte(kvm, hpte, pte_index);
+-			rmap = revmap_for_hpte(kvm, v, gr);
++			rmap = revmap_for_hpte(kvm, v, gr, NULL, NULL);
+ 			if (rmap) {
+ 				lock_rmap(rmap);
+ 				*rmap |= KVMPPC_RMAP_REFERENCED;
+@@ -820,7 +842,6 @@ long kvmppc_h_clear_mod(struct kvm_vcpu *vcpu, unsigned long flags,
+ 	__be64 *hpte;
+ 	unsigned long v, r, gr;
+ 	struct revmap_entry *rev;
+-	unsigned long *rmap;
+ 	long ret = H_NOT_FOUND;
+ 
+ 	if (kvm_is_radix(kvm))
+@@ -849,16 +870,9 @@ long kvmppc_h_clear_mod(struct kvm_vcpu *vcpu, unsigned long flags,
+ 		r = be64_to_cpu(hpte[1]);
+ 		gr |= r & (HPTE_R_R | HPTE_R_C);
+ 		if (r & HPTE_R_C) {
+-			unsigned long psize = kvmppc_actual_pgsz(v, r);
+ 			hpte[1] = cpu_to_be64(r & ~HPTE_R_C);
+ 			eieio();
+-			rmap = revmap_for_hpte(kvm, v, gr);
+-			if (rmap) {
+-				lock_rmap(rmap);
+-				*rmap |= KVMPPC_RMAP_CHANGED;
+-				kvmppc_update_rmap_change(rmap, psize);
+-				unlock_rmap(rmap);
+-			}
++			kvmppc_set_dirty_from_hpte(kvm, v, gr);
+ 		}
+ 	}
+ 	vcpu->arch.gpr[4] = gr;
+-- 
+2.13.6
+
