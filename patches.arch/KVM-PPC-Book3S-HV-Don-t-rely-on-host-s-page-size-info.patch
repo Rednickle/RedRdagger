@@ -1,0 +1,373 @@
+From 8dc6cca556e4126f77b71cf8e0c45ccc78d1d213 Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Mon, 11 Sep 2017 15:29:45 +1000
+Subject: [PATCH] KVM: PPC: Book3S HV: Don't rely on host's page size
+ information
+
+References: bsc#1061840
+Patch-mainline: v4.15-rc1
+Git-commit: 8dc6cca556e4126f77b71cf8e0c45ccc78d1d213
+
+This removes the dependence of KVM on the mmu_psize_defs array (which
+stores information about hardware support for various page sizes) and
+the things derived from it, chiefly hpte_page_sizes[], hpte_page_size(),
+hpte_actual_page_size() and get_sllp_encoding().  We also no longer
+rely on the mmu_slb_size variable or the MMU_FTR_1T_SEGMENTS feature
+bit.
+
+The reason for doing this is so we can support a HPT guest on a radix
+host.  In a radix host, the mmu_psize_defs array contains information
+about page sizes supported by the MMU in radix mode rather than the
+page sizes supported by the MMU in HPT mode.  Similarly, mmu_slb_size
+and the MMU_FTR_1T_SEGMENTS bit are not set.
+
+Instead we hard-code knowledge of the behaviour of the HPT MMU in the
+POWER7, POWER8 and POWER9 processors (which are the only processors
+supported by HV KVM) - specifically the encoding of the LP fields in
+the HPT and SLB entries, and the fact that they have 32 SLB entries
+and support 1TB segments.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/kvm_book3s_64.h | 116 +++++++++++++++++++++++++------
+ arch/powerpc/kvm/book3s_64_mmu_hv.c      |  13 ++--
+ arch/powerpc/kvm/book3s_hv.c             |  39 +++++------
+ arch/powerpc/kvm/book3s_hv_rm_mmu.c      |  11 +--
+ 4 files changed, 126 insertions(+), 53 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s_64.h b/arch/powerpc/include/asm/kvm_book3s_64.h
+index d55c7f881ce7..b21936c7b190 100644
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@ -107,18 +107,96 @@ static inline void __unlock_hpte(__be64 *hpte, unsigned long hpte_v)
+ 	hpte[0] = cpu_to_be64(hpte_v);
+ }
+ 
++/*
++ * These functions encode knowledge of the POWER7/8/9 hardware
++ * interpretations of the HPTE LP (large page size) field.
++ */
++static inline int kvmppc_hpte_page_shifts(unsigned long h, unsigned long l)
++{
++	unsigned int lphi;
++
++	if (!(h & HPTE_V_LARGE))
++		return 12;	/* 4kB */
++	lphi = (l >> 16) & 0xf;
++	switch ((l >> 12) & 0xf) {
++	case 0:
++		return !lphi ? 24 : -1;		/* 16MB */
++		break;
++	case 1:
++		return 16;			/* 64kB */
++		break;
++	case 3:
++		return !lphi ? 34 : -1;		/* 16GB */
++		break;
++	case 7:
++		return (16 << 8) + 12;		/* 64kB in 4kB */
++		break;
++	case 8:
++		if (!lphi)
++			return (24 << 8) + 16;	/* 16MB in 64kkB */
++		if (lphi == 3)
++			return (24 << 8) + 12;	/* 16MB in 4kB */
++		break;
++	}
++	return -1;
++}
++
++static inline int kvmppc_hpte_base_page_shift(unsigned long h, unsigned long l)
++{
++	return kvmppc_hpte_page_shifts(h, l) & 0xff;
++}
++
++static inline int kvmppc_hpte_actual_page_shift(unsigned long h, unsigned long l)
++{
++	int tmp = kvmppc_hpte_page_shifts(h, l);
++
++	if (tmp >= 0x100)
++		tmp >>= 8;
++	return tmp;
++}
++
++static inline unsigned long kvmppc_actual_pgsz(unsigned long v, unsigned long r)
++{
++	return 1ul << kvmppc_hpte_actual_page_shift(v, r);
++}
++
++static inline int kvmppc_pgsize_lp_encoding(int base_shift, int actual_shift)
++{
++	switch (base_shift) {
++	case 12:
++		switch (actual_shift) {
++		case 12:
++			return 0;
++		case 16:
++			return 7;
++		case 24:
++			return 0x38;
++		}
++		break;
++	case 16:
++		switch (actual_shift) {
++		case 16:
++			return 1;
++		case 24:
++			return 8;
++		}
++		break;
++	case 24:
++		return 0;
++	}
++	return -1;
++}
++
+ static inline unsigned long compute_tlbie_rb(unsigned long v, unsigned long r,
+ 					     unsigned long pte_index)
+ {
+-	int i, b_psize = MMU_PAGE_4K, a_psize = MMU_PAGE_4K;
+-	unsigned int penc;
++	int a_pgshift, b_pgshift;
+ 	unsigned long rb = 0, va_low, sllp;
+-	unsigned int lp = (r >> LP_SHIFT) & ((1 << LP_BITS) - 1);
+ 
+-	if (v & HPTE_V_LARGE) {
+-		i = hpte_page_sizes[lp];
+-		b_psize = i & 0xf;
+-		a_psize = i >> 4;
++	b_pgshift = a_pgshift = kvmppc_hpte_page_shifts(v, r);
++	if (a_pgshift >= 0x100) {
++		b_pgshift &= 0xff;
++		a_pgshift >>= 8;
+ 	}
+ 
+ 	/*
+@@ -152,37 +230,33 @@ static inline unsigned long compute_tlbie_rb(unsigned long v, unsigned long r,
+ 		va_low ^= v >> (SID_SHIFT_1T - 16);
+ 	va_low &= 0x7ff;
+ 
+-	switch (b_psize) {
+-	case MMU_PAGE_4K:
+-		sllp = get_sllp_encoding(a_psize);
+-		rb |= sllp << 5;	/*  AP field */
++	if (b_pgshift == 12) {
++		if (a_pgshift > 12) {
++			sllp = (a_pgshift == 16) ? 5 : 4;
++			rb |= sllp << 5;	/*  AP field */
++		}
+ 		rb |= (va_low & 0x7ff) << 12;	/* remaining 11 bits of AVA */
+-		break;
+-	default:
+-	{
++	} else {
+ 		int aval_shift;
+ 		/*
+ 		 * remaining bits of AVA/LP fields
+ 		 * Also contain the rr bits of LP
+ 		 */
+-		rb |= (va_low << mmu_psize_defs[b_psize].shift) & 0x7ff000;
++		rb |= (va_low << b_pgshift) & 0x7ff000;
+ 		/*
+ 		 * Now clear not needed LP bits based on actual psize
+ 		 */
+-		rb &= ~((1ul << mmu_psize_defs[a_psize].shift) - 1);
++		rb &= ~((1ul << a_pgshift) - 1);
+ 		/*
+ 		 * AVAL field 58..77 - base_page_shift bits of va
+ 		 * we have space for 58..64 bits, Missing bits should
+ 		 * be zero filled. +1 is to take care of L bit shift
+ 		 */
+-		aval_shift = 64 - (77 - mmu_psize_defs[b_psize].shift) + 1;
++		aval_shift = 64 - (77 - b_pgshift) + 1;
+ 		rb |= ((va_low << aval_shift) & 0xfe);
+ 
+ 		rb |= 1;		/* L field */
+-		penc = mmu_psize_defs[b_psize].penc[a_psize];
+-		rb |= penc << 12;	/* LP field */
+-		break;
+-	}
++		rb |= r & 0xff000 & ((1ul << a_pgshift) - 1); /* LP field */
+ 	}
+ 	rb |= (v >> HPTE_V_SSIZE_SHIFT) << 8;	/* B field */
+ 	return rb;
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 624b01175b79..cc21d3c71a8d 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -333,7 +333,7 @@ static unsigned long kvmppc_mmu_get_real_addr(unsigned long v, unsigned long r,
+ {
+ 	unsigned long ra_mask;
+ 
+-	ra_mask = hpte_page_size(v, r) - 1;
++	ra_mask = kvmppc_actual_pgsz(v, r) - 1;
+ 	return (r & HPTE_R_RPN & ~ra_mask) | (ea & ra_mask);
+ }
+ 
+@@ -504,7 +504,8 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 		mmio_update = atomic64_read(&kvm->arch.mmio_update);
+ 		if (mmio_update == vcpu->arch.pgfault_cache->mmio_update) {
+ 			r = vcpu->arch.pgfault_cache->rpte;
+-			psize = hpte_page_size(vcpu->arch.pgfault_hpte[0], r);
++			psize = kvmppc_actual_pgsz(vcpu->arch.pgfault_hpte[0],
++						   r);
+ 			gpa_base = r & HPTE_R_RPN & ~(psize - 1);
+ 			gfn_base = gpa_base >> PAGE_SHIFT;
+ 			gpa = gpa_base | (ea & (psize - 1));
+@@ -533,7 +534,7 @@ int kvmppc_book3s_hv_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 		return RESUME_GUEST;
+ 
+ 	/* Translate the logical address and get the page */
+-	psize = hpte_page_size(hpte[0], r);
++	psize = kvmppc_actual_pgsz(hpte[0], r);
+ 	gpa_base = r & HPTE_R_RPN & ~(psize - 1);
+ 	gfn_base = gpa_base >> PAGE_SHIFT;
+ 	gpa = gpa_base | (ea & (psize - 1));
+@@ -797,7 +798,7 @@ static void kvmppc_unmap_hpte(struct kvm *kvm, unsigned long i,
+ 
+ 	/* Now check and modify the HPTE */
+ 	ptel = rev[i].guest_rpte;
+-	psize = hpte_page_size(be64_to_cpu(hptep[0]), ptel);
++	psize = kvmppc_actual_pgsz(be64_to_cpu(hptep[0]), ptel);
+ 	if ((be64_to_cpu(hptep[0]) & HPTE_V_VALID) &&
+ 	    hpte_rpn(ptel, psize) == gfn) {
+ 		hptep[0] |= cpu_to_be64(HPTE_V_ABSENT);
+@@ -1091,7 +1092,7 @@ static int kvm_test_clear_dirty_npages(struct kvm *kvm, unsigned long *rmapp)
+ 				rev[i].guest_rpte |= HPTE_R_C;
+ 				note_hpte_modification(kvm, &rev[i]);
+ 			}
+-			n = hpte_page_size(v, r);
++			n = kvmppc_actual_pgsz(v, r);
+ 			n = (n + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ 			if (n > npages_dirty)
+ 				npages_dirty = n;
+@@ -1266,7 +1267,7 @@ static unsigned long resize_hpt_rehash_hpte(struct kvm_resize_hpt *resize,
+ 	guest_rpte = rev->guest_rpte;
+ 
+ 	ret = -EIO;
+-	apsize = hpte_page_size(vpte, guest_rpte);
++	apsize = kvmppc_actual_pgsz(vpte, guest_rpte);
+ 	if (!apsize)
+ 		goto out;
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 9634425f0f39..b3817df58e0e 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -3300,22 +3300,21 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ }
+ 
+ static void kvmppc_add_seg_page_size(struct kvm_ppc_one_seg_page_size **sps,
+-				     int linux_psize)
++				     int shift, int sllp)
+ {
+-	struct mmu_psize_def *def = &mmu_psize_defs[linux_psize];
+-
+-	if (!def->shift)
+-		return;
+-	(*sps)->page_shift = def->shift;
+-	(*sps)->slb_enc = def->sllp;
+-	(*sps)->enc[0].page_shift = def->shift;
+-	(*sps)->enc[0].pte_enc = def->penc[linux_psize];
++	(*sps)->page_shift = shift;
++	(*sps)->slb_enc = sllp;
++	(*sps)->enc[0].page_shift = shift;
++	(*sps)->enc[0].pte_enc = kvmppc_pgsize_lp_encoding(shift, shift);
+ 	/*
+-	 * Add 16MB MPSS support if host supports it
++	 * Add 16MB MPSS support (may get filtered out by userspace)
+ 	 */
+-	if (linux_psize != MMU_PAGE_16M && def->penc[MMU_PAGE_16M] != -1) {
+-		(*sps)->enc[1].page_shift = 24;
+-		(*sps)->enc[1].pte_enc = def->penc[MMU_PAGE_16M];
++	if (shift != 24) {
++		int penc = kvmppc_pgsize_lp_encoding(shift, 24);
++		if (penc != -1) {
++			(*sps)->enc[1].page_shift = 24;
++			(*sps)->enc[1].pte_enc = penc;
++		}
+ 	}
+ 	(*sps)++;
+ }
+@@ -3340,16 +3339,15 @@ static int kvm_vm_ioctl_get_smmu_info_hv(struct kvm *kvm,
+ 	info->data_keys = 32;
+ 	info->instr_keys = cpu_has_feature(CPU_FTR_ARCH_207S) ? 32 : 0;
+ 
+-	info->flags = KVM_PPC_PAGE_SIZES_REAL;
+-	if (mmu_has_feature(MMU_FTR_1T_SEGMENT))
+-		info->flags |= KVM_PPC_1T_SEGMENTS;
+-	info->slb_size = mmu_slb_size;
++	/* POWER7, 8 and 9 all have 1T segments and 32-entry SLB */
++	info->flags = KVM_PPC_PAGE_SIZES_REAL | KVM_PPC_1T_SEGMENTS;
++	info->slb_size = 32;
+ 
+ 	/* We only support these sizes for now, and no muti-size segments */
+ 	sps = &info->sps[0];
+-	kvmppc_add_seg_page_size(&sps, MMU_PAGE_4K);
+-	kvmppc_add_seg_page_size(&sps, MMU_PAGE_64K);
+-	kvmppc_add_seg_page_size(&sps, MMU_PAGE_16M);
++	kvmppc_add_seg_page_size(&sps, 12, 0);
++	kvmppc_add_seg_page_size(&sps, 16, SLB_VSID_L | SLB_VSID_LP_01);
++	kvmppc_add_seg_page_size(&sps, 24, SLB_VSID_L);
+ 
+ 	return 0;
+ }
+@@ -4352,4 +4350,3 @@ module_exit(kvmppc_book3s_exit_hv);
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS_MISCDEV(KVM_MINOR);
+ MODULE_ALIAS("devname:kvm");
+-
+diff --git a/arch/powerpc/kvm/book3s_hv_rm_mmu.c b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+index 4efe364f1188..cf98f17c1aa6 100644
+--- a/arch/powerpc/kvm/book3s_hv_rm_mmu.c
++++ b/arch/powerpc/kvm/book3s_hv_rm_mmu.c
+@@ -129,7 +129,7 @@ static unsigned long *revmap_for_hpte(struct kvm *kvm, unsigned long hpte_v,
+ 	unsigned long *rmap;
+ 	unsigned long gfn;
+ 
+-	gfn = hpte_rpn(hpte_gr, hpte_page_size(hpte_v, hpte_gr));
++	gfn = hpte_rpn(hpte_gr, kvmppc_actual_pgsz(hpte_v, hpte_gr));
+ 	memslot = __gfn_to_memslot(kvm_memslots_raw(kvm), gfn);
+ 	if (!memslot)
+ 		return NULL;
+@@ -169,7 +169,8 @@ static void remove_revmap_chain(struct kvm *kvm, long pte_index,
+ 	}
+ 	*rmap |= rcbits << KVMPPC_RMAP_RC_SHIFT;
+ 	if (rcbits & HPTE_R_C)
+-		kvmppc_update_rmap_change(rmap, hpte_page_size(hpte_v, hpte_r));
++		kvmppc_update_rmap_change(rmap,
++					  kvmppc_actual_pgsz(hpte_v, hpte_r));
+ 	unlock_rmap(rmap);
+ }
+ 
+@@ -193,7 +194,7 @@ long kvmppc_do_h_enter(struct kvm *kvm, unsigned long flags,
+ 
+ 	if (kvm_is_radix(kvm))
+ 		return H_FUNCTION;
+-	psize = hpte_page_size(pteh, ptel);
++	psize = kvmppc_actual_pgsz(pteh, ptel);
+ 	if (!psize)
+ 		return H_PARAMETER;
+ 	writing = hpte_is_writable(ptel);
+@@ -848,7 +849,7 @@ long kvmppc_h_clear_mod(struct kvm_vcpu *vcpu, unsigned long flags,
+ 		r = be64_to_cpu(hpte[1]);
+ 		gr |= r & (HPTE_R_R | HPTE_R_C);
+ 		if (r & HPTE_R_C) {
+-			unsigned long psize = hpte_page_size(v, r);
++			unsigned long psize = kvmppc_actual_pgsz(v, r);
+ 			hpte[1] = cpu_to_be64(r & ~HPTE_R_C);
+ 			eieio();
+ 			rmap = revmap_for_hpte(kvm, v, gr);
+@@ -1014,7 +1015,7 @@ long kvmppc_hv_find_lock_hpte(struct kvm *kvm, gva_t eaddr, unsigned long slb_v,
+ 			 * Check the HPTE again, including base page size
+ 			 */
+ 			if ((v & valid) && (v & mask) == val &&
+-			    hpte_base_page_size(v, r) == (1ul << pshift))
++			    kvmppc_hpte_base_page_shift(v, r) == pshift)
+ 				/* Return with the HPTE still locked */
+ 				return (hash << 3) + (i >> 1);
+ 
+-- 
+2.13.6
+
