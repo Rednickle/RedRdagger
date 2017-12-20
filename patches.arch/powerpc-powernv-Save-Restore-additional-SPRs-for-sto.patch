@@ -1,0 +1,194 @@
+From e1c1cfed54326fd2b17c78f0c85092167fc0783b Mon Sep 17 00:00:00 2001
+From: "Gautham R. Shenoy" <ego@linux.vnet.ibm.com>
+Date: Fri, 21 Jul 2017 16:11:37 +0530
+Subject: [PATCH] powerpc/powernv: Save/Restore additional SPRs for stop4
+ cpuidle
+
+References: bsc#1055121
+Patch-mainline: v4.14-rc1
+Git-commit: e1c1cfed54326fd2b17c78f0c85092167fc0783b
+
+The stop4 idle state on POWER9 is a deep idle state which loses
+hypervisor resources, but whose latency is low enough that it can be
+exposed via cpuidle.
+
+Until now, the deep idle states which lose hypervisor resources (eg:
+winkle) were only exposed via CPU-Hotplug.  Hence currently on wakeup
+from such states, barring a few SPRs which need to be restored to
+their older value, rest of the SPRS are reinitialized to their values
+corresponding to that at boot time.
+
+When stop4 is used in the context of cpuidle, we want these additional
+SPRs to be restored to their older value, to ensure that the context
+on the CPU coming back from idle is same as it was before going idle.
+
+In this patch, we define a SPR save area in PACA (since we have used
+up the volatile register space in the stack) and on POWER9, we restore
+SPRN_PID, SPRN_LDBAR, SPRN_FSCR, SPRN_HFSCR, SPRN_MMCRA, SPRN_MMCR1,
+SPRN_MMCR2 to the values they had before entering stop.
+
+Signed-off-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/cpuidle.h | 11 +++++++
+ arch/powerpc/include/asm/paca.h    |  7 ++++
+ arch/powerpc/kernel/asm-offsets.c  |  8 +++++
+ arch/powerpc/kernel/idle_book3s.S  | 65 ++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/cpuidle.h b/arch/powerpc/include/asm/cpuidle.h
+index 52586f9956bb..8a174cba5567 100644
+--- a/arch/powerpc/include/asm/cpuidle.h
++++ b/arch/powerpc/include/asm/cpuidle.h
+@@ -67,6 +67,17 @@
+ #define ERR_DEEP_STATE_ESL_MISMATCH	-2
+ 
+ #ifndef __ASSEMBLY__
++/* Additional SPRs that need to be saved/restored during stop */
++struct stop_sprs {
++	u64 pid;
++	u64 ldbar;
++	u64 fscr;
++	u64 hfscr;
++	u64 mmcr1;
++	u64 mmcr2;
++	u64 mmcra;
++};
++
+ extern u32 pnv_fastsleep_workaround_at_entry[];
+ extern u32 pnv_fastsleep_workaround_at_exit[];
+ 
+diff --git a/arch/powerpc/include/asm/paca.h b/arch/powerpc/include/asm/paca.h
+index dc88a31cc79a..04b60af027ae 100644
+--- a/arch/powerpc/include/asm/paca.h
++++ b/arch/powerpc/include/asm/paca.h
+@@ -31,6 +31,7 @@
+ #endif
+ #include <asm/accounting.h>
+ #include <asm/hmi.h>
++#include <asm/cpuidle.h>
+ 
+ register struct paca_struct *local_paca asm("r13");
+ 
+@@ -183,6 +184,12 @@ struct paca_struct {
+ 	struct paca_struct **thread_sibling_pacas;
+ 	/* The PSSCR value that the kernel requested before going to stop */
+ 	u64 requested_psscr;
++
++	/*
++	 * Save area for additional SPRs that need to be
++	 * saved/restored during cpuidle stop.
++	 */
++	struct stop_sprs stop_sprs;
+ #endif
+ 
+ #ifdef CONFIG_PPC_STD_MMU_64
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 6e95c2c19a7e..8cfb20e38cfe 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -746,6 +746,14 @@ int main(void)
+ 	OFFSET(PACA_SUBCORE_SIBLING_MASK, paca_struct, subcore_sibling_mask);
+ 	OFFSET(PACA_SIBLING_PACA_PTRS, paca_struct, thread_sibling_pacas);
+ 	OFFSET(PACA_REQ_PSSCR, paca_struct, requested_psscr);
++#define STOP_SPR(x, f)	OFFSET(x, paca_struct, stop_sprs.f)
++	STOP_SPR(STOP_PID, pid);
++	STOP_SPR(STOP_LDBAR, ldbar);
++	STOP_SPR(STOP_FSCR, fscr);
++	STOP_SPR(STOP_HFSCR, hfscr);
++	STOP_SPR(STOP_MMCR1, mmcr1);
++	STOP_SPR(STOP_MMCR2, mmcr2);
++	STOP_SPR(STOP_MMCRA, mmcra);
+ #endif
+ 
+ 	DEFINE(PPC_DBELL_SERVER, PPC_DBELL_SERVER);
+diff --git a/arch/powerpc/kernel/idle_book3s.S b/arch/powerpc/kernel/idle_book3s.S
+index 516ebef905c0..4621568277f2 100644
+--- a/arch/powerpc/kernel/idle_book3s.S
++++ b/arch/powerpc/kernel/idle_book3s.S
+@@ -85,7 +85,61 @@ ALT_FTR_SECTION_END_IFSET(CPU_FTR_ARCH_300)
+ 	std	r3,_WORT(r1)
+ 	mfspr	r3,SPRN_WORC
+ 	std	r3,_WORC(r1)
++/*
++ * On POWER9, there are idle states such as stop4, invoked via cpuidle,
++ * that lose hypervisor resources. In such cases, we need to save
++ * additional SPRs before entering those idle states so that they can
++ * be restored to their older values on wakeup from the idle state.
++ *
++ * On POWER8, the only such deep idle state is winkle which is used
++ * only in the context of CPU-Hotplug, where these additional SPRs are
++ * reinitiazed to a sane value. Hence there is no need to save/restore
++ * these SPRs.
++ */
++BEGIN_FTR_SECTION
++	blr
++END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_300)
++
++power9_save_additional_sprs:
++	mfspr	r3, SPRN_PID
++	mfspr	r4, SPRN_LDBAR
++	std	r3, STOP_PID(r13)
++	std	r4, STOP_LDBAR(r13)
+ 
++	mfspr	r3, SPRN_FSCR
++	mfspr	r4, SPRN_HFSCR
++	std	r3, STOP_FSCR(r13)
++	std	r4, STOP_HFSCR(r13)
++
++	mfspr	r3, SPRN_MMCRA
++	mfspr	r4, SPRN_MMCR1
++	std	r3, STOP_MMCRA(r13)
++	std	r4, STOP_MMCR1(r13)
++
++	mfspr	r3, SPRN_MMCR2
++	std	r3, STOP_MMCR2(r13)
++	blr
++
++power9_restore_additional_sprs:
++	ld	r3,_LPCR(r1)
++	ld	r4, STOP_PID(r13)
++	mtspr	SPRN_LPCR,r3
++	mtspr	SPRN_PID, r4
++
++	ld	r3, STOP_LDBAR(r13)
++	ld	r4, STOP_FSCR(r13)
++	mtspr	SPRN_LDBAR, r3
++	mtspr	SPRN_FSCR, r4
++
++	ld	r3, STOP_HFSCR(r13)
++	ld	r4, STOP_MMCRA(r13)
++	mtspr	SPRN_HFSCR, r3
++	mtspr	SPRN_MMCRA, r4
++	/* We have already restored PACA_MMCR0 */
++	ld	r3, STOP_MMCR1(r13)
++	ld	r4, STOP_MMCR2(r13)
++	mtspr	SPRN_MMCR1, r3
++	mtspr	SPRN_MMCR2, r4
+ 	blr
+ 
+ /*
+@@ -803,9 +857,16 @@ no_segments:
+ 	mtctr	r12
+ 	bctrl
+ 
++/*
++ * On POWER9, we can come here on wakeup from a cpuidle stop state.
++ * Hence restore the additional SPRs to the saved value.
++ *
++ * On POWER8, we come here only on winkle. Since winkle is used
++ * only in the case of CPU-Hotplug, we don't need to restore
++ * the additional SPRs.
++ */
+ BEGIN_FTR_SECTION
+-	ld	r4,_LPCR(r1)
+-	mtspr	SPRN_LPCR,r4
++	bl 	power9_restore_additional_sprs
+ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
+ hypervisor_state_restored:
+ 
+-- 
+2.13.6
+
