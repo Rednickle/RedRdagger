@@ -1,0 +1,134 @@
+From: Sathya Perla <sathya.perla@broadcom.com>
+Date: Fri, 1 Dec 2017 03:13:04 -0500
+Subject: bnxt_en: fix dst/src fid for vxlan encap/decap actions
+Patch-mainline: v4.15-rc3
+Git-commit: e9ecc731a87912d209d6e9b4ed20ed70451c08cb
+References: bsc#1050242 FATE#322914
+
+For flows that involve a vxlan encap action, the vxlan sock
+interface may be specified as the outgoing interface. The driver
+must resolve the outgoing PF interface used by this socket and
+use the dst_fid of the PF in the hwrm_cfa_encap_record_alloc cmd.
+
+Similarily for flows that have a vxlan decap action, the
+fid of the incoming PF interface must be used as the src_fid in
+the hwrm_cfa_decap_filter_alloc cmd.
+
+Fixes: 8c95f773b4a3 ("bnxt_en: add support for Flower based vxlan encap/decap offload")
+Signed-off-by: Sathya Perla <sathya.perla@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c |   48 ++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 22 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+@@ -56,7 +56,6 @@ static int bnxt_tc_parse_redir(struct bn
+ {
+ 	int ifindex = tcf_mirred_ifindex(tc_act);
+ 	struct net_device *dev;
+-	u16 dst_fid;
+ 
+ 	dev = __dev_get_by_index(dev_net(bp->dev), ifindex);
+ 	if (!dev) {
+@@ -64,15 +63,7 @@ static int bnxt_tc_parse_redir(struct bn
+ 		return -EINVAL;
+ 	}
+ 
+-	/* find the FID from dev */
+-	dst_fid = bnxt_flow_get_dst_fid(bp, dev);
+-	if (dst_fid == BNXT_FID_INVALID) {
+-		netdev_info(bp->dev, "can't get fid for ifindex=%d", ifindex);
+-		return -EINVAL;
+-	}
+-
+ 	actions->flags |= BNXT_TC_ACTION_FLAG_FWD;
+-	actions->dst_fid = dst_fid;
+ 	actions->dst_dev = dev;
+ 	return 0;
+ }
+@@ -160,13 +151,17 @@ static int bnxt_tc_parse_actions(struct
+ 	if (rc)
+ 		return rc;
+ 
+-	/* Tunnel encap/decap action must be accompanied by a redirect action */
+-	if ((actions->flags & BNXT_TC_ACTION_FLAG_TUNNEL_ENCAP ||
+-	     actions->flags & BNXT_TC_ACTION_FLAG_TUNNEL_DECAP) &&
+-	    !(actions->flags & BNXT_TC_ACTION_FLAG_FWD)) {
+-		netdev_info(bp->dev,
+-			    "error: no redir action along with encap/decap");
+-		return -EINVAL;
++	if (actions->flags & BNXT_TC_ACTION_FLAG_FWD) {
++		if (actions->flags & BNXT_TC_ACTION_FLAG_TUNNEL_ENCAP) {
++			/* dst_fid is PF's fid */
++			actions->dst_fid = bp->pf.fw_fid;
++		} else {
++			/* find the FID from dst_dev */
++			actions->dst_fid =
++				bnxt_flow_get_dst_fid(bp, actions->dst_dev);
++			if (actions->dst_fid == BNXT_FID_INVALID)
++				return -EINVAL;
++		}
+ 	}
+ 
+ 	return rc;
+@@ -899,10 +894,10 @@ static void bnxt_tc_put_decap_handle(str
+ 
+ static int bnxt_tc_resolve_tunnel_hdrs(struct bnxt *bp,
+ 				       struct ip_tunnel_key *tun_key,
+-				       struct bnxt_tc_l2_key *l2_info,
+-				       struct net_device *real_dst_dev)
++				       struct bnxt_tc_l2_key *l2_info)
+ {
+ #ifdef CONFIG_INET
++	struct net_device *real_dst_dev = bp->dev;
+ 	struct flowi4 flow = { {0} };
+ 	struct net_device *dst_dev;
+ 	struct neighbour *nbr;
+@@ -1006,7 +1001,7 @@ static int bnxt_tc_get_decap_handle(stru
+ 	 */
+ 	tun_key.u.ipv4.dst = flow->tun_key.u.ipv4.src;
+ 	tun_key.tp_dst = flow->tun_key.tp_dst;
+-	rc = bnxt_tc_resolve_tunnel_hdrs(bp, &tun_key, &l2_info, bp->dev);
++	rc = bnxt_tc_resolve_tunnel_hdrs(bp, &tun_key, &l2_info);
+ 	if (rc)
+ 		goto put_decap;
+ 
+@@ -1092,8 +1087,7 @@ static int bnxt_tc_get_encap_handle(stru
+ 	if (encap_node->tunnel_handle != INVALID_TUNNEL_HANDLE)
+ 		goto done;
+ 
+-	rc = bnxt_tc_resolve_tunnel_hdrs(bp, encap_key, &encap_node->l2_info,
+-					 flow->actions.dst_dev);
++	rc = bnxt_tc_resolve_tunnel_hdrs(bp, encap_key, &encap_node->l2_info);
+ 	if (rc)
+ 		goto put_encap;
+ 
+@@ -1166,6 +1160,15 @@ static int __bnxt_tc_del_flow(struct bnx
+ 	return 0;
+ }
+ 
++static void bnxt_tc_set_src_fid(struct bnxt *bp, struct bnxt_tc_flow *flow,
++				u16 src_fid)
++{
++	if (flow->actions.flags & BNXT_TC_ACTION_FLAG_TUNNEL_DECAP)
++		flow->src_fid = bp->pf.fw_fid;
++	else
++		flow->src_fid = src_fid;
++}
++
+ /* Add a new flow or replace an existing flow.
+  * Notes on locking:
+  * There are essentially two critical sections here.
+@@ -1201,7 +1204,8 @@ static int bnxt_tc_add_flow(struct bnxt
+ 	rc = bnxt_tc_parse_flow(bp, tc_flow_cmd, flow);
+ 	if (rc)
+ 		goto free_node;
+-	flow->src_fid = src_fid;
++
++	bnxt_tc_set_src_fid(bp, flow, src_fid);
+ 
+ 	if (!bnxt_tc_can_offload(bp, flow)) {
+ 		rc = -ENOSPC;
