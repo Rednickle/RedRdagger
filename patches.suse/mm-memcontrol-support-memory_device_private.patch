@@ -1,0 +1,189 @@
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Glisse?= <jglisse@redhat.com>
+Date: Fri, 8 Sep 2017 16:11:54 -0700
+Subject: mm/memcontrol: support MEMORY_DEVICE_PRIVATE
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: c733a82874a79261866a4178edbb608847df4879
+Patch-mainline: v4.14-rc1
+References: VM Functionality, FATE#323338, bsc#1047814
+
+HMM pages (private or public device pages) are ZONE_DEVICE page and thus
+need special handling when it comes to lru or refcount.  This patch make
+sure that memcontrol properly handle those when it face them.  Those pages
+are use like regular pages in a process address space either as anonymous
+page or as file back page.  So from memcg point of view we want to handle
+them like regular page for now at least.
+
+Link: http://lkml.kernel.org/r/20170817000548.32038-11-jglisse@redhat.com
+Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+Acked-by: Balbir Singh <bsingharora@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: David Nellans <dnellans@nvidia.com>
+Cc: Evgeny Baskakov <ebaskakov@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Mark Hairgrove <mhairgrove@nvidia.com>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+Cc: Sherry Cheung <SCheung@nvidia.com>
+Cc: Subhash Gutti <sgutti@nvidia.com>
+Cc: Bob Liu <liubo95@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ kernel/memremap.c |    1 +
+ mm/memcontrol.c   |   52 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 49 insertions(+), 4 deletions(-)
+
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@ -518,6 +518,7 @@ void put_zone_device_private_page(struct
+ 		__ClearPageWaiters(page);
+ 
+ 		page->mapping = NULL;
++		mem_cgroup_uncharge(page);
+ 
+ 		page->pgmap->page_free(page, page->pgmap->data);
+ 	} else if (!count)
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -4417,12 +4417,13 @@ enum mc_target_type {
+ 	MC_TARGET_NONE = 0,
+ 	MC_TARGET_PAGE,
+ 	MC_TARGET_SWAP,
++	MC_TARGET_DEVICE,
+ };
+ 
+ static struct page *mc_handle_present_pte(struct vm_area_struct *vma,
+ 						unsigned long addr, pte_t ptent)
+ {
+-	struct page *page = vm_normal_page(vma, addr, ptent);
++	struct page *page = _vm_normal_page(vma, addr, ptent, true);
+ 
+ 	if (!page || !page_mapped(page))
+ 		return NULL;
+@@ -4439,7 +4440,7 @@ static struct page *mc_handle_present_pt
+ 	return page;
+ }
+ 
+-#ifdef CONFIG_SWAP
++#if defined(CONFIG_SWAP) || defined(CONFIG_DEVICE_PRIVATE)
+ static struct page *mc_handle_swap_pte(struct vm_area_struct *vma,
+ 			pte_t ptent, swp_entry_t *entry)
+ {
+@@ -4448,6 +4449,23 @@ static struct page *mc_handle_swap_pte(s
+ 
+ 	if (!(mc.flags & MOVE_ANON) || non_swap_entry(ent))
+ 		return NULL;
++
++	/*
++	 * Handle MEMORY_DEVICE_PRIVATE which are ZONE_DEVICE page belonging to
++	 * a device and because they are not accessible by CPU they are store
++	 * as special swap entry in the CPU page table.
++	 */
++	if (is_device_private_entry(ent)) {
++		page = device_private_entry_to_page(ent);
++		/*
++		 * MEMORY_DEVICE_PRIVATE means ZONE_DEVICE page and which have
++		 * a refcount of 1 when free (unlike normal page)
++		 */
++		if (!page_ref_add_unless(page, 1, 1))
++			return NULL;
++		return page;
++	}
++
+ 	/*
+ 	 * Because lookup_swap_cache() updates some statistics counter,
+ 	 * we call find_get_page() with swapper_space directly.
+@@ -4608,6 +4626,12 @@ out:
+  *   2(MC_TARGET_SWAP): if the swap entry corresponding to this pte is a
+  *     target for charge migration. if @target is not NULL, the entry is stored
+  *     in target->ent.
++ *   3(MC_TARGET_DEVICE): like MC_TARGET_PAGE  but page is MEMORY_DEVICE_PRIVATE
++ *     (so ZONE_DEVICE page and thus not on the lru). For now we such page is
++ *     charge like a regular page would be as for all intent and purposes it is
++ *     just special memory taking the place of a regular page.
++ *
++ *     See Documentations/vm/hmm.txt and include/linux/hmm.h
+  *
+  * Called with pte lock held.
+  */
+@@ -4636,6 +4660,8 @@ static enum mc_target_type get_mctgt_typ
+ 		 */
+ 		if (page->mem_cgroup == mc.from) {
+ 			ret = MC_TARGET_PAGE;
++			if (is_device_private_page(page))
++				ret = MC_TARGET_DEVICE;
+ 			if (target)
+ 				target->page = page;
+ 		}
+@@ -4695,6 +4721,11 @@ static int mem_cgroup_count_precharge_pt
+ 
+ 	ptl = pmd_trans_huge_lock(pmd, vma);
+ 	if (ptl) {
++		/*
++		 * Note their can not be MC_TARGET_DEVICE for now as we do not
++		 * support transparent huge page with MEMORY_DEVICE_PUBLIC or
++		 * MEMORY_DEVICE_PRIVATE but this might change.
++		 */
+ 		if (get_mctgt_type_thp(vma, addr, *pmd, NULL) == MC_TARGET_PAGE)
+ 			mc.precharge += HPAGE_PMD_NR;
+ 		spin_unlock(ptl);
+@@ -4910,6 +4941,14 @@ static int mem_cgroup_move_charge_pte_ra
+ 				putback_lru_page(page);
+ 			}
+ 			put_page(page);
++		} else if (target_type == MC_TARGET_DEVICE) {
++			page = target.page;
++			if (!mem_cgroup_move_account(page, true,
++						     mc.from, mc.to)) {
++				mc.precharge -= HPAGE_PMD_NR;
++				mc.moved_charge += HPAGE_PMD_NR;
++			}
++			put_page(page);
+ 		}
+ 		spin_unlock(ptl);
+ 		return 0;
+@@ -4921,12 +4960,16 @@ retry:
+ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+ 	for (; addr != end; addr += PAGE_SIZE) {
+ 		pte_t ptent = *(pte++);
++		bool device = false;
+ 		swp_entry_t ent;
+ 
+ 		if (!mc.precharge)
+ 			break;
+ 
+ 		switch (get_mctgt_type(vma, addr, ptent, &target)) {
++		case MC_TARGET_DEVICE:
++			device = true;
++			/* fall through */
+ 		case MC_TARGET_PAGE:
+ 			page = target.page;
+ 			/*
+@@ -4937,7 +4980,7 @@ retry:
+ 			 */
+ 			if (PageTransCompound(page))
+ 				goto put;
+-			if (isolate_lru_page(page))
++			if (!device && isolate_lru_page(page))
+ 				goto put;
+ 			if (!mem_cgroup_move_account(page, false,
+ 						mc.from, mc.to)) {
+@@ -4945,7 +4988,8 @@ retry:
+ 				/* we uncharge from mc.from later. */
+ 				mc.moved_charge++;
+ 			}
+-			putback_lru_page(page);
++			if (!device)
++				putback_lru_page(page);
+ put:			/* get_mctgt_type() gets the page */
+ 			put_page(page);
+ 			break;
