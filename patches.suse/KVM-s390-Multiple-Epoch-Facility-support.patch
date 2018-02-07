@@ -1,0 +1,307 @@
+From: "Collin L. Walling" <walling@linux.vnet.ibm.com>
+Date: Tue, 26 Jul 2016 15:29:44 -0400
+Subject: KVM: s390: Multiple Epoch Facility support
+Patch-mainline: v4.14-rc1
+Git-commit: 8fa1696ea78162ca3112a26879d9379483443c85
+References: bsc#1077761
+
+Allow for the enablement of MEF and the support for the extended
+epoch in SIE and VSIE for the extended guest TOD-Clock.
+
+A new interface is used for getting/setting a guest's extended TOD-Clock
+that uses a single ioctl invocation, KVM_S390_VM_TOD_EXT.  Since the
+host time is a moving target that might see an epoch switch or STP sync
+checks we need an atomic ioctl and cannot use the exisiting two
+interfaces. The old method of getting and setting the guest TOD-Clock is
+still retained and is used when the old ioctls are called.
+
+Signed-off-by: Collin L. Walling <walling@linux.vnet.ibm.com>
+Reviewed-by: Janosch Frank <frankja@linux.vnet.ibm.com>
+Reviewed-by: Claudio Imbrenda <imbrenda@linux.vnet.ibm.com>
+Reviewed-by: Jason J. Herne <jjherne@linux.vnet.ibm.com>
+Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ Documentation/virtual/kvm/devices/vm.txt |   14 +++-
+ arch/s390/include/asm/kvm_host.h         |    6 +
+ arch/s390/include/uapi/asm/kvm.h         |    6 +
+ arch/s390/kvm/kvm-s390.c                 |  101 +++++++++++++++++++++++++++++++
+ arch/s390/kvm/kvm-s390.h                 |    2 
+ arch/s390/kvm/vsie.c                     |   10 +++
+ arch/s390/tools/gen_facilities.c         |    1 
+ 7 files changed, 138 insertions(+), 2 deletions(-)
+
+--- a/Documentation/virtual/kvm/devices/vm.txt
++++ b/Documentation/virtual/kvm/devices/vm.txt
+@@ -176,7 +176,8 @@
+ 
+ 3.1. ATTRIBUTE: KVM_S390_VM_TOD_HIGH
+ 
+-Allows user space to set/get the TOD clock extension (u8).
++Allows user space to set/get the TOD clock extension (u8) (superseded by
++KVM_S390_VM_TOD_EXT).
+ 
+ Parameters: address of a buffer in user space to store the data (u8) to
+ Returns:    -EFAULT if the given address is not accessible from kernel space
+@@ -190,6 +191,17 @@
+ Parameters: address of a buffer in user space to store the data (u64) to
+ Returns:    -EFAULT if the given address is not accessible from kernel space
+ 
++3.3. ATTRIBUTE: KVM_S390_VM_TOD_EXT
++Allows user space to set/get bits 0-63 of the TOD clock register as defined in
++the POP (u64). If the guest CPU model supports the TOD clock extension (u8), it
++also allows user space to get/set it. If the guest CPU model does not support
++it, it is stored as 0 and not allowed to be set to a value != 0.
++
++Parameters: address of a buffer in user space to store the data
++            (kvm_s390_vm_tod_clock) to
++Returns:    -EFAULT if the given address is not accessible from kernel space
++	    -EINVAL if setting the TOD clock extension to != 0 is not supported
++
+ 4. GROUP: KVM_S390_VM_CRYPTO
+ Architectures: s390
+ 
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -226,7 +226,9 @@
+ #define ECB3_RI  0x01
+ 	__u8    ecb3;			/* 0x0063 */
+ 	__u32	scaol;			/* 0x0064 */
+-	__u8	reserved68[4];		/* 0x0068 */
++	__u8	reserved68;		/* 0x0068 */
++	__u8    epdx;			/* 0x0069 */
++	__u8    reserved6a[2];		/* 0x006a */
+ 	__u32	todpr;			/* 0x006c */
+ 	__u8	reserved70[16];		/* 0x0070 */
+ 	__u64	mso;			/* 0x0080 */
+@@ -265,6 +267,7 @@
+ 	__u64	cbrlo;			/* 0x01b8 */
+ 	__u8	reserved1c0[8];		/* 0x01c0 */
+ #define ECD_HOSTREGMGMT	0x20000000
++#define ECD_MEF		0x08000000
+ 	__u32	ecd;			/* 0x01c8 */
+ 	__u8	reserved1cc[18];	/* 0x01cc */
+ 	__u64	pp;			/* 0x01de */
+@@ -739,6 +742,7 @@
+ 	struct kvm_s390_cpu_model model;
+ 	struct kvm_s390_crypto crypto;
+ 	struct kvm_s390_vsie vsie;
++	u8 epdx;
+ 	u64 epoch;
+ 	struct kvm_s390_migration_state *migration_state;
+ 	/* subset of available cpu features enabled by user space */
+--- a/arch/s390/include/uapi/asm/kvm.h
++++ b/arch/s390/include/uapi/asm/kvm.h
+@@ -88,6 +88,12 @@
+ /* kvm attributes for KVM_S390_VM_TOD */
+ #define KVM_S390_VM_TOD_LOW		0
+ #define KVM_S390_VM_TOD_HIGH		1
++#define KVM_S390_VM_TOD_EXT		2
++
++struct kvm_s390_vm_tod_clock {
++	__u8  epoch_idx;
++	__u64 tod;
++};
+ 
+ /* kvm attributes for KVM_S390_VM_CPU_MODEL */
+ /* processor related attributes are r/w */
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -130,6 +130,12 @@
+ 	{ NULL }
+ };
+ 
++struct kvm_s390_tod_clock_ext {
++	__u8 epoch_idx;
++	__u64 tod;
++	__u8 reserved[7];
++} __packed;
++
+ /* allow nested virtualization in KVM (if enabled by user space) */
+ static int nested;
+ module_param(nested, int, S_IRUGO);
+@@ -874,6 +880,26 @@
+ 	return 0;
+ }
+ 
++static int kvm_s390_set_tod_ext(struct kvm *kvm, struct kvm_device_attr *attr)
++{
++	struct kvm_s390_vm_tod_clock gtod;
++
++	if (copy_from_user(&gtod, (void __user *)attr->addr, sizeof(gtod)))
++		return -EFAULT;
++
++	if (test_kvm_facility(kvm, 139))
++		kvm_s390_set_tod_clock_ext(kvm, &gtod);
++	else if (gtod.epoch_idx == 0)
++		kvm_s390_set_tod_clock(kvm, gtod.tod);
++	else
++		return -EINVAL;
++
++	VM_EVENT(kvm, 3, "SET: TOD extension: 0x%x, TOD base: 0x%llx",
++		gtod.epoch_idx, gtod.tod);
++
++	return 0;
++}
++
+ static int kvm_s390_set_tod_high(struct kvm *kvm, struct kvm_device_attr *attr)
+ {
+ 	u8 gtod_high;
+@@ -909,6 +935,9 @@
+ 		return -EINVAL;
+ 
+ 	switch (attr->attr) {
++	case KVM_S390_VM_TOD_EXT:
++		ret = kvm_s390_set_tod_ext(kvm, attr);
++		break;
+ 	case KVM_S390_VM_TOD_HIGH:
+ 		ret = kvm_s390_set_tod_high(kvm, attr);
+ 		break;
+@@ -922,6 +951,43 @@
+ 	return ret;
+ }
+ 
++static void kvm_s390_get_tod_clock_ext(struct kvm *kvm,
++					struct kvm_s390_vm_tod_clock *gtod)
++{
++	struct kvm_s390_tod_clock_ext htod;
++
++	preempt_disable();
++
++	get_tod_clock_ext((char *)&htod);
++
++	gtod->tod = htod.tod + kvm->arch.epoch;
++	gtod->epoch_idx = htod.epoch_idx + kvm->arch.epdx;
++
++	if (gtod->tod < htod.tod)
++		gtod->epoch_idx += 1;
++
++	preempt_enable();
++}
++
++static int kvm_s390_get_tod_ext(struct kvm *kvm, struct kvm_device_attr *attr)
++{
++	struct kvm_s390_vm_tod_clock gtod;
++
++	memset(&gtod, 0, sizeof(gtod));
++
++	if (test_kvm_facility(kvm, 139))
++		kvm_s390_get_tod_clock_ext(kvm, &gtod);
++	else
++		gtod.tod = kvm_s390_get_tod_clock_fast(kvm);
++
++	if (copy_to_user((void __user *)attr->addr, &gtod, sizeof(gtod)))
++		return -EFAULT;
++
++	VM_EVENT(kvm, 3, "QUERY: TOD extension: 0x%x, TOD base: 0x%llx",
++		gtod.epoch_idx, gtod.tod);
++	return 0;
++}
++
+ static int kvm_s390_get_tod_high(struct kvm *kvm, struct kvm_device_attr *attr)
+ {
+ 	u8 gtod_high = 0;
+@@ -954,6 +1020,9 @@
+ 		return -EINVAL;
+ 
+ 	switch (attr->attr) {
++	case KVM_S390_VM_TOD_EXT:
++		ret = kvm_s390_get_tod_ext(kvm, attr);
++		break;
+ 	case KVM_S390_VM_TOD_HIGH:
+ 		ret = kvm_s390_get_tod_high(kvm, attr);
+ 		break;
+@@ -2369,6 +2438,9 @@
+ 		vcpu->arch.sie_block->eca |= ECA_VX;
+ 		vcpu->arch.sie_block->ecd |= ECD_HOSTREGMGMT;
+ 	}
++	if (test_kvm_facility(vcpu->kvm, 139))
++		vcpu->arch.sie_block->ecd |= ECD_MEF;
++
+ 	vcpu->arch.sie_block->sdnxo = ((unsigned long) &vcpu->run->s.regs.sdnx)
+ 					| SDNXC;
+ 	vcpu->arch.sie_block->riccbd = (unsigned long) &vcpu->run->s.regs.riccb;
+@@ -2860,6 +2932,35 @@
+ 	return 0;
+ }
+ 
++void kvm_s390_set_tod_clock_ext(struct kvm *kvm,
++				 const struct kvm_s390_vm_tod_clock *gtod)
++{
++	struct kvm_vcpu *vcpu;
++	struct kvm_s390_tod_clock_ext htod;
++	int i;
++
++	mutex_lock(&kvm->lock);
++	preempt_disable();
++
++	get_tod_clock_ext((char *)&htod);
++
++	kvm->arch.epoch = gtod->tod - htod.tod;
++	kvm->arch.epdx = gtod->epoch_idx - htod.epoch_idx;
++
++	if (kvm->arch.epoch > gtod->tod)
++		kvm->arch.epdx -= 1;
++
++	kvm_s390_vcpu_block_all(kvm);
++	kvm_for_each_vcpu(i, vcpu, kvm) {
++		vcpu->arch.sie_block->epoch = kvm->arch.epoch;
++		vcpu->arch.sie_block->epdx  = kvm->arch.epdx;
++	}
++
++	kvm_s390_vcpu_unblock_all(kvm);
++	preempt_enable();
++	mutex_unlock(&kvm->lock);
++}
++
+ void kvm_s390_set_tod_clock(struct kvm *kvm, u64 tod)
+ {
+ 	struct kvm_vcpu *vcpu;
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -272,6 +272,8 @@
+ int handle_sthyi(struct kvm_vcpu *vcpu);
+ 
+ /* implemented in kvm-s390.c */
++void kvm_s390_set_tod_clock_ext(struct kvm *kvm,
++				 const struct kvm_s390_vm_tod_clock *gtod);
+ void kvm_s390_set_tod_clock(struct kvm *kvm, u64 tod);
+ long kvm_arch_fault_in_page(struct kvm_vcpu *vcpu, gpa_t gpa, int writable);
+ int kvm_s390_store_status_unloaded(struct kvm_vcpu *vcpu, unsigned long addr);
+--- a/arch/s390/kvm/vsie.c
++++ b/arch/s390/kvm/vsie.c
+@@ -349,6 +349,9 @@
+ 		scb_s->eca |= scb_o->eca & ECA_IB;
+ 	if (test_kvm_cpu_feat(vcpu->kvm, KVM_S390_VM_CPU_FEAT_CEI))
+ 		scb_s->eca |= scb_o->eca & ECA_CEI;
++	/* Epoch Extension */
++	if (test_kvm_facility(vcpu->kvm, 139))
++		scb_s->ecd |= scb_o->ecd & ECD_MEF;
+ 
+ 	prepare_ibc(vcpu, vsie_page);
+ 	rc = shadow_crycb(vcpu, vsie_page);
+@@ -919,6 +922,13 @@
+ 	 */
+ 	preempt_disable();
+ 	scb_s->epoch += vcpu->kvm->arch.epoch;
++
++	if (scb_s->ecd & ECD_MEF) {
++		scb_s->epdx += vcpu->kvm->arch.epdx;
++		if (scb_s->epoch < vcpu->kvm->arch.epoch)
++			scb_s->epdx += 1;
++	}
++
+ 	preempt_enable();
+ }
+ 
+--- a/arch/s390/tools/gen_facilities.c
++++ b/arch/s390/tools/gen_facilities.c
+@@ -83,6 +83,7 @@
+ 			130, /* instruction-execution-protection */
+ 			131, /* enhanced-SOP 2 and side-effect */
+ 			138, /* configuration z/architecture mode (czam) */
++			139, /* multiple epoch facility */
+ 			146, /* msa extension 8 */
+ 			-1  /* END */
+ 		}
