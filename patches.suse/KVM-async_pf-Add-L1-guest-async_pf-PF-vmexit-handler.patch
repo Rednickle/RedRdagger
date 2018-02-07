@@ -1,0 +1,215 @@
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+Date: Thu, 13 Jul 2017 18:30:40 -0700
+Subject: KVM: async_pf: Add L1 guest async_pf #PF vmexit handler
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v4.13-rc1
+Git-commit: 1261bfa326f5e903166498628a1894edce0caabc
+References: bsc#1077761
+
+This patch adds the L1 guest async page fault #PF vmexit handler, such
+by L1 similar to ordinary async page fault.
+
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+[Passed insn parameters to kvm_mmu_page_fault().]
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ arch/x86/include/asm/kvm_host.h |    1 +
+ arch/x86/kvm/mmu.c              |   33 +++++++++++++++++++++++++++++++++
+ arch/x86/kvm/mmu.h              |    3 +++
+ arch/x86/kvm/svm.c              |   36 ++++++------------------------------
+ arch/x86/kvm/vmx.c              |   15 ++++++++-------
+ 5 files changed, 51 insertions(+), 37 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 8d11ddcb0dbf..4f20ee6c79a1 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -650,6 +650,7 @@ struct kvm_vcpu_arch {
+ 		u64 msr_val;
+ 		u32 id;
+ 		bool send_user_only;
++		u32 host_apf_reason;
+ 	} apf;
+ 
+ 	/* OSVW MSRs (AMD only) */
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index aafd399cf8c6..3825a35cd752 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -46,6 +46,7 @@
+ #include <asm/io.h>
+ #include <asm/vmx.h>
+ #include <asm/kvm_page_track.h>
++#include "trace.h"
+ 
+ /*
+  * When setting this variable to true it enables Two-Dimensional-Paging
+@@ -3780,6 +3781,38 @@ static bool try_async_pf(struct kvm_vcpu *vcpu, bool prefault, gfn_t gfn,
+ 	return false;
+ }
+ 
++int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
++				u64 fault_address, char *insn, int insn_len,
++				bool need_unprotect)
++{
++	int r = 1;
++
++	switch (vcpu->arch.apf.host_apf_reason) {
++	default:
++		trace_kvm_page_fault(fault_address, error_code);
++
++		if (need_unprotect && kvm_event_needs_reinjection(vcpu))
++			kvm_mmu_unprotect_page_virt(vcpu, fault_address);
++		r = kvm_mmu_page_fault(vcpu, fault_address, error_code, insn,
++				insn_len);
++		break;
++	case KVM_PV_REASON_PAGE_NOT_PRESENT:
++		vcpu->arch.apf.host_apf_reason = 0;
++		local_irq_disable();
++		kvm_async_pf_task_wait(fault_address);
++		local_irq_enable();
++		break;
++	case KVM_PV_REASON_PAGE_READY:
++		vcpu->arch.apf.host_apf_reason = 0;
++		local_irq_disable();
++		kvm_async_pf_task_wake(fault_address);
++		local_irq_enable();
++		break;
++	}
++	return r;
++}
++EXPORT_SYMBOL_GPL(kvm_handle_page_fault);
++
+ static bool
+ check_hugepage_cache_consistency(struct kvm_vcpu *vcpu, gfn_t gfn, int level)
+ {
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index a276834950c1..d7d248a000dd 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -77,6 +77,9 @@ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu);
+ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly,
+ 			     bool accessed_dirty);
+ bool kvm_can_do_async_pf(struct kvm_vcpu *vcpu);
++int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
++				u64 fault_address, char *insn, int insn_len,
++				bool need_unprotect);
+ 
+ static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+ {
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index cde756a02b1a..fb23497cf915 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -194,7 +194,6 @@ struct vcpu_svm {
+ 
+ 	unsigned int3_injected;
+ 	unsigned long int3_rip;
+-	u32 apf_reason;
+ 
+ 	/* cached guest cpuid flags for faster access */
+ 	bool nrips_enabled	: 1;
+@@ -2122,34 +2121,11 @@ static void svm_set_dr7(struct kvm_vcpu *vcpu, unsigned long value)
+ static int pf_interception(struct vcpu_svm *svm)
+ {
+ 	u64 fault_address = svm->vmcb->control.exit_info_2;
+-	u64 error_code;
+-	int r = 1;
++	u64 error_code = svm->vmcb->control.exit_info_1;
+ 
+-	switch (svm->apf_reason) {
+-	default:
+-		error_code = svm->vmcb->control.exit_info_1;
+-
+-		trace_kvm_page_fault(fault_address, error_code);
+-		if (!npt_enabled && kvm_event_needs_reinjection(&svm->vcpu))
+-			kvm_mmu_unprotect_page_virt(&svm->vcpu, fault_address);
+-		r = kvm_mmu_page_fault(&svm->vcpu, fault_address, error_code,
++	return kvm_handle_page_fault(&svm->vcpu, error_code, fault_address,
+ 			svm->vmcb->control.insn_bytes,
+-			svm->vmcb->control.insn_len);
+-		break;
+-	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+-		svm->apf_reason = 0;
+-		local_irq_disable();
+-		kvm_async_pf_task_wait(fault_address);
+-		local_irq_enable();
+-		break;
+-	case KVM_PV_REASON_PAGE_READY:
+-		svm->apf_reason = 0;
+-		local_irq_disable();
+-		kvm_async_pf_task_wake(fault_address);
+-		local_irq_enable();
+-		break;
+-	}
+-	return r;
++			svm->vmcb->control.insn_len, !npt_enabled);
+ }
+ 
+ static int db_interception(struct vcpu_svm *svm)
+@@ -2630,7 +2606,7 @@ static int nested_svm_exit_special(struct vcpu_svm *svm)
+ 		break;
+ 	case SVM_EXIT_EXCP_BASE + PF_VECTOR:
+ 		/* When we're shadowing, trap PFs, but not async PF */
+-		if (!npt_enabled && svm->apf_reason == 0)
++		if (!npt_enabled && svm->vcpu.arch.apf.host_apf_reason == 0)
+ 			return NESTED_EXIT_HOST;
+ 		break;
+ 	default:
+@@ -2677,7 +2653,7 @@ static int nested_svm_intercept(struct vcpu_svm *svm)
+ 		}
+ 		/* async page fault always cause vmexit */
+ 		else if ((exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR) &&
+-			 svm->apf_reason != 0)
++			 svm->vcpu.arch.apf.host_apf_reason != 0)
+ 			vmexit = NESTED_EXIT_DONE;
+ 		break;
+ 	}
+@@ -4998,7 +4974,7 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	/* if exit due to PF check for async PF */
+ 	if (svm->vmcb->control.exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR)
+-		svm->apf_reason = kvm_read_and_reset_pf_reason();
++		svm->vcpu.arch.apf.host_apf_reason = kvm_read_and_reset_pf_reason();
+ 
+ 	if (npt_enabled) {
+ 		vcpu->arch.regs_avail &= ~(1 << VCPU_EXREG_PDPTR);
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 69cc228436ea..c9c46e63f744 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5698,14 +5698,11 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	if (is_page_fault(intr_info)) {
+-		/* EPT won't cause page fault directly */
+-		BUG_ON(enable_ept);
+ 		cr2 = vmcs_readl(EXIT_QUALIFICATION);
+-		trace_kvm_page_fault(cr2, error_code);
+-
+-		if (kvm_event_needs_reinjection(vcpu))
+-			kvm_mmu_unprotect_page_virt(vcpu, cr2);
+-		return kvm_mmu_page_fault(vcpu, cr2, error_code, NULL, 0);
++		/* EPT won't cause page fault directly */
++		WARN_ON_ONCE(!vcpu->arch.apf.host_apf_reason && enable_ept);
++		return kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0,
++				true);
+ 	}
+ 
+ 	ex_no = intr_info & INTR_INFO_VECTOR_MASK;
+@@ -8643,6 +8640,10 @@ static void vmx_complete_atomic_exit(struct vcpu_vmx *vmx)
+ 		exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+ 	vmx->exit_intr_info = exit_intr_info;
+ 
++	/* if exit due to PF check for async PF */
++	if (is_page_fault(exit_intr_info))
++		vmx->vcpu.arch.apf.host_apf_reason = kvm_read_and_reset_pf_reason();
++
+ 	/* Handle machine checks before interrupts are enabled */
+ 	if (basic_exit_reason == EXIT_REASON_MCE_DURING_VMENTRY ||
+ 	    is_machine_check(exit_intr_info))
