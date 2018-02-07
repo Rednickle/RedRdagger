@@ -1,0 +1,129 @@
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+Date: Thu, 13 Jul 2017 18:30:42 -0700
+Subject: KVM: async_pf: Let guest support delivery of async_pf from guest mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v4.13-rc1
+Git-commit: 52a5c155cf79f1f059bffebf4d06d0249573e659
+References: bsc#1077761
+
+Adds another flag bit (bit 2) to MSR_KVM_ASYNC_PF_EN. If bit 2 is 1,
+async page faults are delivered to L1 as #PF vmexits; if bit 2 is 0,
+kvm_can_do_async_pf returns 0 if in guest mode.
+
+This is similar to what svm.c wanted to do all along, but it is only
+enabled for Linux as L1 hypervisor.  Foreign hypervisors must never
+receive async page faults as vmexits, because they'd probably be very
+confused about that.
+
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ Documentation/virtual/kvm/msr.txt    |    5 +++--
+ arch/x86/include/asm/kvm_host.h      |    1 +
+ arch/x86/include/uapi/asm/kvm_para.h |    1 +
+ arch/x86/kernel/kvm.c                |    7 ++++++-
+ arch/x86/kvm/mmu.c                   |    2 +-
+ arch/x86/kvm/vmx.c                   |    2 +-
+ arch/x86/kvm/x86.c                   |    5 +++--
+ 7 files changed, 16 insertions(+), 7 deletions(-)
+
+--- a/Documentation/virtual/kvm/msr.txt
++++ b/Documentation/virtual/kvm/msr.txt
+@@ -166,10 +166,11 @@
+ MSR_KVM_ASYNC_PF_EN: 0x4b564d02
+ 	data: Bits 63-6 hold 64-byte aligned physical address of a
+ 	64 byte memory area which must be in guest RAM and must be
+-	zeroed. Bits 5-2 are reserved and should be zero. Bit 0 is 1
++	zeroed. Bits 5-3 are reserved and should be zero. Bit 0 is 1
+ 	when asynchronous page faults are enabled on the vcpu 0 when
+ 	disabled. Bit 1 is 1 if asynchronous page faults can be injected
+-	when vcpu is in cpl == 0.
++	when vcpu is in cpl == 0. Bit 2 is 1 if asynchronous page faults
++	are delivered to L1 as #PF vmexits.
+ 
+ 	First 4 byte of 64 byte memory location will be written to by
+ 	the hypervisor at the time of asynchronous page fault (APF)
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -654,6 +654,7 @@
+ 		bool send_user_only;
+ 		u32 host_apf_reason;
+ 		unsigned long nested_apf_token;
++		bool delivery_as_pf_vmexit;
+ 	} apf;
+ 
+ 	/* OSVW MSRs (AMD only) */
+--- a/arch/x86/include/uapi/asm/kvm_para.h
++++ b/arch/x86/include/uapi/asm/kvm_para.h
+@@ -67,6 +67,7 @@
+ 
+ #define KVM_ASYNC_PF_ENABLED			(1 << 0)
+ #define KVM_ASYNC_PF_SEND_ALWAYS		(1 << 1)
++#define KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT	(1 << 2)
+ 
+ /* Operations for KVM_HC_MMU_OP */
+ #define KVM_MMU_OP_WRITE_PTE            1
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -332,7 +332,12 @@
+ #ifdef CONFIG_PREEMPT
+ 		pa |= KVM_ASYNC_PF_SEND_ALWAYS;
+ #endif
+-		wrmsrl(MSR_KVM_ASYNC_PF_EN, pa | KVM_ASYNC_PF_ENABLED);
++		pa |= KVM_ASYNC_PF_ENABLED;
++
++		/* Async page fault support for L1 hypervisor is optional */
++		if (wrmsr_safe(MSR_KVM_ASYNC_PF_EN,
++			(pa | KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT) & 0xffffffff, pa >> 32) < 0)
++			wrmsrl(MSR_KVM_ASYNC_PF_EN, pa);
+ 		__this_cpu_write(apf_reason.enabled, 1);
+ 		printk(KERN_INFO"KVM setup async PF for cpu %d\n",
+ 		       smp_processor_id());
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3752,7 +3752,7 @@
+ 		     kvm_event_needs_reinjection(vcpu)))
+ 		return false;
+ 
+-	if (is_guest_mode(vcpu))
++	if (!vcpu->arch.apf.delivery_as_pf_vmexit && is_guest_mode(vcpu))
+ 		return false;
+ 
+ 	return kvm_x86_ops->interrupt_allowed(vcpu);
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -8020,7 +8020,7 @@
+ 		if (is_nmi(intr_info))
+ 			return false;
+ 		else if (is_page_fault(intr_info))
+-			return enable_ept;
++			return !vmx->vcpu.arch.apf.host_apf_reason && enable_ept;
+ 		else if (is_no_device(intr_info) &&
+ 			 !(vmcs12->guest_cr0 & X86_CR0_TS))
+ 			return false;
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2064,8 +2064,8 @@
+ {
+ 	gpa_t gpa = data & ~0x3f;
+ 
+-	/* Bits 2:5 are reserved, Should be zero */
+-	if (data & 0x3c)
++	/* Bits 3:5 are reserved, Should be zero */
++	if (data & 0x38)
+ 		return 1;
+ 
+ 	vcpu->arch.apf.msr_val = data;
+@@ -2081,6 +2081,7 @@
+ 		return 1;
+ 
+ 	vcpu->arch.apf.send_user_only = !(data & KVM_ASYNC_PF_SEND_ALWAYS);
++	vcpu->arch.apf.delivery_as_pf_vmexit = data & KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT;
+ 	kvm_async_pf_wakeup_all(vcpu);
+ 	return 0;
+ }
