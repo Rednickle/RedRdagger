@@ -1,0 +1,195 @@
+From: Eric Auger <eric.auger@redhat.com>
+Date: Fri, 27 Oct 2017 15:28:32 +0100
+Subject: KVM: arm/arm64: vgic: restructure kvm_vgic_(un)map_phys_irq
+Patch-mainline: v4.15-rc1
+Git-commit: 47bbd31f740c4e693d01766f367ad3366fb49a6d
+References: bsc#1077761
+
+We want to reuse the core of the map/unmap functions for IRQ
+forwarding. Let's move the computation of the hwirq in
+kvm_vgic_map_phys_irq and pass the linux IRQ as parameter.
+the host_irq is added to struct vgic_irq.
+
+We introduce kvm_vgic_map/unmap_irq which take a struct vgic_irq
+handle as a parameter.
+
+Acked-by: Christoffer Dall <christoffer.dall@linaro.org>
+Signed-off-by: Eric Auger <eric.auger@redhat.com>
+Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Christoffer Dall <christoffer.dall@linaro.org>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ include/kvm/arm_vgic.h    |    8 +++---
+ virt/kvm/arm/arch_timer.c |   24 ------------------
+ virt/kvm/arm/vgic/vgic.c  |   60 ++++++++++++++++++++++++++++++++++------------
+ 3 files changed, 51 insertions(+), 41 deletions(-)
+
+--- a/include/kvm/arm_vgic.h
++++ b/include/kvm/arm_vgic.h
+@@ -116,6 +116,7 @@
+ 	bool hw;			/* Tied to HW IRQ */
+ 	struct kref refcount;		/* Used for LPIs */
+ 	u32 hwintid;			/* HW INTID number */
++	unsigned int host_irq;		/* linux irq corresponding to hwintid */
+ 	union {
+ 		u8 targets;			/* GICv2 target VCPUs mask */
+ 		u32 mpidr;			/* GICv3 target VCPU */
+@@ -307,9 +308,10 @@
+ 
+ int kvm_vgic_inject_irq(struct kvm *kvm, int cpuid, unsigned int intid,
+ 			bool level, void *owner);
+-int kvm_vgic_map_phys_irq(struct kvm_vcpu *vcpu, u32 virt_irq, u32 phys_irq);
+-int kvm_vgic_unmap_phys_irq(struct kvm_vcpu *vcpu, unsigned int virt_irq);
+-bool kvm_vgic_map_is_active(struct kvm_vcpu *vcpu, unsigned int virt_irq);
++int kvm_vgic_map_phys_irq(struct kvm_vcpu *vcpu, unsigned int host_irq,
++			  u32 vintid);
++int kvm_vgic_unmap_phys_irq(struct kvm_vcpu *vcpu, unsigned int vintid);
++bool kvm_vgic_map_is_active(struct kvm_vcpu *vcpu, unsigned int vintid);
+ 
+ int kvm_vgic_vcpu_pending_irq(struct kvm_vcpu *vcpu);
+ 
+--- a/virt/kvm/arm/arch_timer.c
++++ b/virt/kvm/arm/arch_timer.c
+@@ -817,9 +817,6 @@
+ {
+ 	struct arch_timer_cpu *timer = &vcpu->arch.timer_cpu;
+ 	struct arch_timer_context *vtimer = vcpu_vtimer(vcpu);
+-	struct irq_desc *desc;
+-	struct irq_data *data;
+-	int phys_irq;
+ 	int ret;
+ 
+ 	if (timer->enabled)
+@@ -837,26 +834,7 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	/*
+-	 * Find the physical IRQ number corresponding to the host_vtimer_irq
+-	 */
+-	desc = irq_to_desc(host_vtimer_irq);
+-	if (!desc) {
+-		kvm_err("%s: no interrupt descriptor\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	data = irq_desc_get_irq_data(desc);
+-	while (data->parent_data)
+-		data = data->parent_data;
+-
+-	phys_irq = data->hwirq;
+-
+-	/*
+-	 * Tell the VGIC that the virtual interrupt is tied to a
+-	 * physical interrupt. We do that once per VCPU.
+-	 */
+-	ret = kvm_vgic_map_phys_irq(vcpu, vtimer->irq.irq, phys_irq);
++	ret = kvm_vgic_map_phys_irq(vcpu, host_vtimer_irq, vtimer->irq.irq);
+ 	if (ret)
+ 		return ret;
+ 
+--- a/virt/kvm/arm/vgic/vgic.c
++++ b/virt/kvm/arm/vgic/vgic.c
+@@ -17,6 +17,8 @@
+ #include <linux/kvm.h>
+ #include <linux/kvm_host.h>
+ #include <linux/list_sort.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
+ 
+ #include "vgic.h"
+ 
+@@ -409,25 +411,56 @@
+ 	return 0;
+ }
+ 
+-int kvm_vgic_map_phys_irq(struct kvm_vcpu *vcpu, u32 virt_irq, u32 phys_irq)
++/* @irq->irq_lock must be held */
++static int kvm_vgic_map_irq(struct kvm_vcpu *vcpu, struct vgic_irq *irq,
++			    unsigned int host_irq)
+ {
+-	struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, virt_irq);
++	struct irq_desc *desc;
++	struct irq_data *data;
++
++	/*
++	 * Find the physical IRQ number corresponding to @host_irq
++	 */
++	desc = irq_to_desc(host_irq);
++	if (!desc) {
++		kvm_err("%s: no interrupt descriptor\n", __func__);
++		return -EINVAL;
++	}
++	data = irq_desc_get_irq_data(desc);
++	while (data->parent_data)
++		data = data->parent_data;
++
++	irq->hw = true;
++	irq->host_irq = host_irq;
++	irq->hwintid = data->hwirq;
++	return 0;
++}
++
++/* @irq->irq_lock must be held */
++static inline void kvm_vgic_unmap_irq(struct vgic_irq *irq)
++{
++	irq->hw = false;
++	irq->hwintid = 0;
++}
++
++int kvm_vgic_map_phys_irq(struct kvm_vcpu *vcpu, unsigned int host_irq,
++			  u32 vintid)
++{
++	struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, vintid);
+ 	unsigned long flags;
++	int ret;
+ 
+ 	BUG_ON(!irq);
+ 
+ 	spin_lock_irqsave(&irq->irq_lock, flags);
+-
+-	irq->hw = true;
+-	irq->hwintid = phys_irq;
+-
++	ret = kvm_vgic_map_irq(vcpu, irq, host_irq);
+ 	spin_unlock_irqrestore(&irq->irq_lock, flags);
+ 	vgic_put_irq(vcpu->kvm, irq);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+-int kvm_vgic_unmap_phys_irq(struct kvm_vcpu *vcpu, unsigned int virt_irq)
++int kvm_vgic_unmap_phys_irq(struct kvm_vcpu *vcpu, unsigned int vintid)
+ {
+ 	struct vgic_irq *irq;
+ 	unsigned long flags;
+@@ -435,14 +468,11 @@
+ 	if (!vgic_initialized(vcpu->kvm))
+ 		return -EAGAIN;
+ 
+-	irq = vgic_get_irq(vcpu->kvm, vcpu, virt_irq);
++	irq = vgic_get_irq(vcpu->kvm, vcpu, vintid);
+ 	BUG_ON(!irq);
+ 
+ 	spin_lock_irqsave(&irq->irq_lock, flags);
+-
+-	irq->hw = false;
+-	irq->hwintid = 0;
+-
++	kvm_vgic_unmap_irq(irq);
+ 	spin_unlock_irqrestore(&irq->irq_lock, flags);
+ 	vgic_put_irq(vcpu->kvm, irq);
+ 
+@@ -784,9 +814,9 @@
+ 	}
+ }
+ 
+-bool kvm_vgic_map_is_active(struct kvm_vcpu *vcpu, unsigned int virt_irq)
++bool kvm_vgic_map_is_active(struct kvm_vcpu *vcpu, unsigned int vintid)
+ {
+-	struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, virt_irq);
++	struct vgic_irq *irq = vgic_get_irq(vcpu->kvm, vcpu, vintid);
+ 	bool map_is_active;
+ 	unsigned long flags;
+ 
