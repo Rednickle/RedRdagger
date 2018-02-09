@@ -1,0 +1,193 @@
+From: Marc Zyngier <marc.zyngier@arm.com>
+Date: Tue, 20 Dec 2016 15:09:31 +0000
+Subject: irqchip/gic-v3-its: Add VPE scheduling
+Patch-mainline: v4.14-rc1
+Git-commit: e643d80340363c9d172abfbe437537196cfc1643
+References: FATE#323954
+
+When a VPE is scheduled to run, the corresponding redistributor must
+be told so, by setting VPROPBASER to the VM's property table, and
+VPENDBASER to the vcpu's pending table.
+
+When scheduled out, we preserve the IDAI and PendingLast bits. The
+latter is specially important, as it tells the hypervisor that
+there are pending interrupts for this vcpu.
+
+Reviewed-by: Eric Auger <eric.auger@redhat.com>
+Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ drivers/irqchip/irq-gic-v3-its.c   |   85 +++++++++++++++++++++++++++++++++++++
+ include/linux/irqchip/arm-gic-v3.h |   58 +++++++++++++++++++++++++
+ 2 files changed, 143 insertions(+)
+
+--- a/drivers/irqchip/irq-gic-v3-its.c
++++ b/drivers/irqchip/irq-gic-v3-its.c
+@@ -152,6 +152,7 @@
+ 
+ #define gic_data_rdist()		(raw_cpu_ptr(gic_rdists->rdist))
+ #define gic_data_rdist_rd_base()	(gic_data_rdist()->rd_base)
++#define gic_data_rdist_vlpi_base()	(gic_data_rdist_rd_base() + SZ_128K)
+ 
+ static struct its_collection *dev_event_to_col(struct its_device *its_dev,
+ 					       u32 event)
+@@ -2158,8 +2159,92 @@
+ 	.deactivate		= its_irq_domain_deactivate,
+ };
+ 
++static void its_vpe_schedule(struct its_vpe *vpe)
++{
++	void * __iomem vlpi_base = gic_data_rdist_vlpi_base();
++	u64 val;
++
++	/* Schedule the VPE */
++	val  = virt_to_phys(page_address(vpe->its_vm->vprop_page)) &
++		GENMASK_ULL(51, 12);
++	val |= (LPI_NRBITS - 1) & GICR_VPROPBASER_IDBITS_MASK;
++	val |= GICR_VPROPBASER_RaWb;
++	val |= GICR_VPROPBASER_InnerShareable;
++	gits_write_vpropbaser(val, vlpi_base + GICR_VPROPBASER);
++
++	val  = virt_to_phys(page_address(vpe->vpt_page)) &
++		GENMASK_ULL(51, 16);
++	val |= GICR_VPENDBASER_RaWaWb;
++	val |= GICR_VPENDBASER_NonShareable;
++	/*
++	 * There is no good way of finding out if the pending table is
++	 * empty as we can race against the doorbell interrupt very
++	 * easily. So in the end, vpe->pending_last is only an
++	 * indication that the vcpu has something pending, not one
++	 * that the pending table is empty. A good implementation
++	 * would be able to read its coarse map pretty quickly anyway,
++	 * making this a tolerable issue.
++	 */
++	val |= GICR_VPENDBASER_PendingLast;
++	val |= vpe->idai ? GICR_VPENDBASER_IDAI : 0;
++	val |= GICR_VPENDBASER_Valid;
++	gits_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
++}
++
++static void its_vpe_deschedule(struct its_vpe *vpe)
++{
++	void * __iomem vlpi_base = gic_data_rdist_vlpi_base();
++	u32 count = 1000000;	/* 1s! */
++	bool clean;
++	u64 val;
++
++	/* We're being scheduled out */
++	val = gits_read_vpendbaser(vlpi_base + GICR_VPENDBASER);
++	val &= ~GICR_VPENDBASER_Valid;
++	gits_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
++
++	do {
++		val = gits_read_vpendbaser(vlpi_base + GICR_VPENDBASER);
++		clean = !(val & GICR_VPENDBASER_Dirty);
++		if (!clean) {
++			count--;
++			cpu_relax();
++			udelay(1);
++		}
++	} while (!clean && count);
++
++	if (unlikely(!clean && !count)) {
++		pr_err_ratelimited("ITS virtual pending table not cleaning\n");
++		vpe->idai = false;
++		vpe->pending_last = true;
++	} else {
++		vpe->idai = !!(val & GICR_VPENDBASER_IDAI);
++		vpe->pending_last = !!(val & GICR_VPENDBASER_PendingLast);
++	}
++}
++
++static int its_vpe_set_vcpu_affinity(struct irq_data *d, void *vcpu_info)
++{
++	struct its_vpe *vpe = irq_data_get_irq_chip_data(d);
++	struct its_cmd_info *info = vcpu_info;
++
++	switch (info->cmd_type) {
++	case SCHEDULE_VPE:
++		its_vpe_schedule(vpe);
++		return 0;
++
++	case DESCHEDULE_VPE:
++		its_vpe_deschedule(vpe);
++		return 0;
++
++	default:
++		return -EINVAL;
++	}
++}
++
+ static struct irq_chip its_vpe_irq_chip = {
+ 	.name			= "GICv4-vpe",
++	.irq_set_vcpu_affinity	= its_vpe_set_vcpu_affinity,
+ };
+ 
+ static int its_vpe_id_alloc(void)
+--- a/include/linux/irqchip/arm-gic-v3.h
++++ b/include/linux/irqchip/arm-gic-v3.h
+@@ -212,6 +212,64 @@
+ #define LPI_PROP_GROUP1			(1 << 1)
+ #define LPI_PROP_ENABLED		(1 << 0)
+ 
++/*
++ * Re-Distributor registers, offsets from VLPI_base
++ */
++#define GICR_VPROPBASER			0x0070
++
++#define GICR_VPROPBASER_IDBITS_MASK	0x1f
++
++#define GICR_VPROPBASER_SHAREABILITY_SHIFT		(10)
++#define GICR_VPROPBASER_INNER_CACHEABILITY_SHIFT	(7)
++#define GICR_VPROPBASER_OUTER_CACHEABILITY_SHIFT	(56)
++
++#define GICR_VPROPBASER_SHAREABILITY_MASK				\
++	GIC_BASER_SHAREABILITY(GICR_VPROPBASER, SHAREABILITY_MASK)
++#define GICR_VPROPBASER_INNER_CACHEABILITY_MASK				\
++	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, MASK)
++#define GICR_VPROPBASER_OUTER_CACHEABILITY_MASK				\
++	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, OUTER, MASK)
++#define GICR_VPROPBASER_CACHEABILITY_MASK				\
++	GICR_VPROPBASER_INNER_CACHEABILITY_MASK
++
++#define GICR_VPROPBASER_InnerShareable					\
++	GIC_BASER_SHAREABILITY(GICR_VPROPBASER, InnerShareable)
++
++#define GICR_VPROPBASER_nCnB	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, nCnB)
++#define GICR_VPROPBASER_nC 	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, nC)
++#define GICR_VPROPBASER_RaWt	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, RaWt)
++#define GICR_VPROPBASER_RaWb	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, RaWt)
++#define GICR_VPROPBASER_WaWt	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, WaWt)
++#define GICR_VPROPBASER_WaWb	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, WaWb)
++#define GICR_VPROPBASER_RaWaWt	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, RaWaWt)
++#define GICR_VPROPBASER_RaWaWb	GIC_BASER_CACHEABILITY(GICR_VPROPBASER, INNER, RaWaWb)
++
++#define GICR_VPENDBASER			0x0078
++
++#define GICR_VPENDBASER_SHAREABILITY_SHIFT		(10)
++#define GICR_VPENDBASER_INNER_CACHEABILITY_SHIFT	(7)
++#define GICR_VPENDBASER_OUTER_CACHEABILITY_SHIFT	(56)
++#define GICR_VPENDBASER_SHAREABILITY_MASK				\
++	GIC_BASER_SHAREABILITY(GICR_VPENDBASER, SHAREABILITY_MASK)
++#define GICR_VPENDBASER_INNER_CACHEABILITY_MASK				\
++	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, MASK)
++#define GICR_VPENDBASER_OUTER_CACHEABILITY_MASK				\
++	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, OUTER, MASK)
++#define GICR_VPENDBASER_CACHEABILITY_MASK				\
++	GICR_VPENDBASER_INNER_CACHEABILITY_MASK
++
++#define GICR_VPENDBASER_NonShareable					\
++	GIC_BASER_SHAREABILITY(GICR_VPENDBASER, NonShareable)
++
++#define GICR_VPENDBASER_nCnB	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, nCnB)
++#define GICR_VPENDBASER_nC 	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, nC)
++#define GICR_VPENDBASER_RaWt	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, RaWt)
++#define GICR_VPENDBASER_RaWb	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, RaWt)
++#define GICR_VPENDBASER_WaWt	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, WaWt)
++#define GICR_VPENDBASER_WaWb	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, WaWb)
++#define GICR_VPENDBASER_RaWaWt	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, RaWaWt)
++#define GICR_VPENDBASER_RaWaWb	GIC_BASER_CACHEABILITY(GICR_VPENDBASER, INNER, RaWaWb)
++
+ #define GICR_VPENDBASER_Dirty		(1ULL << 60)
+ #define GICR_VPENDBASER_PendingLast	(1ULL << 61)
+ #define GICR_VPENDBASER_IDAI		(1ULL << 62)

@@ -1,0 +1,355 @@
+From: Yu Zhang <yu.c.zhang@linux.intel.com>
+Date: Thu, 24 Aug 2017 20:27:55 +0800
+Subject: KVM: MMU: Add 5 level EPT & Shadow page table support.
+Patch-mainline: v4.14-rc1
+Git-commit: 855feb6736403f398dd43764254c5f0522bfc130
+References: bsc#1077761
+
+Extends the shadow paging code, so that 5 level shadow page
+table can be constructed if VM is running in 5 level paging
+mode.
+
+Also extends the ept code, so that 5 level ept table can be
+constructed if maxphysaddr of VM exceeds 48 bits. Unlike the
+shadow logic, KVM should still use 4 level ept table for a VM
+whose physical address width is less than 48 bits, even when
+the VM is running in 5 level paging mode.
+
+Signed-off-by: Yu Zhang <yu.c.zhang@linux.intel.com>
+[Unconditionally reset the MMU context in kvm_cpuid_update.
+ Changing MAXPHYADDR invalidates the reserved bit bitmasks.
+ - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ arch/x86/include/asm/kvm_host.h |   10 ++++-----
+ arch/x86/include/asm/vmx.h      |    2 +
+ arch/x86/kvm/cpuid.c            |    1 
+ arch/x86/kvm/mmu.c              |   43 ++++++++++++++++++++++++++--------------
+ arch/x86/kvm/mmu.h              |    1 
+ arch/x86/kvm/mmu_audit.c        |    4 +--
+ arch/x86/kvm/svm.c              |    4 +--
+ arch/x86/kvm/vmx.c              |   21 +++++++++++++------
+ arch/x86/kvm/x86.h              |   10 +++++++++
+ 9 files changed, 67 insertions(+), 29 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -315,7 +315,7 @@
+ 	int size;
+ };
+ 
+-#define PT64_ROOT_MAX_LEVEL 4
++#define PT64_ROOT_MAX_LEVEL 5
+ 
+ struct rsvd_bits_validate {
+ 	u64 rsvd_bits_mask[2][PT64_ROOT_MAX_LEVEL];
+@@ -323,9 +323,9 @@
+ };
+ 
+ /*
+- * x86 supports 3 paging modes (4-level 64-bit, 3-level 64-bit, and 2-level
+- * 32-bit).  The kvm_mmu structure abstracts the details of the current mmu
+- * mode.
++ * x86 supports 4 paging modes (5-level 64-bit, 4-level 64-bit, 3-level 32-bit,
++ * and 2-level 32-bit).  The kvm_mmu structure abstracts the details of the
++ * current mmu mode.
+  */
+ struct kvm_mmu {
+ 	void (*set_cr3)(struct kvm_vcpu *vcpu, unsigned long root);
+@@ -983,7 +983,7 @@
+ 	void (*deliver_posted_interrupt)(struct kvm_vcpu *vcpu, int vector);
+ 	int (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
+ 	int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
+-	int (*get_tdp_level)(void);
++	int (*get_tdp_level)(struct kvm_vcpu *vcpu);
+ 	u64 (*get_mt_mask)(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio);
+ 	int (*get_lpage_level)(void);
+ 	bool (*rdtscp_supported)(void);
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -453,6 +453,7 @@
+ 
+ #define VMX_EPT_EXECUTE_ONLY_BIT		(1ull)
+ #define VMX_EPT_PAGE_WALK_4_BIT			(1ull << 6)
++#define VMX_EPT_PAGE_WALK_5_BIT			(1ull << 7)
+ #define VMX_EPTP_UC_BIT				(1ull << 8)
+ #define VMX_EPTP_WB_BIT				(1ull << 14)
+ #define VMX_EPT_2MB_PAGE_BIT			(1ull << 16)
+@@ -471,6 +472,7 @@
+ #define VMX_EPT_MT_EPTE_SHIFT			3
+ #define VMX_EPTP_PWL_MASK			0x38ull
+ #define VMX_EPTP_PWL_4				0x18ull
++#define VMX_EPTP_PWL_5				0x20ull
+ #define VMX_EPTP_AD_ENABLE_BIT			(1ull << 6)
+ #define VMX_EPTP_MT_MASK			0x7ull
+ #define VMX_EPTP_MT_WB				0x6ull
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -136,6 +136,7 @@
+ 
+ 	/* Update physical-address width */
+ 	vcpu->arch.maxphyaddr = cpuid_query_maxphyaddr(vcpu);
++	kvm_mmu_reset_context(vcpu);
+ 
+ 	kvm_pmu_refresh(vcpu);
+ 	return 0;
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3325,8 +3325,8 @@
+ 	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
+ 		return;
+ 
+-	if (vcpu->arch.mmu.shadow_root_level == PT64_ROOT_4LEVEL &&
+-	    (vcpu->arch.mmu.root_level == PT64_ROOT_4LEVEL ||
++	if (vcpu->arch.mmu.shadow_root_level >= PT64_ROOT_4LEVEL &&
++	    (vcpu->arch.mmu.root_level >= PT64_ROOT_4LEVEL ||
+ 	     vcpu->arch.mmu.direct_map)) {
+ 		hpa_t root = vcpu->arch.mmu.root_hpa;
+ 
+@@ -3378,13 +3378,14 @@
+ 	struct kvm_mmu_page *sp;
+ 	unsigned i;
+ 
+-	if (vcpu->arch.mmu.shadow_root_level == PT64_ROOT_4LEVEL) {
++	if (vcpu->arch.mmu.shadow_root_level >= PT64_ROOT_4LEVEL) {
+ 		spin_lock(&vcpu->kvm->mmu_lock);
+ 		if(make_mmu_pages_available(vcpu) < 0) {
+ 			spin_unlock(&vcpu->kvm->mmu_lock);
+ 			return 1;
+ 		}
+-		sp = kvm_mmu_get_page(vcpu, 0, 0, PT64_ROOT_4LEVEL, 1, ACC_ALL);
++		sp = kvm_mmu_get_page(vcpu, 0, 0,
++				vcpu->arch.mmu.shadow_root_level, 1, ACC_ALL);
+ 		++sp->root_count;
+ 		spin_unlock(&vcpu->kvm->mmu_lock);
+ 		vcpu->arch.mmu.root_hpa = __pa(sp->spt);
+@@ -3428,7 +3429,7 @@
+ 	 * Do we shadow a long mode page table? If so we need to
+ 	 * write-protect the guests page table root.
+ 	 */
+-	if (vcpu->arch.mmu.root_level == PT64_ROOT_4LEVEL) {
++	if (vcpu->arch.mmu.root_level >= PT64_ROOT_4LEVEL) {
+ 		hpa_t root = vcpu->arch.mmu.root_hpa;
+ 
+ 		MMU_WARN_ON(VALID_PAGE(root));
+@@ -3438,8 +3439,8 @@
+ 			spin_unlock(&vcpu->kvm->mmu_lock);
+ 			return 1;
+ 		}
+-		sp = kvm_mmu_get_page(vcpu, root_gfn, 0, PT64_ROOT_4LEVEL,
+-				      0, ACC_ALL);
++		sp = kvm_mmu_get_page(vcpu, root_gfn, 0,
++				vcpu->arch.mmu.shadow_root_level, 0, ACC_ALL);
+ 		root = __pa(sp->spt);
+ 		++sp->root_count;
+ 		spin_unlock(&vcpu->kvm->mmu_lock);
+@@ -3534,7 +3535,7 @@
+ 
+ 	vcpu_clear_mmio_info(vcpu, MMIO_GVA_ANY);
+ 	kvm_mmu_audit(vcpu, AUDIT_PRE_SYNC);
+-	if (vcpu->arch.mmu.root_level == PT64_ROOT_4LEVEL) {
++	if (vcpu->arch.mmu.root_level >= PT64_ROOT_4LEVEL) {
+ 		hpa_t root = vcpu->arch.mmu.root_hpa;
+ 		sp = page_header(root);
+ 		mmu_sync_children(vcpu, sp);
+@@ -4060,6 +4061,12 @@
+ 		rsvd_check->rsvd_bits_mask[1][0] =
+ 			rsvd_check->rsvd_bits_mask[0][0];
+ 		break;
++	case PT64_ROOT_5LEVEL:
++		rsvd_check->rsvd_bits_mask[0][4] = exb_bit_rsvd |
++			nonleaf_bit8_rsvd | rsvd_bits(7, 7) |
++			rsvd_bits(maxphyaddr, 51);
++		rsvd_check->rsvd_bits_mask[1][4] =
++			rsvd_check->rsvd_bits_mask[0][4];
+ 	case PT64_ROOT_4LEVEL:
+ 		rsvd_check->rsvd_bits_mask[0][3] = exb_bit_rsvd |
+ 			nonleaf_bit8_rsvd | rsvd_bits(7, 7) |
+@@ -4101,6 +4108,8 @@
+ {
+ 	u64 bad_mt_xwr;
+ 
++	rsvd_check->rsvd_bits_mask[0][4] =
++		rsvd_bits(maxphyaddr, 51) | rsvd_bits(3, 7);
+ 	rsvd_check->rsvd_bits_mask[0][3] =
+ 		rsvd_bits(maxphyaddr, 51) | rsvd_bits(3, 7);
+ 	rsvd_check->rsvd_bits_mask[0][2] =
+@@ -4110,6 +4119,7 @@
+ 	rsvd_check->rsvd_bits_mask[0][0] = rsvd_bits(maxphyaddr, 51);
+ 
+ 	/* large page */
++	rsvd_check->rsvd_bits_mask[1][4] = rsvd_check->rsvd_bits_mask[0][4];
+ 	rsvd_check->rsvd_bits_mask[1][3] = rsvd_check->rsvd_bits_mask[0][3];
+ 	rsvd_check->rsvd_bits_mask[1][2] =
+ 		rsvd_bits(maxphyaddr, 51) | rsvd_bits(12, 29);
+@@ -4394,7 +4404,10 @@
+ static void paging64_init_context(struct kvm_vcpu *vcpu,
+ 				  struct kvm_mmu *context)
+ {
+-	paging64_init_context_common(vcpu, context, PT64_ROOT_4LEVEL);
++	int root_level = is_la57_mode(vcpu) ?
++			 PT64_ROOT_5LEVEL : PT64_ROOT_4LEVEL;
++
++	paging64_init_context_common(vcpu, context, root_level);
+ }
+ 
+ static void paging32_init_context(struct kvm_vcpu *vcpu,
+@@ -4435,7 +4448,7 @@
+ 	context->sync_page = nonpaging_sync_page;
+ 	context->invlpg = nonpaging_invlpg;
+ 	context->update_pte = nonpaging_update_pte;
+-	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
++	context->shadow_root_level = kvm_x86_ops->get_tdp_level(vcpu);
+ 	context->root_hpa = INVALID_PAGE;
+ 	context->direct_map = true;
+ 	context->set_cr3 = kvm_x86_ops->set_tdp_cr3;
+@@ -4449,7 +4462,8 @@
+ 		context->root_level = 0;
+ 	} else if (is_long_mode(vcpu)) {
+ 		context->nx = is_nx(vcpu);
+-		context->root_level = PT64_ROOT_4LEVEL;
++		context->root_level = is_la57_mode(vcpu) ?
++				PT64_ROOT_5LEVEL : PT64_ROOT_4LEVEL;
+ 		reset_rsvds_bits_mask(vcpu, context);
+ 		context->gva_to_gpa = paging64_gva_to_gpa;
+ 	} else if (is_pae(vcpu)) {
+@@ -4506,7 +4520,7 @@
+ 
+ 	MMU_WARN_ON(VALID_PAGE(context->root_hpa));
+ 
+-	context->shadow_root_level = kvm_x86_ops->get_tdp_level();
++	context->shadow_root_level = PT64_ROOT_4LEVEL;
+ 
+ 	context->nx = true;
+ 	context->ept_ad = accessed_dirty;
+@@ -4515,7 +4529,7 @@
+ 	context->sync_page = ept_sync_page;
+ 	context->invlpg = ept_invlpg;
+ 	context->update_pte = ept_update_pte;
+-	context->root_level = context->shadow_root_level;
++	context->root_level = PT64_ROOT_4LEVEL;
+ 	context->root_hpa = INVALID_PAGE;
+ 	context->direct_map = false;
+ 	context->base_role.ad_disabled = !accessed_dirty;
+@@ -4560,7 +4574,8 @@
+ 		g_context->gva_to_gpa = nonpaging_gva_to_gpa_nested;
+ 	} else if (is_long_mode(vcpu)) {
+ 		g_context->nx = is_nx(vcpu);
+-		g_context->root_level = PT64_ROOT_4LEVEL;
++		g_context->root_level = is_la57_mode(vcpu) ?
++					PT64_ROOT_5LEVEL : PT64_ROOT_4LEVEL;
+ 		reset_rsvds_bits_mask(vcpu, g_context);
+ 		g_context->gva_to_gpa = paging64_gva_to_gpa_nested;
+ 	} else if (is_pae(vcpu)) {
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -37,6 +37,7 @@
+ #define PT32_DIR_PSE36_MASK \
+ 	(((1ULL << PT32_DIR_PSE36_SIZE) - 1) << PT32_DIR_PSE36_SHIFT)
+ 
++#define PT64_ROOT_5LEVEL 5
+ #define PT64_ROOT_4LEVEL 4
+ #define PT32_ROOT_LEVEL 2
+ #define PT32E_ROOT_LEVEL 3
+--- a/arch/x86/kvm/mmu_audit.c
++++ b/arch/x86/kvm/mmu_audit.c
+@@ -62,11 +62,11 @@
+ 	if (!VALID_PAGE(vcpu->arch.mmu.root_hpa))
+ 		return;
+ 
+-	if (vcpu->arch.mmu.root_level == PT64_ROOT_4LEVEL) {
++	if (vcpu->arch.mmu.root_level >= PT64_ROOT_4LEVEL) {
+ 		hpa_t root = vcpu->arch.mmu.root_hpa;
+ 
+ 		sp = page_header(root);
+-		__mmu_spte_walk(vcpu, sp, fn, PT64_ROOT_4LEVEL);
++		__mmu_spte_walk(vcpu, sp, fn, vcpu->arch.mmu.root_level);
+ 		return;
+ 	}
+ 
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -561,7 +561,7 @@
+ 	asm volatile (__ex(SVM_INVLPGA) : : "a"(addr), "c"(asid));
+ }
+ 
+-static int get_npt_level(void)
++static int get_npt_level(struct kvm_vcpu *vcpu)
+ {
+ #ifdef CONFIG_X86_64
+ 	return PT64_ROOT_4LEVEL;
+@@ -2336,7 +2336,7 @@
+ 	vcpu->arch.mmu.get_cr3           = nested_svm_get_tdp_cr3;
+ 	vcpu->arch.mmu.get_pdptr         = nested_svm_get_tdp_pdptr;
+ 	vcpu->arch.mmu.inject_page_fault = nested_svm_inject_npf_exit;
+-	vcpu->arch.mmu.shadow_root_level = get_npt_level();
++	vcpu->arch.mmu.shadow_root_level = get_npt_level(vcpu);
+ 	reset_shadow_zero_bits_mask(vcpu, &vcpu->arch.mmu);
+ 	vcpu->arch.walk_mmu              = &vcpu->arch.nested_mmu;
+ }
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1202,6 +1202,11 @@
+ 	return vmx_capability.ept & VMX_EPTP_WB_BIT;
+ }
+ 
++static inline bool cpu_has_vmx_ept_5levels(void)
++{
++	return vmx_capability.ept & VMX_EPT_PAGE_WALK_5_BIT;
++}
++
+ static inline bool cpu_has_vmx_ept_ad_bits(void)
+ {
+ 	return vmx_capability.ept & VMX_EPT_AD_BIT;
+@@ -4294,9 +4299,18 @@
+ 	vmx->emulation_required = emulation_required(vcpu);
+ }
+ 
++static int get_ept_level(struct kvm_vcpu *vcpu)
++{
++	if (cpu_has_vmx_ept_5levels() && (cpuid_maxphyaddr(vcpu) > 48))
++		return 5;
++	return 4;
++}
++
+ static u64 construct_eptp(struct kvm_vcpu *vcpu, unsigned long root_hpa)
+ {
+-	u64 eptp = VMX_EPTP_MT_WB | VMX_EPTP_PWL_4;
++	u64 eptp = VMX_EPTP_MT_WB;
++
++	eptp |= (get_ept_level(vcpu) == 5) ? VMX_EPTP_PWL_5 : VMX_EPTP_PWL_4;
+ 
+ 	if (enable_ept_ad_bits &&
+ 	    (!is_guest_mode(vcpu) || nested_ept_ad_enabled(vcpu)))
+@@ -9587,11 +9601,6 @@
+ 	}
+ }
+ 
+-static int get_ept_level(void)
+-{
+-	return 4;
+-}
+-
+ static u64 vmx_get_mt_mask(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio)
+ {
+ 	u8 cache;
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -62,6 +62,16 @@
+ 	return cs_l;
+ }
+ 
++static inline bool is_la57_mode(struct kvm_vcpu *vcpu)
++{
++#ifdef CONFIG_X86_64
++	return (vcpu->arch.efer & EFER_LMA) &&
++		 kvm_read_cr4_bits(vcpu, X86_CR4_LA57);
++#else
++	return 0;
++#endif
++}
++
+ static inline bool mmu_is_nested(struct kvm_vcpu *vcpu)
+ {
+ 	return vcpu->arch.walk_mmu == &vcpu->arch.nested_mmu;

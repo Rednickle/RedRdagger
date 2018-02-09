@@ -1,0 +1,352 @@
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Tue, 16 May 2017 16:41:20 +1000
+Subject: KVM: PPC: Book3S HV: Virtualize doorbell facility on POWER9
+Patch-mainline: v4.13-rc1
+Git-commit: 579006944e0d675361e987c646b83d2d1725966c
+References: bsc#1077761
+
+On POWER9, we no longer have the restriction that we had on POWER8
+where all threads in a core have to be in the same partition, so
+the CPU threads are now independent.  However, we still want to be
+able to run guests with a virtual SMT topology, if only to allow
+migration of guests from POWER8 systems to POWER9.
+
+A guest that has a virtual SMT mode greater than 1 will expect to
+be able to use the doorbell facility; it will expect the msgsndp
+and msgclrp instructions to work appropriately and to be able to read
+sensible values from the TIR (thread identification register) and
+DPDES (directed privileged doorbell exception status) special-purpose
+registers.  However, since each CPU thread is a separate sub-processor
+in POWER9, these instructions and registers can only be used within
+a single CPU thread.
+
+In order for these instructions to appear to act correctly according
+to the guest's virtual SMT mode, we have to trap and emulate them.
+We cause them to trap by clearing the HFSCR_MSGP bit in the HFSCR
+register.  The emulation is triggered by the hypervisor facility
+unavailable interrupt that occurs when the guest uses them.
+
+To cause a doorbell interrupt to occur within the guest, we set the
+DPDES register to 1.  If the guest has interrupts enabled, the CPU
+will generate a doorbell interrupt and clear the DPDES register in
+hardware.  The DPDES hardware register for the guest is saved in the
+vcpu->arch.vcore->dpdes field.  Since this gets written by the guest
+exit code, other VCPUs wishing to cause a doorbell interrupt don't
+write that field directly, but instead set a vcpu->arch.doorbell_request
+flag.  This is consumed and set to 0 by the guest entry code, which
+then sets DPDES to 1.
+
+Emulating reads of the DPDES register is somewhat involved, because
+it requires reading the doorbell pending interrupt status of all of the
+VCPU threads in the virtual core, and if any of those VCPUs are
+running, their doorbell status is only up-to-date in the hardware
+DPDES registers of the CPUs where they are running.  In order to get
+a reasonable approximation of the current doorbell status, we send
+those CPUs an IPI, causing an exit from the guest which will update
+the vcpu->arch.vcore->dpdes field.  We then use that value in
+constructing the emulated DPDES register value.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ arch/powerpc/include/asm/kvm_host.h     |    2 
+ arch/powerpc/include/asm/ppc-opcode.h   |    2 
+ arch/powerpc/kernel/asm-offsets.c       |    1 
+ arch/powerpc/kvm/book3s_hv.c            |  133 ++++++++++++++++++++++++++++++--
+ arch/powerpc/kvm/book3s_hv_rmhandlers.S |   17 ++++
+ arch/powerpc/kvm/powerpc.c              |    9 +-
+ 6 files changed, 153 insertions(+), 11 deletions(-)
+
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -266,6 +266,7 @@
+ struct kvm_arch {
+ 	unsigned int lpid;
+ 	unsigned int smt_mode;		/* # vcpus per virtual core */
++	unsigned int emul_smt_mode;	/* emualted SMT mode, on P9 */
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	unsigned int tlb_sets;
+ 	struct kvm_hpt_info hpt;
+@@ -711,6 +712,7 @@
+ 	unsigned long pending_exceptions;
+ 	u8 ceded;
+ 	u8 prodded;
++	u8 doorbell_request;
+ 	u32 last_inst;
+ 
+ 	struct swait_queue_head *wqp;
+--- a/arch/powerpc/include/asm/ppc-opcode.h
++++ b/arch/powerpc/include/asm/ppc-opcode.h
+@@ -103,6 +103,8 @@
+ #define OP_31_XOP_STBUX     247
+ #define OP_31_XOP_LHZX      279
+ #define OP_31_XOP_LHZUX     311
++#define OP_31_XOP_MSGSNDP   142
++#define OP_31_XOP_MSGCLRP   174
+ #define OP_31_XOP_MFSPR     339
+ #define OP_31_XOP_LWAX      341
+ #define OP_31_XOP_LHAX      343
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -519,6 +519,7 @@
+ 	OFFSET(VCPU_PENDING_EXC, kvm_vcpu, arch.pending_exceptions);
+ 	OFFSET(VCPU_CEDED, kvm_vcpu, arch.ceded);
+ 	OFFSET(VCPU_PRODDED, kvm_vcpu, arch.prodded);
++	OFFSET(VCPU_DBELL_REQ, kvm_vcpu, arch.doorbell_request);
+ 	OFFSET(VCPU_MMCR, kvm_vcpu, arch.mmcr);
+ 	OFFSET(VCPU_PMC, kvm_vcpu, arch.pmc);
+ 	OFFSET(VCPU_SPMC, kvm_vcpu, arch.spmc);
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -46,6 +46,8 @@
+ #include <linux/of.h>
+ 
+ #include <asm/reg.h>
++#include <asm/ppc-opcode.h>
++#include <asm/disassemble.h>
+ #include <asm/cputable.h>
+ #include <asm/cacheflush.h>
+ #include <asm/tlbflush.h>
+@@ -682,6 +684,15 @@
+ 	int thr;
+ 	struct kvmppc_vcore *vc;
+ 
++	if (vcpu->arch.doorbell_request)
++		return true;
++	/*
++	 * Ensure that the read of vcore->dpdes comes after the read
++	 * of vcpu->doorbell_request.  This barrier matches the
++	 * lwsync in book3s_hv_rmhandlers.S just before the
++	 * fast_guest_return label.
++	 */
++	smp_rmb();
+ 	vc = vcpu->arch.vcore;
+ 	thr = vcpu->vcpu_id - vc->first_vcpuid;
+ 	return !!(vc->dpdes & (1 << thr));
+@@ -938,6 +949,101 @@
+ 	}
+ }
+ 
++static void do_nothing(void *x)
++{
++}
++
++static unsigned long kvmppc_read_dpdes(struct kvm_vcpu *vcpu)
++{
++	int thr, cpu, pcpu, nthreads;
++	struct kvm_vcpu *v;
++	unsigned long dpdes;
++
++	nthreads = vcpu->kvm->arch.emul_smt_mode;
++	dpdes = 0;
++	cpu = vcpu->vcpu_id & ~(nthreads - 1);
++	for (thr = 0; thr < nthreads; ++thr, ++cpu) {
++		v = kvmppc_find_vcpu(vcpu->kvm, cpu);
++		if (!v)
++			continue;
++		/*
++		 * If the vcpu is currently running on a physical cpu thread,
++		 * interrupt it in order to pull it out of the guest briefly,
++		 * which will update its vcore->dpdes value.
++		 */
++		pcpu = READ_ONCE(v->cpu);
++		if (pcpu >= 0)
++			smp_call_function_single(pcpu, do_nothing, NULL, 1);
++		if (kvmppc_doorbell_pending(v))
++			dpdes |= 1 << thr;
++	}
++	return dpdes;
++}
++
++/*
++ * On POWER9, emulate doorbell-related instructions in order to
++ * give the guest the illusion of running on a multi-threaded core.
++ * The instructions emulated are msgsndp, msgclrp, mfspr TIR,
++ * and mfspr DPDES.
++ */
++static int kvmppc_emulate_doorbell_instr(struct kvm_vcpu *vcpu)
++{
++	u32 inst, rb, thr;
++	unsigned long arg;
++	struct kvm *kvm = vcpu->kvm;
++	struct kvm_vcpu *tvcpu;
++
++	if (!cpu_has_feature(CPU_FTR_ARCH_300))
++		return EMULATE_FAIL;
++	if (kvmppc_get_last_inst(vcpu, INST_GENERIC, &inst) != EMULATE_DONE)
++		return RESUME_GUEST;
++	if (get_op(inst) != 31)
++		return EMULATE_FAIL;
++	rb = get_rb(inst);
++	thr = vcpu->vcpu_id & (kvm->arch.emul_smt_mode - 1);
++	switch (get_xop(inst)) {
++	case OP_31_XOP_MSGSNDP:
++		arg = kvmppc_get_gpr(vcpu, rb);
++		if (((arg >> 27) & 0xf) != PPC_DBELL_SERVER)
++			break;
++		arg &= 0x3f;
++		if (arg >= kvm->arch.emul_smt_mode)
++			break;
++		tvcpu = kvmppc_find_vcpu(kvm, vcpu->vcpu_id - thr + arg);
++		if (!tvcpu)
++			break;
++		if (!tvcpu->arch.doorbell_request) {
++			tvcpu->arch.doorbell_request = 1;
++			kvmppc_fast_vcpu_kick_hv(tvcpu);
++		}
++		break;
++	case OP_31_XOP_MSGCLRP:
++		arg = kvmppc_get_gpr(vcpu, rb);
++		if (((arg >> 27) & 0xf) != PPC_DBELL_SERVER)
++			break;
++		vcpu->arch.vcore->dpdes = 0;
++		vcpu->arch.doorbell_request = 0;
++		break;
++	case OP_31_XOP_MFSPR:
++		switch (get_sprn(inst)) {
++		case SPRN_TIR:
++			arg = thr;
++			break;
++		case SPRN_DPDES:
++			arg = kvmppc_read_dpdes(vcpu);
++			break;
++		default:
++			return EMULATE_FAIL;
++		}
++		kvmppc_set_gpr(vcpu, get_rt(inst), arg);
++		break;
++	default:
++		return EMULATE_FAIL;
++	}
++	kvmppc_set_pc(vcpu, kvmppc_get_pc(vcpu) + 4);
++	return RESUME_GUEST;
++}
++
+ static int kvmppc_handle_exit_hv(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 				 struct task_struct *tsk)
+ {
+@@ -1065,12 +1171,19 @@
+ 		break;
+ 	/*
+ 	 * This occurs if the guest (kernel or userspace), does something that
+-	 * is prohibited by HFSCR.  We just generate a program interrupt to
+-	 * the guest.
++	 * is prohibited by HFSCR.
++	 * On POWER9, this could be a doorbell instruction that we need
++	 * to emulate.
++	 * Otherwise, we just generate a program interrupt to the guest.
+ 	 */
+ 	case BOOK3S_INTERRUPT_H_FAC_UNAVAIL:
+-		kvmppc_core_queue_program(vcpu, SRR1_PROGILL);
+-		r = RESUME_GUEST;
++		r = EMULATE_FAIL;
++		if ((vcpu->arch.hfscr >> 56) == FSCR_MSGP_LG)
++			r = kvmppc_emulate_doorbell_instr(vcpu);
++		if (r == EMULATE_FAIL) {
++			kvmppc_core_queue_program(vcpu, SRR1_PROGILL);
++			r = RESUME_GUEST;
++		}
+ 		break;
+ 	case BOOK3S_INTERRUPT_HV_RM_HARD:
+ 		r = RESUME_PASSTHROUGH;
+@@ -1832,10 +1945,14 @@
+ 	 * This value is only used on POWER9.
+ 	 * On POWER9 DD1, TM doesn't work, so we make sure to
+ 	 * prevent the guest from using it.
++	 * On POWER9, we want to virtualize the doorbell facility, so we
++	 * turn off the HFSCR bit, which causes those instructions to trap.
+ 	 */
+ 	vcpu->arch.hfscr = mfspr(SPRN_HFSCR);
+ 	if (!cpu_has_feature(CPU_FTR_TM))
+ 		vcpu->arch.hfscr &= ~HFSCR_TM;
++	if (cpu_has_feature(CPU_FTR_ARCH_300))
++		vcpu->arch.hfscr &= ~HFSCR_MSGP;
+ 
+ 	kvmppc_mmu_book3s_hv_init(vcpu);
+ 
+@@ -1886,6 +2003,7 @@
+ 			      unsigned long flags)
+ {
+ 	int err;
++	int esmt = 0;
+ 
+ 	if (flags)
+ 		return -EINVAL;
+@@ -1903,12 +2021,14 @@
+ 		 * On POWER9, the threading mode is "loose",
+ 		 * so each vcpu gets its own vcore.
+ 		 */
++		esmt = smt_mode;
+ 		smt_mode = 1;
+ 	}
+ 	mutex_lock(&kvm->lock);
+ 	err = -EBUSY;
+ 	if (!kvm->arch.online_vcores) {
+ 		kvm->arch.smt_mode = smt_mode;
++		kvm->arch.emul_smt_mode = esmt;
+ 		err = 0;
+ 	}
+ 	mutex_unlock(&kvm->lock);
+@@ -2031,10 +2151,6 @@
+ 	tpaca->kvm_hstate.kvm_split_mode = NULL;
+ }
+ 
+-static void do_nothing(void *x)
+-{
+-}
+-
+ static void radix_flush_cpu(struct kvm *kvm, int cpu, struct kvm_vcpu *vcpu)
+ {
+ 	int i;
+@@ -3722,6 +3838,7 @@
+ 		kvm->arch.smt_mode = threads_per_subcore;
+ 	else
+ 		kvm->arch.smt_mode = 1;
++	kvm->arch.emul_smt_mode = 1;
+ 
+ 	/*
+ 	 * Create a debugfs directory for the VM
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -1044,6 +1044,23 @@
+ 	mr	r9, r4
+ 	bl	kvmppc_msr_interrupt
+ 5:
++BEGIN_FTR_SECTION
++	b	fast_guest_return
++END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_300)
++	/* On POWER9, check for pending doorbell requests */
++	lbz	r0, VCPU_DBELL_REQ(r4)
++	cmpwi	r0, 0
++	beq	fast_guest_return
++	ld	r5, HSTATE_KVM_VCORE(r13)
++	/* Set DPDES register so the CPU will take a doorbell interrupt */
++	li	r0, 1
++	mtspr	SPRN_DPDES, r0
++	std	r0, VCORE_DPDES(r5)
++	/* Make sure other cpus see vcore->dpdes set before dbell req clear */
++	lwsync
++	/* Clear the pending doorbell request */
++	li	r0, 0
++	stb	r0, VCPU_DBELL_REQ(r4)
+ 
+ /*
+  * Required state:
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -553,9 +553,12 @@
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	case KVM_CAP_PPC_SMT:
+ 		r = 0;
+-		if (kvm)
+-			r = kvm->arch.smt_mode;
+-		else if (hv_enabled) {
++		if (kvm) {
++			if (kvm->arch.emul_smt_mode > 1)
++				r = kvm->arch.emul_smt_mode;
++			else
++				r = kvm->arch.smt_mode;
++		} else if (hv_enabled) {
+ 			if (cpu_has_feature(CPU_FTR_ARCH_300))
+ 				r = 1;
+ 			else

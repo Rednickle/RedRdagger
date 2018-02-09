@@ -1,0 +1,227 @@
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Mon, 6 Feb 2017 13:24:41 +1100
+Subject: KVM: PPC: Book3S HV: Allow userspace to set the desired SMT mode
+Patch-mainline: v4.13-rc1
+Git-commit: 3c313524605a6afd8207448a8e9967f5e8cba734
+References: bsc#1077761
+
+This allows userspace to set the desired virtual SMT (simultaneous
+multithreading) mode for a VM, that is, the number of VCPUs that
+get assigned to each virtual core.  Previously, the virtual SMT mode
+was fixed to the number of threads per subcore, and if userspace
+wanted to have fewer vcpus per vcore, then it would achieve that by
+using a sparse CPU numbering.  This had the disadvantage that the
+vcpu numbers can get quite large, particularly for SMT1 guests on
+a POWER8 with 8 threads per core.  With this patch, userspace can
+set its desired virtual SMT mode and then use contiguous vcpu
+numbering.
+
+On POWER8, where the threading mode is "strict", the virtual SMT mode
+must be less than or equal to the number of threads per subcore.  On
+POWER9, which implements a "loose" threading mode, the virtual SMT
+mode can be any power of 2 between 1 and 8, even though there is
+effectively one thread per subcore, since the threads are independent
+and can all be in different partitions.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ Documentation/virtual/kvm/api.txt   |   15 +++++++
+ arch/powerpc/include/asm/kvm_host.h |    1 
+ arch/powerpc/include/asm/kvm_ppc.h  |    2 +
+ arch/powerpc/kvm/book3s_hv.c        |   71 ++++++++++++++++++++++++++++++------
+ arch/powerpc/kvm/powerpc.c          |   13 ++++++
+ 5 files changed, 90 insertions(+), 12 deletions(-)
+
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -4142,6 +4142,21 @@
+ machine check handling routine. Without this capability KVM will
+ branch to guests' 0x200 interrupt vector.
+ 
++7.11 KVM_CAP_PPC_SMT
++
++Architectures: ppc
++Parameters: vsmt_mode, flags
++
++Enabling this capability on a VM provides userspace with a way to set
++the desired virtual SMT mode (i.e. the number of virtual CPUs per
++virtual core).  The virtual SMT mode, vsmt_mode, must be a power of 2
++between 1 and 8.  On POWER8, vsmt_mode must also be no greater than
++the number of threads per subcore for the host.  Currently flags must
++be 0.  A successful call to enable this capability will result in
++vsmt_mode being returned when the KVM_CAP_PPC_SMT capability is
++subsequently queried for the VM.  This capability is only supported by
++HV KVM, and can only be set before any VCPUs have been created.
++
+ 8. Other capabilities.
+ ----------------------
+ 
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -265,6 +265,7 @@
+ 
+ struct kvm_arch {
+ 	unsigned int lpid;
++	unsigned int smt_mode;		/* # vcpus per virtual core */
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	unsigned int tlb_sets;
+ 	struct kvm_hpt_info hpt;
+--- a/arch/powerpc/include/asm/kvm_ppc.h
++++ b/arch/powerpc/include/asm/kvm_ppc.h
+@@ -319,6 +319,8 @@
+ 					struct irq_bypass_producer *);
+ 	int (*configure_mmu)(struct kvm *kvm, struct kvm_ppc_mmuv3_cfg *cfg);
+ 	int (*get_rmmu_info)(struct kvm *kvm, struct kvm_ppc_rmmu_info *info);
++	int (*set_smt_mode)(struct kvm *kvm, unsigned long mode,
++			    unsigned long flags);
+ };
+ 
+ extern struct kvmppc_ops *kvmppc_hv_ops;
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -1634,7 +1634,7 @@
+ 	init_swait_queue_head(&vcore->wq);
+ 	vcore->preempt_tb = TB_NIL;
+ 	vcore->lpcr = kvm->arch.lpcr;
+-	vcore->first_vcpuid = core * threads_per_vcore();
++	vcore->first_vcpuid = core * kvm->arch.smt_mode;
+ 	vcore->kvm = kvm;
+ 	INIT_LIST_HEAD(&vcore->preempt_list);
+ 
+@@ -1793,14 +1793,10 @@
+ 						   unsigned int id)
+ {
+ 	struct kvm_vcpu *vcpu;
+-	int err = -EINVAL;
++	int err;
+ 	int core;
+ 	struct kvmppc_vcore *vcore;
+ 
+-	core = id / threads_per_vcore();
+-	if (core >= KVM_MAX_VCORES)
+-		goto out;
+-
+ 	err = -ENOMEM;
+ 	vcpu = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL);
+ 	if (!vcpu)
+@@ -1848,11 +1844,17 @@
+ 	init_waitqueue_head(&vcpu->arch.cpu_run);
+ 
+ 	mutex_lock(&kvm->lock);
+-	vcore = kvm->arch.vcores[core];
+-	if (!vcore) {
+-		vcore = kvmppc_vcore_create(kvm, core);
+-		kvm->arch.vcores[core] = vcore;
+-		kvm->arch.online_vcores++;
++	vcore = NULL;
++	err = -EINVAL;
++	core = id / kvm->arch.smt_mode;
++	if (core < KVM_MAX_VCORES) {
++		vcore = kvm->arch.vcores[core];
++		if (!vcore) {
++			err = -ENOMEM;
++			vcore = kvmppc_vcore_create(kvm, core);
++			kvm->arch.vcores[core] = vcore;
++			kvm->arch.online_vcores++;
++		}
+ 	}
+ 	mutex_unlock(&kvm->lock);
+ 
+@@ -1880,6 +1882,40 @@
+ 	return ERR_PTR(err);
+ }
+ 
++static int kvmhv_set_smt_mode(struct kvm *kvm, unsigned long smt_mode,
++			      unsigned long flags)
++{
++	int err;
++
++	if (flags)
++		return -EINVAL;
++	if (smt_mode > MAX_SMT_THREADS || !is_power_of_2(smt_mode))
++		return -EINVAL;
++	if (!cpu_has_feature(CPU_FTR_ARCH_300)) {
++		/*
++		 * On POWER8 (or POWER7), the threading mode is "strict",
++		 * so we pack smt_mode vcpus per vcore.
++		 */
++		if (smt_mode > threads_per_subcore)
++			return -EINVAL;
++	} else {
++		/*
++		 * On POWER9, the threading mode is "loose",
++		 * so each vcpu gets its own vcore.
++		 */
++		smt_mode = 1;
++	}
++	mutex_lock(&kvm->lock);
++	err = -EBUSY;
++	if (!kvm->arch.online_vcores) {
++		kvm->arch.smt_mode = smt_mode;
++		err = 0;
++	}
++	mutex_unlock(&kvm->lock);
++
++	return err;
++}
++
+ static void unpin_vpa(struct kvm *kvm, struct kvmppc_vpa *vpa)
+ {
+ 	if (vpa->pinned_addr)
+@@ -3676,6 +3712,18 @@
+ 		kvm_hv_vm_activated();
+ 
+ 	/*
++	 * Initialize smt_mode depending on processor.
++	 * POWER8 and earlier have to use "strict" threading, where
++	 * all vCPUs in a vcore have to run on the same (sub)core,
++	 * whereas on POWER9 the threads can each run a different
++	 * guest.
++	 */
++	if (!cpu_has_feature(CPU_FTR_ARCH_300))
++		kvm->arch.smt_mode = threads_per_subcore;
++	else
++		kvm->arch.smt_mode = 1;
++
++	/*
+ 	 * Create a debugfs directory for the VM
+ 	 */
+ 	snprintf(buf, sizeof(buf), "vm%d", current->pid);
+@@ -4128,6 +4176,7 @@
+ #endif
+ 	.configure_mmu = kvmhv_configure_mmu,
+ 	.get_rmmu_info = kvmhv_get_rmmu_info,
++	.set_smt_mode = kvmhv_set_smt_mode,
+ };
+ 
+ static int kvm_init_subcore_bitmap(void)
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -553,7 +553,9 @@
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	case KVM_CAP_PPC_SMT:
+ 		r = 0;
+-		if (hv_enabled) {
++		if (kvm)
++			r = kvm->arch.smt_mode;
++		else if (hv_enabled) {
+ 			if (cpu_has_feature(CPU_FTR_ARCH_300))
+ 				r = 1;
+ 			else
+@@ -1724,6 +1726,15 @@
+ 		r = 0;
+ 		break;
+ 	}
++	case KVM_CAP_PPC_SMT: {
++		unsigned long mode = cap->args[0];
++		unsigned long flags = cap->args[1];
++
++		r = -EINVAL;
++		if (kvm->arch.kvm_ops->set_smt_mode)
++			r = kvm->arch.kvm_ops->set_smt_mode(kvm, mode, flags);
++		break;
++	}
+ #endif
+ 	default:
+ 		r = -EINVAL;

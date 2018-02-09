@@ -1,0 +1,212 @@
+From: Jim Mattson <jmattson@google.com>
+Date: Thu, 14 Sep 2017 16:31:44 -0700
+Subject: kvm: nVMX: Handle deferred early VMLAUNCH/VMRESUME failure properly
+Patch-mainline: v4.14-rc1
+Git-commit: 4f350c6dbcb9000e18907515ec8a7b205ac33c69
+References: bsc#1077761
+
+When emulating a nested VM-entry from L1 to L2, several control field
+validation checks are deferred to the hardware. Should one of these
+validation checks fail, vcpu_vmx_run will set the vmx->fail flag. When
+this happens, the L2 guest state is not loaded (even in part), and
+execution should continue in L1 with the next instruction after the
+VMLAUNCH/VMRESUME.
+
+The VMCS12 is not modified (except for the VM-instruction error
+field), the VMCS12 MSR save/load lists are not processed, and the CPU
+state is not loaded from the VMCS12 host area. Moreover, the vmcs02
+exit reason is stale, so it should not be consulted for any reason.
+
+Signed-off-by: Jim Mattson <jmattson@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ arch/x86/kvm/vmx.c |  136 +++++++++++++++++++++++++++++------------------------
+ 1 file changed, 76 insertions(+), 60 deletions(-)
+
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -8334,12 +8334,14 @@
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ 
+-	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason,
+-				vmcs_readl(EXIT_QUALIFICATION),
+-				vmx->idt_vectoring_info,
+-				intr_info,
+-				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
+-				KVM_ISA_VMX);
++	if (vmx->nested.nested_run_pending)
++		return false;
++
++	if (unlikely(vmx->fail)) {
++		pr_info_ratelimited("%s failed vm entry %x\n", __func__,
++				    vmcs_read32(VM_INSTRUCTION_ERROR));
++		return true;
++	}
+ 
+ 	/*
+ 	 * The host physical addresses of some pages of guest memory
+@@ -8353,14 +8355,12 @@
+ 	 */
+ 	nested_mark_vmcs12_pages_dirty(vcpu);
+ 
+-	if (vmx->nested.nested_run_pending)
+-		return false;
+-
+-	if (unlikely(vmx->fail)) {
+-		pr_info_ratelimited("%s failed vm entry %x\n", __func__,
+-				    vmcs_read32(VM_INSTRUCTION_ERROR));
+-		return true;
+-	}
++	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason,
++				vmcs_readl(EXIT_QUALIFICATION),
++				vmx->idt_vectoring_info,
++				intr_info,
++				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
++				KVM_ISA_VMX);
+ 
+ 	switch (exit_reason) {
+ 	case EXIT_REASON_EXCEPTION_NMI:
+@@ -11378,46 +11378,30 @@
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+-	u32 vm_inst_error = 0;
+ 
+ 	/* trying to cancel vmlaunch/vmresume is a bug */
+ 	WARN_ON_ONCE(vmx->nested.nested_run_pending);
+ 
+-	leave_guest_mode(vcpu);
+-	prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
+-		       exit_qualification);
++	/*
++	 * The only expected VM-instruction error is "VM entry with
++	 * invalid control field(s)." Anything else indicates a
++	 * problem with L0.
++	 */
++	WARN_ON_ONCE(vmx->fail && (vmcs_read32(VM_INSTRUCTION_ERROR) !=
++				   VMXERR_ENTRY_INVALID_CONTROL_FIELD));
+ 
+-	if (nested_vmx_store_msr(vcpu, vmcs12->vm_exit_msr_store_addr,
+-				 vmcs12->vm_exit_msr_store_count))
+-		nested_vmx_abort(vcpu, VMX_ABORT_SAVE_GUEST_MSR_FAIL);
++	leave_guest_mode(vcpu);
+ 
+-	if (unlikely(vmx->fail))
+-		vm_inst_error = vmcs_read32(VM_INSTRUCTION_ERROR);
++	if (likely(!vmx->fail)) {
++		prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
++			       exit_qualification);
++
++		if (nested_vmx_store_msr(vcpu, vmcs12->vm_exit_msr_store_addr,
++					 vmcs12->vm_exit_msr_store_count))
++			nested_vmx_abort(vcpu, VMX_ABORT_SAVE_GUEST_MSR_FAIL);
++	}
+ 
+ 	vmx_switch_vmcs(vcpu, &vmx->vmcs01);
+-
+-	/*
+-	 * TODO: SDM says that with acknowledge interrupt on exit, bit 31 of
+-	 * the VM-exit interrupt information (valid interrupt) is always set to
+-	 * 1 on EXIT_REASON_EXTERNAL_INTERRUPT, so we shouldn't need
+-	 * kvm_cpu_has_interrupt().  See the commit message for details.
+-	 */
+-	if (nested_exit_intr_ack_set(vcpu) &&
+-	    exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
+-	    kvm_cpu_has_interrupt(vcpu)) {
+-		int irq = kvm_cpu_get_interrupt(vcpu);
+-		WARN_ON(irq < 0);
+-		vmcs12->vm_exit_intr_info = irq |
+-			INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
+-	}
+-
+-	trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
+-				       vmcs12->exit_qualification,
+-				       vmcs12->idt_vectoring_info_field,
+-				       vmcs12->vm_exit_intr_info,
+-				       vmcs12->vm_exit_intr_error_code,
+-				       KVM_ISA_VMX);
+-
+ 	vm_entry_controls_reset_shadow(vmx);
+ 	vm_exit_controls_reset_shadow(vmx);
+ 	vmx_segment_cache_clear(vmx);
+@@ -11426,8 +11410,6 @@
+ 	if (VMCS02_POOL_SIZE == 0)
+ 		nested_free_vmcs02(vmx, vmx->nested.current_vmptr);
+ 
+-	load_vmcs12_host_state(vcpu, vmcs12);
+-
+ 	/* Update any VMCS fields that might have changed while L2 ran */
+ 	vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, vmx->msr_autoload.nr);
+ 	vmcs_write32(VM_ENTRY_MSR_LOAD_COUNT, vmx->msr_autoload.nr);
+@@ -11476,23 +11458,57 @@
+ 	 */
+ 	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
+ 
+-	if (unlikely(vmx->fail)) {
+-		/*
+-		 * After an early L2 VM-entry failure, we're now back
+-		 * in L1 which thinks it just finished a VMLAUNCH or
+-		 * VMRESUME instruction, so we need to set the failure
+-		 * flag and the VM-instruction error field of the VMCS
+-		 * accordingly.
+-		 */
+-		vmx->fail = 0;
+-		nested_vmx_failValid(vcpu, vm_inst_error);
+-	}
+-
+ 	if (enable_shadow_vmcs)
+ 		vmx->nested.sync_shadow_vmcs = true;
+ 
+ 	/* in case we halted in L2 */
+ 	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
++
++	if (likely(!vmx->fail)) {
++		/*
++		 * TODO: SDM says that with acknowledge interrupt on
++		 * exit, bit 31 of the VM-exit interrupt information
++		 * (valid interrupt) is always set to 1 on
++		 * EXIT_REASON_EXTERNAL_INTERRUPT, so we shouldn't
++		 * need kvm_cpu_has_interrupt().  See the commit
++		 * message for details.
++		 */
++		if (nested_exit_intr_ack_set(vcpu) &&
++		    exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
++		    kvm_cpu_has_interrupt(vcpu)) {
++			int irq = kvm_cpu_get_interrupt(vcpu);
++			WARN_ON(irq < 0);
++			vmcs12->vm_exit_intr_info = irq |
++				INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
++		}
++
++		trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
++					       vmcs12->exit_qualification,
++					       vmcs12->idt_vectoring_info_field,
++					       vmcs12->vm_exit_intr_info,
++					       vmcs12->vm_exit_intr_error_code,
++					       KVM_ISA_VMX);
++
++		load_vmcs12_host_state(vcpu, vmcs12);
++
++		return;
++	}
++	
++	/*
++	 * After an early L2 VM-entry failure, we're now back
++	 * in L1 which thinks it just finished a VMLAUNCH or
++	 * VMRESUME instruction, so we need to set the failure
++	 * flag and the VM-instruction error field of the VMCS
++	 * accordingly.
++	 */
++	nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
++	/*
++	 * The emulated instruction was already skipped in
++	 * nested_vmx_run, but the updated RIP was never
++	 * written back to the vmcs01.
++	 */
++	skip_emulated_instruction(vcpu);
++	vmx->fail = 0;
+ }
+ 
+ /*

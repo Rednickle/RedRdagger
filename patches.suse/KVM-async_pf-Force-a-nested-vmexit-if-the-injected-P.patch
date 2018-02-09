@@ -1,0 +1,162 @@
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+Date: Thu, 13 Jul 2017 18:30:41 -0700
+Subject: KVM: async_pf: Force a nested vmexit if the injected #PF is async_pf
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v4.13-rc1
+Git-commit: adfe20fb48785dd73af3bf91407196eb5403c8cf
+References: bsc#1077761
+
+Add an nested_apf field to vcpu->arch.exception to identify an async page
+fault, and constructs the expected vm-exit information fields. Force a
+nested VM exit from nested_vmx_check_exception() if the injected #PF is
+async page fault.
+
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Acked-by: Alexander Graf <agraf@suse.de>
+---
+ arch/x86/include/asm/kvm_emulate.h |    1 +
+ arch/x86/include/asm/kvm_host.h    |    2 ++
+ arch/x86/kvm/svm.c                 |   16 ++++++++++------
+ arch/x86/kvm/vmx.c                 |   17 ++++++++++++++---
+ arch/x86/kvm/x86.c                 |    9 ++++++++-
+ 5 files changed, 35 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_emulate.h
++++ b/arch/x86/include/asm/kvm_emulate.h
+@@ -23,6 +23,7 @@
+ 	u16 error_code;
+ 	bool nested_page_fault;
+ 	u64 address; /* cr2 or nested page fault gpa */
++	u8 async_page_fault;
+ };
+ 
+ /*
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -551,6 +551,7 @@
+ 		bool reinject;
+ 		u8 nr;
+ 		u32 error_code;
++		u8 nested_apf;
+ 	} exception;
+ 
+ 	struct kvm_queued_interrupt {
+@@ -652,6 +653,7 @@
+ 		u32 id;
+ 		bool send_user_only;
+ 		u32 host_apf_reason;
++		unsigned long nested_apf_token;
+ 	} apf;
+ 
+ 	/* OSVW MSRs (AMD only) */
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -2417,15 +2417,19 @@
+ 	if (!is_guest_mode(&svm->vcpu))
+ 		return 0;
+ 
++	vmexit = nested_svm_intercept(svm);
++	if (vmexit != NESTED_EXIT_DONE)
++		return 0;
++
+ 	svm->vmcb->control.exit_code = SVM_EXIT_EXCP_BASE + nr;
+ 	svm->vmcb->control.exit_code_hi = 0;
+ 	svm->vmcb->control.exit_info_1 = error_code;
+-	svm->vmcb->control.exit_info_2 = svm->vcpu.arch.cr2;
+-
+-	vmexit = nested_svm_intercept(svm);
+-	if (vmexit == NESTED_EXIT_DONE)
+-		svm->nested.exit_required = true;
++	if (svm->vcpu.arch.exception.nested_apf)
++		svm->vmcb->control.exit_info_2 = svm->vcpu.arch.apf.nested_apf_token;
++	else
++		svm->vmcb->control.exit_info_2 = svm->vcpu.arch.cr2;
+ 
++	svm->nested.exit_required = true;
+ 	return vmexit;
+ }
+ 
+@@ -2647,7 +2651,7 @@
+ 		}
+ 		/* async page fault always cause vmexit */
+ 		else if ((exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR) &&
+-			 svm->vcpu.arch.apf.host_apf_reason != 0)
++			 svm->vcpu.arch.exception.nested_apf != 0)
+ 			vmexit = NESTED_EXIT_DONE;
+ 		break;
+ 	}
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2412,13 +2412,24 @@
+  * KVM wants to inject page-faults which it got to the guest. This function
+  * checks whether in a nested guest, we need to inject them to L1 or L2.
+  */
+-static int nested_vmx_check_exception(struct kvm_vcpu *vcpu, unsigned nr)
++static int nested_vmx_check_exception(struct kvm_vcpu *vcpu)
+ {
+ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++	unsigned int nr = vcpu->arch.exception.nr;
+ 
+-	if (!(vmcs12->exception_bitmap & (1u << nr)))
++	if (!((vmcs12->exception_bitmap & (1u << nr)) ||
++		(nr == PF_VECTOR && vcpu->arch.exception.nested_apf)))
+ 		return 0;
+ 
++	if (vcpu->arch.exception.nested_apf) {
++		vmcs_write32(VM_EXIT_INTR_ERROR_CODE, vcpu->arch.exception.error_code);
++		nested_vmx_vmexit(vcpu, EXIT_REASON_EXCEPTION_NMI,
++			PF_VECTOR | INTR_TYPE_HARD_EXCEPTION |
++			INTR_INFO_DELIVER_CODE_MASK | INTR_INFO_VALID_MASK,
++			vcpu->arch.apf.nested_apf_token);
++		return 1;
++	}
++
+ 	nested_vmx_vmexit(vcpu, EXIT_REASON_EXCEPTION_NMI,
+ 			  vmcs_read32(VM_EXIT_INTR_INFO),
+ 			  vmcs_readl(EXIT_QUALIFICATION));
+@@ -2435,7 +2446,7 @@
+ 	u32 intr_info = nr | INTR_INFO_VALID_MASK;
+ 
+ 	if (!reinject && is_guest_mode(vcpu) &&
+-	    nested_vmx_check_exception(vcpu, nr))
++	    nested_vmx_check_exception(vcpu))
+ 		return;
+ 
+ 	if (has_error_code) {
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -451,7 +451,12 @@
+ void kvm_inject_page_fault(struct kvm_vcpu *vcpu, struct x86_exception *fault)
+ {
+ 	++vcpu->stat.pf_guest;
+-	vcpu->arch.cr2 = fault->address;
++	vcpu->arch.exception.nested_apf =
++		is_guest_mode(vcpu) && fault->async_page_fault;
++	if (vcpu->arch.exception.nested_apf)
++		vcpu->arch.apf.nested_apf_token = fault->address;
++	else
++		vcpu->arch.cr2 = fault->address;
+ 	kvm_queue_exception_e(vcpu, PF_VECTOR, fault->error_code);
+ }
+ EXPORT_SYMBOL_GPL(kvm_inject_page_fault);
+@@ -8594,6 +8599,7 @@
+ 		fault.error_code = 0;
+ 		fault.nested_page_fault = false;
+ 		fault.address = work->arch.token;
++		fault.async_page_fault = true;
+ 		kvm_inject_page_fault(vcpu, &fault);
+ 	}
+ }
+@@ -8616,6 +8622,7 @@
+ 		fault.error_code = 0;
+ 		fault.nested_page_fault = false;
+ 		fault.address = work->arch.token;
++		fault.async_page_fault = true;
+ 		kvm_inject_page_fault(vcpu, &fault);
+ 	}
+ 	vcpu->arch.apf.halted = false;
