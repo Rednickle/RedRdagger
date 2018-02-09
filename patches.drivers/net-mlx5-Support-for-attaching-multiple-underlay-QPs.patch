@@ -1,0 +1,424 @@
+From: Alex Vesker <valex@mellanox.com>
+Date: Wed, 13 Sep 2017 11:37:02 +0300
+Subject: net/mlx5: Support for attaching multiple underlay QPs to root flow
+ table
+Patch-mainline: v4.15-rc1
+Git-commit: dae37456c8ac3afe8d5f306717f2b75ed5ca38d9
+References: bsc#1075020
+
+Previous support allowed connecting only a single QPN to the FT.
+Now using a linked list multiple QPNs can be attached to the same FT.
+
+Supporting attaching multiple underlay QPs is required for PKEY
+support in which child and parent share the same FT.
+
+The actual attaching/detaching FW commands will be called inside the
+function symmetrically.
+
+This change requires a change in IPoIB open and close functions, the
+attaching/detaching to/from the FT is done each time we open/close.
+
+Signed-off-by: Alex Vesker <valex@mellanox.com>
+Reviewed-by: Maor Gottlieb <maorg@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c      |   13 +
+ drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h      |    4 
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c     |  125 +++++++++++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.h     |    7 -
+ drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c |   78 ++++++-----
+ 5 files changed, 172 insertions(+), 55 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+@@ -40,7 +40,8 @@
+ #include "eswitch.h"
+ 
+ int mlx5_cmd_update_root_ft(struct mlx5_core_dev *dev,
+-			    struct mlx5_flow_table *ft, u32 underlay_qpn)
++			    struct mlx5_flow_table *ft, u32 underlay_qpn,
++			    bool disconnect)
+ {
+ 	u32 in[MLX5_ST_SZ_DW(set_flow_table_root_in)]   = {0};
+ 	u32 out[MLX5_ST_SZ_DW(set_flow_table_root_out)] = {0};
+@@ -52,7 +53,15 @@ int mlx5_cmd_update_root_ft(struct mlx5_
+ 	MLX5_SET(set_flow_table_root_in, in, opcode,
+ 		 MLX5_CMD_OP_SET_FLOW_TABLE_ROOT);
+ 	MLX5_SET(set_flow_table_root_in, in, table_type, ft->type);
+-	MLX5_SET(set_flow_table_root_in, in, table_id, ft->id);
++
++	if (disconnect) {
++		MLX5_SET(set_flow_table_root_in, in, op_mod, 1);
++		MLX5_SET(set_flow_table_root_in, in, table_id, 0);
++	} else {
++		MLX5_SET(set_flow_table_root_in, in, op_mod, 0);
++		MLX5_SET(set_flow_table_root_in, in, table_id, ft->id);
++	}
++
+ 	MLX5_SET(set_flow_table_root_in, in, underlay_qpn, underlay_qpn);
+ 	if (ft->vport) {
+ 		MLX5_SET(set_flow_table_root_in, in, vport_number, ft->vport);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.h
+@@ -71,8 +71,8 @@ int mlx5_cmd_delete_fte(struct mlx5_core
+ 			unsigned int index);
+ 
+ int mlx5_cmd_update_root_ft(struct mlx5_core_dev *dev,
+-			    struct mlx5_flow_table *ft,
+-			    u32 underlay_qpn);
++			    struct mlx5_flow_table *ft, u32 underlay_qpn,
++			    bool disconnect);
+ 
+ int mlx5_cmd_fc_alloc(struct mlx5_core_dev *dev, u32 *id);
+ int mlx5_cmd_fc_free(struct mlx5_core_dev *dev, u32 id);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -693,8 +693,10 @@ static int update_root_ft_create(struct
+ 				 *prio)
+ {
+ 	struct mlx5_flow_root_namespace *root = find_root(&prio->node);
++	struct mlx5_ft_underlay_qp *uqp;
+ 	int min_level = INT_MAX;
+ 	int err;
++	u32 qpn;
+ 
+ 	if (root->root_ft)
+ 		min_level = root->root_ft->level;
+@@ -702,10 +704,24 @@ static int update_root_ft_create(struct
+ 	if (ft->level >= min_level)
+ 		return 0;
+ 
+-	err = mlx5_cmd_update_root_ft(root->dev, ft, root->underlay_qpn);
++	if (list_empty(&root->underlay_qpns)) {
++		/* Don't set any QPN (zero) in case QPN list is empty */
++		qpn = 0;
++		err = mlx5_cmd_update_root_ft(root->dev, ft, qpn, false);
++	} else {
++		list_for_each_entry(uqp, &root->underlay_qpns, list) {
++			qpn = uqp->qpn;
++			err = mlx5_cmd_update_root_ft(root->dev, ft, qpn,
++						      false);
++			if (err)
++				break;
++		}
++	}
++
+ 	if (err)
+-		mlx5_core_warn(root->dev, "Update root flow table of id=%u failed\n",
+-			       ft->id);
++		mlx5_core_warn(root->dev,
++			       "Update root flow table of id(%u) qpn(%d) failed\n",
++			       ft->id, qpn);
+ 	else
+ 		root->root_ft = ft;
+ 
+@@ -1661,23 +1677,43 @@ static struct mlx5_flow_table *find_next
+ static int update_root_ft_destroy(struct mlx5_flow_table *ft)
+ {
+ 	struct mlx5_flow_root_namespace *root = find_root(&ft->node);
++	struct mlx5_ft_underlay_qp *uqp;
+ 	struct mlx5_flow_table *new_root_ft = NULL;
++	int err = 0;
++	u32 qpn;
+ 
+ 	if (root->root_ft != ft)
+ 		return 0;
+ 
+ 	new_root_ft = find_next_ft(ft);
+-	if (new_root_ft) {
+-		int err = mlx5_cmd_update_root_ft(root->dev, new_root_ft,
+-						  root->underlay_qpn);
+-
+-		if (err) {
+-			mlx5_core_warn(root->dev, "Update root flow table of id=%u failed\n",
+-				       ft->id);
+-			return err;
++
++	if (!new_root_ft) {
++		root->root_ft = NULL;
++		return 0;
++	}
++
++	if (list_empty(&root->underlay_qpns)) {
++		/* Don't set any QPN (zero) in case QPN list is empty */
++		qpn = 0;
++		err = mlx5_cmd_update_root_ft(root->dev, new_root_ft, qpn,
++					      false);
++	} else {
++		list_for_each_entry(uqp, &root->underlay_qpns, list) {
++			qpn = uqp->qpn;
++			err = mlx5_cmd_update_root_ft(root->dev, new_root_ft,
++						      qpn, false);
++			if (err)
++				break;
+ 		}
+ 	}
+-	root->root_ft = new_root_ft;
++
++	if (err)
++		mlx5_core_warn(root->dev,
++			       "Update root flow table of id(%u) qpn(%d) failed\n",
++			       ft->id, qpn);
++	else
++		root->root_ft = new_root_ft;
++
+ 	return 0;
+ }
+ 
+@@ -1965,6 +2001,8 @@ static struct mlx5_flow_root_namespace *
+ 	root_ns->dev = steering->dev;
+ 	root_ns->table_type = table_type;
+ 
++	INIT_LIST_HEAD(&root_ns->underlay_qpns);
++
+ 	ns = &root_ns->ns;
+ 	fs_init_namespace(ns);
+ 	mutex_init(&root_ns->chain_lock);
+@@ -2247,17 +2285,76 @@ err:
+ int mlx5_fs_add_rx_underlay_qpn(struct mlx5_core_dev *dev, u32 underlay_qpn)
+ {
+ 	struct mlx5_flow_root_namespace *root = dev->priv.steering->root_ns;
++	struct mlx5_ft_underlay_qp *new_uqp;
++	int err = 0;
++
++	new_uqp = kzalloc(sizeof(*new_uqp), GFP_KERNEL);
++	if (!new_uqp)
++		return -ENOMEM;
++
++	mutex_lock(&root->chain_lock);
++
++	if (!root->root_ft) {
++		err = -EINVAL;
++		goto update_ft_fail;
++	}
++
++	err = mlx5_cmd_update_root_ft(dev, root->root_ft, underlay_qpn, false);
++	if (err) {
++		mlx5_core_warn(dev, "Failed adding underlay QPN (%u) to root FT err(%d)\n",
++			       underlay_qpn, err);
++		goto update_ft_fail;
++	}
++
++	new_uqp->qpn = underlay_qpn;
++	list_add_tail(&new_uqp->list, &root->underlay_qpns);
++
++	mutex_unlock(&root->chain_lock);
+ 
+-	root->underlay_qpn = underlay_qpn;
+ 	return 0;
++
++update_ft_fail:
++	mutex_unlock(&root->chain_lock);
++	kfree(new_uqp);
++	return err;
+ }
+ EXPORT_SYMBOL(mlx5_fs_add_rx_underlay_qpn);
+ 
+ int mlx5_fs_remove_rx_underlay_qpn(struct mlx5_core_dev *dev, u32 underlay_qpn)
+ {
+ 	struct mlx5_flow_root_namespace *root = dev->priv.steering->root_ns;
++	struct mlx5_ft_underlay_qp *uqp;
++	bool found = false;
++	int err = 0;
++
++	mutex_lock(&root->chain_lock);
++	list_for_each_entry(uqp, &root->underlay_qpns, list) {
++		if (uqp->qpn == underlay_qpn) {
++			found = true;
++			break;
++		}
++	}
++
++	if (!found) {
++		mlx5_core_warn(dev, "Failed finding underlay qp (%u) in qpn list\n",
++			       underlay_qpn);
++		err = -EINVAL;
++		goto out;
++	}
++
++	err = mlx5_cmd_update_root_ft(dev, root->root_ft, underlay_qpn, true);
++	if (err)
++		mlx5_core_warn(dev, "Failed removing underlay QPN (%u) from root FT err(%d)\n",
++			       underlay_qpn, err);
++
++	list_del(&uqp->list);
++	mutex_unlock(&root->chain_lock);
++	kfree(uqp);
+ 
+-	root->underlay_qpn = 0;
+ 	return 0;
++
++out:
++	mutex_unlock(&root->chain_lock);
++	return err;
+ }
+ EXPORT_SYMBOL(mlx5_fs_remove_rx_underlay_qpn);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -147,6 +147,11 @@ struct mlx5_fc {
+ 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
+ };
+ 
++struct mlx5_ft_underlay_qp {
++	struct list_head list;
++	u32 qpn;
++};
++
+ #define MLX5_FTE_MATCH_PARAM_RESERVED	reserved_at_600
+ /* Calculate the fte_match_param length and without the reserved length.
+  * Make sure the reserved field is the last.
+@@ -212,7 +217,7 @@ struct mlx5_flow_root_namespace {
+ 	struct mlx5_flow_table		*root_ft;
+ 	/* Should be held when chaining flow tables */
+ 	struct mutex			chain_lock;
+-	u32				underlay_qpn;
++	struct list_head		underlay_qpns;
+ };
+ 
+ int mlx5_init_fc_stats(struct mlx5_core_dev *dev);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -218,12 +218,6 @@ static int mlx5i_init_tx(struct mlx5e_pr
+ 		return err;
+ 	}
+ 
+-	err = mlx5i_init_underlay_qp(priv);
+-	if (err) {
+-		mlx5_core_warn(priv->mdev, "intilize underlay QP failed, %d\n", err);
+-		goto err_destroy_underlay_qp;
+-	}
+-
+ 	err = mlx5e_create_tis(priv->mdev, 0 /* tc */, ipriv->qp.qpn, &priv->tisn[0]);
+ 	if (err) {
+ 		mlx5_core_warn(priv->mdev, "create tis failed, %d\n", err);
+@@ -285,7 +279,6 @@ static void mlx5i_destroy_flow_steering(
+ 
+ static int mlx5i_init_rx(struct mlx5e_priv *priv)
+ {
+-	struct mlx5i_priv *ipriv  = priv->ppriv;
+ 	int err;
+ 
+ 	err = mlx5e_create_indirect_rqt(priv);
+@@ -304,18 +297,12 @@ static int mlx5i_init_rx(struct mlx5e_pr
+ 	if (err)
+ 		goto err_destroy_indirect_tirs;
+ 
+-	err = mlx5_fs_add_rx_underlay_qpn(priv->mdev, ipriv->qp.qpn);
+-	if (err)
+-		goto err_destroy_direct_tirs;
+-
+ 	err = mlx5i_create_flow_steering(priv);
+ 	if (err)
+-		goto err_remove_rx_underlay_qpn;
++		goto err_destroy_direct_tirs;
+ 
+ 	return 0;
+ 
+-err_remove_rx_underlay_qpn:
+-	mlx5_fs_remove_rx_underlay_qpn(priv->mdev, ipriv->qp.qpn);
+ err_destroy_direct_tirs:
+ 	mlx5e_destroy_direct_tirs(priv);
+ err_destroy_indirect_tirs:
+@@ -329,9 +316,6 @@ err_destroy_indirect_rqts:
+ 
+ static void mlx5i_cleanup_rx(struct mlx5e_priv *priv)
+ {
+-	struct mlx5i_priv *ipriv  = priv->ppriv;
+-
+-	mlx5_fs_remove_rx_underlay_qpn(priv->mdev, ipriv->qp.qpn);
+ 	mlx5i_destroy_flow_steering(priv);
+ 	mlx5e_destroy_direct_tirs(priv);
+ 	mlx5e_destroy_indirect_tirs(priv);
+@@ -423,49 +407,71 @@ static void mlx5i_dev_cleanup(struct net
+ 
+ static int mlx5i_open(struct net_device *netdev)
+ {
+-	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
++	struct mlx5e_priv *epriv = mlx5i_epriv(netdev);
++	struct mlx5i_priv *ipriv = epriv->ppriv;
++	struct mlx5_core_dev *mdev = epriv->mdev;
+ 	int err;
+ 
+-	mutex_lock(&priv->state_lock);
++	mutex_lock(&epriv->state_lock);
+ 
+-	set_bit(MLX5E_STATE_OPENED, &priv->state);
++	set_bit(MLX5E_STATE_OPENED, &epriv->state);
+ 
+-	err = mlx5e_open_channels(priv, &priv->channels);
+-	if (err)
++	err = mlx5i_init_underlay_qp(epriv);
++	if (err) {
++		mlx5_core_warn(mdev, "prepare underlay qp state failed, %d\n", err);
+ 		goto err_clear_state_opened_flag;
++	}
++
++	err = mlx5_fs_add_rx_underlay_qpn(mdev, ipriv->qp.qpn);
++	if (err) {
++		mlx5_core_warn(mdev, "attach underlay qp to ft failed, %d\n", err);
++		goto err_reset_qp;
++	}
+ 
+-	mlx5e_refresh_tirs(priv, false);
+-	mlx5e_activate_priv_channels(priv);
+-	mlx5e_timestamp_set(priv);
++	err = mlx5e_open_channels(epriv, &epriv->channels);
++	if (err)
++		goto err_remove_fs_underlay_qp;
+ 
+-	mutex_unlock(&priv->state_lock);
++	mlx5e_refresh_tirs(epriv, false);
++	mlx5e_activate_priv_channels(epriv);
++	mlx5e_timestamp_set(epriv);
++
++	mutex_unlock(&epriv->state_lock);
+ 	return 0;
+ 
++err_remove_fs_underlay_qp:
++	mlx5_fs_remove_rx_underlay_qpn(mdev, ipriv->qp.qpn);
++err_reset_qp:
++	mlx5i_uninit_underlay_qp(epriv);
+ err_clear_state_opened_flag:
+-	clear_bit(MLX5E_STATE_OPENED, &priv->state);
+-	mutex_unlock(&priv->state_lock);
++	clear_bit(MLX5E_STATE_OPENED, &epriv->state);
++	mutex_unlock(&epriv->state_lock);
+ 	return err;
+ }
+ 
+ static int mlx5i_close(struct net_device *netdev)
+ {
+-	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
++	struct mlx5e_priv *epriv = mlx5i_epriv(netdev);
++	struct mlx5i_priv *ipriv = epriv->ppriv;
++	struct mlx5_core_dev *mdev = epriv->mdev;
+ 
+ 	/* May already be CLOSED in case a previous configuration operation
+ 	 * (e.g RX/TX queue size change) that involves close&open failed.
+ 	 */
+-	mutex_lock(&priv->state_lock);
++	mutex_lock(&epriv->state_lock);
+ 
+-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
++	if (!test_bit(MLX5E_STATE_OPENED, &epriv->state))
+ 		goto unlock;
+ 
+-	clear_bit(MLX5E_STATE_OPENED, &priv->state);
++	clear_bit(MLX5E_STATE_OPENED, &epriv->state);
+ 
+-	netif_carrier_off(priv->netdev);
+-	mlx5e_deactivate_priv_channels(priv);
+-	mlx5e_close_channels(&priv->channels);
++	netif_carrier_off(epriv->netdev);
++	mlx5_fs_remove_rx_underlay_qpn(mdev, ipriv->qp.qpn);
++	mlx5i_uninit_underlay_qp(epriv);
++	mlx5e_deactivate_priv_channels(epriv);
++	mlx5e_close_channels(&epriv->channels);;
+ unlock:
+-	mutex_unlock(&priv->state_lock);
++	mutex_unlock(&epriv->state_lock);
+ 	return 0;
+ }
+ 
