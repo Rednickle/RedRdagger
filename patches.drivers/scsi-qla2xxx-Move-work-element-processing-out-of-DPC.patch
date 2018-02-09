@@ -1,0 +1,259 @@
+From: Quinn Tran <quinn.tran@cavium.com>
+Date: Thu, 28 Dec 2017 12:33:16 -0800
+Subject: scsi: qla2xxx: Move work element processing out of DPC thread
+Patch-mainline: v4.16-rc1
+Git-commit: 9b3e0f4d4147c9718756f420875dd667dd07e050
+References: bsc#1077338
+
+DPC thread can stall during switch scan due to slow switch response.
+This will stall other work element that needs attention. Moving work
+element processing and relogin logic out of DPC thread and into its
+own work queue.
+
+Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/scsi/qla2xxx/qla_def.h  |    6 +--
+ drivers/scsi/qla2xxx/qla_gbl.h  |    1 
+ drivers/scsi/qla2xxx/qla_init.c |    1 
+ drivers/scsi/qla2xxx/qla_mid.c  |    6 ---
+ drivers/scsi/qla2xxx/qla_os.c   |   76 ++++++++++++++++++++++++++++++----------
+ 5 files changed, 63 insertions(+), 27 deletions(-)
+
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3139,6 +3139,7 @@ enum qla_work_type {
+ 	QLA_EVT_UPD_FCPORT,
+ 	QLA_EVT_GNL,
+ 	QLA_EVT_NACK,
++	QLA_EVT_RELOGIN,
+ };
+ 
+ 
+@@ -3447,10 +3448,6 @@ struct qlt_hw_data {
+ 
+ #define LEAK_EXCHG_THRESH_HOLD_PERCENT 75	/* 75 percent */
+ 
+-#define QLA_EARLY_LINKUP(_ha) \
+-	((_ha->flags.n2n_ae || _ha->flags.lip_ae) && \
+-	 _ha->flags.fw_started && !_ha->flags.fw_init_done)
+-
+ /*
+  * Qlogic host adapter specific data structure.
+ */
+@@ -4155,6 +4152,7 @@ typedef struct scsi_qla_host {
+ #define SET_ZIO_THRESHOLD_NEEDED	28
+ #define DETECT_SFP_CHANGE	29
+ #define N2N_LOGIN_NEEDED	30
++#define IOCB_WORK_ACTIVE	31
+ 
+ 	unsigned long	pci_flags;
+ #define PFLG_DISCONNECTED	0	/* PCI device removed */
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -203,6 +203,7 @@ void qla2x00_handle_login_done_event(str
+ 	uint16_t *);
+ int qla24xx_post_gnl_work(struct scsi_qla_host *, fc_port_t *);
+ int qla24xx_async_abort_cmd(srb_t *);
++int qla24xx_post_relogin_work(struct scsi_qla_host *vha);
+ 
+ /*
+  * Global Functions in qla_mid.c source file.
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -898,6 +898,7 @@ void qla24xx_handle_gpdb_event(scsi_qla_
+ 		    __func__, fcport->port_name, fcport->last_rscn_gen,
+ 		    fcport->rscn_gen, fcport->last_login_gen,
+ 		    fcport->login_gen);
++		set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
+ 		return;
+ 	} else if (ea->sp->gen1 != fcport->rscn_gen) {
+ 		ql_dbg(ql_dbg_disc, vha, 0x20d4, "%s %d %8phC post gidpn\n",
+--- a/drivers/scsi/qla2xxx/qla_mid.c
++++ b/drivers/scsi/qla2xxx/qla_mid.c
+@@ -319,8 +319,6 @@ qla2x00_do_dpc_vp(scsi_qla_host_t *vha)
+ 	ql_dbg(ql_dbg_dpc + ql_dbg_verbose, vha, 0x4012,
+ 	    "Entering %s vp_flags: 0x%lx.\n", __func__, vha->vp_flags);
+ 
+-	qla2x00_do_work(vha);
+-
+ 	/* Check if Fw is ready to configure VP first */
+ 	if (test_bit(VP_CONFIG_OK, &base_vha->vp_flags)) {
+ 		if (test_and_clear_bit(VP_IDX_ACQUIRED, &vha->vp_flags)) {
+@@ -354,9 +352,7 @@ qla2x00_do_dpc_vp(scsi_qla_host_t *vha)
+ 
+ 			ql_dbg(ql_dbg_dpc, vha, 0x4018,
+ 			    "Relogin needed scheduled.\n");
+-			qla2x00_relogin(vha);
+-			ql_dbg(ql_dbg_dpc, vha, 0x4019,
+-			    "Relogin needed end.\n");
++			qla24xx_post_relogin_work(vha);
+ 		}
+ 	}
+ 
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -2700,14 +2700,22 @@ static void qla2x00_iocb_work_fn(struct
+ {
+ 	struct scsi_qla_host *vha = container_of(work,
+ 		struct scsi_qla_host, iocb_work);
+-	int cnt = 0;
++	struct qla_hw_data *ha = vha->hw;
++	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
++	int i = 20;
++	unsigned long flags;
+ 
+-	while (!list_empty(&vha->work_list)) {
++	if (test_bit(UNLOADING, &base_vha->dpc_flags))
++		return;
++
++	while (!list_empty(&vha->work_list) && i > 0) {
+ 		qla2x00_do_work(vha);
+-		cnt++;
+-		if (cnt > 10)
+-			break;
++		i--;
+ 	}
++
++	spin_lock_irqsave(&vha->work_lock, flags);
++	clear_bit(IOCB_WORK_ACTIVE, &vha->dpc_flags);
++	spin_unlock_irqrestore(&vha->work_lock, flags);
+ }
+ 
+ /*
+@@ -3205,7 +3213,7 @@ qla2x00_probe_one(struct pci_dev *pdev,
+ 	    host->can_queue, base_vha->req,
+ 	    base_vha->mgmt_svr_loop_id, host->sg_tablesize);
+ 
+-	ha->wq = alloc_workqueue("qla2xxx_wq", WQ_MEM_RECLAIM, 0);
++	ha->wq = alloc_workqueue("qla2xxx_wq", 0, 0);
+ 
+ 	if (ha->mqenable) {
+ 		bool mq = false;
+@@ -4557,6 +4565,7 @@ struct scsi_qla_host *qla2x00_create_hos
+ 	INIT_LIST_HEAD(&vha->gnl.fcports);
+ 	INIT_LIST_HEAD(&vha->nvme_rport_list);
+ 	INIT_LIST_HEAD(&vha->gpnid_list);
++	INIT_WORK(&vha->iocb_work, qla2x00_iocb_work_fn);
+ 
+ 	spin_lock_init(&vha->work_lock);
+ 	spin_lock_init(&vha->cmd_list_lock);
+@@ -4609,15 +4618,18 @@ int
+ qla2x00_post_work(struct scsi_qla_host *vha, struct qla_work_evt *e)
+ {
+ 	unsigned long flags;
++	bool q = false;
+ 
+ 	spin_lock_irqsave(&vha->work_lock, flags);
+ 	list_add_tail(&e->list, &vha->work_list);
++
++	if (!test_and_set_bit(IOCB_WORK_ACTIVE, &vha->dpc_flags))
++		q = true;
++
+ 	spin_unlock_irqrestore(&vha->work_lock, flags);
+ 
+-	if (QLA_EARLY_LINKUP(vha->hw))
+-		schedule_work(&vha->iocb_work);
+-	else
+-		qla2xxx_wake_dpc(vha);
++	if (q)
++		queue_work(vha->hw->wq, &vha->iocb_work);
+ 
+ 	return QLA_SUCCESS;
+ }
+@@ -4749,6 +4761,9 @@ void qla24xx_create_new_sess(struct scsi
+ 		fcport->d_id = e->u.new_sess.id;
+ 		if (pla) {
+ 			fcport->fw_login_state = DSC_LS_PLOGI_PEND;
++			memcpy(fcport->node_name,
++			    pla->iocb.u.isp24.u.plogi.node_name,
++			    WWN_SIZE);
+ 			qlt_plogi_ack_link(vha, pla, fcport, QLT_PLOGI_LINK_SAME_WWN);
+ 			/* we took an extra ref_count to prevent PLOGI ACK when
+ 			 * fcport/sess has not been created.
+@@ -4899,6 +4914,9 @@ qla2x00_do_work(struct scsi_qla_host *vh
+ 		case QLA_EVT_GPNID_DONE:
+ 			qla24xx_async_gpnid_done(vha, e->u.iosb.sp);
+ 			break;
++		case QLA_EVT_RELOGIN:
++			qla2x00_relogin(vha);
++			break;
+ 		case QLA_EVT_NEW_SESS:
+ 			qla24xx_create_new_sess(vha, e);
+ 			break;
+@@ -4930,6 +4948,20 @@ qla2x00_do_work(struct scsi_qla_host *vh
+ 	}
+ }
+ 
++int qla24xx_post_relogin_work(struct scsi_qla_host *vha)
++{
++	struct qla_work_evt *e;
++
++	e = qla2x00_alloc_work(vha, QLA_EVT_RELOGIN);
++
++	if (!e) {
++		set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
++		return QLA_FUNCTION_FAILED;
++	}
++
++	return qla2x00_post_work(vha, e);
++}
++
+ /* Relogins all the fcports of a vport
+  * Context: dpc thread
+  */
+@@ -4985,6 +5017,9 @@ void qla2x00_relogin(struct scsi_qla_hos
+ 		if (test_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags))
+ 			break;
+ 	}
++
++	ql_dbg(ql_dbg_disc, vha, 0x400e,
++	    "Relogin end.\n");
+ }
+ 
+ /* Schedule work on any of the dpc-workqueues */
+@@ -5760,8 +5795,6 @@ qla2x00_do_dpc(void *data)
+ 		if (test_bit(UNLOADING, &base_vha->dpc_flags))
+ 			break;
+ 
+-		qla2x00_do_work(base_vha);
+-
+ 		if (IS_P3P_TYPE(ha)) {
+ 			if (IS_QLA8044(ha)) {
+ 				if (test_and_clear_bit(ISP_UNRECOVERABLE,
+@@ -5949,11 +5982,9 @@ qla2x00_do_dpc(void *data)
+ 				base_vha->relogin_jif = jiffies + HZ;
+ 				clear_bit(RELOGIN_NEEDED, &base_vha->dpc_flags);
+ 
+-				ql_dbg(ql_dbg_dpc, base_vha, 0x400d,
++				ql_dbg(ql_dbg_disc, base_vha, 0x400d,
+ 				    "Relogin scheduled.\n");
+-				qla2x00_relogin(base_vha);
+-				ql_dbg(ql_dbg_dpc, base_vha, 0x400e,
+-				    "Relogin end.\n");
++				qla24xx_post_relogin_work(base_vha);
+ 			}
+ 		}
+ loop_resync_check:
+@@ -6212,8 +6243,17 @@ qla2x00_timer(scsi_qla_host_t *vha)
+ 	}
+ 
+ 	/* Process any deferred work. */
+-	if (!list_empty(&vha->work_list))
+-		start_dpc++;
++	if (!list_empty(&vha->work_list)) {
++		unsigned long flags;
++		bool q = false;
++
++		spin_lock_irqsave(&vha->work_lock, flags);
++		if (!test_and_set_bit(IOCB_WORK_ACTIVE, &vha->dpc_flags))
++			q = true;
++		spin_unlock_irqrestore(&vha->work_lock, flags);
++		if (q)
++			queue_work(vha->hw->wq, &vha->iocb_work);
++	}
+ 
+ 	/*
+ 	 * FC-NVME

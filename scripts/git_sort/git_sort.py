@@ -179,6 +179,7 @@ remotes = (
     Head(RepoURL("klassert/ipsec.git")),
     Head(RepoURL("klassert/ipsec-next.git")),
     Head(RepoURL("mkp/scsi.git"), "4.15/scsi-fixes"),
+    Head(RepoURL("mkp/scsi.git"), "4.16/scsi-fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next")
 )
 
