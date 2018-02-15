@@ -1,0 +1,136 @@
+From b26a32a82a901f894c79d1ec8b1ac94dde83e83c Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 29 Jan 2018 14:41:04 +0000
+Subject: [PATCH] drm/i915: Always run hangcheck while the GPU is busy
+Git-commit: b26a32a82a901f894c79d1ec8b1ac94dde83e83c
+Patch-mainline: v4.16-rc1
+References: bsc#1051510
+No-Fix: 889230489b6b138ba97ba2f13fc9644a3d16d0d2
+
+Previously, we relied on only running the hangcheck while somebody was
+waiting on the GPU, in order to minimise the amount of time hangcheck
+had to run. (If nobody was watching the GPU, nobody would notice if the
+GPU wasn't responding -- eventually somebody would care and so kick
+hangcheck into action.) However, this falls apart from around commit
+4680816be336 ("drm/i915: Wait first for submission, before waiting for
+request completion"), as not all waiters declare themselves to hangcheck
+and so we could switch off hangcheck and miss GPU hangs even when
+waiting under the struct_mutex.
+
+If we enable hangcheck from the first request submission, and let it run
+until the GPU is idle again, we forgo all the complexity involved with
+only enabling around waiters. We just have to remember to be careful that
+we do not declare a GPU hang when idly waiting for the next request to
+be come ready, as we will run hangcheck continuously even when the
+engines are stalled waiting for external events. This should be true
+already as we should only be tracking requests submitted to hardware for
+execution as an indicator that the engine is busy.
+
+Fixes: 4680816be336 ("drm/i915: Wait first for submission, before waiting for request completion"
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=104840
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180129144104.3921-1-chris@chris-wilson.co.uk
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+(cherry picked from commit 889230489b6b138ba97ba2f13fc9644a3d16d0d2)
+
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_gem.c          |    7 +++----
+ drivers/gpu/drm/i915/i915_gem_request.c  |    2 ++
+ drivers/gpu/drm/i915/intel_breadcrumbs.c |   11 -----------
+ drivers/gpu/drm/i915/intel_hangcheck.c   |    7 +------
+ 4 files changed, 6 insertions(+), 21 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3113,16 +3113,15 @@ i915_gem_retire_work_handler(struct work
+ 		mutex_unlock(&dev->struct_mutex);
+ 	}
+ 
+-	/* Keep the retire handler running until we are finally idle.
++	/*
++	 * Keep the retire handler running until we are finally idle.
+ 	 * We do not need to do this test under locking as in the worst-case
+ 	 * we queue the retire worker once too often.
+ 	 */
+-	if (READ_ONCE(dev_priv->gt.awake)) {
+-		i915_queue_hangcheck(dev_priv);
++	if (READ_ONCE(dev_priv->gt.awake))
+ 		queue_delayed_work(dev_priv->wq,
+ 				   &dev_priv->gt.retire_work,
+ 				   round_jiffies_up_relative(HZ));
+-	}
+ }
+ 
+ static void
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -829,6 +829,8 @@ static void i915_gem_mark_busy(const str
+ 	if (INTEL_GEN(dev_priv) >= 6)
+ 		gen6_rps_busy(dev_priv);
+ 
++	i915_queue_hangcheck(dev_priv);
++
+ 	queue_delayed_work(dev_priv->wq,
+ 			   &dev_priv->gt.retire_work,
+ 			   round_jiffies_up_relative(HZ));
+--- a/drivers/gpu/drm/i915/intel_breadcrumbs.c
++++ b/drivers/gpu/drm/i915/intel_breadcrumbs.c
+@@ -126,17 +126,6 @@ static void intel_breadcrumbs_fake_irq(u
+ 		return;
+ 
+ 	mod_timer(&b->fake_irq, jiffies + 1);
+-
+-	/* Ensure that even if the GPU hangs, we get woken up.
+-	 *
+-	 * However, note that if no one is waiting, we never notice
+-	 * a gpu hang. Eventually, we will have to wait for a resource
+-	 * held by the GPU and so trigger a hangcheck. In the most
+-	 * pathological case, this will be upon memory starvation! To
+-	 * prevent this, we also queue the hangcheck from the retire
+-	 * worker.
+-	 */
+-	i915_queue_hangcheck(engine->i915);
+ }
+ 
+ static void irq_enable(struct intel_engine_cs *engine)
+--- a/drivers/gpu/drm/i915/intel_hangcheck.c
++++ b/drivers/gpu/drm/i915/intel_hangcheck.c
+@@ -426,7 +426,6 @@ static void i915_hangcheck_elapsed(struc
+ 	struct intel_engine_cs *engine;
+ 	enum intel_engine_id id;
+ 	unsigned int hung = 0, stuck = 0;
+-	int busy_count = 0;
+ 
+ 	if (!i915.enable_hangcheck)
+ 		return;
+@@ -445,7 +444,6 @@ static void i915_hangcheck_elapsed(struc
+ 
+ 	for_each_engine(engine, dev_priv, id) {
+ 		struct intel_engine_hangcheck cur_state, *hc = &cur_state;
+-		const bool busy = intel_engine_has_waiter(engine);
+ 
+ 		semaphore_clear_deadlocks(dev_priv);
+ 
+@@ -458,16 +456,13 @@ static void i915_hangcheck_elapsed(struc
+ 			if (hc->action != ENGINE_DEAD)
+ 				stuck |= intel_engine_flag(engine);
+ 		}
+-
+-		busy_count += busy;
+ 	}
+ 
+ 	if (hung)
+ 		hangcheck_declare_hang(dev_priv, hung, stuck);
+ 
+ 	/* Reset timer in case GPU hangs without another request being added */
+-	if (busy_count)
+-		i915_queue_hangcheck(dev_priv);
++	i915_queue_hangcheck(dev_priv);
+ }
+ 
+ void intel_engine_init_hangcheck(struct intel_engine_cs *engine)

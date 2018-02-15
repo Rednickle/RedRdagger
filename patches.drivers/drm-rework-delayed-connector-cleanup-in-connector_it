@@ -1,0 +1,252 @@
+From ea497bb92064875497554ee7cdf10df7fb7393fc Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 13 Dec 2017 13:49:36 +0100
+Subject: [PATCH] drm: rework delayed connector cleanup in connector_iter
+Git-commit: ea497bb92064875497554ee7cdf10df7fb7393fc
+Patch-mainline: v4.15-rc4
+References: bsc#1051510
+
+PROBE_DEFER also uses system_wq to reprobe drivers, which means when
+that again fails, and we try to flush the overall system_wq (to get
+all the delayed connectore cleanup work_struct completed), we
+deadlock.
+
+Fix this by using just a single cleanup work, so that we can only
+flush that one and don't block on anything else. That means a free
+list plus locking, a standard pattern.
+
+V2: 
+- Correctly free connectors only on last ref. Oops (Chris).
+- use llist_head/node (Chris).
+
+v3
+- Add init_llist_head (Chris).
+
+Fixes: a703c55004e1 ("drm: safely free connectors from connector_iter")
+Fixes: 613051dac40d ("drm: locking&new iterators for connector_list")
+Cc: Ben Widawsky <ben@bwidawsk.net>
+Cc: Dave Airlie <airlied@gmail.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Sean Paul <seanpaul@chromium.org>
+Cc: <stable@vger.kernel.org> # v4.11+: 613051dac40d ("drm: locking&new iterators for connector_list"
+Cc: <stable@vger.kernel.org> # v4.11+
+Cc: Daniel Vetter <daniel.vetter@intel.com>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Gustavo Padovan <gustavo@padovan.org>
+Cc: David Airlie <airlied@linux.ie>
+Cc: Javier Martinez Canillas <javier@dowhile0.org>
+Cc: Shuah Khan <shuahkh@osg.samsung.com>
+Cc: Guillaume Tucker <guillaume.tucker@collabora.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Kevin Hilman <khilman@baylibre.com>
+Cc: Matt Hart <matthew.hart@linaro.org>
+Cc: Thierry Escande <thierry.escande@collabora.co.uk>
+Cc: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Cc: Enric Balletbo i Serra <enric.balletbo@collabora.com>
+Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171213124936.17914-1-daniel.vetter@ffwll.ch
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/drm_connector.c     |   50 +++++++++++++++++++++++++-----------
+ drivers/gpu/drm/drm_crtc_internal.h |    1 
+ drivers/gpu/drm/drm_mode_config.c   |    5 ++-
+ include/drm/drm_connector.h         |   10 ++++---
+ include/drm/drm_mode_config.h       |   18 ++++++++++++
+ 5 files changed, 63 insertions(+), 21 deletions(-)
+
+--- a/drivers/gpu/drm/drm_connector.c
++++ b/drivers/gpu/drm/drm_connector.c
+@@ -152,14 +152,23 @@ static void drm_connector_free(struct kr
+ 	connector->funcs->destroy(connector);
+ }
+ 
+-static void drm_connector_free_work_fn(struct work_struct *work)
++void drm_connector_free_work_fn(struct work_struct *work)
+ {
+-	struct drm_connector *connector =
+-		container_of(work, struct drm_connector, free_work);
+-	struct drm_device *dev = connector->dev;
++	struct drm_connector *connector, *n;
++	struct drm_device *dev =
++		container_of(work, struct drm_device, mode_config.connector_free_work);
++	struct drm_mode_config *config = &dev->mode_config;
++	unsigned long flags;
++	struct llist_node *freed;
+ 
+-	drm_mode_object_unregister(dev, &connector->base);
+-	connector->funcs->destroy(connector);
++	spin_lock_irqsave(&config->connector_list_lock, flags);
++	freed = llist_del_all(&config->connector_free_list);
++	spin_unlock_irqrestore(&config->connector_list_lock, flags);
++
++	llist_for_each_entry_safe(connector, n, freed, free_node) {
++		drm_mode_object_unregister(dev, &connector->base);
++		connector->funcs->destroy(connector);
++	}
+ }
+ 
+ /**
+@@ -191,8 +200,6 @@ int drm_connector_init(struct drm_device
+ 	if (ret)
+ 		return ret;
+ 
+-	INIT_WORK(&connector->free_work, drm_connector_free_work_fn);
+-
+ 	connector->base.properties = &connector->properties;
+ 	connector->dev = dev;
+ 	connector->funcs = funcs;
+@@ -543,10 +550,17 @@ EXPORT_SYMBOL(drm_connector_list_iter_be
+  * actually release the connector when dropping our final reference.
+  */
+ static void
+-drm_connector_put_safe(struct drm_connector *conn)
++__drm_connector_put_safe(struct drm_connector *conn)
+ {
+-	if (refcount_dec_and_test(&conn->base.refcount.refcount))
+-		schedule_work(&conn->free_work);
++	struct drm_mode_config *config = &conn->dev->mode_config;
++
++	lockdep_assert_held(&config->connector_list_lock);
++
++	if (!refcount_dec_and_test(&conn->base.refcount.refcount))
++		return;
++
++	llist_add(&conn->free_node, &config->connector_free_list);
++	schedule_work(&config->connector_free_work);
+ }
+ 
+ /**
+@@ -578,10 +592,10 @@ drm_connector_list_iter_next(struct drm_
+ 
+ 		/* loop until it's not a zombie connector */
+ 	} while (!kref_get_unless_zero(&iter->conn->base.refcount));
+-	spin_unlock_irqrestore(&config->connector_list_lock, flags);
+ 
+ 	if (old_conn)
+-		drm_connector_put_safe(old_conn);
++		__drm_connector_put_safe(old_conn);
++	spin_unlock_irqrestore(&config->connector_list_lock, flags);
+ 
+ 	return iter->conn;
+ }
+@@ -598,9 +612,15 @@ EXPORT_SYMBOL(drm_connector_list_iter_ne
+  */
+ void drm_connector_list_iter_end(struct drm_connector_list_iter *iter)
+ {
++	struct drm_mode_config *config = &iter->dev->mode_config;
++	unsigned long flags;
++
+ 	iter->dev = NULL;
+-	if (iter->conn)
+-		drm_connector_put_safe(iter->conn);
++	if (iter->conn) {
++		spin_lock_irqsave(&config->connector_list_lock, flags);
++		__drm_connector_put_safe(iter->conn);
++		spin_unlock_irqrestore(&config->connector_list_lock, flags);
++	}
+ 	lock_release(&connector_list_iter_dep_map, 0, _RET_IP_);
+ }
+ EXPORT_SYMBOL(drm_connector_list_iter_end);
+--- a/drivers/gpu/drm/drm_crtc_internal.h
++++ b/drivers/gpu/drm/drm_crtc_internal.h
+@@ -141,6 +141,7 @@ int drm_mode_connector_set_obj_prop(stru
+ 				    uint64_t value);
+ int drm_connector_create_standard_properties(struct drm_device *dev);
+ const char *drm_get_connector_force_name(enum drm_connector_force force);
++void drm_connector_free_work_fn(struct work_struct *work);
+ 
+ /* IOCTL */
+ int drm_mode_connector_property_set_ioctl(struct drm_device *dev,
+--- a/drivers/gpu/drm/drm_mode_config.c
++++ b/drivers/gpu/drm/drm_mode_config.c
+@@ -371,6 +371,9 @@ void drm_mode_config_init(struct drm_dev
+ 	ida_init(&dev->mode_config.connector_ida);
+ 	spin_lock_init(&dev->mode_config.connector_list_lock);
+ 
++	init_llist_head(&dev->mode_config.connector_free_list);
++	INIT_WORK(&dev->mode_config.connector_free_work, drm_connector_free_work_fn);
++
+ 	drm_mode_create_standard_properties(dev);
+ 
+ 	/* Just to be sure */
+@@ -422,7 +425,7 @@ void drm_mode_config_cleanup(struct drm_
+ 	}
+ 	drm_connector_list_iter_end(&conn_iter);
+ 	/* connector_iter drops references in a work item. */
+-	flush_scheduled_work();
++	flush_work(&dev->mode_config.connector_free_work);
+ 	if (WARN_ON(!list_empty(&dev->mode_config.connector_list))) {
+ 		drm_connector_list_iter_begin(dev, &conn_iter);
+ 		drm_for_each_connector_iter(connector, &conn_iter)
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -24,6 +24,7 @@
+ #define __DRM_CONNECTOR_H__
+ 
+ #include <linux/list.h>
++#include <linux/llist.h>
+ #include <linux/ctype.h>
+ #include <drm/drm_mode_object.h>
+ 
+@@ -860,12 +861,13 @@ struct drm_connector {
+ 	uint16_t tile_h_size, tile_v_size;
+ 
+ 	/**
+-	 * @free_work:
++	 * @free_node:
+ 	 *
+-	 * Work used only by &drm_connector_iter to be able to clean up a
+-	 * connector from any context.
++	 * List used only by &drm_connector_iter to be able to clean up a
++	 * connector from any context, in conjunction with
++	 * &drm_mode_config.connector_free_work.
+ 	 */
+-	struct work_struct free_work;
++	struct llist_node free_node;
+ };
+ 
+ #define obj_to_connector(x) container_of(x, struct drm_connector, base)
+--- a/include/drm/drm_mode_config.h
++++ b/include/drm/drm_mode_config.h
+@@ -27,6 +27,7 @@
+ #include <linux/types.h>
+ #include <linux/idr.h>
+ #include <linux/workqueue.h>
++#include <linux/llist.h>
+ 
+ #include <drm/drm_modeset_lock.h>
+ 
+@@ -393,7 +394,7 @@ struct drm_mode_config {
+ 
+ 	/**
+ 	 * @connector_list_lock: Protects @num_connector and
+-	 * @connector_list.
++	 * @connector_list and @connector_free_list.
+ 	 */
+ 	spinlock_t connector_list_lock;
+ 	/**
+@@ -414,6 +415,21 @@ struct drm_mode_config {
+ 	 */
+ 	struct list_head connector_list;
+ 	/**
++	 * @connector_free_list:
++	 *
++	 * List of connector objects linked with &drm_connector.free_head.
++	 * Protected by @connector_list_lock. Used by
++	 * drm_for_each_connector_iter() and
++	 * &struct drm_connector_list_iter to savely free connectors using
++	 * @connector_free_work.
++	 */
++	struct llist_head connector_free_list;
++	/**
++	 * @connector_free_work: Work to clean up @connector_free_list.
++	 */
++	struct work_struct connector_free_work;
++
++	/**
+ 	 * @num_encoder:
+ 	 *
+ 	 * Number of encoders on this device. This is invariant over the
