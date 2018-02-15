@@ -1,0 +1,206 @@
+From 02b3bd647d38f3d180b7fe0d9d7b169fe5107628 Mon Sep 17 00:00:00 2001
+From: Lukas Czerner <lczerner@redhat.com>
+Date: Thu, 21 Sep 2017 08:16:29 -0600
+Subject: [PATCH 1/3] fs: Fix page cache inconsistency when mixing buffered and
+ AIO DIO
+Git-commit: 332391a9935da939319e473b4680e173df75afcf
+Patch-mainline: v4.14
+References: bsc#1073407 bsc#1069135
+
+Currently when mixing buffered reads and asynchronous direct writes it
+is possible to end up with the situation where we have stale data in the
+page cache while the new data is already written to disk. This is
+permanent until the affected pages are flushed away. Despite the fact
+that mixing buffered and direct IO is ill-advised it does pose a thread
+for a data integrity, is unexpected and should be fixed.
+
+Fix this by deferring completion of asynchronous direct writes to a
+process context in the case that there are mapped pages to be found in
+the inode. Later before the completion in dio_complete() invalidate
+the pages in question. This ensures that after the completion the pages
+in the written area are either unmapped, or populated with up-to-date
+data. Also do the same for the iomap case which uses
+iomap_dio_complete() instead.
+
+This has a side effect of deferring the completion to a process context
+for every AIO DIO that happens on inode that has pages mapped. However
+since the consensus is that this is ill-advised practice the performance
+implication should not be a problem.
+
+This was based on proposal from Jeff Moyer, thanks!
+
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Lukas Czerner <lczerner@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Luis R. Rodriguez <mcgrof@suse.com>
+---
+ fs/direct-io.c | 49 +++++++++++++++++++++++++++++++++++++++++++------
+ fs/iomap.c     | 29 ++++++++++++++++-------------
+ mm/filemap.c   | 10 ++++++++--
+ 3 files changed, 67 insertions(+), 21 deletions(-)
+
+diff --git a/fs/direct-io.c b/fs/direct-io.c
+index a04ebea77de8..e1d76464beac 100644
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@ -229,6 +229,7 @@ static ssize_t dio_complete(struct dio *dio, ssize_t ret, bool is_async)
+ {
+ 	loff_t offset = dio->iocb->ki_pos;
+ 	ssize_t transferred = 0;
++	int err;
+ 
+ 	/*
+ 	 * AIO submission can race with bio completion to get here while
+@@ -258,8 +259,22 @@ static ssize_t dio_complete(struct dio *dio, ssize_t ret, bool is_async)
+ 	if (ret == 0)
+ 		ret = transferred;
+ 
++	/*
++	 * Try again to invalidate clean pages which might have been cached by
++	 * non-direct readahead, or faulted in by get_user_pages() if the source
++	 * of the write was an mmap'ed region of the file we're writing.  Either
++	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
++	 * this invalidation fails, tough, the write still worked...
++	 */
++	if (ret > 0 && dio->op == REQ_OP_WRITE &&
++	    dio->inode->i_mapping->nrpages) {
++		err = invalidate_inode_pages2_range(dio->inode->i_mapping,
++					offset >> PAGE_SHIFT,
++					(offset + ret - 1) >> PAGE_SHIFT);
++		WARN_ON_ONCE(err);
++	}
++
+ 	if (dio->end_io) {
+-		int err;
+ 
+ 		// XXX: ki_pos??
+ 		err = dio->end_io(dio->iocb, offset, ret, dio->private);
+@@ -304,6 +319,7 @@ static void dio_bio_end_aio(struct bio *bio)
+ 	struct dio *dio = bio->bi_private;
+ 	unsigned long remaining;
+ 	unsigned long flags;
++	bool defer_completion = false;
+ 
+ 	/* cleanup the bio */
+ 	dio_bio_complete(dio, bio);
+@@ -315,7 +331,19 @@ static void dio_bio_end_aio(struct bio *bio)
+ 	spin_unlock_irqrestore(&dio->bio_lock, flags);
+ 
+ 	if (remaining == 0) {
+-		if (dio->result && dio->defer_completion) {
++		/*
++		 * Defer completion when defer_completion is set or
++		 * when the inode has pages mapped and this is AIO write.
++		 * We need to invalidate those pages because there is a
++		 * chance they contain stale data in the case buffered IO
++		 * went in between AIO submission and completion into the
++		 * same region.
++		 */
++		if (dio->result)
++			defer_completion = dio->defer_completion ||
++					   (dio->op == REQ_OP_WRITE &&
++					    dio->inode->i_mapping->nrpages);
++		if (defer_completion) {
+ 			INIT_WORK(&dio->complete_work, dio_aio_complete_work);
+ 			queue_work(dio->inode->i_sb->s_dio_done_wq,
+ 				   &dio->complete_work);
+@@ -1205,10 +1233,19 @@ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+ 	 * For AIO O_(D)SYNC writes we need to defer completions to a workqueue
+ 	 * so that we can call ->fsync.
+ 	 */
+-	if (dio->is_async && iov_iter_rw(iter) == WRITE &&
+-	    ((iocb->ki_filp->f_flags & O_DSYNC) ||
+-	     IS_SYNC(iocb->ki_filp->f_mapping->host))) {
+-		retval = dio_set_defer_completion(dio);
++	if (dio->is_async && iov_iter_rw(iter) == WRITE) {
++		retval = 0;
++		if ((iocb->ki_filp->f_flags & O_DSYNC) ||
++		    IS_SYNC(iocb->ki_filp->f_mapping->host))
++			retval = dio_set_defer_completion(dio);
++		else if (!dio->inode->i_sb->s_dio_done_wq) {
++			/*
++			 * In case of AIO write racing with buffered read we
++			 * need to defer completion. We can't decide this now,
++			 * however the workqueue needs to be initialized here.
++			 */
++			retval = sb_init_dio_done_wq(dio->inode->i_sb);
++		}
+ 		if (retval) {
+ 			/*
+ 			 * We grab i_mutex only for reads so we don't have
+diff --git a/fs/iomap.c b/fs/iomap.c
+index 7dfe7ad6c35c..eb66a6327517 100644
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@ -619,8 +619,24 @@ struct iomap_dio {
+ static ssize_t iomap_dio_complete(struct iomap_dio *dio)
+ {
+ 	struct kiocb *iocb = dio->iocb;
++	struct inode *inode = file_inode(iocb->ki_filp);
+ 	ssize_t ret;
+ 
++	/*
++	 * Try again to invalidate clean pages which might have been cached by
++	 * non-direct readahead, or faulted in by get_user_pages() if the source
++	 * of the write was an mmap'ed region of the file we're writing.  Either
++	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
++	 * this invalidation fails, tough, the write still worked...
++	 */
++	if (!dio->error &&
++	    (dio->flags & IOMAP_DIO_WRITE) && inode->i_mapping->nrpages) {
++		ret = invalidate_inode_pages2_range(inode->i_mapping,
++				iocb->ki_pos >> PAGE_SHIFT,
++				(iocb->ki_pos + dio->size - 1) >> PAGE_SHIFT);
++		WARN_ON_ONCE(ret);
++	}
++
+ 	if (dio->end_io) {
+ 		ret = dio->end_io(iocb,
+ 				dio->error ? dio->error : dio->size,
+@@ -947,19 +963,6 @@ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 
+ 	ret = iomap_dio_complete(dio);
+ 
+-	/*
+-	 * Try again to invalidate clean pages which might have been cached by
+-	 * non-direct readahead, or faulted in by get_user_pages() if the source
+-	 * of the write was an mmap'ed region of the file we're writing.  Either
+-	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
+-	 * this invalidation fails, tough, the write still worked...
+-	 */
+-	if (iov_iter_rw(iter) == WRITE) {
+-		int err = invalidate_inode_pages2_range(mapping,
+-				start >> PAGE_SHIFT, end >> PAGE_SHIFT);
+-		WARN_ON_ONCE(err);
+-	}
+-
+ 	return ret;
+ 
+ out_free_dio:
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 3db61201f094..2a429a449454 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2915,9 +2915,15 @@ generic_file_direct_write(struct kiocb *iocb, struct iov_iter *from)
+ 	 * we're writing.  Either one is a pretty crazy thing to do,
+ 	 * so we don't support it 100%.  If this invalidation
+ 	 * fails, tough, the write still worked...
++	 *
++	 * Most of the time we do not need this since dio_complete() will do
++	 * the invalidation for us. However there are some file systems that
++	 * do not end up with dio_complete() being called, so let's not break
++	 * them by removing it completely
+ 	 */
+-	invalidate_inode_pages2_range(mapping,
+-				pos >> PAGE_SHIFT, end);
++	if (mapping->nrpages)
++		invalidate_inode_pages2_range(mapping,
++					pos >> PAGE_SHIFT, end);
+ 
+ 	if (written > 0) {
+ 		pos += written;
+-- 
+2.15.0
+
