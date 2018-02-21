@@ -1,0 +1,221 @@
+From 7125397b82460d74ae0584bdcdc006deec5e895d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 6 Dec 2017 12:49:14 +0000
+Subject: [PATCH] drm/i915: Track GGTT writes on the vma
+Git-commit: 7125397b82460d74ae0584bdcdc006deec5e895d
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+As writes through the GTT and GGTT PTE updates do not share the same
+path, they are not strictly ordered and so we must explicitly flush the
+indirect writes prior to modifying the PTE. We do track outstanding GGTT
+writes on the object itself, but since the object may have multiple GGTT
+vma, that is overly coarse as we can track and flush individual vma as
+required.
+
+Whilst here, update the GGTT flushing behaviour for Cannonlake.
+
+V2: Hard-code ring offset to allow use during unload (after RCS may have
+been freed, or never existed!)
+
+References: https://bugs.freedesktop.org/show_bug.cgi?id=104002
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171206124914.19960-2-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h |    2 +
+ drivers/gpu/drm/i915/i915_gem.c |   58 +++++++++++++++++++++++++++-------------
+ drivers/gpu/drm/i915/i915_vma.c |   22 +++++++++++++++
+ drivers/gpu/drm/i915/i915_vma.h |   19 +++++++++++++
+ 4 files changed, 83 insertions(+), 18 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3838,6 +3838,8 @@ int __must_check i915_gem_evict_for_node
+ 					 unsigned int flags);
+ int i915_gem_evict_vm(struct i915_address_space *vm);
+ 
++void i915_gem_flush_ggtt_writes(struct drm_i915_private *dev_priv);
++
+ /* belongs in i915_gem_gtt.h */
+ static inline void i915_gem_chipset_flush(struct drm_i915_private *dev_priv)
+ {
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -661,17 +661,13 @@ fb_write_origin(struct drm_i915_gem_obje
+ 		obj->frontbuffer_ggtt_origin : ORIGIN_CPU);
+ }
+ 
+-static void
+-flush_write_domain(struct drm_i915_gem_object *obj, unsigned int flush_domains)
++void i915_gem_flush_ggtt_writes(struct drm_i915_private *dev_priv)
+ {
+-	struct drm_i915_private *dev_priv = to_i915(obj->base.dev);
+-
+-	if (!(obj->base.write_domain & flush_domains))
+-		return;
+-
+-	/* No actual flushing is required for the GTT write domain.  Writes
+-	 * to it "immediately" go to main memory as far as we know, so there's
+-	 * no chipset flush.  It also doesn't land in render cache.
++	/*
++	 * No actual flushing is required for the GTT write domain for reads
++	 * from the GTT domain. Writes to it "immediately" go to main memory
++	 * as far as we know, so there's no chipset flush. It also doesn't
++	 * land in the GPU render cache.
+ 	 *
+ 	 * However, we do have to enforce the order so that all writes through
+ 	 * the GTT land before any writes to the device, such as updates to
+@@ -682,22 +678,46 @@ flush_write_domain(struct drm_i915_gem_o
+ 	 * timing. This issue has only been observed when switching quickly
+ 	 * between GTT writes and CPU reads from inside the kernel on recent hw,
+ 	 * and it appears to only affect discrete GTT blocks (i.e. on LLC
+-	 * system agents we cannot reproduce this behaviour).
++	 * system agents we cannot reproduce this behaviour, until Cannonlake
++	 * that was!).
+ 	 */
++
+ 	wmb();
+ 
++	intel_runtime_pm_get(dev_priv);
++	spin_lock_irq(&dev_priv->uncore.lock);
++
++	POSTING_READ_FW(RING_HEAD(RENDER_RING_BASE));
++
++	spin_unlock_irq(&dev_priv->uncore.lock);
++	intel_runtime_pm_put(dev_priv);
++}
++
++static void
++flush_write_domain(struct drm_i915_gem_object *obj, unsigned int flush_domains)
++{
++	struct drm_i915_private *dev_priv = to_i915(obj->base.dev);
++	struct i915_vma *vma;
++
++	if (!(obj->base.write_domain & flush_domains))
++		return;
++
+ 	switch (obj->base.write_domain) {
+ 	case I915_GEM_DOMAIN_GTT:
+-		if (!HAS_LLC(dev_priv)) {
+-			intel_runtime_pm_get(dev_priv);
+-			spin_lock_irq(&dev_priv->uncore.lock);
+-			POSTING_READ_FW(RING_HEAD(dev_priv->engine[RCS]->mmio_base));
+-			spin_unlock_irq(&dev_priv->uncore.lock);
+-			intel_runtime_pm_put(dev_priv);
+-		}
++		i915_gem_flush_ggtt_writes(dev_priv);
+ 
+ 		intel_fb_obj_flush(obj,
+ 				   fb_write_origin(obj, I915_GEM_DOMAIN_GTT));
++
++		list_for_each_entry(vma, &obj->vma_list, obj_link) {
++			if (!i915_vma_is_ggtt(vma))
++				break;
++
++			if (vma->iomap)
++				continue;
++
++			i915_vma_unset_ggtt_write(vma);
++		}
+ 		break;
+ 
+ 	case I915_GEM_DOMAIN_CPU:
+@@ -1960,6 +1980,8 @@ int i915_gem_fault(struct vm_fault *vmf)
+ 		list_add(&obj->userfault_link, &dev_priv->mm.userfault_list);
+ 	GEM_BUG_ON(!obj->userfault_count);
+ 
++	i915_vma_set_ggtt_write(vma);
++
+ err_fence:
+ 	i915_vma_unpin_fence(vma);
+ err_unpin:
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -320,6 +320,7 @@ void __iomem *i915_vma_pin_iomap(struct
+ 	if (err)
+ 		goto err_unpin;
+ 
++	i915_vma_set_ggtt_write(vma);
+ 	return ptr;
+ 
+ err_unpin:
+@@ -328,12 +329,24 @@ err:
+ 	return IO_ERR_PTR(err);
+ }
+ 
++void i915_vma_flush_writes(struct i915_vma *vma)
++{
++	if (!i915_vma_has_ggtt_write(vma))
++		return;
++
++	i915_gem_flush_ggtt_writes(vma->vm->i915);
++
++	i915_vma_unset_ggtt_write(vma);
++}
++
+ void i915_vma_unpin_iomap(struct i915_vma *vma)
+ {
+ 	lockdep_assert_held(&vma->obj->base.dev->struct_mutex);
+ 
+ 	GEM_BUG_ON(vma->iomap == NULL);
+ 
++	i915_vma_flush_writes(vma);
++
+ 	i915_vma_unpin_fence(vma);
+ 	i915_vma_unpin(vma);
+ }
+@@ -747,6 +760,15 @@ int i915_vma_unbind(struct i915_vma *vma
+ 	GEM_BUG_ON(!i915_gem_object_has_pinned_pages(obj));
+ 
+ 	if (i915_vma_is_map_and_fenceable(vma)) {
++		/*
++		 * Check that we have flushed all writes through the GGTT
++		 * before the unbind, other due to non-strict nature of those
++		 * indirect writes they may end up referencing the GGTT PTE
++		 * after the unbind.
++		 */
++		i915_vma_flush_writes(vma);
++		GEM_BUG_ON(i915_vma_has_ggtt_write(vma));
++
+ 		/* release the fence reg _after_ flushing */
+ 		ret = i915_vma_put_fence(vma);
+ 		if (ret)
+--- a/drivers/gpu/drm/i915/i915_vma.h
++++ b/drivers/gpu/drm/i915/i915_vma.h
+@@ -89,6 +89,7 @@ struct i915_vma {
+ #define I915_VMA_CLOSED		BIT(10)
+ #define I915_VMA_USERFAULT_BIT	11
+ #define I915_VMA_USERFAULT	BIT(I915_VMA_USERFAULT_BIT)
++#define I915_VMA_GGTT_WRITE	BIT(12)
+ 
+ 	unsigned int active;
+ 	struct i915_gem_active last_read[I915_NUM_ENGINES];
+@@ -137,6 +138,24 @@ static inline bool i915_vma_is_ggtt(cons
+ 	return vma->flags & I915_VMA_GGTT;
+ }
+ 
++static inline bool i915_vma_has_ggtt_write(const struct i915_vma *vma)
++{
++	return vma->flags & I915_VMA_GGTT_WRITE;
++}
++
++static inline void i915_vma_set_ggtt_write(struct i915_vma *vma)
++{
++	GEM_BUG_ON(!i915_vma_is_ggtt(vma));
++	vma->flags |= I915_VMA_GGTT_WRITE;
++}
++
++static inline void i915_vma_unset_ggtt_write(struct i915_vma *vma)
++{
++	vma->flags &= ~I915_VMA_GGTT_WRITE;
++}
++
++void i915_vma_flush_writes(struct i915_vma *vma);
++
+ static inline bool i915_vma_is_map_and_fenceable(const struct i915_vma *vma)
+ {
+ 	return vma->flags & I915_VMA_CAN_FENCE;
