@@ -1,0 +1,265 @@
+From bcbd5c33a342bc6f4a25fed528dc3ed2a0b1c140 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 25 Oct 2017 15:39:42 +0100
+Subject: [PATCH] drm/i915/guc: Always enable the breadcrumbs irq
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: bcbd5c33a342bc6f4a25fed528dc3ed2a0b1c140
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+The execlists emulation on top of the GuC (used for scheduling and
+preemption) depends on the MI_USER_INTERRUPT for its notifications and
+tasklet action. As we always employ the irq, there is no advantage in
+ever disabling it while we are using the GuC, so allow us to arm the
+breadcrumb irq when enabling GuC submission and disarm upon disabling.
+The impact should be lessened by the delayed irq disabling we do (we
+only disable after receiving an interrupt for which no one was wanting),
+but allowing guc to explicitly manage the irq in relation to itself is
+simpler and prevents an issue with losing an interrupt for preemption
+as it is not coupled to an active request.
+
+Internally, we add a reference counter (breadcrumbs.irq_enabled) as a
+simple mechanism to allow GuC to keep the breadcrumb irq enabled. To
+improve upon always enabling the irq while guc is selected, we need
+to hook into the parking facility of intel_engines so that we only enable
+the breadcrumbs while the GT is active (one step better would be to
+individually park/unpark each engine).
+
+In effect, this means that we keep the breadcrumb irq always enabled for
+the entire duration the guc is busy, whereas before we would try to
+switch it off whenever we idled for more than interrupt with no
+associated waiters. The difference *should* be negligible in practice!
+
+V2: Stop abusing fence signaling (and its auxiliary data structures) to
+enable the breadcrumbs irqs.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Michał Winiarski <michal.winiarski@intel.com>,
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Michał Winiarski <michal.winiarski@intel.com>,
+Link: https://patchwork.freedesktop.org/patch/msgid/20171025143943.7661-3-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_guc_submission.c |   39 +++++++++----------------
+ drivers/gpu/drm/i915/i915_irq.c            |    6 +++
+ drivers/gpu/drm/i915/intel_breadcrumbs.c   |   45 ++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    5 ++-
+ 4 files changed, 59 insertions(+), 36 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -523,29 +523,6 @@ static void i915_guc_submit(struct intel
+ 	}
+ }
+ 
+-static void nested_enable_signaling(struct drm_i915_gem_request *rq)
+-{
+-	/* If we use dma_fence_enable_sw_signaling() directly, lockdep
+-	 * detects an ordering issue between the fence lockclass and the
+-	 * global_timeline. This circular dependency can only occur via 2
+-	 * different fences (but same fence lockclass), so we use the nesting
+-	 * annotation here to prevent the warn, equivalent to the nesting
+-	 * inside i915_gem_request_submit() for when we also enable the
+-	 * signaler.
+-	 */
+-
+-	if (test_and_set_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT,
+-			     &rq->fence.flags))
+-		return;
+-
+-	GEM_BUG_ON(test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &rq->fence.flags));
+-	trace_dma_fence_enable_signal(&rq->fence);
+-
+-	spin_lock_nested(&rq->lock, SINGLE_DEPTH_NESTING);
+-	intel_engine_enable_signaling(rq, true);
+-	spin_unlock(&rq->lock);
+-}
+-
+ static void port_assign(struct execlist_port *port,
+ 			struct drm_i915_gem_request *rq)
+ {
+@@ -555,7 +532,6 @@ static void port_assign(struct execlist_
+ 		i915_gem_request_put(port_request(port));
+ 
+ 	port_set(port, port_pack(i915_gem_request_get(rq), port_count(port)));
+-	nested_enable_signaling(rq);
+ }
+ 
+ static void i915_guc_dequeue(struct intel_engine_cs *engine)
+@@ -1097,6 +1073,16 @@ static void guc_interrupts_release(struc
+ 	rps->pm_intrmsk_mbz &= ~ARAT_EXPIRED_INTRMSK;
+ }
+ 
++static void i915_guc_submission_park(struct intel_engine_cs *engine)
++{
++	intel_engine_unpin_breadcrumbs_irq(engine);
++}
++
++static void i915_guc_submission_unpark(struct intel_engine_cs *engine)
++{
++	intel_engine_pin_breadcrumbs_irq(engine);
++}
++
+ int i915_guc_submission_enable(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_guc *guc = &dev_priv->guc;
+@@ -1154,6 +1140,9 @@ int i915_guc_submission_enable(struct dr
+ 		execlists->irq_tasklet.func = i915_guc_irq_handler;
+ 		clear_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted);
+ 		tasklet_schedule(&execlists->irq_tasklet);
++
++		engine->park = i915_guc_submission_park;
++		engine->unpark = i915_guc_submission_unpark;
+ 	}
+ 
+ 	return 0;
+@@ -1168,6 +1157,8 @@ void i915_guc_submission_disable(struct
+ {
+ 	struct intel_guc *guc = &dev_priv->guc;
+ 
++	GEM_BUG_ON(dev_priv->gt.awake); /* GT should be parked first */
++
+ 	guc_interrupts_release(dev_priv);
+ 
+ 	/* Revert back to manual ELSP submission */
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1068,6 +1068,9 @@ static void notify_ring(struct intel_eng
+ 	struct drm_i915_gem_request *rq = NULL;
+ 	struct intel_wait *wait;
+ 
++	if (!engine->breadcrumbs.irq_armed)
++		return;
++
+ 	atomic_inc(&engine->irq_count);
+ 	set_bit(ENGINE_IRQ_BREADCRUMB, &engine->irq_posted);
+ 
+@@ -1101,7 +1104,8 @@ static void notify_ring(struct intel_eng
+ 		if (wakeup)
+ 			wake_up_process(wait->tsk);
+ 	} else {
+-		__intel_engine_disarm_breadcrumbs(engine);
++		if (engine->breadcrumbs.irq_armed)
++			__intel_engine_disarm_breadcrumbs(engine);
+ 	}
+ 	spin_unlock(&engine->breadcrumbs.irq_lock);
+ 
+--- a/drivers/gpu/drm/i915/intel_breadcrumbs.c
++++ b/drivers/gpu/drm/i915/intel_breadcrumbs.c
+@@ -121,7 +121,7 @@ static void intel_breadcrumbs_fake_irq(u
+ 	 */
+ 
+ 	spin_lock_irq(&b->irq_lock);
+-	if (!__intel_breadcrumbs_wakeup(b))
++	if (b->irq_armed && !__intel_breadcrumbs_wakeup(b))
+ 		__intel_engine_disarm_breadcrumbs(engine);
+ 	spin_unlock_irq(&b->irq_lock);
+ 	if (!b->irq_armed)
+@@ -169,15 +169,37 @@ void __intel_engine_disarm_breadcrumbs(s
+ 
+ 	lockdep_assert_held(&b->irq_lock);
+ 	GEM_BUG_ON(b->irq_wait);
++	GEM_BUG_ON(!b->irq_armed);
+ 
+-	if (b->irq_enabled) {
++	GEM_BUG_ON(!b->irq_enabled);
++	if (!--b->irq_enabled)
+ 		irq_disable(engine);
+-		b->irq_enabled = false;
+-	}
+ 
+ 	b->irq_armed = false;
+ }
+ 
++void intel_engine_pin_breadcrumbs_irq(struct intel_engine_cs *engine)
++{
++	struct intel_breadcrumbs *b = &engine->breadcrumbs;
++
++	spin_lock_irq(&b->irq_lock);
++	if (!b->irq_enabled++)
++		irq_enable(engine);
++	GEM_BUG_ON(!b->irq_enabled); /* no overflow! */
++	spin_unlock_irq(&b->irq_lock);
++}
++
++void intel_engine_unpin_breadcrumbs_irq(struct intel_engine_cs *engine)
++{
++	struct intel_breadcrumbs *b = &engine->breadcrumbs;
++
++	spin_lock_irq(&b->irq_lock);
++	GEM_BUG_ON(!b->irq_enabled); /* no underflow! */
++	if (!--b->irq_enabled)
++		irq_disable(engine);
++	spin_unlock_irq(&b->irq_lock);
++}
++
+ void intel_engine_disarm_breadcrumbs(struct intel_engine_cs *engine)
+ {
+ 	struct intel_breadcrumbs *b = &engine->breadcrumbs;
+@@ -247,6 +269,9 @@ static bool __intel_breadcrumbs_enable_i
+ 	struct intel_engine_cs *engine =
+ 		container_of(b, struct intel_engine_cs, breadcrumbs);
+ 	struct drm_i915_private *i915 = engine->i915;
++	bool enabled;
++
++	GEM_BUG_ON(!intel_irqs_enabled(i915));
+ 
+ 	lockdep_assert_held(&b->irq_lock);
+ 	if (b->irq_armed)
+@@ -258,7 +283,6 @@ static bool __intel_breadcrumbs_enable_i
+ 	 * the irq.
+ 	 */
+ 	b->irq_armed = true;
+-	GEM_BUG_ON(b->irq_enabled);
+ 
+ 	if (I915_SELFTEST_ONLY(b->mock)) {
+ 		/* For our mock objects we want to avoid interaction
+@@ -279,14 +303,15 @@ static bool __intel_breadcrumbs_enable_i
+ 	 */
+ 
+ 	/* No interrupts? Kick the waiter every jiffie! */
+-	if (intel_irqs_enabled(i915)) {
+-		if (!test_bit(engine->id, &i915->gpu_error.test_irq_rings))
+-			irq_enable(engine);
+-		b->irq_enabled = true;
++	enabled = false;
++	if (!b->irq_enabled++ &&
++	    !test_bit(engine->id, &i915->gpu_error.test_irq_rings)) {
++		irq_enable(engine);
++		enabled = true;
+ 	}
+ 
+ 	enable_fake_irq(b);
+-	return true;
++	return enabled;
+ }
+ 
+ static inline struct intel_wait *to_wait(struct rb_node *node)
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -339,9 +339,9 @@ struct intel_engine_cs {
+ 		struct timer_list hangcheck; /* detect missed interrupts */
+ 
+ 		unsigned int hangcheck_interrupts;
++		unsigned int irq_enabled;
+ 
+ 		bool irq_armed : 1;
+-		bool irq_enabled : 1;
+ 		I915_SELFTEST_DECLARE(bool mock : 1);
+ 	} breadcrumbs;
+ 
+@@ -848,6 +848,9 @@ unsigned int intel_engine_wakeup(struct
+ #define ENGINE_WAKEUP_WAITER BIT(0)
+ #define ENGINE_WAKEUP_ASLEEP BIT(1)
+ 
++void intel_engine_pin_breadcrumbs_irq(struct intel_engine_cs *engine);
++void intel_engine_unpin_breadcrumbs_irq(struct intel_engine_cs *engine);
++
+ void __intel_engine_disarm_breadcrumbs(struct intel_engine_cs *engine);
+ void intel_engine_disarm_breadcrumbs(struct intel_engine_cs *engine);
+ 
