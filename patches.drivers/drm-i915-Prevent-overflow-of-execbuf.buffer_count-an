@@ -1,0 +1,178 @@
+From d710fc16ff0749f7a8bd33c69785513fe8b95fb8 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 16 Nov 2017 10:50:59 +0000
+Subject: [PATCH] drm/i915: Prevent overflow of execbuf.buffer_count and num_cliprects
+Git-commit: d710fc16ff0749f7a8bd33c69785513fe8b95fb8
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+We check whether the multiplies will overflow prior to calling
+kmalloc_array so that we can respond with -EINVAL for the invalid user
+arguments rather than treating it as an -ENOMEM that would otherwise
+occur. However, as Dan Carpenter pointed out, we did an addition on the
+unsigned int prior to passing to kmalloc_array where it would be
+promoted to size_t for the calculation, thereby allowing it to overflow
+and underallocate.
+
+V2: buffer_count is currently limited to INT_MAX because we treat it as
+signaled variable for LUT_HANDLE in eb_lookup_vma
+V3: Move common checks for eb1/eb2 into the same function
+V4: Put the check back for nfence*sizeof(user_fence) overflow
+V5: access_ok uses ULONG_MAX but kvmalloc_array uses SIZE_MAX
+V6: size_t and unsigned long are not type-equivalent on 32b
+
+Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171116105059.25142-1-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   64 +++++++++++++++++++----------
+ 1 file changed, 42 insertions(+), 22 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -2074,20 +2074,24 @@ static struct drm_syncobj **
+ get_fence_array(struct drm_i915_gem_execbuffer2 *args,
+ 		struct drm_file *file)
+ {
+-	const unsigned int nfences = args->num_cliprects;
++	const unsigned long nfences = args->num_cliprects;
+ 	struct drm_i915_gem_exec_fence __user *user;
+ 	struct drm_syncobj **fences;
+-	unsigned int n;
++	unsigned long n;
+ 	int err;
+ 
+ 	if (!(args->flags & I915_EXEC_FENCE_ARRAY))
+ 		return NULL;
+ 
+-	if (nfences > SIZE_MAX / sizeof(*fences))
++	/* Check multiplication overflow for access_ok() and kvmalloc_array() */
++	BUILD_BUG_ON(sizeof(size_t) > sizeof(unsigned long));
++	if (nfences > min_t(unsigned long,
++			    ULONG_MAX / sizeof(*user),
++			    SIZE_MAX / sizeof(*fences)))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	user = u64_to_user_ptr(args->cliprects_ptr);
+-	if (!access_ok(VERIFY_READ, user, nfences * 2 * sizeof(u32)))
++	if (!access_ok(VERIFY_READ, user, nfences * sizeof(*user)))
+ 		return ERR_PTR(-EFAULT);
+ 
+ 	fences = kvmalloc_array(args->num_cliprects, sizeof(*fences),
+@@ -2447,6 +2451,26 @@ err_in_fence:
+ 	return err;
+ }
+ 
++static size_t eb_element_size(void)
++{
++	return (sizeof(struct drm_i915_gem_exec_object2) +
++		sizeof(struct i915_vma *) +
++		sizeof(unsigned int));
++}
++
++static bool check_buffer_count(size_t count)
++{
++	const size_t sz = eb_element_size();
++
++	/*
++	 * When using LUT_HANDLE, we impose a limit of INT_MAX for the lookup
++	 * array size (see eb_create()). Otherwise, we can accept an array as
++	 * large as can be addressed (though use large arrays at your peril)!
++	 */
++
++	return !(count < 1 || count > INT_MAX || count > SIZE_MAX / sz - 1);
++}
++
+ /*
+  * Legacy execbuffer just creates an exec2 list from the original exec object
+  * list array and passes it to the real function.
+@@ -2455,18 +2479,16 @@ int
+ i915_gem_execbuffer(struct drm_device *dev, void *data,
+ 		    struct drm_file *file)
+ {
+-	const size_t sz = (sizeof(struct drm_i915_gem_exec_object2) +
+-			   sizeof(struct i915_vma *) +
+-			   sizeof(unsigned int));
+ 	struct drm_i915_gem_execbuffer *args = data;
+ 	struct drm_i915_gem_execbuffer2 exec2;
+ 	struct drm_i915_gem_exec_object *exec_list = NULL;
+ 	struct drm_i915_gem_exec_object2 *exec2_list = NULL;
++	const size_t count = args->buffer_count;
+ 	unsigned int i;
+ 	int err;
+ 
+-	if (args->buffer_count < 1 || args->buffer_count > SIZE_MAX / sz - 1) {
+-		DRM_DEBUG("execbuf2 with %d buffers\n", args->buffer_count);
++	if (!check_buffer_count(count)) {
++		DRM_DEBUG("execbuf2 with %zd buffers\n", count);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -2485,9 +2507,9 @@ i915_gem_execbuffer(struct drm_device *d
+ 		return -EINVAL;
+ 
+ 	/* Copy in the exec list from userland */
+-	exec_list = kvmalloc_array(args->buffer_count, sizeof(*exec_list),
++	exec_list = kvmalloc_array(count, sizeof(*exec_list),
+ 				   __GFP_NOWARN | GFP_TEMPORARY);
+-	exec2_list = kvmalloc_array(args->buffer_count + 1, sz,
++	exec2_list = kvmalloc_array(count + 1, eb_element_size(),
+ 				    __GFP_NOWARN | GFP_TEMPORARY);
+ 	if (exec_list == NULL || exec2_list == NULL) {
+ 		DRM_DEBUG("Failed to allocate exec list for %d buffers\n",
+@@ -2498,7 +2520,7 @@ i915_gem_execbuffer(struct drm_device *d
+ 	}
+ 	err = copy_from_user(exec_list,
+ 			     u64_to_user_ptr(args->buffers_ptr),
+-			     sizeof(*exec_list) * args->buffer_count);
++			     sizeof(*exec_list) * count);
+ 	if (err) {
+ 		DRM_DEBUG("copy %d exec entries failed %d\n",
+ 			  args->buffer_count, err);
+@@ -2548,16 +2570,14 @@ int
+ i915_gem_execbuffer2(struct drm_device *dev, void *data,
+ 		     struct drm_file *file)
+ {
+-	const size_t sz = (sizeof(struct drm_i915_gem_exec_object2) +
+-			   sizeof(struct i915_vma *) +
+-			   sizeof(unsigned int));
+ 	struct drm_i915_gem_execbuffer2 *args = data;
+ 	struct drm_i915_gem_exec_object2 *exec2_list;
+ 	struct drm_syncobj **fences = NULL;
++	const size_t count = args->buffer_count;
+ 	int err;
+ 
+-	if (args->buffer_count < 1 || args->buffer_count > SIZE_MAX / sz - 1) {
+-		DRM_DEBUG("execbuf2 with %d buffers\n", args->buffer_count);
++	if (!check_buffer_count(count)) {
++		DRM_DEBUG("execbuf2 with %zd buffers\n", count);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -2565,17 +2585,17 @@ i915_gem_execbuffer2(struct drm_device *
+ 		return -EINVAL;
+ 
+ 	/* Allocate an extra slot for use by the command parser */
+-	exec2_list = kvmalloc_array(args->buffer_count + 1, sz,
++	exec2_list = kvmalloc_array(count + 1, eb_element_size(),
+ 				    __GFP_NOWARN | GFP_TEMPORARY);
+ 	if (exec2_list == NULL) {
+-		DRM_DEBUG("Failed to allocate exec list for %d buffers\n",
+-			  args->buffer_count);
++		DRM_DEBUG("Failed to allocate exec list for %zd buffers\n",
++			  count);
+ 		return -ENOMEM;
+ 	}
+ 	if (copy_from_user(exec2_list,
+ 			   u64_to_user_ptr(args->buffers_ptr),
+-			   sizeof(*exec2_list) * args->buffer_count)) {
+-		DRM_DEBUG("copy %d exec entries failed\n", args->buffer_count);
++			   sizeof(*exec2_list) * count)) {
++		DRM_DEBUG("copy %zd exec entries failed\n", count);
+ 		kvfree(exec2_list);
+ 		return -EFAULT;
+ 	}
