@@ -1,0 +1,373 @@
+From e27ab73d17ef90db3e586a02ce2f03eb660451cd Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 15 Jun 2017 13:38:49 +0100
+Subject: [PATCH] drm/i915: Mark CPU cache as dirty on every transition for CPU writes
+Git-commit: e27ab73d17ef90db3e586a02ce2f03eb660451cd
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+Currently, we only mark the CPU cache as dirty if we skip a clflush.
+This leads to some confusion where we have to ask if the object is in
+the write domain or missed a clflush. If we always mark the cache as
+dirty, this becomes a much simply question to answer.
+
+The goal remains to do as few clflushes as required and to do them as
+late as possible, in the hope of deferring the work to a kthread and not
+block the caller (e.g. execbuf, flips).
+
+V2: Always call clflush before GPU execution when the cache_dirty flag
+is set. This may cause some extra work on llc systems that migrate dirty
+buffers back and forth - but we do try to limit that by only setting
+cache_dirty at the end of the gpu sequence.
+
+V3: Always mark the cache as dirty upon a level change, as we need to
+invalidate any stale cachelines due to external writes.
+
+Reported-by: Dongwon Kim <dongwon.kim@intel.com>
+Fixes: a6a7cc4b7db6 ("drm/i915: Always flush the dirty CPU cache when pinning the scanout")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Dongwon Kim <dongwon.kim@intel.com>
+Cc: Matt Roper <matthew.d.roper@intel.com>
+Tested-by: Dongwon Kim <dongwon.kim@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170615123850.26843-1-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_gem.c                  |   76 +++++++++++++----------
+ drivers/gpu/drm/i915/i915_gem_clflush.c          |   15 ++--
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c       |   21 ++----
+ drivers/gpu/drm/i915/i915_gem_internal.c         |    3 
+ drivers/gpu/drm/i915/i915_gem_userptr.c          |    5 -
+ drivers/gpu/drm/i915/selftests/huge_gem_object.c |    3 
+ 6 files changed, 67 insertions(+), 56 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -49,7 +49,7 @@ static void i915_gem_flush_free_objects(
+ 
+ static bool cpu_write_needs_clflush(struct drm_i915_gem_object *obj)
+ {
+-	if (obj->base.write_domain == I915_GEM_DOMAIN_CPU)
++	if (obj->cache_dirty)
+ 		return false;
+ 
+ 	if (!i915_gem_object_is_coherent(obj))
+@@ -233,6 +233,14 @@ err_phys:
+ 	return st;
+ }
+ 
++static void __start_cpu_write(struct drm_i915_gem_object *obj)
++{
++	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
++	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
++	if (cpu_write_needs_clflush(obj))
++		obj->cache_dirty = true;
++}
++
+ static void
+ __i915_gem_object_release_shmem(struct drm_i915_gem_object *obj,
+ 				struct sg_table *pages,
+@@ -248,8 +256,7 @@ __i915_gem_object_release_shmem(struct d
+ 	    !i915_gem_object_is_coherent(obj))
+ 		drm_clflush_sg(pages);
+ 
+-	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
+-	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
++	__start_cpu_write(obj);
+ }
+ 
+ static void
+@@ -684,6 +691,12 @@ i915_gem_dumb_create(struct drm_file *fi
+ 			       args->size, &args->handle);
+ }
+ 
++static bool gpu_write_needs_clflush(struct drm_i915_gem_object *obj)
++{
++	return !(obj->cache_level == I915_CACHE_NONE ||
++		 obj->cache_level == I915_CACHE_WT);
++}
++
+ /**
+  * Creates a new mm object and returns a handle to it.
+  * @dev: drm device pointer
+@@ -753,6 +766,11 @@ flush_write_domain(struct drm_i915_gem_o
+ 	case I915_GEM_DOMAIN_CPU:
+ 		i915_gem_clflush_object(obj, I915_CLFLUSH_SYNC);
+ 		break;
++
++	case I915_GEM_DOMAIN_RENDER:
++		if (gpu_write_needs_clflush(obj))
++			obj->cache_dirty = true;
++		break;
+ 	}
+ 
+ 	obj->base.write_domain = 0;
+@@ -854,7 +872,8 @@ int i915_gem_obj_prepare_shmem_read(stru
+ 	 * optimizes for the case when the gpu will dirty the data
+ 	 * anyway again before the next pread happens.
+ 	 */
+-	if (!(obj->base.read_domains & I915_GEM_DOMAIN_CPU))
++	if (!obj->cache_dirty &&
++	    !(obj->base.read_domains & I915_GEM_DOMAIN_CPU))
+ 		*needs_clflush = CLFLUSH_BEFORE;
+ 
+ out:
+@@ -906,14 +925,16 @@ int i915_gem_obj_prepare_shmem_write(str
+ 	 * This optimizes for the case when the gpu will use the data
+ 	 * right away and we therefore have to clflush anyway.
+ 	 */
+-	if (obj->base.write_domain != I915_GEM_DOMAIN_CPU)
++	if (!obj->cache_dirty) {
+ 		*needs_clflush |= CLFLUSH_AFTER;
+ 
+-	/* Same trick applies to invalidate partially written cachelines read
+-	 * before writing.
+-	 */
+-	if (!(obj->base.read_domains & I915_GEM_DOMAIN_CPU))
+-		*needs_clflush |= CLFLUSH_BEFORE;
++		/*
++		 * Same trick applies to invalidate partially written
++		 * cachelines read before writing.
++		 */
++		if (!(obj->base.read_domains & I915_GEM_DOMAIN_CPU))
++			*needs_clflush |= CLFLUSH_BEFORE;
++	}
+ 
+ out:
+ 	intel_fb_obj_invalidate(obj, ORIGIN_CPU);
+@@ -3395,10 +3416,13 @@ int i915_gem_wait_for_idle(struct drm_i9
+ 
+ static void __i915_gem_object_flush_for_display(struct drm_i915_gem_object *obj)
+ {
+-	if (obj->base.write_domain != I915_GEM_DOMAIN_CPU && !obj->cache_dirty)
+-		return;
+-
+-	i915_gem_clflush_object(obj, I915_CLFLUSH_FORCE);
++	/*
++	 * We manually flush the CPU domain so that we can override and
++	 * force the flush for the display, and perform it asyncrhonously.
++	 */
++	flush_write_domain(obj, ~I915_GEM_DOMAIN_CPU);
++	if (obj->cache_dirty)
++		i915_gem_clflush_object(obj, I915_CLFLUSH_FORCE);
+ 	obj->base.write_domain = 0;
+ }
+ 
+@@ -3657,13 +3681,10 @@ restart:
+ 		}
+ 	}
+ 
+-	if (obj->base.write_domain == I915_GEM_DOMAIN_CPU &&
+-	    i915_gem_object_is_coherent(obj))
+-		obj->cache_dirty = true;
+-
+ 	list_for_each_entry(vma, &obj->vma_list, obj_link)
+ 		vma->node.color = cache_level;
+ 	obj->cache_level = cache_level;
++	obj->cache_dirty = true; /* Always invalidate stale cachelines */
+ 
+ 	return 0;
+ }
+@@ -3885,9 +3906,6 @@ i915_gem_object_set_to_cpu_domain(struct
+ 	if (ret)
+ 		return ret;
+ 
+-	if (obj->base.write_domain == I915_GEM_DOMAIN_CPU)
+-		return 0;
+-
+ 	flush_write_domain(obj, ~I915_GEM_DOMAIN_CPU);
+ 
+ 	/* Flush the CPU cache if it's still invalid. */
+@@ -3899,15 +3917,13 @@ i915_gem_object_set_to_cpu_domain(struct
+ 	/* It should now be out of any other write domains, and we can update
+ 	 * the domain values for our changes.
+ 	 */
+-	GEM_BUG_ON((obj->base.write_domain & ~I915_GEM_DOMAIN_CPU) != 0);
++	GEM_BUG_ON(obj->base.write_domain & ~I915_GEM_DOMAIN_CPU);
+ 
+ 	/* If we're writing through the CPU, then the GPU read domains will
+ 	 * need to be invalidated at next use.
+ 	 */
+-	if (write) {
+-		obj->base.read_domains = I915_GEM_DOMAIN_CPU;
+-		obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+-	}
++	if (write)
++		__start_cpu_write(obj);
+ 
+ 	return 0;
+ }
+@@ -4328,6 +4344,8 @@ i915_gem_object_create(struct drm_i915_p
+ 	} else
+ 		obj->cache_level = I915_CACHE_NONE;
+ 
++	obj->cache_dirty = !i915_gem_object_is_coherent(obj);
++
+ 	trace_i915_gem_object_create(obj);
+ 
+ 	return obj;
+@@ -4994,10 +5012,8 @@ int i915_gem_freeze_late(struct drm_i915
+ 
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+ 	for (p = phases; *p; p++) {
+-		list_for_each_entry(obj, *p, global_link) {
+-			obj->base.read_domains = I915_GEM_DOMAIN_CPU;
+-			obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+-		}
++		list_for_each_entry(obj, *p, global_link)
++			__start_cpu_write(obj);
+ 	}
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 
+--- a/drivers/gpu/drm/i915/i915_gem_clflush.c
++++ b/drivers/gpu/drm/i915/i915_gem_clflush.c
+@@ -71,8 +71,6 @@ static const struct dma_fence_ops i915_c
+ static void __i915_do_clflush(struct drm_i915_gem_object *obj)
+ {
+ 	drm_clflush_sg(obj->mm.pages);
+-	obj->cache_dirty = false;
+-
+ 	intel_fb_obj_flush(obj, ORIGIN_CPU);
+ }
+ 
+@@ -81,9 +79,6 @@ static void i915_clflush_work(struct wor
+ 	struct clflush *clflush = container_of(work, typeof(*clflush), work);
+ 	struct drm_i915_gem_object *obj = clflush->obj;
+ 
+-	if (!obj->cache_dirty)
+-		goto out;
+-
+ 	if (i915_gem_object_pin_pages(obj)) {
+ 		DRM_ERROR("Failed to acquire obj->pages for clflushing\n");
+ 		goto out;
+@@ -131,10 +126,10 @@ void i915_gem_clflush_object(struct drm_
+ 	 * anything not backed by physical memory we consider to be always
+ 	 * coherent and not need clflushing.
+ 	 */
+-	if (!i915_gem_object_has_struct_page(obj))
++	if (!i915_gem_object_has_struct_page(obj)) {
++		obj->cache_dirty = false;
+ 		return;
+-
+-	obj->cache_dirty = true;
++	}
+ 
+ 	/* If the GPU is snooping the contents of the CPU cache,
+ 	 * we do not need to manually clear the CPU cache lines.  However,
+@@ -153,6 +148,8 @@ void i915_gem_clflush_object(struct drm_
+ 	if (!(flags & I915_CLFLUSH_SYNC))
+ 		clflush = kmalloc(sizeof(*clflush), GFP_KERNEL);
+ 	if (clflush) {
++		GEM_BUG_ON(!obj->cache_dirty);
++
+ 		dma_fence_init(&clflush->dma,
+ 			       &i915_clflush_ops,
+ 			       &clflush_lock,
+@@ -180,4 +177,6 @@ void i915_gem_clflush_object(struct drm_
+ 	} else {
+ 		GEM_BUG_ON(obj->base.write_domain != I915_GEM_DOMAIN_CPU);
+ 	}
++
++	obj->cache_dirty = false;
+ }
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -309,7 +309,7 @@ static inline int use_cpu_reloc(struct d
+ 		return DBG_USE_CPU_RELOC > 0;
+ 
+ 	return (HAS_LLC(to_i915(obj->base.dev)) ||
+-		obj->base.write_domain == I915_GEM_DOMAIN_CPU ||
++		obj->cache_dirty ||
+ 		obj->cache_level != I915_CACHE_NONE);
+ }
+ 
+@@ -1110,10 +1110,8 @@ eb_move_to_gpu(struct i915_execbuffer *e
+ 		if (vma->exec_entry->flags & EXEC_OBJECT_ASYNC)
+ 			continue;
+ 
+-		if (obj->base.write_domain & I915_GEM_DOMAIN_CPU) {
++		if (obj->cache_dirty)
+ 			i915_gem_clflush_object(obj, 0);
+-			obj->base.write_domain = 0;
+-		}
+ 
+ 		ret = i915_gem_request_await_object
+ 			(eb->request, obj, obj->base.pending_write_domain);
+@@ -1248,12 +1246,6 @@ static int eb_select_context(struct i915
+ 	return 0;
+ }
+ 
+-static bool gpu_write_needs_clflush(struct drm_i915_gem_object *obj)
+-{
+-	return !(obj->cache_level == I915_CACHE_NONE ||
+-		 obj->cache_level == I915_CACHE_WT);
+-}
+-
+ void i915_vma_move_to_active(struct i915_vma *vma,
+ 			     struct drm_i915_gem_request *req,
+ 			     unsigned int flags)
+@@ -1277,15 +1269,16 @@ void i915_vma_move_to_active(struct i915
+ 	i915_gem_active_set(&vma->last_read[idx], req);
+ 	list_move_tail(&vma->vm_link, &vma->vm->active_list);
+ 
++	obj->base.write_domain = 0;
+ 	if (flags & EXEC_OBJECT_WRITE) {
++		obj->base.write_domain = I915_GEM_DOMAIN_RENDER;
++
+ 		if (intel_fb_obj_invalidate(obj, ORIGIN_CS))
+ 			i915_gem_active_set(&obj->frontbuffer_write, req);
+ 
+-		/* update for the implicit flush after a batch */
+-		obj->base.write_domain &= ~I915_GEM_GPU_DOMAINS;
+-		if (!obj->cache_dirty && gpu_write_needs_clflush(obj))
+-			obj->cache_dirty = true;
++		obj->base.read_domains = 0;
+ 	}
++	obj->base.read_domains |= I915_GEM_GPU_DOMAINS;
+ 
+ 	if (flags & EXEC_OBJECT_NEEDS_FENCE)
+ 		i915_gem_active_set(&vma->last_fence, req);
+--- a/drivers/gpu/drm/i915/i915_gem_internal.c
++++ b/drivers/gpu/drm/i915/i915_gem_internal.c
+@@ -188,9 +188,10 @@ i915_gem_object_create_internal(struct d
+ 	drm_gem_private_object_init(&i915->drm, &obj->base, size);
+ 	i915_gem_object_init(obj, &i915_gem_object_internal_ops);
+ 
+-	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
++	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	obj->cache_level = HAS_LLC(i915) ? I915_CACHE_LLC : I915_CACHE_NONE;
++	obj->cache_dirty = !i915_gem_object_is_coherent(obj);
+ 
+ 	return obj;
+ }
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -802,9 +802,10 @@ i915_gem_userptr_ioctl(struct drm_device
+ 
+ 	drm_gem_private_object_init(dev, &obj->base, args->user_size);
+ 	i915_gem_object_init(obj, &i915_gem_userptr_ops);
+-	obj->cache_level = I915_CACHE_LLC;
+-	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
++	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
++	obj->cache_level = I915_CACHE_LLC;
++	obj->cache_dirty = !i915_gem_object_is_coherent(obj);
+ 
+ 	obj->userptr.ptr = args->user_ptr;
+ 	obj->userptr.read_only = !!(args->flags & I915_USERPTR_READ_ONLY);
+--- a/drivers/gpu/drm/i915/selftests/huge_gem_object.c
++++ b/drivers/gpu/drm/i915/selftests/huge_gem_object.c
+@@ -126,9 +126,10 @@ huge_gem_object(struct drm_i915_private
+ 	drm_gem_private_object_init(&i915->drm, &obj->base, dma_size);
+ 	i915_gem_object_init(obj, &huge_ops);
+ 
+-	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
++	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
+ 	obj->cache_level = HAS_LLC(i915) ? I915_CACHE_LLC : I915_CACHE_NONE;
++	obj->cache_dirty = !i915_gem_object_is_coherent(obj);
+ 	obj->scratch = phys_size;
+ 
+ 	return obj;
