@@ -1,0 +1,160 @@
+From 6d2cb5aa383bf020ee95e33d9d107975f340ae1c Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 13 Sep 2017 14:35:34 +0100
+Subject: [PATCH] drm/i915/execlists: Read the context-status buffer from the HWSP
+Git-commit: 6d2cb5aa383bf020ee95e33d9d107975f340ae1c
+Patch-mainline: v4.15-rc1
+References: FATE#322643 bsc#1055900
+
+The engine provides a mirror of the CSB in the HWSP. If we use the
+cacheable reads from the HWSP, we can shave off a few mmio reads per
+context-switch interrupt (which are quite frequent!). Just removing a
+couple of mmio is not enough to actually reduce any latency, but a small
+reduction in overall cpu usage.
+
+Much appreciation for Ben dropping the bombshell that the CSB was in the
+HWSP and for Michel in digging out the details.
+
+V2: Don't be lazy, add the defines for the indices.
+V3: Include the HWSP in debugfs/i915_engine_info
+V4: Check for GVT-g, it currently depends on intercepting CSB mmio
+V5: Fixup GVT-g mmio path
+V6: Disable HWSP if VT-d is active as the iommu adds unpredictable
+memory latency. (Mika)
+V7: Also markup the CSB read with READ_ONCE() as it may still be an mmio
+read and we want to stop the compiler from issuing a later (v.slow) reload.
+
+Suggested-by: Ben Widawsky <benjamin.widawsky@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+Cc: Zhi Wang <zhi.a.wang@intel.com>
+Acked-by: Michel Thierry <michel.thierry@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170913133534.26927-1-chris@chris-wilson.co.uk
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |    7 ++++--
+ drivers/gpu/drm/i915/intel_lrc.c        |   35 +++++++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    3 ++
+ 3 files changed, 38 insertions(+), 7 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -3315,6 +3315,7 @@ static int i915_engine_info(struct seq_f
+ 			   upper_32_bits(addr), lower_32_bits(addr));
+ 
+ 		if (i915.enable_execlists) {
++			const u32 *hws = &engine->status_page.page_addr[I915_HWS_CSB_BUF0_INDEX];
+ 			u32 ptr, read, write;
+ 			unsigned int idx;
+ 
+@@ -3337,10 +3338,12 @@ static int i915_engine_info(struct seq_f
+ 				write += GEN8_CSB_ENTRIES;
+ 			while (read < write) {
+ 				idx = ++read % GEN8_CSB_ENTRIES;
+-				seq_printf(m, "\tExeclist CSB[%d]: 0x%08x, context: %d\n",
++				seq_printf(m, "\tExeclist CSB[%d]: 0x%08x [0x%08x in hwsp], context: %d [%d in hwsp]\n",
+ 					   idx,
+ 					   I915_READ(RING_CONTEXT_STATUS_BUF_LO(engine, idx)),
+-					   I915_READ(RING_CONTEXT_STATUS_BUF_HI(engine, idx)));
++					   hws[idx * 2],
++					   I915_READ(RING_CONTEXT_STATUS_BUF_HI(engine, idx)),
++					   hws[idx * 2 + 1]);
+ 			}
+ 
+ 			rcu_read_lock();
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -541,10 +541,17 @@ static void intel_lrc_irq_handler(unsign
+ 	while (test_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted)) {
+ 		u32 __iomem *csb_mmio =
+ 			dev_priv->regs + i915_mmio_reg_offset(RING_CONTEXT_STATUS_PTR(engine));
+-		u32 __iomem *buf =
+-			dev_priv->regs + i915_mmio_reg_offset(RING_CONTEXT_STATUS_BUF_LO(engine, 0));
++		/* The HWSP contains a (cacheable) mirror of the CSB */
++		const u32 *buf =
++			&engine->status_page.page_addr[I915_HWS_CSB_BUF0_INDEX];
+ 		unsigned int head, tail;
+ 
++		/* However GVT emulation depends upon intercepting CSB mmio */
++		if (unlikely(engine->csb_use_mmio)) {
++			buf = (u32 * __force)
++				(dev_priv->regs + i915_mmio_reg_offset(RING_CONTEXT_STATUS_BUF_LO(engine, 0)));
++		}
++
+ 		/* The write will be ordered by the uncached read (itself
+ 		 * a memory barrier), so we do not need another in the form
+ 		 * of a locked instruction. The race between the interrupt
+@@ -584,13 +591,12 @@ static void intel_lrc_irq_handler(unsign
+ 			 * status notifier.
+ 			 */
+ 
+-			status = readl(buf + 2 * head);
++			status = READ_ONCE(buf[2 * head]); /* maybe mmio! */
+ 			if (!(status & GEN8_CTX_STATUS_COMPLETED_MASK))
+ 				continue;
+ 
+ 			/* Check the context/desc id for this event matches */
+-			GEM_DEBUG_BUG_ON(readl(buf + 2 * head + 1) !=
+-					 port->context_id);
++			GEM_DEBUG_BUG_ON(buf[2 * head + 1] != port->context_id);
+ 
+ 			rq = port_unpack(port, &count);
+ 			GEM_BUG_ON(count == 0);
+@@ -1720,6 +1726,23 @@ logical_ring_default_irqs(struct intel_e
+ 	engine->irq_keep_mask = GT_CONTEXT_SWITCH_INTERRUPT << shift;
+ }
+ 
++static bool irq_handler_force_mmio(struct drm_i915_private *i915)
++{
++	/* GVT emulation depends upon intercepting CSB mmio */
++	if (intel_vgpu_active(i915))
++		return true;
++
++	/*
++	 * IOMMU adds unpredictable latency causing the CSB write (from the
++	 * GPU into the HWSP) to only be visible some time after the interrupt
++	 * (missed breadcrumb syndrome).
++	 */
++	if (intel_vtd_active())
++		return true;
++
++	return false;
++}
++
+ static void
+ logical_ring_setup(struct intel_engine_cs *engine)
+ {
+@@ -1731,6 +1754,8 @@ logical_ring_setup(struct intel_engine_c
+ 	/* Intentionally left blank. */
+ 	engine->buffer = NULL;
+ 
++	engine->csb_use_mmio = irq_handler_force_mmio(dev_priv);
++
+ 	fw_domains = intel_uncore_forcewake_for_reg(dev_priv,
+ 						    RING_ELSP(engine),
+ 						    FW_REG_WRITE);
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -391,6 +391,7 @@ struct intel_engine_cs {
+ 	struct rb_root execlist_queue;
+ 	struct rb_node *execlist_first;
+ 	unsigned int fw_domains;
++	bool csb_use_mmio;
+ 
+ 	/* Contexts are pinned whilst they are active on the GPU. The last
+ 	 * context executed remains active whilst the GPU is idle - the
+@@ -496,6 +497,8 @@ intel_write_status_page(struct intel_eng
+ #define I915_GEM_HWS_SCRATCH_INDEX	0x40
+ #define I915_GEM_HWS_SCRATCH_ADDR (I915_GEM_HWS_SCRATCH_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
+ 
++#define I915_HWS_CSB_BUF0_INDEX		0x10
++
+ struct intel_ring *
+ intel_engine_create_ring(struct intel_engine_cs *engine, int size);
+ int intel_ring_pin(struct intel_ring *ring,
