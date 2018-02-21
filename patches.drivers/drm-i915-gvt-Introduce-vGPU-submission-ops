@@ -1,0 +1,242 @@
+From ad1d36369b07f6b9db81897802ee5d8764eaa922 Mon Sep 17 00:00:00 2001
+From: Zhi Wang <zhi.a.wang@intel.com>
+Date: Wed, 13 Sep 2017 00:31:29 +0800
+Subject: [PATCH] drm/i915/gvt: Introduce vGPU submission ops
+Git-commit: ad1d36369b07f6b9db81897802ee5d8764eaa922
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+Introduce vGPU submission ops to support easy switching submission mode
+of one vGPU between different OSes.
+
+Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/execlist.c  |   10 +++++-
+ drivers/gpu/drm/i915/gvt/gvt.h       |   14 +++++++++
+ drivers/gpu/drm/i915/gvt/handlers.c  |   16 +++++++++-
+ drivers/gpu/drm/i915/gvt/scheduler.c |   53 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/gvt/scheduler.h |    6 +++
+ drivers/gpu/drm/i915/gvt/vgpu.c      |   13 +-------
+ 6 files changed, 98 insertions(+), 14 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/execlist.c
++++ b/drivers/gpu/drm/i915/gvt/execlist.c
+@@ -548,7 +548,7 @@ static void clean_workloads(struct intel
+ 	}
+ }
+ 
+-void intel_vgpu_clean_execlist(struct intel_vgpu *vgpu)
++void clean_execlist(struct intel_vgpu *vgpu)
+ {
+ 	enum intel_engine_id i;
+ 	struct intel_engine_cs *engine;
+@@ -564,7 +564,7 @@ void intel_vgpu_clean_execlist(struct in
+ 	}
+ }
+ 
+-int intel_vgpu_init_execlist(struct intel_vgpu *vgpu)
++int init_execlist(struct intel_vgpu *vgpu)
+ {
+ 	enum intel_engine_id i;
+ 	struct intel_engine_cs *engine;
+@@ -586,3 +586,9 @@ void intel_vgpu_reset_execlist(struct in
+ 	for_each_engine_masked(engine, dev_priv, engine_mask, tmp)
+ 		init_vgpu_execlist(vgpu, engine->id);
+ }
++
++const struct intel_vgpu_submission_ops intel_vgpu_execlist_submission_ops = {
++	.name = "execlist",
++	.init = init_execlist,
++	.clean = clean_execlist,
++};
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -142,6 +142,17 @@ struct vgpu_sched_ctl {
+ 	int weight;
+ };
+ 
++enum {
++	INTEL_VGPU_EXECLIST_SUBMISSION = 1,
++	INTEL_VGPU_GUC_SUBMISSION,
++};
++
++struct intel_vgpu_submission_ops {
++	const char *name;
++	int (*init)(struct intel_vgpu *vgpu);
++	void (*clean)(struct intel_vgpu *vgpu);
++};
++
+ struct intel_vgpu_submission {
+ 	struct intel_vgpu_execlist execlist[I915_NUM_ENGINES];
+ 	struct list_head workload_q_head[I915_NUM_ENGINES];
+@@ -152,6 +163,9 @@ struct intel_vgpu_submission {
+ 	DECLARE_BITMAP(tlb_handle_pending, I915_NUM_ENGINES);
+ 	void *ring_scan_buffer[I915_NUM_ENGINES];
+ 	int ring_scan_buffer_size[I915_NUM_ENGINES];
++	const struct intel_vgpu_submission_ops *ops;
++	int virtual_submission_interface;
++	bool active;
+ };
+ 
+ struct intel_vgpu {
+--- a/drivers/gpu/drm/i915/gvt/handlers.c
++++ b/drivers/gpu/drm/i915/gvt/handlers.c
+@@ -1464,9 +1464,11 @@ static int elsp_mmio_write(struct intel_
+ static int ring_mode_mmio_write(struct intel_vgpu *vgpu, unsigned int offset,
+ 		void *p_data, unsigned int bytes)
+ {
++	struct intel_vgpu_submission *s = &vgpu->submission;
+ 	u32 data = *(u32 *)p_data;
+ 	int ring_id = intel_gvt_render_mmio_to_ring_id(vgpu->gvt, offset);
+ 	bool enable_execlist;
++	int ret;
+ 
+ 	write_vreg(vgpu, offset, p_data, bytes);
+ 
+@@ -1488,8 +1490,18 @@ static int ring_mode_mmio_write(struct i
+ 				(enable_execlist ? "enabling" : "disabling"),
+ 				ring_id);
+ 
+-		if (enable_execlist)
+-			intel_vgpu_start_schedule(vgpu);
++		if (!enable_execlist)
++			return 0;
++
++		if (s->active)
++			return 0;
++
++		ret = intel_vgpu_select_submission_ops(vgpu,
++				INTEL_VGPU_EXECLIST_SUBMISSION);
++		if (ret)
++			return ret;
++
++		intel_vgpu_start_schedule(vgpu);
+ 	}
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -919,6 +919,7 @@ void intel_vgpu_clean_submission(struct
+ {
+ 	struct intel_vgpu_submission *s = &vgpu->submission;
+ 
++	intel_vgpu_select_submission_ops(vgpu, 0);
+ 	i915_gem_context_put(s->shadow_ctx);
+ 	kmem_cache_destroy(s->workloads);
+ }
+@@ -974,6 +975,58 @@ out_shadow_ctx:
+ }
+ 
+ /**
++ * intel_vgpu_select_submission_ops - select virtual submission interface
++ * @vgpu: a vGPU
++ * @interface: expected vGPU virtual submission interface
++ *
++ * This function is called when guest configures submission interface.
++ *
++ * Returns:
++ * Zero on success, negative error code if failed.
++ *
++ */
++int intel_vgpu_select_submission_ops(struct intel_vgpu *vgpu,
++				     unsigned int interface)
++{
++	struct intel_vgpu_submission *s = &vgpu->submission;
++	const struct intel_vgpu_submission_ops *ops[] = {
++		[INTEL_VGPU_EXECLIST_SUBMISSION] =
++			&intel_vgpu_execlist_submission_ops,
++	};
++	int ret;
++
++	if (WARN_ON(interface >= ARRAY_SIZE(ops)))
++		return -EINVAL;
++
++	if (s->active) {
++		s->ops->clean(vgpu);
++		s->active = false;
++		gvt_dbg_core("vgpu%d: de-select ops [ %s ] \n",
++				vgpu->id, s->ops->name);
++	}
++
++	if (interface == 0) {
++		s->ops = NULL;
++		s->virtual_submission_interface = 0;
++		gvt_dbg_core("vgpu%d: no submission ops\n", vgpu->id);
++		return 0;
++	}
++
++	ret = ops[interface]->init(vgpu);
++	if (ret)
++		return ret;
++
++	s->ops = ops[interface];
++	s->virtual_submission_interface = interface;
++	s->active = true;
++
++	gvt_dbg_core("vgpu%d: activate ops [ %s ]\n",
++			vgpu->id, s->ops->name);
++
++	return 0;
++}
++
++/**
+  * intel_vgpu_destroy_workload - destroy a vGPU workload
+  * @vgpu: a vGPU
+  *
+--- a/drivers/gpu/drm/i915/gvt/scheduler.h
++++ b/drivers/gpu/drm/i915/gvt/scheduler.h
+@@ -141,6 +141,12 @@ int intel_vgpu_setup_submission(struct i
+ 
+ void intel_vgpu_clean_submission(struct intel_vgpu *vgpu);
+ 
++int intel_vgpu_select_submission_ops(struct intel_vgpu *vgpu,
++				     unsigned int interface);
++
++extern const struct intel_vgpu_submission_ops
++intel_vgpu_execlist_submission_ops;
++
+ struct intel_vgpu_workload *
+ intel_vgpu_create_workload(struct intel_vgpu *vgpu, int ring_id,
+ 			   struct execlist_ctx_descriptor_format *desc);
+--- a/drivers/gpu/drm/i915/gvt/vgpu.c
++++ b/drivers/gpu/drm/i915/gvt/vgpu.c
+@@ -255,7 +255,6 @@ void intel_gvt_destroy_vgpu(struct intel
+ 	idr_remove(&gvt->vgpu_idr, vgpu->id);
+ 	intel_vgpu_clean_sched_policy(vgpu);
+ 	intel_vgpu_clean_submission(vgpu);
+-	intel_vgpu_clean_execlist(vgpu);
+ 	intel_vgpu_clean_display(vgpu);
+ 	intel_vgpu_clean_opregion(vgpu);
+ 	intel_vgpu_clean_gtt(vgpu);
+@@ -371,26 +370,20 @@ static struct intel_vgpu *__intel_gvt_cr
+ 	if (ret)
+ 		goto out_clean_gtt;
+ 
+-	ret = intel_vgpu_init_execlist(vgpu);
+-	if (ret)
+-		goto out_clean_display;
+-
+ 	ret = intel_vgpu_setup_submission(vgpu);
+ 	if (ret)
+-		goto out_clean_execlist;
++		goto out_clean_display;
+ 
+ 	ret = intel_vgpu_init_sched_policy(vgpu);
+ 	if (ret)
+-		goto out_clean_shadow_ctx;
++		goto out_clean_submission;
+ 
+ 	mutex_unlock(&gvt->lock);
+ 
+ 	return vgpu;
+ 
+-out_clean_shadow_ctx:
++out_clean_submission:
+ 	intel_vgpu_clean_submission(vgpu);
+-out_clean_execlist:
+-	intel_vgpu_clean_execlist(vgpu);
+ out_clean_display:
+ 	intel_vgpu_clean_display(vgpu);
+ out_clean_gtt:
