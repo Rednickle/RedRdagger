@@ -1,0 +1,170 @@
+From ff8f797557c73f1f191866a013b61a7286330021 Mon Sep 17 00:00:00 2001
+From: Weinan Li <weinan.z.li@intel.com>
+Date: Wed, 31 May 2017 10:35:52 +0800
+Subject: [PATCH] drm/i915: return the correct usable aperture size under gvt environment
+Git-commit: ff8f797557c73f1f191866a013b61a7286330021
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+I915_GEM_GET_APERTURE ioctl is used to probe aperture size from userspace.
+In gvt environment, each vm only use the ballooned part of aperture, so we
+should return the correct available aperture size exclude the reserved part
+by balloon.
+
+V2: add 'reserved' in struct i915_address_space to record the reserved size
+in ggtt (Chris)
+
+V3: remain aper_size as total, adjust aper_available_size exclude reserved
+and pinned. UMD driver need to adjust the max allocation size according to
+the available aperture size but not total size. KMD return the correct
+usable aperture size any time (Chris, Joonas)
+
+V4: decrease reserved in deballoon (Joonas)
+
+V5: add onion teardown in balloon, add vgt_deballoon_space (Joonas)
+
+V6: change title name (Zhenyu)
+
+V7: code style refine (Joonas)
+
+Suggested-by: Chris Wilson <chris@chris-wilson.co.uk>
+Suggested-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+Signed-off-by: Weinan Li <weinan.z.li@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1496198152-14175-1-git-send-email-weinan.z.li@intel.com
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_gem.c     |    4 +--
+ drivers/gpu/drm/i915/i915_gem_gtt.h |    1 
+ drivers/gpu/drm/i915/i915_vgpu.c    |   44 +++++++++++++++++++++++++-----------
+ 3 files changed, 34 insertions(+), 15 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -143,9 +143,9 @@ i915_gem_get_aperture_ioctl(struct drm_d
+ 	struct i915_ggtt *ggtt = &dev_priv->ggtt;
+ 	struct drm_i915_gem_get_aperture *args = data;
+ 	struct i915_vma *vma;
+-	size_t pinned;
++	u64 pinned;
+ 
+-	pinned = 0;
++	pinned = ggtt->base.reserved;
+ 	mutex_lock(&dev->struct_mutex);
+ 	list_for_each_entry(vma, &ggtt->base.active_list, vm_link)
+ 		if (i915_vma_is_pinned(vma))
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -255,6 +255,7 @@ struct i915_address_space {
+ 	struct drm_i915_file_private *file;
+ 	struct list_head global_link;
+ 	u64 total;		/* size addr space maps (ex. 2GB for ggtt) */
++	u64 reserved;		/* size addr space reserved */
+ 
+ 	bool closed;
+ 
+--- a/drivers/gpu/drm/i915/i915_vgpu.c
++++ b/drivers/gpu/drm/i915/i915_vgpu.c
+@@ -90,6 +90,18 @@ struct _balloon_info_ {
+ 
+ static struct _balloon_info_ bl_info;
+ 
++static void vgt_deballoon_space(struct i915_ggtt *ggtt,
++				struct drm_mm_node *node)
++{
++	DRM_DEBUG_DRIVER("deballoon space: range [0x%llx - 0x%llx] %llu KiB.\n",
++			 node->start,
++			 node->start + node->size,
++			 node->size / 1024);
++
++	ggtt->base.reserved -= node->size;
++	drm_mm_remove_node(node);
++}
++
+ /**
+  * intel_vgt_deballoon - deballoon reserved graphics address trunks
+  * @dev_priv: i915 device private data
+@@ -106,12 +118,8 @@ void intel_vgt_deballoon(struct drm_i915
+ 
+ 	DRM_DEBUG("VGT deballoon.\n");
+ 
+-	for (i = 0; i < 4; i++) {
+-		if (bl_info.space[i].allocated)
+-			drm_mm_remove_node(&bl_info.space[i]);
+-	}
+-
+-	memset(&bl_info, 0, sizeof(bl_info));
++	for (i = 0; i < 4; i++)
++		vgt_deballoon_space(&dev_priv->ggtt, &bl_info.space[i]);
+ }
+ 
+ static int vgt_balloon_space(struct i915_ggtt *ggtt,
+@@ -119,15 +127,20 @@ static int vgt_balloon_space(struct i915
+ 			     unsigned long start, unsigned long end)
+ {
+ 	unsigned long size = end - start;
++	int ret;
+ 
+ 	if (start >= end)
+ 		return -EINVAL;
+ 
+ 	DRM_INFO("balloon space: range [ 0x%lx - 0x%lx ] %lu KiB.\n",
+ 		 start, end, size / 1024);
+-	return i915_gem_gtt_reserve(&ggtt->base, node,
+-				    size, start, I915_COLOR_UNEVICTABLE,
+-				    0);
++	ret = i915_gem_gtt_reserve(&ggtt->base, node,
++				   size, start, I915_COLOR_UNEVICTABLE,
++				   0);
++	if (!ret)
++		ggtt->base.reserved += size;
++
++	return ret;
+ }
+ 
+ /**
+@@ -220,7 +233,7 @@ int intel_vgt_balloon(struct drm_i915_pr
+ 		ret = vgt_balloon_space(ggtt, &bl_info.space[3],
+ 					unmappable_end, ggtt_end);
+ 		if (ret)
+-			goto err;
++			goto err_upon_mappable;
+ 	}
+ 
+ 	/* Mappable graphic memory ballooning */
+@@ -229,7 +242,7 @@ int intel_vgt_balloon(struct drm_i915_pr
+ 					0, mappable_base);
+ 
+ 		if (ret)
+-			goto err;
++			goto err_upon_unmappable;
+ 	}
+ 
+ 	if (mappable_end < ggtt->mappable_end) {
+@@ -237,14 +250,19 @@ int intel_vgt_balloon(struct drm_i915_pr
+ 					mappable_end, ggtt->mappable_end);
+ 
+ 		if (ret)
+-			goto err;
++			goto err_below_mappable;
+ 	}
+ 
+ 	DRM_INFO("VGT balloon successfully\n");
+ 	return 0;
+ 
++err_below_mappable:
++	vgt_deballoon_space(ggtt, &bl_info.space[0]);
++err_upon_unmappable:
++	vgt_deballoon_space(ggtt, &bl_info.space[3]);
++err_upon_mappable:
++	vgt_deballoon_space(ggtt, &bl_info.space[2]);
+ err:
+ 	DRM_ERROR("VGT balloon fail\n");
+-	intel_vgt_deballoon(dev_priv);
+ 	return ret;
+ }
