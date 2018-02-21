@@ -1,0 +1,336 @@
+From cf6e7bac6357f0ccca51fcb5eb325e724f6b4c95 Mon Sep 17 00:00:00 2001
+From: Jason Ekstrand <jason@jlekstrand.net>
+Date: Tue, 15 Aug 2017 15:57:33 +0100
+Subject: [PATCH] drm/i915: Add support for drm syncobjs
+Git-commit: cf6e7bac6357f0ccca51fcb5eb325e724f6b4c95
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+This commit adds support for waiting on or signaling DRM syncobjs as
+part of execbuf.  It does so by hijacking the currently unused cliprects
+pointer to instead point to an array of i915_gem_exec_fence structs
+which containe a DRM syncobj and a flags parameter which specifies
+whether to wait on it or to signal it.  This implementation
+theoretically allows for both flags to be set in which case it waits on
+the dma_fence that was in the syncobj and then immediately replaces it
+with the dma_fence from the current execbuf.
+
+V2: - Rebase on new syncobj API
+V3: - Pull everything out into helpers - Do all allocation in gem_execbuffer2 - Pack the flags in the bottom 2 bits of the drm_syncobj*
+V4: - Prevent a potential race on syncobj->fence
+
+Testcase: igt/gem_exec_fence/syncobj*
+Signed-off-by: Jason Ekstrand <jason@jlekstrand.net>
+Link: https://patchwork.freedesktop.org/patch/msgid/1499289202-25441-1-git-send-email-jason.ekstrand@intel.com
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170815145733.4562-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.c            |    3 
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |  152 ++++++++++++++++++++++++++++-
+ include/uapi/drm/i915_drm.h                |   31 +++++
+ 3 files changed, 178 insertions(+), 8 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -388,6 +388,7 @@ static int i915_getparam(struct drm_devi
+ 	case I915_PARAM_HAS_EXEC_FENCE:
+ 	case I915_PARAM_HAS_EXEC_CAPTURE:
+ 	case I915_PARAM_HAS_EXEC_BATCH_FIRST:
++	case I915_PARAM_HAS_EXEC_FENCE_ARRAY:
+ 		/* For the time being all of these are always true;
+ 		 * if some supported hardware does not have one of these
+ 		 * features this value needs to be provided from
+@@ -2738,7 +2739,7 @@ static struct drm_driver driver = {
+ 	 */
+ 	.driver_features =
+ 	    DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED | DRIVER_GEM | DRIVER_PRIME |
+-	    DRIVER_RENDER | DRIVER_MODESET | DRIVER_ATOMIC,
++	    DRIVER_RENDER | DRIVER_MODESET | DRIVER_ATOMIC | DRIVER_SYNCOBJ,
+ 	.release = i915_driver_release,
+ 	.open = i915_driver_open,
+ 	.lastclose = i915_driver_lastclose,
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -32,6 +32,7 @@
+ #include <linux/uaccess.h>
+ 
+ #include <drm/drmP.h>
++#include <drm/drm_syncobj.h>
+ #include <drm/i915_drm.h>
+ 
+ #include "i915_drv.h"
+@@ -1896,8 +1897,10 @@ static bool i915_gem_check_execbuffer(st
+ 		return false;
+ 
+ 	/* Kernel clipping was a DRI1 misfeature */
+-	if (exec->num_cliprects || exec->cliprects_ptr)
+-		return false;
++	if (!(exec->flags & I915_EXEC_FENCE_ARRAY)) {
++		if (exec->num_cliprects || exec->cliprects_ptr)
++			return false;
++	}
+ 
+ 	if (exec->DR4 == 0xffffffff) {
+ 		DRM_DEBUG("UXA submitting garbage DR4, fixing up\n");
+@@ -2128,11 +2131,131 @@ eb_select_engine(struct drm_i915_private
+ 	return engine;
+ }
+ 
++static void
++__free_fence_array(struct drm_syncobj **fences, unsigned int n)
++{
++	while (n--)
++		drm_syncobj_put(ptr_mask_bits(fences[n], 2));
++	kvfree(fences);
++}
++
++static struct drm_syncobj **
++get_fence_array(struct drm_i915_gem_execbuffer2 *args,
++		struct drm_file *file)
++{
++	const unsigned int nfences = args->num_cliprects;
++	struct drm_i915_gem_exec_fence __user *user;
++	struct drm_syncobj **fences;
++	unsigned int n;
++	int err;
++
++	if (!(args->flags & I915_EXEC_FENCE_ARRAY))
++		return NULL;
++
++	if (nfences > SIZE_MAX / sizeof(*fences))
++		return ERR_PTR(-EINVAL);
++
++	user = u64_to_user_ptr(args->cliprects_ptr);
++	if (!access_ok(VERIFY_READ, user, nfences * 2 * sizeof(u32)))
++		return ERR_PTR(-EFAULT);
++
++	fences = kvmalloc_array(args->num_cliprects, sizeof(*fences),
++				__GFP_NOWARN | GFP_TEMPORARY);
++	if (!fences)
++		return ERR_PTR(-ENOMEM);
++
++	for (n = 0; n < nfences; n++) {
++		struct drm_i915_gem_exec_fence fence;
++		struct drm_syncobj *syncobj;
++
++		if (__copy_from_user(&fence, user++, sizeof(fence))) {
++			err = -EFAULT;
++			goto err;
++		}
++
++		syncobj = drm_syncobj_find(file, fence.handle);
++		if (!syncobj) {
++			DRM_DEBUG("Invalid syncobj handle provided\n");
++			err = -ENOENT;
++			goto err;
++		}
++
++		fences[n] = ptr_pack_bits(syncobj, fence.flags, 2);
++	}
++
++	return fences;
++
++err:
++	__free_fence_array(fences, n);
++	return ERR_PTR(err);
++}
++
++static void
++put_fence_array(struct drm_i915_gem_execbuffer2 *args,
++		struct drm_syncobj **fences)
++{
++	if (fences)
++		__free_fence_array(fences, args->num_cliprects);
++}
++
++static int
++await_fence_array(struct i915_execbuffer *eb,
++		  struct drm_syncobj **fences)
++{
++	const unsigned int nfences = eb->args->num_cliprects;
++	unsigned int n;
++	int err;
++
++	for (n = 0; n < nfences; n++) {
++		struct drm_syncobj *syncobj;
++		struct dma_fence *fence;
++		unsigned int flags;
++
++		syncobj = ptr_unpack_bits(fences[n], &flags, 2);
++		if (!(flags & I915_EXEC_FENCE_WAIT))
++			continue;
++
++		rcu_read_lock();
++		fence = dma_fence_get_rcu_safe(&syncobj->fence);
++		rcu_read_unlock();
++		if (!fence)
++			return -EINVAL;
++
++		err = i915_gem_request_await_dma_fence(eb->request, fence);
++		dma_fence_put(fence);
++		if (err < 0)
++			return err;
++	}
++
++	return 0;
++}
++
++static void
++signal_fence_array(struct i915_execbuffer *eb,
++		   struct drm_syncobj **fences)
++{
++	const unsigned int nfences = eb->args->num_cliprects;
++	struct dma_fence * const fence = &eb->request->fence;
++	unsigned int n;
++
++	for (n = 0; n < nfences; n++) {
++		struct drm_syncobj *syncobj;
++		unsigned int flags;
++
++		syncobj = ptr_unpack_bits(fences[n], &flags, 2);
++		if (!(flags & I915_EXEC_FENCE_SIGNAL))
++			continue;
++
++		drm_syncobj_replace_fence(syncobj, fence);
++	}
++}
++
+ static int
+ i915_gem_do_execbuffer(struct drm_device *dev,
+ 		       struct drm_file *file,
+ 		       struct drm_i915_gem_execbuffer2 *args,
+-		       struct drm_i915_gem_exec_object2 *exec)
++		       struct drm_i915_gem_exec_object2 *exec,
++		       struct drm_syncobj **fences)
+ {
+ 	struct i915_execbuffer eb;
+ 	struct dma_fence *in_fence = NULL;
+@@ -2318,6 +2441,12 @@ i915_gem_do_execbuffer(struct drm_device
+ 			goto err_request;
+ 	}
+ 
++	if (fences) {
++		err = await_fence_array(&eb, fences);
++		if (err)
++			goto err_request;
++	}
++
+ 	if (out_fence_fd != -1) {
+ 		out_fence = sync_file_create(&eb.request->fence);
+ 		if (!out_fence) {
+@@ -2341,6 +2470,9 @@ err_request:
+ 	__i915_add_request(eb.request, err == 0);
+ 	add_to_client(eb.request, file);
+ 
++	if (fences)
++		signal_fence_array(&eb, fences);
++
+ 	if (out_fence) {
+ 		if (err == 0) {
+ 			fd_install(out_fence_fd, out_fence->file);
+@@ -2442,7 +2574,7 @@ i915_gem_execbuffer(struct drm_device *d
+ 			exec2_list[i].flags = 0;
+ 	}
+ 
+-	err = i915_gem_do_execbuffer(dev, file, &exec2, exec2_list);
++	err = i915_gem_do_execbuffer(dev, file, &exec2, exec2_list, NULL);
+ 	if (exec2.flags & __EXEC_HAS_RELOC) {
+ 		struct drm_i915_gem_exec_object __user *user_exec_list =
+ 			u64_to_user_ptr(args->buffers_ptr);
+@@ -2474,6 +2606,7 @@ i915_gem_execbuffer2(struct drm_device *
+ 	const size_t sz = sizeof(struct drm_i915_gem_exec_object2);
+ 	struct drm_i915_gem_execbuffer2 *args = data;
+ 	struct drm_i915_gem_exec_object2 *exec2_list;
++	struct drm_syncobj **fences = NULL;
+ 	int err;
+ 
+ 	if (args->buffer_count < 1 || args->buffer_count > SIZE_MAX / sz - 1) {
+@@ -2500,7 +2633,15 @@ i915_gem_execbuffer2(struct drm_device *
+ 		return -EFAULT;
+ 	}
+ 
+-	err = i915_gem_do_execbuffer(dev, file, args, exec2_list);
++	if (args->flags & I915_EXEC_FENCE_ARRAY) {
++		fences = get_fence_array(args, file);
++		if (IS_ERR(fences)) {
++			kvfree(exec2_list);
++			return PTR_ERR(fences);
++		}
++	}
++
++	err = i915_gem_do_execbuffer(dev, file, args, exec2_list, fences);
+ 
+ 	/*
+ 	 * Now that we have begun execution of the batchbuffer, we ignore
+@@ -2530,6 +2671,7 @@ end_user:
+ 	}
+ 
+ 	args->flags &= ~__I915_EXEC_UNKNOWN_FLAGS;
++	put_fence_array(args, fences);
+ 	kvfree(exec2_list);
+ 	return err;
+ }
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -435,6 +435,11 @@ typedef struct drm_i915_irq_wait {
+  */
+ #define I915_PARAM_HAS_EXEC_BATCH_FIRST	 48
+ 
++/* Query whether DRM_I915_GEM_EXECBUFFER2 supports supplying an array of
++ * drm_i915_gem_exec_fence structures.  See I915_EXEC_FENCE_ARRAY.
++ */
++#define I915_PARAM_HAS_EXEC_FENCE_ARRAY  49
++
+ typedef struct drm_i915_getparam {
+ 	__s32 param;
+ 	/*
+@@ -816,6 +821,17 @@ struct drm_i915_gem_exec_object2 {
+ 	__u64 rsvd2;
+ };
+ 
++struct drm_i915_gem_exec_fence {
++	/**
++	 * User's handle for a drm_syncobj to wait on or signal.
++	 */
++	__u32 handle;
++
++#define I915_EXEC_FENCE_WAIT            (1<<0)
++#define I915_EXEC_FENCE_SIGNAL          (1<<1)
++	__u32 flags;
++};
++
+ struct drm_i915_gem_execbuffer2 {
+ 	/**
+ 	 * List of gem_exec_object2 structs
+@@ -830,7 +846,11 @@ struct drm_i915_gem_execbuffer2 {
+ 	__u32 DR1;
+ 	__u32 DR4;
+ 	__u32 num_cliprects;
+-	/** This is a struct drm_clip_rect *cliprects */
++	/**
++	 * This is a struct drm_clip_rect *cliprects if I915_EXEC_FENCE_ARRAY
++	 * is not set.  If I915_EXEC_FENCE_ARRAY is set, then this is a
++	 * struct drm_i915_gem_exec_fence *fences.
++	 */
+ 	__u64 cliprects_ptr;
+ #define I915_EXEC_RING_MASK              (7<<0)
+ #define I915_EXEC_DEFAULT                (0<<0)
+@@ -931,7 +951,14 @@ struct drm_i915_gem_execbuffer2 {
+  * element).
+  */
+ #define I915_EXEC_BATCH_FIRST		(1<<18)
+-#define __I915_EXEC_UNKNOWN_FLAGS (-(I915_EXEC_BATCH_FIRST<<1))
++
++/* Setting I915_FENCE_ARRAY implies that num_cliprects and cliprects_ptr
++ * define an array of i915_gem_exec_fence structures which specify a set of
++ * dma fences to wait upon or signal.
++ */
++#define I915_EXEC_FENCE_ARRAY   (1<<19)
++
++#define __I915_EXEC_UNKNOWN_FLAGS (-(I915_EXEC_FENCE_ARRAY<<1))
+ 
+ #define I915_EXEC_CONTEXT_ID_MASK	(0xffffffff)
+ #define i915_execbuffer2_set_context_id(eb2, context) \
