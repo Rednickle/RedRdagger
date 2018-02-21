@@ -1,0 +1,289 @@
+From fef9df8b594531a4257b6a3bf7e190570c17be29 Mon Sep 17 00:00:00 2001
+From: Gustavo Padovan <gustavo.padovan@collabora.com>
+Date: Fri, 30 Jun 2017 15:03:17 -0300
+Subject: [PATCH] drm/atomic: initial support for asynchronous plane update
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: fef9df8b594531a4257b6a3bf7e190570c17be29
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+In some cases, like cursor updates, it is interesting to update the
+plane in an asynchronous fashion to avoid big delays. The current queued
+update could be still waiting for a fence to signal and thus block any
+subsequent update until its scan out. In cases like this if we update the
+cursor synchronously through the atomic API it will cause significant
+delays that would even be noticed by the final user.
+
+This patch creates a fast path to jump ahead the current queued state and
+do single planes updates without going through all atomic steps in
+drm_atomic_helper_commit(). We take this path for legacy cursor updates.
+
+For now only single plane updates are supported, but we plan to support
+multiple planes updates and async PageFlips through this interface as well
+in the near future.
+
+V6: - move check code to drm_atomic_helper.c (Daniel Vetter)
+
+V5: - improve comments (Eric Anholt)
+
+V4: - fix state->crtc NULL check (Archit Taneja)
+
+V3: - fix iteration on the wrong crtc state	- put back code to forbid updates if there is a queued update for	the same plane (Ville Syrjälä)	- move size checks back to drivers (Ville Syrjälä)	- move ASYNC_UPDATE flag addition to its own patch (Ville Syrjälä)
+
+V2: - allow updates even if there is a queued update for the same	plane.        - fixes on the documentation (Emil Velikov)        - unconditionally call ->atomic_async_update (Emil Velikov)        - check for ->atomic_async_update earlier (Daniel Vetter)        - make ->atomic_async_check() the last step (Daniel Vetter)        - add ASYNC_UPDATE flag (Eric Anholt)        - update state in core after ->atomic_async_update (Eric Anholt)	- update docs (Eric Anholt)
+
+Cc: Daniel Vetter <daniel.vetter@intel.com>
+Cc: Rob Clark <robdclark@gmail.com>
+Cc: Eric Anholt <eric@anholt.net>
+Signed-off-by: Gustavo Padovan <gustavo.padovan@collabora.com>
+Reviewed-by: Archit Taneja <architt@codeaurora.org> (v5)
+Acked-by: Eric Anholt <eric@anholt.net> (v5)
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170630180322.29007-2-gustavo@padovan.org
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/drm_atomic_helper.c      |  122 +++++++++++++++++++++++++++++++
+ include/drm/drm_atomic.h                 |    2 
+ include/drm/drm_atomic_helper.h          |    4 +
+ include/drm/drm_modeset_helper_vtables.h |   50 ++++++++++++
+ 4 files changed, 178 insertions(+)
+
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -795,6 +795,9 @@ int drm_atomic_helper_check(struct drm_d
+ 	if (ret)
+ 		return ret;
+ 
++	if (state->legacy_cursor_update)
++		state->async_update = !drm_atomic_helper_async_check(dev, state);
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(drm_atomic_helper_check);
+@@ -1352,6 +1355,114 @@ static void commit_work(struct work_stru
+ }
+ 
+ /**
++ * drm_atomic_helper_async_check - check if state can be commited asynchronously
++ * @dev: DRM device
++ * @state: the driver state object
++ *
++ * This helper will check if it is possible to commit the state asynchronously.
++ * Async commits are not supposed to swap the states like normal sync commits
++ * but just do in-place changes on the current state.
++ *
++ * It will return 0 if the commit can happen in an asynchronous fashion or error
++ * if not. Note that error just mean it can't be commited asynchronously, if it
++ * fails the commit should be treated like a normal synchronous commit.
++ */
++int drm_atomic_helper_async_check(struct drm_device *dev,
++				   struct drm_atomic_state *state)
++{
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
++	struct drm_crtc_commit *commit;
++	struct drm_plane *__plane, *plane = NULL;
++	struct drm_plane_state *__plane_state, *plane_state = NULL;
++	const struct drm_plane_helper_funcs *funcs;
++	int i, j, n_planes = 0;
++
++	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
++		if (drm_atomic_crtc_needs_modeset(crtc_state))
++			return -EINVAL;
++	}
++
++	for_each_new_plane_in_state(state, __plane, __plane_state, i) {
++		n_planes++;
++		plane = __plane;
++		plane_state = __plane_state;
++	}
++
++	/* FIXME: we support only single plane updates for now */
++	if (!plane || n_planes != 1)
++		return -EINVAL;
++
++	if (!plane_state->crtc)
++		return -EINVAL;
++
++	funcs = plane->helper_private;
++	if (!funcs->atomic_async_update)
++		return -EINVAL;
++
++	if (plane_state->fence)
++		return -EINVAL;
++
++	/*
++	 * Don't do an async update if there is an outstanding commit modifying
++	 * the plane.  This prevents our async update's changes from getting
++	 * overridden by a previous synchronous update's state.
++	 */
++	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
++		if (plane->crtc != crtc)
++			continue;
++
++		spin_lock(&crtc->commit_lock);
++		commit = list_first_entry_or_null(&crtc->commit_list,
++						  struct drm_crtc_commit,
++						  commit_entry);
++		if (!commit) {
++			spin_unlock(&crtc->commit_lock);
++			continue;
++		}
++		spin_unlock(&crtc->commit_lock);
++
++		if (!crtc->state->state)
++			continue;
++
++		for_each_plane_in_state(crtc->state->state, __plane,
++					__plane_state, j) {
++			if (__plane == plane)
++				return -EINVAL;
++		}
++	}
++
++	return funcs->atomic_async_check(plane, plane_state);
++}
++EXPORT_SYMBOL(drm_atomic_helper_async_check);
++
++/**
++ * drm_atomic_helper_async_commit - commit state asynchronously
++ * @dev: DRM device
++ * @state: the driver state object
++ *
++ * This function commits a state asynchronously, i.e., not vblank
++ * synchronized. It should be used on a state only when
++ * drm_atomic_async_check() succeeds. Async commits are not supposed to swap
++ * the states like normal sync commits, but just do in-place changes on the
++ * current state.
++ */
++void drm_atomic_helper_async_commit(struct drm_device *dev,
++				    struct drm_atomic_state *state)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	const struct drm_plane_helper_funcs *funcs;
++	int i;
++
++	for_each_new_plane_in_state(state, plane, plane_state, i) {
++		funcs = plane->helper_private;
++		funcs->atomic_async_update(plane, plane_state);
++	}
++}
++EXPORT_SYMBOL(drm_atomic_helper_async_commit);
++
++/**
+  * drm_atomic_helper_commit - commit validated state object
+  * @dev: DRM device
+  * @state: the driver state object
+@@ -1375,6 +1486,17 @@ int drm_atomic_helper_commit(struct drm_
+ {
+ 	int ret;
+ 
++	if (state->async_update) {
++		ret = drm_atomic_helper_prepare_planes(dev, state);
++		if (ret)
++			return ret;
++
++		drm_atomic_helper_async_commit(dev, state);
++		drm_atomic_helper_cleanup_planes(dev, state);
++
++		return 0;
++	}
++
+ 	ret = drm_atomic_helper_setup_commit(state, nonblock);
+ 	if (ret)
+ 		return ret;
+--- a/include/drm/drm_atomic.h
++++ b/include/drm/drm_atomic.h
+@@ -207,6 +207,7 @@ struct __drm_private_objs_state {
+  * @dev: parent DRM device
+  * @allow_modeset: allow full modeset
+  * @legacy_cursor_update: hint to enforce legacy cursor IOCTL semantics
++ * @async_update: hint for asynchronous plane update
+  * @planes: pointer to array of structures with per-plane data
+  * @crtcs: pointer to array of CRTC pointers
+  * @num_connector: size of the @connectors and @connector_states arrays
+@@ -221,6 +222,7 @@ struct drm_atomic_state {
+ 	struct drm_device *dev;
+ 	bool allow_modeset : 1;
+ 	bool legacy_cursor_update : 1;
++	bool async_update : 1;
+ 	struct __drm_planes_state *planes;
+ 	struct __drm_crtcs_state *crtcs;
+ 	int num_connector;
+--- a/include/drm/drm_atomic_helper.h
++++ b/include/drm/drm_atomic_helper.h
+@@ -44,6 +44,10 @@ void drm_atomic_helper_commit_tail(struc
+ int drm_atomic_helper_commit(struct drm_device *dev,
+ 			     struct drm_atomic_state *state,
+ 			     bool nonblock);
++int drm_atomic_helper_async_check(struct drm_device *dev,
++				  struct drm_atomic_state *state);
++void drm_atomic_helper_async_commit(struct drm_device *dev,
++				    struct drm_atomic_state *state);
+ 
+ int drm_atomic_helper_wait_for_fences(struct drm_device *dev,
+ 					struct drm_atomic_state *state,
+--- a/include/drm/drm_modeset_helper_vtables.h
++++ b/include/drm/drm_modeset_helper_vtables.h
+@@ -1129,6 +1129,56 @@ struct drm_plane_helper_funcs {
+ 	 */
+ 	void (*atomic_disable)(struct drm_plane *plane,
+ 			       struct drm_plane_state *old_state);
++
++	/**
++	 * @atomic_async_check:
++	 *
++	 * Drivers should set this function pointer to check if the plane state
++	 * can be updated in a async fashion. Here async means "not vblank
++	 * synchronized".
++	 *
++	 * This hook is called by drm_atomic_async_check() to establish if a
++	 * given update can be committed asynchronously, that is, if it can
++	 * jump ahead of the state currently queued for update.
++	 *
++	 * RETURNS:
++	 *
++	 * Return 0 on success and any error returned indicates that the update
++	 * can not be applied in asynchronous manner.
++	 */
++	int (*atomic_async_check)(struct drm_plane *plane,
++				  struct drm_plane_state *state);
++
++	/**
++	 * @atomic_async_update:
++	 *
++	 * Drivers should set this function pointer to perform asynchronous
++	 * updates of planes, that is, jump ahead of the currently queued
++	 * state and update the plane. Here async means "not vblank
++	 * synchronized".
++	 *
++	 * This hook is called by drm_atomic_helper_async_commit().
++	 *
++	 * An async update will happen on legacy cursor updates. An async
++	 * update won't happen if there is an outstanding commit modifying
++	 * the same plane.
++	 *
++	 * Note that unlike &drm_plane_helper_funcs.atomic_update this hook
++	 * takes the new &drm_plane_state as parameter. When doing async_update
++	 * drivers shouldn't replace the &drm_plane_state but update the
++	 * current one with the new plane configurations in the new
++	 * plane_state.
++	 *
++	 * FIXME:
++	 *  - It only works for single plane updates
++	 *  - Async Pageflips are not supported yet
++	 *  - Some hw might still scan out the old buffer until the next
++	 *  vblank, however we let go of the fb references as soon as
++	 *  we run this hook. For now drivers must implement their own workers
++	 *  for deferring if needed, until a common solution is created.
++	 */
++	void (*atomic_async_update)(struct drm_plane *plane,
++				    struct drm_plane_state *new_state);
+ };
+ 
+ /**
