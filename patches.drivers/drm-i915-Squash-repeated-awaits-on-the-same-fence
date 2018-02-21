@@ -1,0 +1,1823 @@
+From 4797948071f607c5b43753cb8f1b7ddcf22e146d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 3 May 2017 10:39:21 +0100
+Subject: [PATCH] drm/i915: Squash repeated awaits on the same fence
+Git-commit: 4797948071f607c5b43753cb8f1b7ddcf22e146d
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+Track the latest fence waited upon on each context, and only add a new
+asynchronous wait if the new fence is more recent than the recorded
+fence for that context. This requires us to filter out unordered
+timelines, which are noted by DMA_FENCE_NO_CONTEXT. However, in the
+absence of a universal identifier, we have to use our own
+i915->mm.unordered_timeline token.
+
+V2: Throw around the debug crutches
+V3: Inline the likely case of the pre-allocation cache being full.
+V4: Drop the pre-allocation support, we can lose the most recent fence
+in case of allocation failure -- it just means we may emit more awaits
+than strictly necessary but will not break.
+V5: Trim allocation size for leaf nodes, they only need an array of u32
+not pointers.
+V6: Create mock_timeline to tidy selftest writing
+V7: s/intel_timeline_sync_get/intel_timeline_sync_is_later/ (Tvrtko)
+V8: Prune the stale sync points when we idle.
+V9: Include a small benchmark in the kselftests
+V10: Separate the idr implementation into its own compartment. (Tvrkto)
+V11: Refactor igt_sync kselftests to avoid deep nesting (Tvrkto)
+V12: __sync_leaf_idx() to assert that p->height is 0 when checking leaves
+V13: kselftests to investigate struct i915_syncmap itself (Tvrtko)
+V14: Foray into ascii art graphs
+V15: Take into account that the random lookup/insert does 2 prng calls,
+not 1, when benchmarking, and use for_each_set_bit() (Tvrtko)
+V16: Improved ascii art
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170503093924.5320-4-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/Makefile                        |    1 
+ drivers/gpu/drm/i915/i915_gem.c                      |    1 
+ drivers/gpu/drm/i915/i915_gem.h                      |    2 
+ drivers/gpu/drm/i915/i915_gem_request.c              |    9 
+ drivers/gpu/drm/i915/i915_gem_timeline.c             |   95 ++
+ drivers/gpu/drm/i915/i915_gem_timeline.h             |   38 +
+ drivers/gpu/drm/i915/i915_syncmap.c                  |  412 ++++++++++++
+ drivers/gpu/drm/i915/i915_syncmap.h                  |   38 +
+ drivers/gpu/drm/i915/selftests/i915_gem_timeline.c   |  301 +++++++++
+ drivers/gpu/drm/i915/selftests/i915_mock_selftests.h |    2 
+ drivers/gpu/drm/i915/selftests/i915_random.c         |   11 
+ drivers/gpu/drm/i915/selftests/i915_random.h         |    2 
+ drivers/gpu/drm/i915/selftests/i915_syncmap.c        |  616 +++++++++++++++++++
+ drivers/gpu/drm/i915/selftests/mock_timeline.c       |   45 +
+ drivers/gpu/drm/i915/selftests/mock_timeline.h       |   33 +
+ 15 files changed, 1588 insertions(+), 18 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/i915_syncmap.c
+ create mode 100644 drivers/gpu/drm/i915/i915_syncmap.h
+ create mode 100644 drivers/gpu/drm/i915/selftests/i915_gem_timeline.c
+ create mode 100644 drivers/gpu/drm/i915/selftests/i915_syncmap.c
+ create mode 100644 drivers/gpu/drm/i915/selftests/mock_timeline.c
+ create mode 100644 drivers/gpu/drm/i915/selftests/mock_timeline.h
+
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -16,6 +16,7 @@ i915-y := i915_drv.o \
+ 	  i915_params.o \
+ 	  i915_pci.o \
+           i915_suspend.o \
++	  i915_syncmap.o \
+ 	  i915_sw_fence.o \
+ 	  i915_sysfs.o \
+ 	  intel_csr.o \
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3216,6 +3216,7 @@ i915_gem_idle_work_handler(struct work_s
+ 		intel_engine_disarm_breadcrumbs(engine);
+ 		i915_gem_batch_pool_fini(&engine->batch_pool);
+ 	}
++	i915_gem_timelines_mark_idle(dev_priv);
+ 
+ 	GEM_BUG_ON(!dev_priv->gt.awake);
+ 	dev_priv->gt.awake = false;
+--- a/drivers/gpu/drm/i915/i915_gem.h
++++ b/drivers/gpu/drm/i915/i915_gem.h
+@@ -25,6 +25,8 @@
+ #ifndef __I915_GEM_H__
+ #define __I915_GEM_H__
+ 
++#include <linux/bug.h>
++
+ #ifdef CONFIG_DRM_I915_DEBUG_GEM
+ #define GEM_BUG_ON(expr) BUG_ON(expr)
+ #define GEM_WARN_ON(expr) WARN_ON(expr)
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -765,6 +765,11 @@ i915_gem_request_await_dma_fence(struct
+ 		if (fence->context == req->fence.context)
+ 			continue;
+ 
++		/* Squash repeated waits to the same timelines */
++		if (fence->context != req->i915->mm.unordered_timeline &&
++		    intel_timeline_sync_is_later(req->timeline, fence))
++			continue;
++
+ 		if (dma_fence_is_i915(fence))
+ 			ret = i915_gem_request_await_request(req,
+ 							     to_request(fence));
+@@ -774,6 +779,10 @@ i915_gem_request_await_dma_fence(struct
+ 							    GFP_KERNEL);
+ 		if (ret < 0)
+ 			return ret;
++
++		/* Record the latest fence used against each timeline */
++		if (fence->context != req->i915->mm.unordered_timeline)
++			intel_timeline_sync_set(req->timeline, fence);
+ 	} while (--nchild);
+ 
+ 	return 0;
+--- a/drivers/gpu/drm/i915/i915_gem_timeline.c
++++ b/drivers/gpu/drm/i915/i915_gem_timeline.c
+@@ -23,6 +23,32 @@
+  */
+ 
+ #include "i915_drv.h"
++#include "i915_syncmap.h"
++
++static void __intel_timeline_init(struct intel_timeline *tl,
++				  struct i915_gem_timeline *parent,
++				  u64 context,
++				  struct lock_class_key *lockclass,
++				  const char *lockname)
++{
++	tl->fence_context = context;
++	tl->common = parent;
++#ifdef CONFIG_DEBUG_SPINLOCK
++	__raw_spin_lock_init(&tl->lock.rlock, lockname, lockclass);
++#else
++	spin_lock_init(&tl->lock);
++#endif
++	init_request_active(&tl->last_request, NULL);
++	INIT_LIST_HEAD(&tl->requests);
++	i915_syncmap_init(&tl->sync);
++}
++
++static void __intel_timeline_fini(struct intel_timeline *tl)
++{
++	GEM_BUG_ON(!list_empty(&tl->requests));
++
++	i915_syncmap_free(&tl->sync);
++}
+ 
+ static int __i915_gem_timeline_init(struct drm_i915_private *i915,
+ 				    struct i915_gem_timeline *timeline,
+@@ -35,6 +61,14 @@ static int __i915_gem_timeline_init(stru
+ 
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 
++	/*
++	 * Ideally we want a set of engines on a single leaf as we expect
++	 * to mostly be tracking synchronisation between engines. It is not
++	 * a huge issue if this is not the case, but we may want to mitigate
++	 * any page crossing penalties if they become an issue.
++	 */
++	BUILD_BUG_ON(KSYNCMAP < I915_NUM_ENGINES);
++
+ 	timeline->i915 = i915;
+ 	timeline->name = kstrdup(name ?: "[kernel]", GFP_KERNEL);
+ 	if (!timeline->name)
+@@ -44,19 +78,10 @@ static int __i915_gem_timeline_init(stru
+ 
+ 	/* Called during early_init before we know how many engines there are */
+ 	fences = dma_fence_context_alloc(ARRAY_SIZE(timeline->engine));
+-	for (i = 0; i < ARRAY_SIZE(timeline->engine); i++) {
+-		struct intel_timeline *tl = &timeline->engine[i];
+-
+-		tl->fence_context = fences++;
+-		tl->common = timeline;
+-#ifdef CONFIG_DEBUG_SPINLOCK
+-		__raw_spin_lock_init(&tl->lock.rlock, lockname, lockclass);
+-#else
+-		spin_lock_init(&tl->lock);
+-#endif
+-		init_request_active(&tl->last_request, NULL);
+-		INIT_LIST_HEAD(&tl->requests);
+-	}
++	for (i = 0; i < ARRAY_SIZE(timeline->engine); i++)
++		__intel_timeline_init(&timeline->engine[i],
++				      timeline, fences++,
++				      lockclass, lockname);
+ 
+ 	return 0;
+ }
+@@ -81,18 +106,52 @@ int i915_gem_timeline_init__global(struc
+ 					&class, "&global_timeline->lock");
+ }
+ 
++/**
++ * i915_gem_timelines_mark_idle -- called when the driver idles
++ * @i915 - the drm_i915_private device
++ *
++ * When the driver is completely idle, we know that all of our sync points
++ * have been signaled and our tracking is then entirely redundant. Any request
++ * to wait upon an older sync point will be completed instantly as we know
++ * the fence is signaled and therefore we will not even look them up in the
++ * sync point map.
++ */
++void i915_gem_timelines_mark_idle(struct drm_i915_private *i915)
++{
++	struct i915_gem_timeline *timeline;
++	int i;
++
++	lockdep_assert_held(&i915->drm.struct_mutex);
++
++	list_for_each_entry(timeline, &i915->gt.timelines, link) {
++		for (i = 0; i < ARRAY_SIZE(timeline->engine); i++) {
++			struct intel_timeline *tl = &timeline->engine[i];
++
++			/*
++			 * All known fences are completed so we can scrap
++			 * the current sync point tracking and start afresh,
++			 * any attempt to wait upon a previous sync point
++			 * will be skipped as the fence was signaled.
++			 */
++			i915_syncmap_free(&tl->sync);
++		}
++	}
++}
++
+ void i915_gem_timeline_fini(struct i915_gem_timeline *timeline)
+ {
+ 	int i;
+ 
+ 	lockdep_assert_held(&timeline->i915->drm.struct_mutex);
+ 
+-	for (i = 0; i < ARRAY_SIZE(timeline->engine); i++) {
+-		struct intel_timeline *tl = &timeline->engine[i];
+-
+-		GEM_BUG_ON(!list_empty(&tl->requests));
+-	}
++	for (i = 0; i < ARRAY_SIZE(timeline->engine); i++)
++		__intel_timeline_fini(&timeline->engine[i]);
+ 
+ 	list_del(&timeline->link);
+ 	kfree(timeline->name);
+ }
++
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++#include "selftests/mock_timeline.c"
++#include "selftests/i915_gem_timeline.c"
++#endif
+--- a/drivers/gpu/drm/i915/i915_gem_timeline.h
++++ b/drivers/gpu/drm/i915/i915_gem_timeline.h
+@@ -27,7 +27,9 @@
+ 
+ #include <linux/list.h>
+ 
++#include "i915_utils.h"
+ #include "i915_gem_request.h"
++#include "i915_syncmap.h"
+ 
+ struct i915_gem_timeline;
+ 
+@@ -55,6 +57,17 @@ struct intel_timeline {
+ 	 * struct_mutex.
+ 	 */
+ 	struct i915_gem_active last_request;
++
++	/**
++	 * We track the most recent seqno that we wait on in every context so
++	 * that we only have to emit a new await and dependency on a more
++	 * recent sync point. As the contexts may be executed out-of-order, we
++	 * have to track each individually and can not rely on an absolute
++	 * global_seqno. When we know that all tracked fences are completed
++	 * (i.e. when the driver is idle), we know that the syncmap is
++	 * redundant and we can discard it without loss of generality.
++	 */
++	struct i915_syncmap *sync;
+ 	u32 sync_seqno[I915_NUM_ENGINES];
+ 
+ 	struct i915_gem_timeline *common;
+@@ -73,6 +86,31 @@ int i915_gem_timeline_init(struct drm_i9
+ 			   struct i915_gem_timeline *tl,
+ 			   const char *name);
+ int i915_gem_timeline_init__global(struct drm_i915_private *i915);
++void i915_gem_timelines_mark_idle(struct drm_i915_private *i915);
+ void i915_gem_timeline_fini(struct i915_gem_timeline *tl);
+ 
++static inline int __intel_timeline_sync_set(struct intel_timeline *tl,
++					    u64 context, u32 seqno)
++{
++	return i915_syncmap_set(&tl->sync, context, seqno);
++}
++
++static inline int intel_timeline_sync_set(struct intel_timeline *tl,
++					  const struct dma_fence *fence)
++{
++	return __intel_timeline_sync_set(tl, fence->context, fence->seqno);
++}
++
++static inline bool __intel_timeline_sync_is_later(struct intel_timeline *tl,
++						  u64 context, u32 seqno)
++{
++	return i915_syncmap_is_later(&tl->sync, context, seqno);
++}
++
++static inline bool intel_timeline_sync_is_later(struct intel_timeline *tl,
++						const struct dma_fence *fence)
++{
++	return __intel_timeline_sync_is_later(tl, fence->context, fence->seqno);
++}
++
+ #endif
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_syncmap.c
+@@ -0,0 +1,412 @@
++/*
++ * Copyright © 2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#include <linux/slab.h>
++
++#include "i915_syncmap.h"
++
++#include "i915_gem.h" /* GEM_BUG_ON() */
++#include "i915_selftest.h"
++
++#define SHIFT ilog2(KSYNCMAP)
++#define MASK (KSYNCMAP - 1)
++
++/*
++ * struct i915_syncmap is a layer of a radixtree that maps a u64 fence
++ * context id to the last u32 fence seqno waited upon from that context.
++ * Unlike lib/radixtree it uses a parent pointer that allows traversal back to
++ * the root. This allows us to access the whole tree via a single pointer
++ * to the most recently used layer. We expect fence contexts to be dense
++ * and most reuse to be on the same i915_gem_context but on neighbouring
++ * engines (i.e. on adjacent contexts) and reuse the same leaf, a very
++ * effective lookup cache. If the new lookup is not on the same leaf, we
++ * expect it to be on the neighbouring branch.
++ *
++ * A leaf holds an array of u32 seqno, and has height 0. The bitmap field
++ * allows us to store whether a particular seqno is valid (i.e. allows us
++ * to distinguish unset from 0).
++ *
++ * A branch holds an array of layer pointers, and has height > 0, and always
++ * has at least 2 layers (either branches or leaves) below it.
++ *
++ * For example,
++ *	for x in
++ *	  0 1 2 0x10 0x11 0x200 0x201
++ *	  0x500000 0x500001 0x503000 0x503001
++ *	  0xE<<60:
++ *		i915_syncmap_set(&sync, x, lower_32_bits(x));
++ * will build a tree like:
++ *	0xXXXXXXXXXXXXXXXX
++ *	0-> 0x0000000000XXXXXX
++ *	|   0-> 0x0000000000000XXX
++ *	|   |   0-> 0x00000000000000XX
++ *	|   |   |   0-> 0x000000000000000X 0:0, 1:1, 2:2
++ *	|   |   |   1-> 0x000000000000001X 0:10, 1:11
++ *	|   |   2-> 0x000000000000020X 0:200, 1:201
++ *	|   5-> 0x000000000050XXXX
++ *	|       0-> 0x000000000050000X 0:500000, 1:500001
++ *	|       3-> 0x000000000050300X 0:503000, 1:503001
++ *	e-> 0xe00000000000000X e:e
++ */
++
++struct i915_syncmap {
++	u64 prefix;
++	unsigned int height;
++	unsigned int bitmap;
++	struct i915_syncmap *parent;
++	/*
++	 * Following this header is an array of either seqno or child pointers:
++	 * union {
++	 *	u32 seqno[KSYNCMAP];
++	 *	struct i915_syncmap *child[KSYNCMAP];
++	 * };
++	 */
++};
++
++/**
++ * i915_syncmap_init -- initialise the #i915_syncmap
++ * @root - pointer to the #i915_syncmap
++ */
++void i915_syncmap_init(struct i915_syncmap **root)
++{
++	BUILD_BUG_ON_NOT_POWER_OF_2(KSYNCMAP);
++	BUILD_BUG_ON_NOT_POWER_OF_2(SHIFT);
++	BUILD_BUG_ON(KSYNCMAP > BITS_PER_BYTE * sizeof((*root)->bitmap));
++	*root = NULL;
++}
++
++static inline u32 *__sync_seqno(struct i915_syncmap *p)
++{
++	GEM_BUG_ON(p->height);
++	return (u32 *)(p + 1);
++}
++
++static inline struct i915_syncmap **__sync_child(struct i915_syncmap *p)
++{
++	GEM_BUG_ON(!p->height);
++	return (struct i915_syncmap **)(p + 1);
++}
++
++static inline unsigned int
++__sync_branch_idx(const struct i915_syncmap *p, u64 id)
++{
++	return (id >> p->height) & MASK;
++}
++
++static inline unsigned int
++__sync_leaf_idx(const struct i915_syncmap *p, u64 id)
++{
++	GEM_BUG_ON(p->height);
++	return id & MASK;
++}
++
++static inline u64 __sync_branch_prefix(const struct i915_syncmap *p, u64 id)
++{
++	return id >> p->height >> SHIFT;
++}
++
++static inline u64 __sync_leaf_prefix(const struct i915_syncmap *p, u64 id)
++{
++	GEM_BUG_ON(p->height);
++	return id >> SHIFT;
++}
++
++static inline bool seqno_later(u32 a, u32 b)
++{
++	return (s32)(a - b) >= 0;
++}
++
++/**
++ * i915_syncmap_is_later -- compare against the last know sync point
++ * @root - pointer to the #i915_syncmap
++ * @id - the context id (other timeline) we are synchronising to
++ * @seqno - the sequence number along the other timeline
++ *
++ * If we have already synchronised this @root timeline with another (@id) then
++ * we can omit any repeated or earlier synchronisation requests. If the two
++ * timelines are already coupled, we can also omit the dependency between the
++ * two as that is already known via the timeline.
++ *
++ * Returns true if the two timelines are already synchronised wrt to @seqno,
++ * false if not and the synchronisation must be emitted.
++ */
++bool i915_syncmap_is_later(struct i915_syncmap **root, u64 id, u32 seqno)
++{
++	struct i915_syncmap *p;
++	unsigned int idx;
++
++	p = *root;
++	if (!p)
++		return false;
++
++	if (likely(__sync_leaf_prefix(p, id) == p->prefix))
++		goto found;
++
++	/* First climb the tree back to a parent branch */
++	do {
++		p = p->parent;
++		if (!p)
++			return false;
++
++		if (__sync_branch_prefix(p, id) == p->prefix)
++			break;
++	} while (1);
++
++	/* And then descend again until we find our leaf */
++	do {
++		if (!p->height)
++			break;
++
++		p = __sync_child(p)[__sync_branch_idx(p, id)];
++		if (!p)
++			return false;
++
++		if (__sync_branch_prefix(p, id) != p->prefix)
++			return false;
++	} while (1);
++
++	*root = p;
++found:
++	idx = __sync_leaf_idx(p, id);
++	if (!(p->bitmap & BIT(idx)))
++		return false;
++
++	return seqno_later(__sync_seqno(p)[idx], seqno);
++}
++
++static struct i915_syncmap *
++__sync_alloc_leaf(struct i915_syncmap *parent, u64 id)
++{
++	struct i915_syncmap *p;
++
++	p = kmalloc(sizeof(*p) + KSYNCMAP * sizeof(u32), GFP_KERNEL);
++	if (unlikely(!p))
++		return NULL;
++
++	p->parent = parent;
++	p->height = 0;
++	p->bitmap = 0;
++	p->prefix = __sync_leaf_prefix(p, id);
++	return p;
++}
++
++static inline void __sync_set_seqno(struct i915_syncmap *p, u64 id, u32 seqno)
++{
++	unsigned int idx = __sync_leaf_idx(p, id);
++
++	p->bitmap |= BIT(idx);
++	__sync_seqno(p)[idx] = seqno;
++}
++
++static inline void __sync_set_child(struct i915_syncmap *p,
++				    unsigned int idx,
++				    struct i915_syncmap *child)
++{
++	p->bitmap |= BIT(idx);
++	__sync_child(p)[idx] = child;
++}
++
++static noinline int __sync_set(struct i915_syncmap **root, u64 id, u32 seqno)
++{
++	struct i915_syncmap *p = *root;
++	unsigned int idx;
++
++	if (!p) {
++		p = __sync_alloc_leaf(NULL, id);
++		if (unlikely(!p))
++			return -ENOMEM;
++
++		goto found;
++	}
++
++	/* Caller handled the likely cached case */
++	GEM_BUG_ON(__sync_leaf_prefix(p, id) == p->prefix);
++
++	/* Climb back up the tree until we find a common prefix */
++	do {
++		if (!p->parent)
++			break;
++
++		p = p->parent;
++
++		if (__sync_branch_prefix(p, id) == p->prefix)
++			break;
++	} while (1);
++
++	/*
++	 * No shortcut, we have to descend the tree to find the right layer
++	 * containing this fence.
++	 *
++	 * Each layer in the tree holds 16 (KSYNCMAP) pointers, either fences
++	 * or lower layers. Leaf nodes (height = 0) contain the fences, all
++	 * other nodes (height > 0) are internal layers that point to a lower
++	 * node. Each internal layer has at least 2 descendents.
++	 *
++	 * Starting at the top, we check whether the current prefix matches. If
++	 * it doesn't, we have gone past our target and need to insert a join
++	 * into the tree, and a new leaf node for the target as a descendent
++	 * of the join, as well as the original layer.
++	 *
++	 * The matching prefix means we are still following the right branch
++	 * of the tree. If it has height 0, we have found our leaf and just
++	 * need to replace the fence slot with ourselves. If the height is
++	 * not zero, our slot contains the next layer in the tree (unless
++	 * it is empty, in which case we can add ourselves as a new leaf).
++	 * As descend the tree the prefix grows (and height decreases).
++	 */
++	do {
++		struct i915_syncmap *next;
++
++		if (__sync_branch_prefix(p, id) != p->prefix) {
++			unsigned int above;
++
++			/* Insert a join above the current layer */
++			next = kzalloc(sizeof(*next) + KSYNCMAP * sizeof(next),
++				       GFP_KERNEL);
++			if (unlikely(!next))
++				return -ENOMEM;
++
++			/* Compute the height at which these two diverge */
++			above = fls64(__sync_branch_prefix(p, id) ^ p->prefix);
++			above = round_up(above, SHIFT);
++			next->height = above + p->height;
++			next->prefix = __sync_branch_prefix(next, id);
++
++			/* Insert the join into the parent */
++			if (p->parent) {
++				idx = __sync_branch_idx(p->parent, id);
++				__sync_child(p->parent)[idx] = next;
++				GEM_BUG_ON(!(p->parent->bitmap & BIT(idx)));
++			}
++			next->parent = p->parent;
++
++			/* Compute the idx of the other branch, not our id! */
++			idx = p->prefix >> (above - SHIFT) & MASK;
++			__sync_set_child(next, idx, p);
++			p->parent = next;
++
++			/* Ascend to the join */
++			p = next;
++		} else {
++			if (!p->height)
++				break;
++		}
++
++		/* Descend into the next layer */
++		GEM_BUG_ON(!p->height);
++		idx = __sync_branch_idx(p, id);
++		next = __sync_child(p)[idx];
++		if (!next) {
++			next = __sync_alloc_leaf(p, id);
++			if (unlikely(!next))
++				return -ENOMEM;
++
++			__sync_set_child(p, idx, next);
++			p = next;
++			break;
++		}
++
++		p = next;
++	} while (1);
++
++found:
++	GEM_BUG_ON(p->prefix != __sync_leaf_prefix(p, id));
++	__sync_set_seqno(p, id, seqno);
++	*root = p;
++	return 0;
++}
++
++/**
++ * i915_syncmap_set -- mark the most recent syncpoint between contexts
++ * @root - pointer to the #i915_syncmap
++ * @id - the context id (other timeline) we have synchronised to
++ * @seqno - the sequence number along the other timeline
++ *
++ * When we synchronise this @root timeline with another (@id), we also know
++ * that we have synchronized with all previous seqno along that timeline. If
++ * we then have a request to synchronise with the same seqno or older, we can
++ * omit it, see i915_syncmap_is_later()
++ *
++ * Returns 0 on success, or a negative error code.
++ */
++int i915_syncmap_set(struct i915_syncmap **root, u64 id, u32 seqno)
++{
++	struct i915_syncmap *p = *root;
++
++	/*
++	 * We expect to be called in sequence following is_later(id), which
++	 * should have preloaded the root for us.
++	 */
++	if (likely(p && __sync_leaf_prefix(p, id) == p->prefix)) {
++		__sync_set_seqno(p, id, seqno);
++		return 0;
++	}
++
++	return __sync_set(root, id, seqno);
++}
++
++static void __sync_free(struct i915_syncmap *p)
++{
++	if (p->height) {
++		unsigned int i;
++
++		while ((i = ffs(p->bitmap))) {
++			p->bitmap &= ~0u << i;
++			__sync_free(__sync_child(p)[i - 1]);
++		}
++	}
++
++	kfree(p);
++}
++
++/**
++ * i915_syncmap_free -- free all memory associated with the syncmap
++ * @root - pointer to the #i915_syncmap
++ *
++ * Either when the timeline is to be freed and we no longer need the sync
++ * point tracking, or when the fences are all known to be signaled and the
++ * sync point tracking is redundant, we can free the #i915_syncmap to recover
++ * its allocations.
++ *
++ * Will reinitialise the @root pointer so that the #i915_syncmap is ready for
++ * reuse.
++ */
++void i915_syncmap_free(struct i915_syncmap **root)
++{
++	struct i915_syncmap *p;
++
++	p = *root;
++	if (!p)
++		return;
++
++	while (p->parent)
++		p = p->parent;
++
++	__sync_free(p);
++	*root = NULL;
++}
++
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++#include "selftests/i915_syncmap.c"
++#endif
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_syncmap.h
+@@ -0,0 +1,38 @@
++/*
++ * Copyright © 2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __I915_SYNCMAP_H__
++#define __I915_SYNCMAP_H__
++
++#include <linux/types.h>
++
++struct i915_syncmap;
++#define KSYNCMAP 16 /* radix of the tree, how many slots in each layer */
++
++void i915_syncmap_init(struct i915_syncmap **root);
++int i915_syncmap_set(struct i915_syncmap **root, u64 id, u32 seqno);
++bool i915_syncmap_is_later(struct i915_syncmap **root, u64 id, u32 seqno);
++void i915_syncmap_free(struct i915_syncmap **root);
++
++#endif /* __I915_SYNCMAP_H__ */
+--- /dev/null
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_timeline.c
+@@ -0,0 +1,301 @@
++/*
++ * Copyright © 2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#include "../i915_selftest.h"
++#include "i915_random.h"
++
++#include "mock_gem_device.h"
++#include "mock_timeline.h"
++
++struct __igt_sync {
++	const char *name;
++	u32 seqno;
++	bool expected;
++	bool set;
++};
++
++static int __igt_sync(struct intel_timeline *tl,
++		      u64 ctx,
++		      const struct __igt_sync *p,
++		      const char *name)
++{
++	int ret;
++
++	if (__intel_timeline_sync_is_later(tl, ctx, p->seqno) != p->expected) {
++		pr_err("%s: %s(ctx=%llu, seqno=%u) expected passed %s but failed\n",
++		       name, p->name, ctx, p->seqno, yesno(p->expected));
++		return -EINVAL;
++	}
++
++	if (p->set) {
++		ret = __intel_timeline_sync_set(tl, ctx, p->seqno);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int igt_sync(void *arg)
++{
++	const struct __igt_sync pass[] = {
++		{ "unset", 0, false, false },
++		{ "new", 0, false, true },
++		{ "0a", 0, true, true },
++		{ "1a", 1, false, true },
++		{ "1b", 1, true, true },
++		{ "0b", 0, true, false },
++		{ "2a", 2, false, true },
++		{ "4", 4, false, true },
++		{ "INT_MAX", INT_MAX, false, true },
++		{ "INT_MAX-1", INT_MAX-1, true, false },
++		{ "INT_MAX+1", (u32)INT_MAX+1, false, true },
++		{ "INT_MAX", INT_MAX, true, false },
++		{ "UINT_MAX", UINT_MAX, false, true },
++		{ "wrap", 0, false, true },
++		{ "unwrap", UINT_MAX, true, false },
++		{},
++	}, *p;
++	struct intel_timeline *tl;
++	int order, offset;
++	int ret;
++
++	tl = mock_timeline(0);
++	if (!tl)
++		return -ENOMEM;
++
++	for (p = pass; p->name; p++) {
++		for (order = 1; order < 64; order++) {
++			for (offset = -1; offset <= (order > 1); offset++) {
++				u64 ctx = BIT_ULL(order) + offset;
++
++				ret = __igt_sync(tl, ctx, p, "1");
++				if (ret)
++					goto out;
++			}
++		}
++	}
++	mock_timeline_destroy(tl);
++
++	tl = mock_timeline(0);
++	if (!tl)
++		return -ENOMEM;
++
++	for (order = 1; order < 64; order++) {
++		for (offset = -1; offset <= (order > 1); offset++) {
++			u64 ctx = BIT_ULL(order) + offset;
++
++			for (p = pass; p->name; p++) {
++				ret = __igt_sync(tl, ctx, p, "2");
++				if (ret)
++					goto out;
++			}
++		}
++	}
++
++out:
++	mock_timeline_destroy(tl);
++	return ret;
++}
++
++static unsigned int random_engine(struct rnd_state *rnd)
++{
++	return ((u64)prandom_u32_state(rnd) * I915_NUM_ENGINES) >> 32;
++}
++
++static int bench_sync(void *arg)
++{
++#define M (1 << 20)
++	struct rnd_state prng;
++	struct intel_timeline *tl;
++	unsigned long end_time, count;
++	u64 prng32_1M;
++	ktime_t kt;
++	int order, last_order;
++
++	tl = mock_timeline(0);
++	if (!tl)
++		return -ENOMEM;
++
++	/* Lookups from cache are very fast and so the random number generation
++	 * and the loop itself becomes a significant factor in the per-iteration
++	 * timings. We try to compensate the results by measuring the overhead
++	 * of the prng and subtract it from the reported results.
++	 */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		u32 x;
++
++		/* Make sure the compiler doesn't optimise away the prng call */
++		WRITE_ONCE(x, prandom_u32_state(&prng));
++
++		count++;
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	pr_debug("%s: %lu random evaluations, %lluns/prng\n",
++		 __func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++	prng32_1M = ktime_to_ns(kt) * M / count;
++
++	/* Benchmark (only) setting random context ids */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		u64 id = i915_prandom_u64_state(&prng);
++
++		__intel_timeline_sync_set(tl, id, 0);
++		count++;
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	kt = ktime_sub_ns(kt, count * prng32_1M * 2 / M);
++	pr_info("%s: %lu random insertions, %lluns/insert\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	/* Benchmark looking up the exact same context ids as we just set */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	end_time = count;
++	kt = ktime_get();
++	while (end_time--) {
++		u64 id = i915_prandom_u64_state(&prng);
++
++		if (!__intel_timeline_sync_is_later(tl, id, 0)) {
++			mock_timeline_destroy(tl);
++			pr_err("Lookup of %llu failed\n", id);
++			return -EINVAL;
++		}
++	}
++	kt = ktime_sub(ktime_get(), kt);
++	kt = ktime_sub_ns(kt, count * prng32_1M * 2 / M);
++	pr_info("%s: %lu random lookups, %lluns/lookup\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	mock_timeline_destroy(tl);
++	cond_resched();
++
++	tl = mock_timeline(0);
++	if (!tl)
++		return -ENOMEM;
++
++	/* Benchmark setting the first N (in order) contexts */
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		__intel_timeline_sync_set(tl, count++, 0);
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	pr_info("%s: %lu in-order insertions, %lluns/insert\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	/* Benchmark looking up the exact same context ids as we just set */
++	end_time = count;
++	kt = ktime_get();
++	while (end_time--) {
++		if (!__intel_timeline_sync_is_later(tl, end_time, 0)) {
++			pr_err("Lookup of %lu failed\n", end_time);
++			mock_timeline_destroy(tl);
++			return -EINVAL;
++		}
++	}
++	kt = ktime_sub(ktime_get(), kt);
++	pr_info("%s: %lu in-order lookups, %lluns/lookup\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	mock_timeline_destroy(tl);
++	cond_resched();
++
++	tl = mock_timeline(0);
++	if (!tl)
++		return -ENOMEM;
++
++	/* Benchmark searching for a random context id and maybe changing it */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		u32 id = random_engine(&prng);
++		u32 seqno = prandom_u32_state(&prng);
++
++		if (!__intel_timeline_sync_is_later(tl, id, seqno))
++			__intel_timeline_sync_set(tl, id, seqno);
++
++		count++;
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	kt = ktime_sub_ns(kt, count * prng32_1M * 2 / M);
++	pr_info("%s: %lu repeated insert/lookups, %lluns/op\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++	mock_timeline_destroy(tl);
++	cond_resched();
++
++	/* Benchmark searching for a known context id and changing the seqno */
++	for (last_order = 1, order = 1; order < 32;
++	     ({ int tmp = last_order; last_order = order; order += tmp; })) {
++		unsigned int mask = BIT(order) - 1;
++
++		tl = mock_timeline(0);
++		if (!tl)
++			return -ENOMEM;
++
++		count = 0;
++		kt = ktime_get();
++		end_time = jiffies + HZ/10;
++		do {
++			/* Without assuming too many details of the underlying
++			 * implementation, try to identify its phase-changes
++			 * (if any)!
++			 */
++			u64 id = (u64)(count & mask) << order;
++
++			__intel_timeline_sync_is_later(tl, id, 0);
++			__intel_timeline_sync_set(tl, id, 0);
++
++			count++;
++		} while (!time_after(jiffies, end_time));
++		kt = ktime_sub(ktime_get(), kt);
++		pr_info("%s: %lu cyclic/%d insert/lookups, %lluns/op\n",
++			__func__, count, order,
++			(long long)div64_ul(ktime_to_ns(kt), count));
++		mock_timeline_destroy(tl);
++		cond_resched();
++	}
++
++	return 0;
++#undef M
++}
++
++int i915_gem_timeline_mock_selftests(void)
++{
++	static const struct i915_subtest tests[] = {
++		SUBTEST(igt_sync),
++		SUBTEST(bench_sync),
++	};
++
++	return i915_subtests(tests, NULL);
++}
+--- a/drivers/gpu/drm/i915/selftests/i915_mock_selftests.h
++++ b/drivers/gpu/drm/i915/selftests/i915_mock_selftests.h
+@@ -10,8 +10,10 @@
+  */
+ selftest(sanitycheck, i915_mock_sanitycheck) /* keep first (igt selfcheck) */
+ selftest(scatterlist, scatterlist_mock_selftests)
++selftest(syncmap, i915_syncmap_mock_selftests)
+ selftest(uncore, intel_uncore_mock_selftests)
+ selftest(breadcrumbs, intel_breadcrumbs_mock_selftests)
++selftest(timelines, i915_gem_timeline_mock_selftests)
+ selftest(requests, i915_gem_request_mock_selftests)
+ selftest(objects, i915_gem_object_mock_selftests)
+ selftest(dmabuf, i915_gem_dmabuf_mock_selftests)
+--- a/drivers/gpu/drm/i915/selftests/i915_random.c
++++ b/drivers/gpu/drm/i915/selftests/i915_random.c
+@@ -30,6 +30,17 @@
+ 
+ #include "i915_random.h"
+ 
++u64 i915_prandom_u64_state(struct rnd_state *rnd)
++{
++	u64 x;
++
++	x = prandom_u32_state(rnd);
++	x <<= 32;
++	x |= prandom_u32_state(rnd);
++
++	return x;
++}
++
+ static inline u32 i915_prandom_u32_max_state(u32 ep_ro, struct rnd_state *state)
+ {
+ 	return upper_32_bits((u64)prandom_u32_state(state) * ep_ro);
+--- a/drivers/gpu/drm/i915/selftests/i915_random.h
++++ b/drivers/gpu/drm/i915/selftests/i915_random.h
+@@ -41,6 +41,8 @@
+ #define I915_RND_SUBSTATE(name__, parent__) \
+ 	struct rnd_state name__ = I915_RND_STATE_INITIALIZER(prandom_u32_state(&(parent__)))
+ 
++u64 i915_prandom_u64_state(struct rnd_state *rnd);
++
+ unsigned int *i915_random_order(unsigned int count,
+ 				struct rnd_state *state);
+ void i915_random_reorder(unsigned int *order,
+--- /dev/null
++++ b/drivers/gpu/drm/i915/selftests/i915_syncmap.c
+@@ -0,0 +1,616 @@
++/*
++ * Copyright © 2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#include "../i915_selftest.h"
++#include "i915_random.h"
++
++static char *
++__sync_print(struct i915_syncmap *p,
++	     char *buf, unsigned long *sz,
++	     unsigned int depth,
++	     unsigned int last,
++	     unsigned int idx)
++{
++	unsigned long len;
++	unsigned int i, X;
++
++	if (depth) {
++		unsigned int d;
++
++		for (d = 0; d < depth - 1; d++) {
++			if (last & BIT(depth - d - 1))
++				len = scnprintf(buf, *sz, "|   ");
++			else
++				len = scnprintf(buf, *sz, "    ");
++			buf += len;
++			*sz -= len;
++		}
++		len = scnprintf(buf, *sz, "%x-> ", idx);
++		buf += len;
++		*sz -= len;
++	}
++
++	/* We mark bits after the prefix as "X" */
++	len = scnprintf(buf, *sz, "0x%016llx", p->prefix << p->height << SHIFT);
++	buf += len;
++	*sz -= len;
++	X = (p->height + SHIFT) / 4;
++	scnprintf(buf - X, *sz + X, "%*s", X, "XXXXXXXXXXXXXXXXX");
++
++	if (!p->height) {
++		for_each_set_bit(i, (unsigned long *)&p->bitmap, KSYNCMAP) {
++			len = scnprintf(buf, *sz, " %x:%x,",
++					i, __sync_seqno(p)[i]);
++			buf += len;
++			*sz -= len;
++		}
++		buf -= 1;
++		*sz += 1;
++	}
++
++	len = scnprintf(buf, *sz, "\n");
++	buf += len;
++	*sz -= len;
++
++	if (p->height) {
++		for_each_set_bit(i, (unsigned long *)&p->bitmap, KSYNCMAP) {
++			buf = __sync_print(__sync_child(p)[i], buf, sz,
++					   depth + 1,
++					   last << 1 | !!(p->bitmap >> (i + 1)),
++					   i);
++		}
++	}
++
++	return buf;
++}
++
++static bool
++i915_syncmap_print_to_buf(struct i915_syncmap *p, char *buf, unsigned long sz)
++{
++	if (!p)
++		return false;
++
++	while (p->parent)
++		p = p->parent;
++
++	__sync_print(p, buf, &sz, 0, 1, 0);
++	return true;
++}
++
++static int check_syncmap_free(struct i915_syncmap **sync)
++{
++	i915_syncmap_free(sync);
++	if (*sync) {
++		pr_err("sync not cleared after free\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int dump_syncmap(struct i915_syncmap *sync, int err)
++{
++	char *buf;
++
++	if (!err)
++		return check_syncmap_free(&sync);
++
++	buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!buf)
++		goto skip;
++
++	if (i915_syncmap_print_to_buf(sync, buf, PAGE_SIZE))
++		pr_err("%s", buf);
++
++	kfree(buf);
++
++skip:
++	i915_syncmap_free(&sync);
++	return err;
++}
++
++static int igt_syncmap_init(void *arg)
++{
++	struct i915_syncmap *sync = (void *)~0ul;
++
++	/*
++	 * Cursory check that we can initialise a random pointer and transform
++	 * it into the root pointer of a syncmap.
++	 */
++
++	i915_syncmap_init(&sync);
++	return check_syncmap_free(&sync);
++}
++
++static int check_seqno(struct i915_syncmap *leaf, unsigned int idx, u32 seqno)
++{
++	if (leaf->height) {
++		pr_err("%s: not a leaf, height is %d\n",
++		       __func__, leaf->height);
++		return -EINVAL;
++	}
++
++	if (__sync_seqno(leaf)[idx] != seqno) {
++		pr_err("%s: seqno[%d], found %x, expected %x\n",
++		       __func__, idx, __sync_seqno(leaf)[idx], seqno);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int check_one(struct i915_syncmap **sync, u64 context, u32 seqno)
++{
++	int err;
++
++	err = i915_syncmap_set(sync, context, seqno);
++	if (err)
++		return err;
++
++	if ((*sync)->height) {
++		pr_err("Inserting first context=%llx did not return leaf (height=%d, prefix=%llx\n",
++		       context, (*sync)->height, (*sync)->prefix);
++		return -EINVAL;
++	}
++
++	if ((*sync)->parent) {
++		pr_err("Inserting first context=%llx created branches!\n",
++		       context);
++		return -EINVAL;
++	}
++
++	if (hweight32((*sync)->bitmap) != 1) {
++		pr_err("First bitmap does not contain a single entry, found %x (count=%d)!\n",
++		       (*sync)->bitmap, hweight32((*sync)->bitmap));
++		return -EINVAL;
++	}
++
++	err = check_seqno((*sync), ilog2((*sync)->bitmap), seqno);
++	if (err)
++		return err;
++
++	if (!i915_syncmap_is_later(sync, context, seqno)) {
++		pr_err("Lookup of first context=%llx/seqno=%x failed!\n",
++		       context, seqno);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int igt_syncmap_one(void *arg)
++{
++	I915_RND_STATE(prng);
++	IGT_TIMEOUT(end_time);
++	struct i915_syncmap *sync;
++	unsigned long max = 1;
++	int err;
++
++	/*
++	 * Check that inserting a new id, creates a leaf and only that leaf.
++	 */
++
++	i915_syncmap_init(&sync);
++
++	do {
++		u64 context = i915_prandom_u64_state(&prng);
++		unsigned long loop;
++
++		err = check_syncmap_free(&sync);
++		if (err)
++			goto out;
++
++		for (loop = 0; loop <= max; loop++) {
++			err = check_one(&sync, context,
++					prandom_u32_state(&prng));
++			if (err)
++				goto out;
++		}
++		max++;
++	} while (!__igt_timeout(end_time, NULL));
++	pr_debug("%s: Completed %lu single insertions\n",
++		 __func__, max * (max - 1) / 2);
++out:
++	return dump_syncmap(sync, err);
++}
++
++static int check_leaf(struct i915_syncmap **sync, u64 context, u32 seqno)
++{
++	int err;
++
++	err = i915_syncmap_set(sync, context, seqno);
++	if (err)
++		return err;
++
++	if ((*sync)->height) {
++		pr_err("Inserting context=%llx did not return leaf (height=%d, prefix=%llx\n",
++		       context, (*sync)->height, (*sync)->prefix);
++		return -EINVAL;
++	}
++
++	if (hweight32((*sync)->bitmap) != 1) {
++		pr_err("First entry into leaf (context=%llx) does not contain a single entry, found %x (count=%d)!\n",
++		       context, (*sync)->bitmap, hweight32((*sync)->bitmap));
++		return -EINVAL;
++	}
++
++	err = check_seqno((*sync), ilog2((*sync)->bitmap), seqno);
++	if (err)
++		return err;
++
++	if (!i915_syncmap_is_later(sync, context, seqno)) {
++		pr_err("Lookup of first entry context=%llx/seqno=%x failed!\n",
++		       context, seqno);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int igt_syncmap_join_above(void *arg)
++{
++	struct i915_syncmap *sync;
++	unsigned int pass, order;
++	int err;
++
++	i915_syncmap_init(&sync);
++
++	/*
++	 * When we have a new id that doesn't fit inside the existing tree,
++	 * we need to add a new layer above.
++	 *
++	 * 1: 0x00000001
++	 * 2: 0x00000010
++	 * 3: 0x00000100
++	 * 4: 0x00001000
++	 * ...
++	 * Each pass the common prefix shrinks and we have to insert a join.
++	 * Each join will only contain two branches, the latest of which
++	 * is always a leaf.
++	 *
++	 * If we then reuse the same set of contexts, we expect to build an
++	 * identical tree.
++	 */
++	for (pass = 0; pass < 3; pass++) {
++		for (order = 0; order < 64; order += SHIFT) {
++			u64 context = BIT_ULL(order);
++			struct i915_syncmap *join;
++
++			err = check_leaf(&sync, context, 0);
++			if (err)
++				goto out;
++
++			join = sync->parent;
++			if (!join) /* very first insert will have no parents */
++				continue;
++
++			if (!join->height) {
++				pr_err("Parent with no height!\n");
++				err = -EINVAL;
++				goto out;
++			}
++
++			if (hweight32(join->bitmap) != 2) {
++				pr_err("Join does not have 2 children: %x (%d)\n",
++				       join->bitmap, hweight32(join->bitmap));
++				err = -EINVAL;
++				goto out;
++			}
++
++			if (__sync_child(join)[__sync_branch_idx(join, context)] != sync) {
++				pr_err("Leaf misplaced in parent!\n");
++				err = -EINVAL;
++				goto out;
++			}
++		}
++	}
++out:
++	return dump_syncmap(sync, err);
++}
++
++static int igt_syncmap_join_below(void *arg)
++{
++	struct i915_syncmap *sync;
++	unsigned int step, order, idx;
++	int err;
++
++	i915_syncmap_init(&sync);
++
++	/*
++	 * Check that we can split a compacted branch by replacing it with
++	 * a join.
++	 */
++	for (step = 0; step < KSYNCMAP; step++) {
++		for (order = 64 - SHIFT; order > 0; order -= SHIFT) {
++			u64 context = step * BIT_ULL(order);
++
++			err = i915_syncmap_set(&sync, context, 0);
++			if (err)
++				goto out;
++
++			if (sync->height) {
++				pr_err("Inserting context=%llx (order=%d, step=%d) did not return leaf (height=%d, prefix=%llx\n",
++				       context, order, step, sync->height, sync->prefix);
++				err = -EINVAL;
++				goto out;
++			}
++		}
++	}
++
++	for (step = 0; step < KSYNCMAP; step++) {
++		for (order = SHIFT; order < 64; order += SHIFT) {
++			u64 context = step * BIT_ULL(order);
++
++			if (!i915_syncmap_is_later(&sync, context, 0)) {
++				pr_err("1: context %llx (order=%d, step=%d) not found\n",
++				       context, order, step);
++				err = -EINVAL;
++				goto out;
++			}
++
++			for (idx = 1; idx < KSYNCMAP; idx++) {
++				if (i915_syncmap_is_later(&sync, context + idx, 0)) {
++					pr_err("1: context %llx (order=%d, step=%d) should not exist\n",
++					       context + idx, order, step);
++					err = -EINVAL;
++					goto out;
++				}
++			}
++		}
++	}
++
++	for (order = SHIFT; order < 64; order += SHIFT) {
++		for (step = 0; step < KSYNCMAP; step++) {
++			u64 context = step * BIT_ULL(order);
++
++			if (!i915_syncmap_is_later(&sync, context, 0)) {
++				pr_err("2: context %llx (order=%d, step=%d) not found\n",
++				       context, order, step);
++				err = -EINVAL;
++				goto out;
++			}
++		}
++	}
++
++out:
++	return dump_syncmap(sync, err);
++}
++
++static int igt_syncmap_neighbours(void *arg)
++{
++	I915_RND_STATE(prng);
++	IGT_TIMEOUT(end_time);
++	struct i915_syncmap *sync;
++	int err;
++
++	/*
++	 * Each leaf holds KSYNCMAP seqno. Check that when we create KSYNCMAP
++	 * neighbouring ids, they all fit into the same leaf.
++	 */
++
++	i915_syncmap_init(&sync);
++	do {
++		u64 context = i915_prandom_u64_state(&prng) & ~MASK;
++		unsigned int idx;
++
++		if (i915_syncmap_is_later(&sync, context, 0)) /* Skip repeats */
++			continue;
++
++		for (idx = 0; idx < KSYNCMAP; idx++) {
++			err = i915_syncmap_set(&sync, context + idx, 0);
++			if (err)
++				goto out;
++
++			if (sync->height) {
++				pr_err("Inserting context=%llx did not return leaf (height=%d, prefix=%llx\n",
++				       context, sync->height, sync->prefix);
++				err = -EINVAL;
++				goto out;
++			}
++
++			if (sync->bitmap != BIT(idx + 1) - 1) {
++				pr_err("Inserting neighbouring context=0x%llx+%d, did not fit into the same leaf bitmap=%x (%d), expected %lx (%d)\n",
++				       context, idx,
++				       sync->bitmap, hweight32(sync->bitmap),
++				       BIT(idx + 1) - 1, idx + 1);
++				err = -EINVAL;
++				goto out;
++			}
++		}
++	} while (!__igt_timeout(end_time, NULL));
++out:
++	return dump_syncmap(sync, err);
++}
++
++static int igt_syncmap_compact(void *arg)
++{
++	struct i915_syncmap *sync;
++	unsigned int idx, order;
++	int err;
++
++	i915_syncmap_init(&sync);
++
++	/*
++	 * The syncmap are "space efficient" compressed radix trees - any
++	 * branch with only one child is skipped and replaced by the child.
++	 *
++	 * If we construct a tree with ids that are neighbouring at a non-zero
++	 * height, we form a join but each child of that join is directly a
++	 * leaf holding the single id.
++	 */
++	for (order = SHIFT; order < 64; order += SHIFT) {
++		err = check_syncmap_free(&sync);
++		if (err)
++			goto out;
++
++		/* Create neighbours in the parent */
++		for (idx = 0; idx < KSYNCMAP; idx++) {
++			u64 context = idx * BIT_ULL(order) + idx;
++
++			err = i915_syncmap_set(&sync, context, 0);
++			if (err)
++				goto out;
++
++			if (sync->height) {
++				pr_err("Inserting context=%llx (order=%d, idx=%d) did not return leaf (height=%d, prefix=%llx\n",
++				       context, order, idx,
++				       sync->height, sync->prefix);
++				err = -EINVAL;
++				goto out;
++			}
++		}
++
++		sync = sync->parent;
++		if (sync->parent) {
++			pr_err("Parent (join) of last leaf was not the sync!\n");
++			err = -EINVAL;
++			goto out;
++		}
++
++		if (sync->height != order) {
++			pr_err("Join does not have the expected height, found %d, expected %d\n",
++			       sync->height, order);
++			err = -EINVAL;
++			goto out;
++		}
++
++		if (sync->bitmap != BIT(KSYNCMAP) - 1) {
++			pr_err("Join is not full!, found %x (%d) expected %lx (%d)\n",
++			       sync->bitmap, hweight32(sync->bitmap),
++			       BIT(KSYNCMAP) - 1, KSYNCMAP);
++			err = -EINVAL;
++			goto out;
++		}
++
++		/* Each of our children should be a leaf */
++		for (idx = 0; idx < KSYNCMAP; idx++) {
++			struct i915_syncmap *leaf = __sync_child(sync)[idx];
++
++			if (leaf->height) {
++				pr_err("Child %d is a not leaf!\n", idx);
++				err = -EINVAL;
++				goto out;
++			}
++
++			if (leaf->parent != sync) {
++				pr_err("Child %d is not attached to us!\n",
++				       idx);
++				err = -EINVAL;
++				goto out;
++			}
++
++			if (!is_power_of_2(leaf->bitmap)) {
++				pr_err("Child %d holds more than one id, found %x (%d)\n",
++				       idx, leaf->bitmap, hweight32(leaf->bitmap));
++				err = -EINVAL;
++				goto out;
++			}
++
++			if (leaf->bitmap != BIT(idx)) {
++				pr_err("Child %d has wrong seqno idx, found %d, expected %d\n",
++				       idx, ilog2(leaf->bitmap), idx);
++				err = -EINVAL;
++				goto out;
++			}
++		}
++	}
++out:
++	return dump_syncmap(sync, err);
++}
++
++static int igt_syncmap_random(void *arg)
++{
++	I915_RND_STATE(prng);
++	IGT_TIMEOUT(end_time);
++	struct i915_syncmap *sync;
++	unsigned long count, phase, i;
++	u32 seqno;
++	int err;
++
++	i915_syncmap_init(&sync);
++
++	/*
++	 * Having tried to test the individual operations within i915_syncmap,
++	 * run a smoketest exploring the entire u64 space with random
++	 * insertions.
++	 */
++
++	count = 0;
++	phase = jiffies + HZ/100 + 1;
++	do {
++		u64 context = i915_prandom_u64_state(&prng);
++
++		err = i915_syncmap_set(&sync, context, 0);
++		if (err)
++			goto out;
++
++		count++;
++	} while (!time_after(jiffies, phase));
++	seqno = 0;
++
++	phase = 0;
++	do {
++		I915_RND_STATE(ctx);
++		u32 last_seqno = seqno;
++		bool expect;
++
++		seqno = prandom_u32_state(&prng);
++		expect = seqno_later(last_seqno, seqno);
++
++		for (i = 0; i < count; i++) {
++			u64 context = i915_prandom_u64_state(&ctx);
++
++			if (i915_syncmap_is_later(&sync, context, seqno) != expect) {
++				pr_err("context=%llu, last=%u this=%u did not match expectation (%d)\n",
++				       context, last_seqno, seqno, expect);
++				err = -EINVAL;
++				goto out;
++			}
++
++			err = i915_syncmap_set(&sync, context, seqno);
++			if (err)
++				goto out;
++		}
++
++		phase++;
++	} while (!__igt_timeout(end_time, NULL));
++	pr_debug("Completed %lu passes, each of %lu contexts\n", phase, count);
++out:
++	return dump_syncmap(sync, err);
++}
++
++int i915_syncmap_mock_selftests(void)
++{
++	static const struct i915_subtest tests[] = {
++		SUBTEST(igt_syncmap_init),
++		SUBTEST(igt_syncmap_one),
++		SUBTEST(igt_syncmap_join_above),
++		SUBTEST(igt_syncmap_join_below),
++		SUBTEST(igt_syncmap_neighbours),
++		SUBTEST(igt_syncmap_compact),
++		SUBTEST(igt_syncmap_random),
++	};
++
++	return i915_subtests(tests, NULL);
++}
+--- /dev/null
++++ b/drivers/gpu/drm/i915/selftests/mock_timeline.c
+@@ -0,0 +1,45 @@
++/*
++ * Copyright © 2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#include "mock_timeline.h"
++
++struct intel_timeline *mock_timeline(u64 context)
++{
++	static struct lock_class_key class;
++	struct intel_timeline *tl;
++
++	tl = kzalloc(sizeof(*tl), GFP_KERNEL);
++	if (!tl)
++		return NULL;
++
++	__intel_timeline_init(tl, NULL, context, &class, "mock");
++
++	return tl;
++}
++
++void mock_timeline_destroy(struct intel_timeline *tl)
++{
++	__intel_timeline_fini(tl);
++	kfree(tl);
++}
+--- /dev/null
++++ b/drivers/gpu/drm/i915/selftests/mock_timeline.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright © 2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#ifndef __MOCK_TIMELINE__
++#define __MOCK_TIMELINE__
++
++#include "../i915_gem_timeline.h"
++
++struct intel_timeline *mock_timeline(u64 context);
++void mock_timeline_destroy(struct intel_timeline *tl);
++
++#endif /* !__MOCK_TIMELINE__ */
