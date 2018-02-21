@@ -1,0 +1,161 @@
+From fd13821219dda093e402c5849e5d4525bb64b4f3 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 15 Nov 2017 15:12:04 +0000
+Subject: [PATCH] drm/i915: Make request's wait-for-space explicit
+Git-commit: fd13821219dda093e402c5849e5d4525bb64b4f3
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+At the start of building a request, we would wait for roughly enough
+space to fit the average request (to reduce the likelihood of having to
+wait and abort partway through request construction). To achieve we
+would try to begin a 0-length command packet, this just adds extra
+confusion so make the wait-for-space explicit, as in the next patch we
+want to move it from the backend to the i915_gem_request_alloc() so it
+can ensure that the wait-for-space is the first operation in building a
+new request.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171115151204.8105-2-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/intel_lrc.c        |    8 ++--
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   56 ++++++++++++++++++++------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 
+ 3 files changed, 41 insertions(+), 24 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1183,7 +1183,7 @@ static int execlists_request_alloc(struc
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+ 	struct intel_context *ce = &request->ctx->engine[engine->id];
+-	u32 *cs;
++	int ret;
+ 
+ 	GEM_BUG_ON(!ce->pin_count);
+ 
+@@ -1193,9 +1193,9 @@ static int execlists_request_alloc(struc
+ 	 */
+ 	request->reserved_space += EXECLISTS_REQUEST_SIZE;
+ 
+-	cs = intel_ring_begin(request, 0);
+-	if (IS_ERR(cs))
+-		return PTR_ERR(cs);
++	ret = intel_ring_wait_for_space(request->ring, request->reserved_space);
++	if (ret)
++		return ret;
+ 
+ 	/* Note that after this point, we have committed to using
+ 	 * this request as it is being used to both track the
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1578,7 +1578,7 @@ void intel_legacy_submission_resume(stru
+ 
+ static int ring_request_alloc(struct drm_i915_gem_request *request)
+ {
+-	u32 *cs;
++	int ret;
+ 
+ 	GEM_BUG_ON(!request->ctx->engine[request->engine->id].pin_count);
+ 
+@@ -1588,37 +1588,24 @@ static int ring_request_alloc(struct drm
+ 	 */
+ 	request->reserved_space += LEGACY_REQUEST_SIZE;
+ 
+-	cs = intel_ring_begin(request, 0);
+-	if (IS_ERR(cs))
+-		return PTR_ERR(cs);
++	ret = intel_ring_wait_for_space(request->ring, request->reserved_space);
++	if (ret)
++		return ret;
+ 
+ 	request->reserved_space -= LEGACY_REQUEST_SIZE;
+ 	return 0;
+ }
+ 
+-static noinline int wait_for_space(struct drm_i915_gem_request *req,
+-				   unsigned int bytes)
++static noinline int wait_for_space(struct intel_ring *ring, unsigned int bytes)
+ {
+-	struct intel_ring *ring = req->ring;
+ 	struct drm_i915_gem_request *target;
+ 	long timeout;
+ 
+-	lockdep_assert_held(&req->i915->drm.struct_mutex);
++	lockdep_assert_held(&ring->vma->vm->i915->drm.struct_mutex);
+ 
+ 	if (intel_ring_update_space(ring) >= bytes)
+ 		return 0;
+ 
+-	/*
+-	 * Space is reserved in the ringbuffer for finalising the request,
+-	 * as that cannot be allowed to fail. During request finalisation,
+-	 * reserved_space is set to 0 to stop the overallocation and the
+-	 * assumption is that then we never need to wait (which has the
+-	 * risk of failing with EINTR).
+-	 *
+-	 * See also i915_gem_request_alloc() and i915_add_request().
+-	 */
+-	GEM_BUG_ON(!req->reserved_space);
+-
+ 	list_for_each_entry(target, &ring->request_list, ring_link) {
+ 		/* Would completion of this request free enough space? */
+ 		if (bytes <= __intel_ring_space(target->postfix,
+@@ -1642,6 +1629,22 @@ static noinline int wait_for_space(struc
+ 	return 0;
+ }
+ 
++int intel_ring_wait_for_space(struct intel_ring *ring, unsigned int bytes)
++{
++	GEM_BUG_ON(bytes > ring->effective_size);
++	if (unlikely(bytes > ring->effective_size - ring->emit))
++		bytes += ring->size - ring->emit;
++
++	if (unlikely(bytes > ring->space)) {
++		int ret = wait_for_space(ring, bytes);
++		if (unlikely(ret))
++			return ret;
++	}
++
++	GEM_BUG_ON(ring->space < bytes);
++	return 0;
++}
++
+ u32 *intel_ring_begin(struct drm_i915_gem_request *req,
+ 		      unsigned int num_dwords)
+ {
+@@ -1681,7 +1684,20 @@ u32 *intel_ring_begin(struct drm_i915_ge
+ 	}
+ 
+ 	if (unlikely(total_bytes > ring->space)) {
+-		int ret = wait_for_space(req, total_bytes);
++		int ret;
++
++		/*
++		 * Space is reserved in the ringbuffer for finalising the
++		 * request, as that cannot be allowed to fail. During request
++		 * finalisation, reserved_space is set to 0 to stop the
++		 * overallocation and the assumption is that then we never need
++		 * to wait (which has the risk of failing with EINTR).
++		 *
++		 * See also i915_gem_request_alloc() and i915_add_request().
++		 */
++		GEM_BUG_ON(!req->reserved_space);
++
++		ret = wait_for_space(ring, total_bytes);
+ 		if (unlikely(ret))
+ 			return ERR_PTR(ret);
+ 	}
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -660,6 +660,7 @@ void intel_legacy_submission_resume(stru
+ 
+ int __must_check intel_ring_cacheline_align(struct drm_i915_gem_request *req);
+ 
++int intel_ring_wait_for_space(struct intel_ring *ring, unsigned int bytes);
+ u32 __must_check *intel_ring_begin(struct drm_i915_gem_request *req,
+ 				   unsigned int n);
+ 
