@@ -1,0 +1,192 @@
+From d480b28a41a628e356dbacfa1c9f6d05b9baf838 Mon Sep 17 00:00:00 2001
+From: Changbin Du <changbin.du@intel.com>
+Date: Tue, 30 Jan 2018 13:51:31 +0800
+Subject: [PATCH] drm/i915/gvt: Fix aperture read/write emulation when enable x-no-mmap=on
+Git-commit: d480b28a41a628e356dbacfa1c9f6d05b9baf838
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+When add 'x-no-mmap=on' for vfio-pci option, aperture access in guest
+is emulated. But the vgpu_aperture_rw() function take wrong offset when
+do memcpy, since vgpu->gm.aperture_va is not the base of entire aperture.
+This mistake cause GPU command in guest get lost and so the seqno is not
+updated in engine HWSP.
+
+This patch fix this, and it also move the emulation code to kvmgt.
+Because only vfio need to emulate it. Put aperture rw to MMIO emulation
+path breaks assumptions in xengt.
+
+V2: Remove PAGE_ALIGN for size (zhenyu)
+
+Fixes: f090a00df9ec ("drm/i915/gvt: Add emulation for BAR2 (aperture) with normal file RW approach")
+Signed-off-by: Changbin Du <changbin.du@intel.com>
+Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/cfg_space.c |   15 ------------
+ drivers/gpu/drm/i915/gvt/gvt.h       |    1 
+ drivers/gpu/drm/i915/gvt/kvmgt.c     |   36 ++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/gvt/mmio.c      |   42 -----------------------------------
+ 4 files changed, 35 insertions(+), 59 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/cfg_space.c
++++ b/drivers/gpu/drm/i915/gvt/cfg_space.c
+@@ -119,16 +119,6 @@ static int map_aperture(struct intel_vgp
+ 	if (map == vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_APERTURE].tracked)
+ 		return 0;
+ 
+-	if (map) {
+-		vgpu->gm.aperture_va = memremap(aperture_pa, aperture_sz,
+-						MEMREMAP_WC);
+-		if (!vgpu->gm.aperture_va)
+-			return -ENOMEM;
+-	} else {
+-		memunmap(vgpu->gm.aperture_va);
+-		vgpu->gm.aperture_va = NULL;
+-	}
+-
+ 	val = vgpu_cfg_space(vgpu)[PCI_BASE_ADDRESS_2];
+ 	if (val & PCI_BASE_ADDRESS_MEM_TYPE_64)
+ 		val = *(u64 *)(vgpu_cfg_space(vgpu) + PCI_BASE_ADDRESS_2);
+@@ -141,11 +131,8 @@ static int map_aperture(struct intel_vgp
+ 						  aperture_pa >> PAGE_SHIFT,
+ 						  aperture_sz >> PAGE_SHIFT,
+ 						  map);
+-	if (ret) {
+-		memunmap(vgpu->gm.aperture_va);
+-		vgpu->gm.aperture_va = NULL;
++	if (ret)
+ 		return ret;
+-	}
+ 
+ 	vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_APERTURE].tracked = map;
+ 	return 0;
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -81,7 +81,6 @@ struct intel_gvt_device_info {
+ struct intel_vgpu_gm {
+ 	u64 aperture_sz;
+ 	u64 hidden_sz;
+-	void *aperture_va;
+ 	struct drm_mm_node low_gm_node;
+ 	struct drm_mm_node high_gm_node;
+ };
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@ -630,6 +630,39 @@ static int intel_vgpu_bar_rw(struct inte
+ 	return ret;
+ }
+ 
++static inline bool intel_vgpu_in_aperture(struct intel_vgpu *vgpu, uint64_t off)
++{
++	return off >= vgpu_aperture_offset(vgpu) &&
++	       off < vgpu_aperture_offset(vgpu) + vgpu_aperture_sz(vgpu);
++}
++
++static int intel_vgpu_aperture_rw(struct intel_vgpu *vgpu, uint64_t off,
++		void *buf, unsigned long count, bool is_write)
++{
++	void *aperture_va;
++
++	if (!intel_vgpu_in_aperture(vgpu, off) ||
++	    !intel_vgpu_in_aperture(vgpu, off + count)) {
++		gvt_vgpu_err("Invalid aperture offset %llu\n", off);
++		return -EINVAL;
++	}
++
++	aperture_va = io_mapping_map_wc(&vgpu->gvt->dev_priv->ggtt.iomap,
++					ALIGN_DOWN(off, PAGE_SIZE),
++					count + offset_in_page(off));
++	if (!aperture_va)
++		return -EIO;
++
++	if (is_write)
++		memcpy(aperture_va + offset_in_page(off), buf, count);
++	else
++		memcpy(buf, aperture_va + offset_in_page(off), count);
++
++	io_mapping_unmap(aperture_va);
++
++	return 0;
++}
++
+ static ssize_t intel_vgpu_rw(struct mdev_device *mdev, char *buf,
+ 			size_t count, loff_t *ppos, bool is_write)
+ {
+@@ -658,8 +691,7 @@ static ssize_t intel_vgpu_rw(struct mdev
+ 					buf, count, is_write);
+ 		break;
+ 	case VFIO_PCI_BAR2_REGION_INDEX:
+-		ret = intel_vgpu_bar_rw(vgpu, PCI_BASE_ADDRESS_2, pos,
+-					buf, count, is_write);
++		ret = intel_vgpu_aperture_rw(vgpu, pos, buf, count, is_write);
+ 		break;
+ 	case VFIO_PCI_BAR1_REGION_INDEX:
+ 	case VFIO_PCI_BAR3_REGION_INDEX:
+--- a/drivers/gpu/drm/i915/gvt/mmio.c
++++ b/drivers/gpu/drm/i915/gvt/mmio.c
+@@ -56,38 +56,6 @@ int intel_vgpu_gpa_to_mmio_offset(struct
+ 	(reg >= gvt->device_info.gtt_start_offset \
+ 	 && reg < gvt->device_info.gtt_start_offset + gvt_ggtt_sz(gvt))
+ 
+-static bool vgpu_gpa_is_aperture(struct intel_vgpu *vgpu, uint64_t gpa)
+-{
+-	u64 aperture_gpa = intel_vgpu_get_bar_gpa(vgpu, PCI_BASE_ADDRESS_2);
+-	u64 aperture_sz = vgpu_aperture_sz(vgpu);
+-
+-	return gpa >= aperture_gpa && gpa < aperture_gpa + aperture_sz;
+-}
+-
+-static int vgpu_aperture_rw(struct intel_vgpu *vgpu, uint64_t gpa,
+-			    void *pdata, unsigned int size, bool is_read)
+-{
+-	u64 aperture_gpa = intel_vgpu_get_bar_gpa(vgpu, PCI_BASE_ADDRESS_2);
+-	u64 offset = gpa - aperture_gpa;
+-
+-	if (!vgpu_gpa_is_aperture(vgpu, gpa + size - 1)) {
+-		gvt_vgpu_err("Aperture rw out of range, offset %llx, size %d\n",
+-			     offset, size);
+-		return -EINVAL;
+-	}
+-
+-	if (!vgpu->gm.aperture_va) {
+-		gvt_vgpu_err("BAR is not enabled\n");
+-		return -ENXIO;
+-	}
+-
+-	if (is_read)
+-		memcpy(pdata, vgpu->gm.aperture_va + offset, size);
+-	else
+-		memcpy(vgpu->gm.aperture_va + offset, pdata, size);
+-	return 0;
+-}
+-
+ static void failsafe_emulate_mmio_rw(struct intel_vgpu *vgpu, uint64_t pa,
+ 		void *p_data, unsigned int bytes, bool read)
+ {
+@@ -144,11 +112,6 @@ int intel_vgpu_emulate_mmio_read(struct
+ 	}
+ 	mutex_lock(&gvt->lock);
+ 
+-	if (vgpu_gpa_is_aperture(vgpu, pa)) {
+-		ret = vgpu_aperture_rw(vgpu, pa, p_data, bytes, true);
+-		goto out;
+-	}
+-
+ 	offset = intel_vgpu_gpa_to_mmio_offset(vgpu, pa);
+ 
+ 	if (WARN_ON(bytes > 8))
+@@ -222,11 +185,6 @@ int intel_vgpu_emulate_mmio_write(struct
+ 
+ 	mutex_lock(&gvt->lock);
+ 
+-	if (vgpu_gpa_is_aperture(vgpu, pa)) {
+-		ret = vgpu_aperture_rw(vgpu, pa, p_data, bytes, false);
+-		goto out;
+-	}
+-
+ 	offset = intel_vgpu_gpa_to_mmio_offset(vgpu, pa);
+ 
+ 	if (WARN_ON(bytes > 8))
