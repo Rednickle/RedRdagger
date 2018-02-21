@@ -1,0 +1,299 @@
+From b1c24a6137af11fca49192a42face03cacbd7fc5 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 23 Nov 2017 15:26:30 +0000
+Subject: [PATCH] drm/i915: Unwind incomplete legacy context switches
+Git-commit: b1c24a6137af11fca49192a42face03cacbd7fc5
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+The legacy context switch for ringbuffer submission is multistaged,
+where each of those stages may fail. However, we were updating global
+state after some stages, and so we had to force the incomplete request
+to be submitted because we could not unwind. Save the global state
+before performing the switches, and so enable us to unwind back to the
+previous global state should any phase fail. We then must cancel the
+request instead of submitting it should the construction fail.
+
+V2: s/saved_ctx/from_ctx/; s/ctx/to_ctx/ etc.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171123152631.31385-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_gem_context.c |  173 ++++++++++----------------------
+ drivers/gpu/drm/i915/i915_gem_request.c |   18 +--
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    1 
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 
+ 4 files changed, 65 insertions(+), 128 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -505,6 +505,7 @@ void i915_gem_contexts_lost(struct drm_i
+ 
+ 	for_each_engine(engine, dev_priv, id) {
+ 		engine->legacy_active_context = NULL;
++		engine->legacy_active_ppgtt = NULL;
+ 
+ 		if (!engine->last_retired_context)
+ 			continue;
+@@ -679,68 +680,49 @@ static int remap_l3(struct drm_i915_gem_
+ 	return 0;
+ }
+ 
+-static inline bool skip_rcs_switch(struct i915_hw_ppgtt *ppgtt,
+-				   struct intel_engine_cs *engine,
+-				   struct i915_gem_context *to)
+-{
+-	if (to->remap_slice)
+-		return false;
+-
+-	if (ppgtt && (intel_engine_flag(engine) & ppgtt->pd_dirty_rings))
+-		return false;
+-
+-	return to == engine->legacy_active_context;
+-}
+-
+-static bool
+-needs_pd_load_pre(struct i915_hw_ppgtt *ppgtt, struct intel_engine_cs *engine)
+-{
+-	struct i915_gem_context *from = engine->legacy_active_context;
+-
+-	if (!ppgtt)
+-		return false;
+-
+-	/* Always load the ppgtt on first use */
+-	if (!from)
+-		return true;
+-
+-	/* Same context without new entries, skip */
+-	if ((!from->ppgtt || from->ppgtt == ppgtt) &&
+-	    !(intel_engine_flag(engine) & ppgtt->pd_dirty_rings))
+-		return false;
+-
+-	if (engine->id != RCS)
+-		return true;
+-
+-	return true;
+-}
+-
+-static int do_rcs_switch(struct drm_i915_gem_request *req)
++/**
++ * i915_switch_context() - perform a GPU context switch.
++ * @rq: request for which we'll execute the context switch
++ *
++ * The context life cycle is simple. The context refcount is incremented and
++ * decremented by 1 on create and destroy. If the context is in use by the GPU,
++ * it will have a refcount > 1. This allows us to destroy the context abstract
++ * object while letting the normal object tracking destroy the backing BO.
++ *
++ * This function should not be used in execlists mode.  Instead the context is
++ * switched by writing to the ELSP and requests keep a reference to their
++ * context.
++ */
++int i915_switch_context(struct drm_i915_gem_request *rq)
+ {
+-	struct i915_gem_context *to = req->ctx;
+-	struct intel_engine_cs *engine = req->engine;
+-	struct i915_hw_ppgtt *ppgtt = to->ppgtt ?: req->i915->mm.aliasing_ppgtt;
+-	struct i915_gem_context *from = engine->legacy_active_context;
+-	u32 hw_flags;
++	struct intel_engine_cs *engine = rq->engine;
++	struct i915_gem_context *to_ctx = rq->ctx;
++	struct i915_hw_ppgtt *to_mm =
++		to_ctx->ppgtt ?: rq->i915->mm.aliasing_ppgtt;
++	struct i915_gem_context *from_ctx = engine->legacy_active_context;
++	struct i915_hw_ppgtt *from_mm = engine->legacy_active_ppgtt;
++	u32 hw_flags = 0;
+ 	int ret, i;
+ 
+-	GEM_BUG_ON(engine->id != RCS);
+-
+-	if (skip_rcs_switch(ppgtt, engine, to))
+-		return 0;
++	lockdep_assert_held(&rq->i915->drm.struct_mutex);
++	GEM_BUG_ON(HAS_EXECLISTS(rq->i915));
+ 
+-	if (needs_pd_load_pre(ppgtt, engine)) {
+-		/* Older GENs and non render rings still want the load first,
+-		 * "PP_DCLV followed by PP_DIR_BASE register through Load
+-		 * Register Immediate commands in Ring Buffer before submitting
+-		 * a context."*/
+-		trace_switch_mm(engine, to);
+-		ret = ppgtt->switch_mm(ppgtt, req);
++	if (to_mm != from_mm ||
++	    (to_mm && intel_engine_flag(engine) & to_mm->pd_dirty_rings)) {
++		trace_switch_mm(engine, to_ctx);
++		ret = to_mm->switch_mm(to_mm, rq);
+ 		if (ret)
+-			return ret;
++			goto err;
++
++		to_mm->pd_dirty_rings &= ~intel_engine_flag(engine);
++		engine->legacy_active_ppgtt = to_mm;
++		hw_flags = MI_FORCE_RESTORE;
+ 	}
+ 
+-	if (i915_gem_context_is_kernel(to))
++	if (to_ctx->engine[engine->id].state &&
++	    (to_ctx != from_ctx || hw_flags & MI_FORCE_RESTORE)) {
++		GEM_BUG_ON(engine->id != RCS);
++
+ 		/*
+ 		 * The kernel context(s) is treated as pure scratch and is not
+ 		 * expected to retain any state (as we sacrifice it during
+@@ -748,78 +730,37 @@ static int do_rcs_switch(struct drm_i915
+ 		 * as nothing actually executes using the kernel context; it
+ 		 * is purely used for flushing user contexts.
+ 		 */
+-		hw_flags = MI_RESTORE_INHIBIT;
+-	else if (ppgtt && intel_engine_flag(engine) & ppgtt->pd_dirty_rings)
+-		hw_flags = MI_FORCE_RESTORE;
+-	else
+-		hw_flags = 0;
+-
+-	if (to != from || (hw_flags & MI_FORCE_RESTORE)) {
+-		ret = mi_set_context(req, hw_flags);
+-		if (ret)
+-			return ret;
+-
+-		engine->legacy_active_context = to;
+-	}
+-
+-	if (ppgtt)
+-		ppgtt->pd_dirty_rings &= ~intel_engine_flag(engine);
+-
+-	for (i = 0; i < MAX_L3_SLICES; i++) {
+-		if (!(to->remap_slice & (1<<i)))
+-			continue;
++		if (i915_gem_context_is_kernel(to_ctx))
++			hw_flags = MI_RESTORE_INHIBIT;
+ 
+-		ret = remap_l3(req, i);
++		ret = mi_set_context(rq, hw_flags);
+ 		if (ret)
+-			return ret;
++			goto err_mm;
+ 
+-		to->remap_slice &= ~(1<<i);
++		engine->legacy_active_context = to_ctx;
+ 	}
+ 
+-	return 0;
+-}
++	if (to_ctx->remap_slice) {
++		for (i = 0; i < MAX_L3_SLICES; i++) {
++			if (!(to_ctx->remap_slice & BIT(i)))
++				continue;
+ 
+-/**
+- * i915_switch_context() - perform a GPU context switch.
+- * @req: request for which we'll execute the context switch
+- *
+- * The context life cycle is simple. The context refcount is incremented and
+- * decremented by 1 and create and destroy. If the context is in use by the GPU,
+- * it will have a refcount > 1. This allows us to destroy the context abstract
+- * object while letting the normal object tracking destroy the backing BO.
+- *
+- * This function should not be used in execlists mode.  Instead the context is
+- * switched by writing to the ELSP and requests keep a reference to their
+- * context.
+- */
+-int i915_switch_context(struct drm_i915_gem_request *req)
+-{
+-	struct intel_engine_cs *engine = req->engine;
+-
+-	lockdep_assert_held(&req->i915->drm.struct_mutex);
+-	GEM_BUG_ON(HAS_EXECLISTS(req->i915));
+-
+-	if (!req->ctx->engine[engine->id].state) {
+-		struct i915_gem_context *to = req->ctx;
+-		struct i915_hw_ppgtt *ppgtt =
+-			to->ppgtt ?: req->i915->mm.aliasing_ppgtt;
+-
+-		if (needs_pd_load_pre(ppgtt, engine)) {
+-			int ret;
+-
+-			trace_switch_mm(engine, to);
+-			ret = ppgtt->switch_mm(ppgtt, req);
++			ret = remap_l3(rq, i);
+ 			if (ret)
+-				return ret;
+-
+-			ppgtt->pd_dirty_rings &= ~intel_engine_flag(engine);
++				goto err_ctx;
+ 		}
+ 
+-		engine->legacy_active_context = to;
+-		return 0;
++		to_ctx->remap_slice = 0;
+ 	}
+ 
+-	return do_rcs_switch(req);
++	return 0;
++
++err_ctx:
++	engine->legacy_active_context = from_ctx;
++err_mm:
++	engine->legacy_active_ppgtt = from_mm;
++err:
++	return ret;
+ }
+ 
+ static bool engine_has_idle_kernel_context(struct intel_engine_cs *engine)
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -710,25 +710,19 @@ i915_gem_request_alloc(struct intel_engi
+ 	/* Unconditionally invalidate GPU caches and TLBs. */
+ 	ret = engine->emit_flush(req, EMIT_INVALIDATE);
+ 	if (ret)
+-		goto err_ctx;
++		goto err_unwind;
+ 
+ 	ret = engine->request_alloc(req);
+-	if (ret) {
+-		/*
+-		 * Past the point-of-no-return. Since we may have updated
+-		 * global state after partially completing the request alloc,
+-		 * we need to commit any commands so far emitted in the
+-		 * request to the HW.
+-		 */
+-		__i915_add_request(req, false);
+-		return ERR_PTR(ret);
+-	}
++	if (ret)
++		goto err_unwind;
+ 
+ 	/* Check that we didn't interrupt ourselves with a new request */
+ 	GEM_BUG_ON(req->timeline->seqno != req->fence.seqno);
+ 	return req;
+ 
+-err_ctx:
++err_unwind:
++	req->ring->emit = req->head;
++
+ 	/* Make sure we didn't add ourselves to external state before freeing */
+ 	GEM_BUG_ON(!list_empty(&req->active_list));
+ 	GEM_BUG_ON(!list_empty(&req->priotree.signalers_list));
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -591,6 +591,7 @@ static void reset_ring_common(struct int
+ 			request->ring->head = request->postfix;
+ 	} else {
+ 		engine->legacy_active_context = NULL;
++		engine->legacy_active_ppgtt = NULL;
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -493,6 +493,7 @@ struct intel_engine_cs {
+ 	 * stream (ring).
+ 	 */
+ 	struct i915_gem_context *legacy_active_context;
++	struct i915_hw_ppgtt *legacy_active_ppgtt;
+ 
+ 	/* status_notifier: list of callbacks for context-switch changes */
+ 	struct atomic_notifier_head context_status_notifier;
