@@ -1,0 +1,253 @@
+From ca91a2758fcef6635626993557dd51cfbb6dd134 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Thu, 6 Jul 2017 15:00:21 +0200
+Subject: [PATCH] drm/fb-helper: Support deferred setup
+Git-commit: ca91a2758fcef6635626993557dd51cfbb6dd134
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+FB helper code falls back to a 1024x768 mode if no outputs are connected
+or don't report back any modes upon initialization. This can be annoying
+because outputs that are added to FB helper later on can't be used with
+FB helper if they don't support a matching mode.
+
+The fallback is in place because VGA connectors can happen to report an
+unknown connection status even when they are in fact connected.
+
+Some drivers have custom solutions in place to defer FB helper setup
+until at least one output is connected. But the logic behind these
+solutions is always the same and there is nothing driver-specific about
+it, so a better alterative is to fix the FB helper core and add support
+for all drivers automatically.
+
+This patch adds support for deferred FB helper setup. It checks all the
+connectors for their connection status, and if all of them report to be
+disconnected marks the FB helper as needing deferred setup. Whet setup
+is deferred, the FB helper core will automatically retry setup after a
+hotplug event, and it will keep trying until it succeeds.
+
+V2: Rebase onto my entirely reworked fbdev helper locking. One big
+difference is that this version again drops&reacquires the fbdev lock
+(which is now fb_helper->lock, but before this patch series it was
+mode_config->mutex), because register_framebuffer must be able to
+recurse back into fbdev helper code for the initial screen setup.
+
+V3: __drm_fb_helper_initial_config must hold fb_helper->lock upon
+return, I've fumbled that in the deferred setup case (Liviu).
+
+V4: I was blind, redo this all. __drm_fb_helper_initial_config
+shouldn't need to reacquire fb_helper->lock, that just confuses
+callers. I myself got confused by kernel_fb_helper_lock and somehow
+thought it's the same as fb_helper->lock. Tsk.
+
+Also simplify the logic a bit (we don't need two functions to probe
+connectors), we can stick much closer to the existing code. And update
+some comments I've spotted that are outdated.
+
+V5: Don't pass -EAGAIN to drivers, it's just an internal error code
+(Liviu).
+
+V6: Add _and_unlock suffix to clarify locking (Maarten)
+
+Cc: Liviu Dudau <liviu@dudau.co.uk>
+Cc: John Stultz <john.stultz@linaro.org>
+Cc: Thierry Reding <treding@nvidia.com>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Tested-by: John Stultz <john.stultz@linaro.org>
+Signed-off-by: Thierry Reding <treding@nvidia.com> (v1)
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@intel.com>
+Reviewed-by: Liviu Dudau <liviu@dudau.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170706130023.28417-3-daniel.vetter@ffwll.ch
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/drm_fb_helper.c |  102 ++++++++++++++++++++++++++--------------
+ include/drm/drm_fb_helper.h     |   23 +++++++++
+ 2 files changed, 90 insertions(+), 35 deletions(-)
+
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -501,6 +501,9 @@ int drm_fb_helper_restore_fbdev_mode_unl
+ 	if (!drm_fbdev_emulation)
+ 		return -ENODEV;
+ 
++	if (READ_ONCE(fb_helper->deferred_setup))
++		return 0;
++
+ 	mutex_lock(&fb_helper->lock);
+ 	ret = restore_fbdev_mode(fb_helper);
+ 
+@@ -1707,8 +1710,7 @@ EXPORT_SYMBOL(drm_fb_helper_pan_display)
+ 
+ /*
+  * Allocates the backing storage and sets up the fbdev info structure through
+- * the ->fb_probe callback and then registers the fbdev and sets up the panic
+- * notifier.
++ * the ->fb_probe callback.
+  */
+ static int drm_fb_helper_single_fb_probe(struct drm_fb_helper *fb_helper,
+ 					 int preferred_bpp)
+@@ -1806,13 +1808,8 @@ static int drm_fb_helper_single_fb_probe
+ 	}
+ 
+ 	if (crtc_count == 0 || sizes.fb_width == -1 || sizes.fb_height == -1) {
+-		/*
+-		 * hmm everyone went away - assume VGA cable just fell out
+-		 * and will come back later.
+-		 */
+-		DRM_INFO("Cannot find any crtc or sizes - going 1024x768\n");
+-		sizes.fb_width = sizes.surface_width = 1024;
+-		sizes.fb_height = sizes.surface_height = 768;
++		DRM_INFO("Cannot find any crtc or sizes\n");
++		return -EAGAIN;
+ 	}
+ 
+ 	/* Handle our overallocation */
+@@ -2441,6 +2438,59 @@ out:
+ 	kfree(enabled);
+ }
+ 
++/* Note: Drops fb_helper->lock before returning. */
++static int
++__drm_fb_helper_initial_config_and_unlock(struct drm_fb_helper *fb_helper,
++					  int bpp_sel)
++{
++	struct drm_device *dev = fb_helper->dev;
++	struct fb_info *info;
++	unsigned int width, height;
++	int ret;
++
++	width = dev->mode_config.max_width;
++	height = dev->mode_config.max_height;
++
++	drm_setup_crtcs(fb_helper, width, height);
++	ret = drm_fb_helper_single_fb_probe(fb_helper, bpp_sel);
++	if (ret < 0) {
++		if (ret == -EAGAIN) {
++			fb_helper->preferred_bpp = bpp_sel;
++			fb_helper->deferred_setup = true;
++			ret = 0;
++		}
++		mutex_unlock(&fb_helper->lock);
++
++		return ret;
++	}
++
++	fb_helper->deferred_setup = false;
++
++	info = fb_helper->fbdev;
++	info->var.pixclock = 0;
++
++	/* Need to drop locks to avoid recursive deadlock in
++	 * register_framebuffer. This is ok because the only thing left to do is
++	 * register the fbdev emulation instance in kernel_fb_helper_list. */
++	mutex_unlock(&fb_helper->lock);
++
++	ret = register_framebuffer(info);
++	if (ret < 0)
++		return ret;
++
++	dev_info(dev->dev, "fb%d: %s frame buffer device\n",
++		 info->node, info->fix.id);
++
++	mutex_lock(&kernel_fb_helper_lock);
++	if (list_empty(&kernel_fb_helper_list))
++		register_sysrq_key('v', &sysrq_drm_fb_helper_restore_op);
++
++	list_add(&fb_helper->kernel_fb_list, &kernel_fb_helper_list);
++	mutex_unlock(&kernel_fb_helper_lock);
++
++	return 0;
++}
++
+ /**
+  * drm_fb_helper_initial_config - setup a sane initial connector configuration
+  * @fb_helper: fb_helper device struct
+@@ -2485,39 +2535,15 @@ out:
+  */
+ int drm_fb_helper_initial_config(struct drm_fb_helper *fb_helper, int bpp_sel)
+ {
+-	struct drm_device *dev = fb_helper->dev;
+-	struct fb_info *info;
+ 	int ret;
+ 
+ 	if (!drm_fbdev_emulation)
+ 		return 0;
+ 
+ 	mutex_lock(&fb_helper->lock);
+-	drm_setup_crtcs(fb_helper,
+-			dev->mode_config.max_width,
+-			dev->mode_config.max_height);
+-	ret = drm_fb_helper_single_fb_probe(fb_helper, bpp_sel);
+-	mutex_unlock(&fb_helper->lock);
+-	if (ret)
+-		return ret;
++	ret = __drm_fb_helper_initial_config_and_unlock(fb_helper, bpp_sel);
+ 
+-	info = fb_helper->fbdev;
+-	info->var.pixclock = 0;
+-	ret = register_framebuffer(info);
+-	if (ret < 0)
+-		return ret;
+-
+-	dev_info(dev->dev, "fb%d: %s frame buffer device\n",
+-		 info->node, info->fix.id);
+-
+-	mutex_lock(&kernel_fb_helper_lock);
+-	if (list_empty(&kernel_fb_helper_list))
+-		register_sysrq_key('v', &sysrq_drm_fb_helper_restore_op);
+-
+-	list_add(&fb_helper->kernel_fb_list, &kernel_fb_helper_list);
+-	mutex_unlock(&kernel_fb_helper_lock);
+-
+-	return 0;
++	return ret;
+ }
+ EXPORT_SYMBOL(drm_fb_helper_initial_config);
+ 
+@@ -2550,6 +2576,12 @@ int drm_fb_helper_hotplug_event(struct d
+ 		return 0;
+ 
+ 	mutex_lock(&fb_helper->lock);
++	if (fb_helper->deferred_setup) {
++		err = __drm_fb_helper_initial_config_and_unlock(fb_helper,
++				fb_helper->preferred_bpp);
++		return err;
++	}
++
+ 	if (!fb_helper->fb || !drm_fb_helper_is_bound(fb_helper)) {
+ 		fb_helper->delayed_hotplug = true;
+ 		mutex_unlock(&fb_helper->lock);
+--- a/include/drm/drm_fb_helper.h
++++ b/include/drm/drm_fb_helper.h
+@@ -232,6 +232,29 @@ struct drm_fb_helper {
+ 	 * needs to be reprobe when fbdev is in control again.
+ 	 */
+ 	bool delayed_hotplug;
++
++	/**
++	 * @deferred_setup:
++	 *
++	 * If no outputs are connected (disconnected or unknown) the FB helper
++	 * code will defer setup until at least one of the outputs shows up.
++	 * This field keeps track of the status so that setup can be retried
++	 * at every hotplug event until it succeeds eventually.
++	 *
++	 * Protected by @lock.
++	 */
++	bool deferred_setup;
++
++	/**
++	 * @preferred_bpp:
++	 *
++	 * Temporary storage for the driver's preferred BPP setting passed to
++	 * FB helper initialization. This needs to be tracked so that deferred
++	 * FB helper setup can pass this on.
++	 *
++	 * See also: @deferred_setup
++	 */
++	int preferred_bpp;
+ };
+ 
+ /**
