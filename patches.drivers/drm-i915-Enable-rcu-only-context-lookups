@@ -1,0 +1,285 @@
+From 1acfc104cdf8a3408f0e83b4115d4419c6315005 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 20 Jun 2017 12:05:47 +0100
+Subject: [PATCH] drm/i915: Enable rcu-only context lookups
+Git-commit: 1acfc104cdf8a3408f0e83b4115d4419c6315005
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+Whilst the contents of the context is still protected by the big
+struct_mutex, this is not much of an improvement. It is just one tiny
+step towards reducing our BKL.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170620110547.15947-3-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h            |   16 ++++--
+ drivers/gpu/drm/i915/i915_gem_context.c    |   77 +++++++++++++----------------
+ drivers/gpu/drm/i915/i915_gem_context.h    |    5 +
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   21 ++++---
+ 4 files changed, 64 insertions(+), 55 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3533,15 +3533,21 @@ void i915_gem_object_save_bit_17_swizzle
+ 					 struct sg_table *pages);
+ 
+ static inline struct i915_gem_context *
++__i915_gem_context_lookup_rcu(struct drm_i915_file_private *file_priv, u32 id)
++{
++	return idr_find(&file_priv->context_idr, id);
++}
++
++static inline struct i915_gem_context *
+ i915_gem_context_lookup(struct drm_i915_file_private *file_priv, u32 id)
+ {
+ 	struct i915_gem_context *ctx;
+ 
+-	lockdep_assert_held(&file_priv->dev_priv->drm.struct_mutex);
+-
+-	ctx = idr_find(&file_priv->context_idr, id);
+-	if (!ctx)
+-		return ERR_PTR(-ENOENT);
++	rcu_read_lock();
++	ctx = __i915_gem_context_lookup_rcu(file_priv, id);
++	if (ctx && !kref_get_unless_zero(&ctx->ref))
++		ctx = NULL;
++	rcu_read_unlock();
+ 
+ 	return ctx;
+ }
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -187,7 +187,7 @@ static void i915_gem_context_free(struct
+ 	list_del(&ctx->link);
+ 
+ 	ida_simple_remove(&ctx->i915->contexts.hw_ida, ctx->hw_id);
+-	kfree(ctx);
++	kfree_rcu(ctx, rcu);
+ }
+ 
+ static void contexts_free(struct drm_i915_private *i915)
+@@ -1022,20 +1022,19 @@ int i915_gem_context_destroy_ioctl(struc
+ 	if (args->ctx_id == DEFAULT_CONTEXT_HANDLE)
+ 		return -ENOENT;
+ 
+-	ret = i915_mutex_lock_interruptible(dev);
+-	if (ret)
+-		return ret;
+-
+ 	ctx = i915_gem_context_lookup(file_priv, args->ctx_id);
+-	if (IS_ERR(ctx)) {
+-		mutex_unlock(&dev->struct_mutex);
+-		return PTR_ERR(ctx);
+-	}
++	if (!ctx)
++		return -ENOENT;
++
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		goto out;
+ 
+ 	__destroy_hw_context(ctx, file_priv);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+-	DRM_DEBUG("HW context %d destroyed\n", args->ctx_id);
++out:
++	i915_gem_context_put(ctx);
+ 	return 0;
+ }
+ 
+@@ -1045,17 +1044,11 @@ int i915_gem_context_getparam_ioctl(stru
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+ 	struct drm_i915_gem_context_param *args = data;
+ 	struct i915_gem_context *ctx;
+-	int ret;
+-
+-	ret = i915_mutex_lock_interruptible(dev);
+-	if (ret)
+-		return ret;
++	int ret = 0;
+ 
+ 	ctx = i915_gem_context_lookup(file_priv, args->ctx_id);
+-	if (IS_ERR(ctx)) {
+-		mutex_unlock(&dev->struct_mutex);
+-		return PTR_ERR(ctx);
+-	}
++	if (!ctx)
++		return -ENOENT;
+ 
+ 	args->size = 0;
+ 	switch (args->param) {
+@@ -1083,8 +1076,8 @@ int i915_gem_context_getparam_ioctl(stru
+ 		ret = -EINVAL;
+ 		break;
+ 	}
+-	mutex_unlock(&dev->struct_mutex);
+ 
++	i915_gem_context_put(ctx);
+ 	return ret;
+ }
+ 
+@@ -1096,15 +1089,13 @@ int i915_gem_context_setparam_ioctl(stru
+ 	struct i915_gem_context *ctx;
+ 	int ret;
+ 
++	ctx = i915_gem_context_lookup(file_priv, args->ctx_id);
++	if (!ctx)
++		return -ENOENT;
++
+ 	ret = i915_mutex_lock_interruptible(dev);
+ 	if (ret)
+-		return ret;
+-
+-	ctx = i915_gem_context_lookup(file_priv, args->ctx_id);
+-	if (IS_ERR(ctx)) {
+-		mutex_unlock(&dev->struct_mutex);
+-		return PTR_ERR(ctx);
+-	}
++		goto out;
+ 
+ 	switch (args->param) {
+ 	case I915_CONTEXT_PARAM_BAN_PERIOD:
+@@ -1142,6 +1133,8 @@ int i915_gem_context_setparam_ioctl(stru
+ 	}
+ 	mutex_unlock(&dev->struct_mutex);
+ 
++out:
++	i915_gem_context_put(ctx);
+ 	return ret;
+ }
+ 
+@@ -1156,27 +1149,31 @@ int i915_gem_context_reset_stats_ioctl(s
+ 	if (args->flags || args->pad)
+ 		return -EINVAL;
+ 
+-	ret = i915_mutex_lock_interruptible(dev);
+-	if (ret)
+-		return ret;
++	ret = -ENOENT;
++	rcu_read_lock();
++	ctx = __i915_gem_context_lookup_rcu(file->driver_priv, args->ctx_id);
++	if (!ctx)
++		goto out;
+ 
+-	ctx = i915_gem_context_lookup(file->driver_priv, args->ctx_id);
+-	if (IS_ERR(ctx)) {
+-		mutex_unlock(&dev->struct_mutex);
+-		return PTR_ERR(ctx);
+-	}
++	/*
++	 * We opt for unserialised reads here. This may result in tearing
++	 * in the extremely unlikely event of a GPU hang on this context
++	 * as we are querying them. If we need that extra layer of protection,
++	 * we should wrap the hangstats with a seqlock.
++	 */
+ 
+ 	if (capable(CAP_SYS_ADMIN))
+ 		args->reset_count = i915_reset_count(&dev_priv->gpu_error);
+ 	else
+ 		args->reset_count = 0;
+ 
+-	args->batch_active = ctx->guilty_count;
+-	args->batch_pending = ctx->active_count;
+-
+-	mutex_unlock(&dev->struct_mutex);
++	args->batch_active = READ_ONCE(ctx->guilty_count);
++	args->batch_pending = READ_ONCE(ctx->active_count);
+ 
+-	return 0;
++	ret = 0;
++out:
++	rcu_read_unlock();
++	return ret;
+ }
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+--- a/drivers/gpu/drm/i915/i915_gem_context.h
++++ b/drivers/gpu/drm/i915/i915_gem_context.h
+@@ -100,6 +100,11 @@ struct i915_gem_context {
+ 	struct kref ref;
+ 
+ 	/**
++	 * @rcu: rcu_head for deferred freeing.
++	 */
++	struct rcu_head rcu;
++
++	/**
+ 	 * @flags: small set of booleans
+ 	 */
+ 	unsigned long flags;
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -675,16 +675,17 @@ static int eb_select_context(struct i915
+ 	struct i915_gem_context *ctx;
+ 
+ 	ctx = i915_gem_context_lookup(eb->file->driver_priv, eb->args->rsvd1);
+-	if (unlikely(IS_ERR(ctx)))
+-		return PTR_ERR(ctx);
++	if (unlikely(!ctx))
++		return -ENOENT;
+ 
+ 	if (unlikely(i915_gem_context_is_banned(ctx))) {
+ 		DRM_DEBUG("Context %u tried to submit while banned\n",
+ 			  ctx->user_handle);
++		i915_gem_context_put(ctx);
+ 		return -EIO;
+ 	}
+ 
+-	eb->ctx = i915_gem_context_get(ctx);
++	eb->ctx = ctx;
+ 	eb->vm = ctx->ppgtt ? &ctx->ppgtt->base : &eb->i915->ggtt.base;
+ 
+ 	eb->context_flags = 0;
+@@ -2136,7 +2137,6 @@ i915_gem_do_execbuffer(struct drm_device
+ 	if (DBG_FORCE_RELOC || !(args->flags & I915_EXEC_NO_RELOC))
+ 		args->flags |= __EXEC_HAS_RELOC;
+ 	eb.exec = exec;
+-	eb.ctx = NULL;
+ 	eb.invalid_flags = __EXEC_OBJECT_UNKNOWN_FLAGS;
+ 	if (USES_FULL_PPGTT(eb.i915))
+ 		eb.invalid_flags |= EXEC_OBJECT_NEEDS_GTT;
+@@ -2194,6 +2194,10 @@ i915_gem_do_execbuffer(struct drm_device
+ 
+ 	GEM_BUG_ON(!eb.lut_size);
+ 
++	err = eb_select_context(&eb);
++	if (unlikely(err))
++		goto err_destroy;
++
+ 	/*
+ 	 * Take a local wakeref for preparing to dispatch the execbuf as
+ 	 * we expect to access the hardware fairly frequently in the
+@@ -2202,14 +2206,11 @@ i915_gem_do_execbuffer(struct drm_device
+ 	 * 100ms.
+ 	 */
+ 	intel_runtime_pm_get(eb.i915);
++
+ 	err = i915_mutex_lock_interruptible(dev);
+ 	if (err)
+ 		goto err_rpm;
+ 
+-	err = eb_select_context(&eb);
+-	if (unlikely(err))
+-		goto err_unlock;
+-
+ 	err = eb_relocate(&eb);
+ 	if (err) {
+ 		/*
+@@ -2345,11 +2346,11 @@ err_batch_unpin:
+ err_vma:
+ 	if (eb.exec)
+ 		eb_release_vmas(&eb);
+-	i915_gem_context_put(eb.ctx);
+-err_unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+ err_rpm:
+ 	intel_runtime_pm_put(eb.i915);
++	i915_gem_context_put(eb.ctx);
++err_destroy:
+ 	eb_destroy(&eb);
+ err_out_fence:
+ 	if (out_fence_fd != -1)
