@@ -1,0 +1,262 @@
+From f090a00df9ecdab5d066b099c1797e0070e27a36 Mon Sep 17 00:00:00 2001
+From: Changbin Du <changbin.du@intel.com>
+Date: Tue, 15 Aug 2017 13:14:04 +0800
+Subject: [PATCH] drm/i915/gvt: Add emulation for BAR2 (aperture) with normal file RW approach
+Git-commit: f090a00df9ecdab5d066b099c1797e0070e27a36
+Patch-mainline: v4.15-rc1
+References: FATE#322643 bsc#1055900
+
+For vfio-pci, if the region support MMAP then it should support both
+mmap and normal file access. The user-space is free to choose which is
+being used. For qemu, we just need add 'x-no-mmap=on' for vfio-pci
+option.
+
+Currently GVTg only support MMAP for BAR2. So GVTg will not work when
+user turn on x-no-mmap option.
+
+This patch added file style access for BAR2, aka the GPU aperture. We
+map the entire aperture partition of active vGPU to kernel space when
+guest driver try to enable PCI Memory Space. Then we redirect the file
+RW operation from kvmgt to this mapped area.
+
+Link: https://bugzilla.redhat.com/show_bug.cgi?id=1458032
+Signed-off-by: Changbin Du <changbin.du@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/cfg_space.c |   26 ++++++++++++++-----
+ drivers/gpu/drm/i915/gvt/gvt.h       |    8 +++++
+ drivers/gpu/drm/i915/gvt/kvmgt.c     |   42 ++++++++++++++++++-------------
+ drivers/gpu/drm/i915/gvt/mmio.c      |   47 +++++++++++++++++++++++++++++++++--
+ 4 files changed, 98 insertions(+), 25 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/cfg_space.c
++++ b/drivers/gpu/drm/i915/gvt/cfg_space.c
+@@ -110,13 +110,25 @@ int intel_vgpu_emulate_cfg_read(struct i
+ 
+ static int map_aperture(struct intel_vgpu *vgpu, bool map)
+ {
+-	u64 first_gfn, first_mfn;
++	phys_addr_t aperture_pa = vgpu_aperture_pa_base(vgpu);
++	unsigned long aperture_sz = vgpu_aperture_sz(vgpu);
++	u64 first_gfn;
+ 	u64 val;
+ 	int ret;
+ 
+ 	if (map == vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_APERTURE].tracked)
+ 		return 0;
+ 
++	if (map) {
++		vgpu->gm.aperture_va = memremap(aperture_pa, aperture_sz,
++						MEMREMAP_WC);
++		if (!vgpu->gm.aperture_va)
++			return -ENOMEM;
++	} else {
++		memunmap(vgpu->gm.aperture_va);
++		vgpu->gm.aperture_va = NULL;
++	}
++
+ 	val = vgpu_cfg_space(vgpu)[PCI_BASE_ADDRESS_2];
+ 	if (val & PCI_BASE_ADDRESS_MEM_TYPE_64)
+ 		val = *(u64 *)(vgpu_cfg_space(vgpu) + PCI_BASE_ADDRESS_2);
+@@ -124,14 +136,16 @@ static int map_aperture(struct intel_vgp
+ 		val = *(u32 *)(vgpu_cfg_space(vgpu) + PCI_BASE_ADDRESS_2);
+ 
+ 	first_gfn = (val + vgpu_aperture_offset(vgpu)) >> PAGE_SHIFT;
+-	first_mfn = vgpu_aperture_pa_base(vgpu) >> PAGE_SHIFT;
+ 
+ 	ret = intel_gvt_hypervisor_map_gfn_to_mfn(vgpu, first_gfn,
+-						  first_mfn,
+-						  vgpu_aperture_sz(vgpu) >>
+-						  PAGE_SHIFT, map);
+-	if (ret)
++						  aperture_pa >> PAGE_SHIFT,
++						  aperture_sz >> PAGE_SHIFT,
++						  map);
++	if (ret) {
++		memunmap(vgpu->gm.aperture_va);
++		vgpu->gm.aperture_va = NULL;
+ 		return ret;
++	}
+ 
+ 	vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_APERTURE].tracked = map;
+ 	return 0;
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -80,6 +80,7 @@ struct intel_gvt_device_info {
+ struct intel_vgpu_gm {
+ 	u64 aperture_sz;
+ 	u64 hidden_sz;
++	void *aperture_va;
+ 	struct drm_mm_node low_gm_node;
+ 	struct drm_mm_node high_gm_node;
+ };
+@@ -474,6 +475,13 @@ int intel_vgpu_emulate_cfg_read(struct i
+ int intel_vgpu_emulate_cfg_write(struct intel_vgpu *vgpu, unsigned int offset,
+ 		void *p_data, unsigned int bytes);
+ 
++static inline u64 intel_vgpu_get_bar_gpa(struct intel_vgpu *vgpu, int bar)
++{
++	/* We are 64bit bar. */
++	return (*(u64 *)(vgpu->cfg_space.virtual_cfg_space + bar)) &
++			PCI_BASE_ADDRESS_MEM_MASK;
++}
++
+ void intel_gvt_clean_opregion(struct intel_gvt *gvt);
+ int intel_gvt_init_opregion(struct intel_gvt *gvt);
+ 
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@ -609,21 +609,20 @@ static void intel_vgpu_release_work(stru
+ 	__intel_vgpu_release(vgpu);
+ }
+ 
+-static uint64_t intel_vgpu_get_bar0_addr(struct intel_vgpu *vgpu)
++static uint64_t intel_vgpu_get_bar_addr(struct intel_vgpu *vgpu, int bar)
+ {
+ 	u32 start_lo, start_hi;
+ 	u32 mem_type;
+-	int pos = PCI_BASE_ADDRESS_0;
+ 
+-	start_lo = (*(u32 *)(vgpu->cfg_space.virtual_cfg_space + pos)) &
++	start_lo = (*(u32 *)(vgpu->cfg_space.virtual_cfg_space + bar)) &
+ 			PCI_BASE_ADDRESS_MEM_MASK;
+-	mem_type = (*(u32 *)(vgpu->cfg_space.virtual_cfg_space + pos)) &
++	mem_type = (*(u32 *)(vgpu->cfg_space.virtual_cfg_space + bar)) &
+ 			PCI_BASE_ADDRESS_MEM_TYPE_MASK;
+ 
+ 	switch (mem_type) {
+ 	case PCI_BASE_ADDRESS_MEM_TYPE_64:
+ 		start_hi = (*(u32 *)(vgpu->cfg_space.virtual_cfg_space
+-						+ pos + 4));
++						+ bar + 4));
+ 		break;
+ 	case PCI_BASE_ADDRESS_MEM_TYPE_32:
+ 	case PCI_BASE_ADDRESS_MEM_TYPE_1M:
+@@ -637,6 +636,21 @@ static uint64_t intel_vgpu_get_bar0_addr
+ 	return ((u64)start_hi << 32) | start_lo;
+ }
+ 
++static int intel_vgpu_bar_rw(struct intel_vgpu *vgpu, int bar, uint64_t off,
++			     void *buf, unsigned int count, bool is_write)
++{
++	uint64_t bar_start = intel_vgpu_get_bar_addr(vgpu, bar);
++	int ret;
++
++	if (is_write)
++		ret = intel_gvt_ops->emulate_mmio_write(vgpu,
++					bar_start + off, buf, count);
++	else
++		ret = intel_gvt_ops->emulate_mmio_read(vgpu,
++					bar_start + off, buf, count);
++	return ret;
++}
++
+ static ssize_t intel_vgpu_rw(struct mdev_device *mdev, char *buf,
+ 			size_t count, loff_t *ppos, bool is_write)
+ {
+@@ -661,20 +675,14 @@ static ssize_t intel_vgpu_rw(struct mdev
+ 						buf, count);
+ 		break;
+ 	case VFIO_PCI_BAR0_REGION_INDEX:
+-		if (is_write) {
+-			uint64_t bar0_start = intel_vgpu_get_bar0_addr(vgpu);
+-
+-			ret = intel_gvt_ops->emulate_mmio_write(vgpu,
+-						bar0_start + pos, buf, count);
+-		} else {
+-			uint64_t bar0_start = intel_vgpu_get_bar0_addr(vgpu);
+-
+-			ret = intel_gvt_ops->emulate_mmio_read(vgpu,
+-						bar0_start + pos, buf, count);
+-		}
++		ret = intel_vgpu_bar_rw(vgpu, PCI_BASE_ADDRESS_0, pos,
++					buf, count, is_write);
+ 		break;
+-	case VFIO_PCI_BAR1_REGION_INDEX:
+ 	case VFIO_PCI_BAR2_REGION_INDEX:
++		ret = intel_vgpu_bar_rw(vgpu, PCI_BASE_ADDRESS_2, pos,
++					buf, count, is_write);
++		break;
++	case VFIO_PCI_BAR1_REGION_INDEX:
+ 	case VFIO_PCI_BAR3_REGION_INDEX:
+ 	case VFIO_PCI_BAR4_REGION_INDEX:
+ 	case VFIO_PCI_BAR5_REGION_INDEX:
+--- a/drivers/gpu/drm/i915/gvt/mmio.c
++++ b/drivers/gpu/drm/i915/gvt/mmio.c
+@@ -45,8 +45,7 @@
+  */
+ int intel_vgpu_gpa_to_mmio_offset(struct intel_vgpu *vgpu, u64 gpa)
+ {
+-	u64 gttmmio_gpa = *(u64 *)(vgpu_cfg_space(vgpu) + PCI_BASE_ADDRESS_0) &
+-			  ~GENMASK(3, 0);
++	u64 gttmmio_gpa = intel_vgpu_get_bar_gpa(vgpu, PCI_BASE_ADDRESS_0);
+ 	return gpa - gttmmio_gpa;
+ }
+ 
+@@ -57,6 +56,38 @@ int intel_vgpu_gpa_to_mmio_offset(struct
+ 	(reg >= gvt->device_info.gtt_start_offset \
+ 	 && reg < gvt->device_info.gtt_start_offset + gvt_ggtt_sz(gvt))
+ 
++static bool vgpu_gpa_is_aperture(struct intel_vgpu *vgpu, uint64_t gpa)
++{
++	u64 aperture_gpa = intel_vgpu_get_bar_gpa(vgpu, PCI_BASE_ADDRESS_2);
++	u64 aperture_sz = vgpu_aperture_sz(vgpu);
++
++	return gpa >= aperture_gpa && gpa < aperture_gpa + aperture_sz;
++}
++
++static int vgpu_aperture_rw(struct intel_vgpu *vgpu, uint64_t gpa,
++			    void *pdata, unsigned int size, bool is_read)
++{
++	u64 aperture_gpa = intel_vgpu_get_bar_gpa(vgpu, PCI_BASE_ADDRESS_2);
++	u64 offset = gpa - aperture_gpa;
++
++	if (!vgpu_gpa_is_aperture(vgpu, gpa + size - 1)) {
++		gvt_vgpu_err("Aperture rw out of range, offset %llx, size %d\n",
++			     offset, size);
++		return -EINVAL;
++	}
++
++	if (!vgpu->gm.aperture_va) {
++		gvt_vgpu_err("BAR is not enabled\n");
++		return -ENXIO;
++	}
++
++	if (is_read)
++		memcpy(pdata, vgpu->gm.aperture_va + offset, size);
++	else
++		memcpy(vgpu->gm.aperture_va + offset, pdata, size);
++	return 0;
++}
++
+ static void failsafe_emulate_mmio_rw(struct intel_vgpu *vgpu, uint64_t pa,
+ 		void *p_data, unsigned int bytes, bool read)
+ {
+@@ -133,6 +164,12 @@ int intel_vgpu_emulate_mmio_read(struct
+ 	}
+ 	mutex_lock(&gvt->lock);
+ 
++	if (vgpu_gpa_is_aperture(vgpu, pa)) {
++		ret = vgpu_aperture_rw(vgpu, pa, p_data, bytes, true);
++		mutex_unlock(&gvt->lock);
++		return ret;
++	}
++
+ 	if (atomic_read(&vgpu->gtt.n_write_protected_guest_page)) {
+ 		struct intel_vgpu_guest_page *gp;
+ 
+@@ -224,6 +261,12 @@ int intel_vgpu_emulate_mmio_write(struct
+ 
+ 	mutex_lock(&gvt->lock);
+ 
++	if (vgpu_gpa_is_aperture(vgpu, pa)) {
++		ret = vgpu_aperture_rw(vgpu, pa, p_data, bytes, false);
++		mutex_unlock(&gvt->lock);
++		return ret;
++	}
++
+ 	if (atomic_read(&vgpu->gtt.n_write_protected_guest_page)) {
+ 		struct intel_vgpu_guest_page *gp;
+ 
