@@ -1,0 +1,401 @@
+From 144a7999d6334be5237d5926ab19c56bc24d0204 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Tue, 25 Jul 2017 14:02:04 +0200
+Subject: [PATCH] drm: Handle properties in the core for atomic drivers
+Git-commit: 144a7999d6334be5237d5926ab19c56bc24d0204
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+The reason behind the original indirection through the helper
+functions was to allow existing drivers to overwrite how they handle
+properties. For example when a vendor-specific userspace had
+expectations that didn't match atomic. That seemed likely, since
+atomic is standardizing a _lot_ more of the behaviour of a kms driver.
+
+But 20 drivers later there's no such need at all. Worse, this forces
+all drivers to hook up the default behaviour, breaking userspace if
+they forget to do that. And it forces us to export a bunch of core
+function just for those helpers.
+
+And finally, these helpers are the last places using
+drm_atomic_legacy_backoff() and the implicit acquire_ctx.
+
+This patch here just implements the new behaviour and updates the
+docs. Follow-up patches will garbage-collect all the dead code.
+
+V2: Fixup docs even better!
+
+V3: Make it actually work ...
+
+V4: Drop the uses_atomic_modeset() checks from the previous patch
+again, since they're now moved up in the callchain.
+
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Archit Taneja <architt@codeaurora.org> (v3)
+Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170725120204.2107-1-daniel.vetter@ffwll.ch
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/drm_atomic.c        |   60 ++++++++++++++++++-
+ drivers/gpu/drm/drm_connector.c     |    8 +-
+ drivers/gpu/drm/drm_crtc.c          |    2 
+ drivers/gpu/drm/drm_crtc_helper.c   |    3 
+ drivers/gpu/drm/drm_crtc_internal.h |    7 ++
+ drivers/gpu/drm/drm_mode_object.c   |  110 +++++++++++++++++++++++++++---------
+ drivers/gpu/drm/drm_plane.c         |    2 
+ include/drm/drm_connector.h         |   10 +--
+ include/drm/drm_crtc.h              |    6 -
+ include/drm/drm_plane.h             |    6 -
+ 10 files changed, 161 insertions(+), 53 deletions(-)
+
+--- a/drivers/gpu/drm/drm_atomic.c
++++ b/drivers/gpu/drm/drm_atomic.c
+@@ -1868,9 +1868,60 @@ static struct drm_pending_vblank_event *
+ 	return e;
+ }
+ 
+-static int atomic_set_prop(struct drm_atomic_state *state,
+-		struct drm_mode_object *obj, struct drm_property *prop,
+-		uint64_t prop_value)
++int drm_atomic_connector_commit_dpms(struct drm_atomic_state *state,
++				     struct drm_connector *connector,
++				     int mode)
++{
++	struct drm_connector *tmp_connector;
++	struct drm_connector_state *new_conn_state;
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
++	int i, ret, old_mode = connector->dpms;
++	bool active = false;
++
++	ret = drm_modeset_lock(&state->dev->mode_config.connection_mutex,
++			       state->acquire_ctx);
++	if (ret)
++		return ret;
++
++	if (mode != DRM_MODE_DPMS_ON)
++		mode = DRM_MODE_DPMS_OFF;
++	connector->dpms = mode;
++
++	crtc = connector->state->crtc;
++	if (!crtc)
++		goto out;
++	ret = drm_atomic_add_affected_connectors(state, crtc);
++	if (ret)
++		goto out;
++
++	crtc_state = drm_atomic_get_crtc_state(state, crtc);
++	if (IS_ERR(crtc_state)) {
++		ret = PTR_ERR(crtc_state);
++		goto out;
++	}
++
++	for_each_new_connector_in_state(state, tmp_connector, new_conn_state, i) {
++		if (new_conn_state->crtc != crtc)
++			continue;
++		if (tmp_connector->dpms == DRM_MODE_DPMS_ON) {
++			active = true;
++			break;
++		}
++	}
++
++	crtc_state->active = active;
++	ret = drm_atomic_commit(state);
++out:
++	if (ret != 0)
++		connector->dpms = old_mode;
++	return ret;
++}
++
++int drm_atomic_set_property(struct drm_atomic_state *state,
++			    struct drm_mode_object *obj,
++			    struct drm_property *prop,
++			    uint64_t prop_value)
+ {
+ 	struct drm_mode_object *ref;
+ 	int ret;
+@@ -2292,7 +2343,8 @@ retry:
+ 				goto out;
+ 			}
+ 
+-			ret = atomic_set_prop(state, obj, prop, prop_value);
++			ret = drm_atomic_set_property(state, obj, prop,
++						      prop_value);
+ 			if (ret) {
+ 				drm_mode_object_put(obj);
+ 				goto out;
+--- a/drivers/gpu/drm/drm_connector.c
++++ b/drivers/gpu/drm/drm_connector.c
+@@ -760,9 +760,9 @@ DRM_ENUM_NAME_FN(drm_get_tv_subconnector
+  * 	drivers, it remaps to controlling the "ACTIVE" property on the CRTC the
+  * 	connector is linked to. Drivers should never set this property directly,
+  * 	it is handled by the DRM core by calling the &drm_connector_funcs.dpms
+- * 	callback. Atomic drivers should implement this hook using
+- * 	drm_atomic_helper_connector_dpms(). This is the only property standard
+- * 	connector property that userspace can change.
++ * 	callback. For atomic drivers the remapping to the "ACTIVE" property is
++ * 	implemented in the DRM core.  This is the only standard connector
++ * 	property that userspace can change.
+  * PATH:
+  * 	Connector path property to identify how this sink is physically
+  * 	connected. Used by DP MST. This should be set by calling
+@@ -1268,7 +1268,7 @@ int drm_mode_connector_set_obj_prop(stru
+ 	} else if (connector->funcs->set_property)
+ 		ret = connector->funcs->set_property(connector, property, value);
+ 
+-	if (!ret && !drm_drv_uses_atomic_modeset(property->dev))
++	if (!ret)
+ 		drm_object_property_set_value(&connector->base, property, value);
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -736,7 +736,7 @@ int drm_mode_crtc_set_obj_prop(struct dr
+ 
+ 	if (crtc->funcs->set_property)
+ 		ret = crtc->funcs->set_property(crtc, property, value);
+-	if (!ret && !drm_drv_uses_atomic_modeset(property->dev))
++	if (!ret)
+ 		drm_object_property_set_value(obj, property, value);
+ 
+ 	return ret;
+--- a/drivers/gpu/drm/drm_crtc_helper.c
++++ b/drivers/gpu/drm/drm_crtc_helper.c
+@@ -863,8 +863,7 @@ static int drm_helper_choose_crtc_dpms(s
+  * provided by the driver.
+  *
+  * This function is deprecated.  New drivers must implement atomic modeset
+- * support, for which this function is unsuitable. Instead drivers should use
+- * drm_atomic_helper_connector_dpms().
++ * support, where DPMS is handled in the DRM core.
+  *
+  * Returns:
+  * Always returns 0.
+--- a/drivers/gpu/drm/drm_crtc_internal.h
++++ b/drivers/gpu/drm/drm_crtc_internal.h
+@@ -179,6 +179,13 @@ struct drm_minor;
+ int drm_atomic_debugfs_init(struct drm_minor *minor);
+ #endif
+ 
++int drm_atomic_connector_commit_dpms(struct drm_atomic_state *state,
++				     struct drm_connector *connector,
++				     int mode);
++int drm_atomic_set_property(struct drm_atomic_state *state,
++			    struct drm_mode_object *obj,
++			    struct drm_property *prop,
++			    uint64_t prop_value);
+ int drm_atomic_get_property(struct drm_mode_object *obj,
+ 			    struct drm_property *property, uint64_t *val);
+ int drm_mode_atomic_ioctl(struct drm_device *dev,
+--- a/drivers/gpu/drm/drm_mode_object.c
++++ b/drivers/gpu/drm/drm_mode_object.c
+@@ -392,6 +392,83 @@ struct drm_property *drm_mode_obj_find_p
+ 	return NULL;
+ }
+ 
++static int set_property_legacy(struct drm_mode_object *obj,
++			       struct drm_property *prop,
++			       uint64_t prop_value)
++{
++	struct drm_device *dev = prop->dev;
++	struct drm_mode_object *ref;
++	int ret = -EINVAL;
++
++	if (!drm_property_change_valid_get(prop, prop_value, &ref))
++		return -EINVAL;
++
++	drm_modeset_lock_all(dev);
++	switch (obj->type) {
++	case DRM_MODE_OBJECT_CONNECTOR:
++		ret = drm_mode_connector_set_obj_prop(obj, prop,
++						      prop_value);
++		break;
++	case DRM_MODE_OBJECT_CRTC:
++		ret = drm_mode_crtc_set_obj_prop(obj, prop, prop_value);
++		break;
++	case DRM_MODE_OBJECT_PLANE:
++		ret = drm_mode_plane_set_obj_prop(obj_to_plane(obj),
++						  prop, prop_value);
++		break;
++	}
++	drm_property_change_valid_put(prop, ref);
++	drm_modeset_unlock_all(dev);
++
++	return ret;
++}
++
++static int set_property_atomic(struct drm_mode_object *obj,
++			       struct drm_property *prop,
++			       uint64_t prop_value)
++{
++	struct drm_device *dev = prop->dev;
++	struct drm_atomic_state *state;
++	struct drm_modeset_acquire_ctx ctx;
++	int ret;
++
++	drm_modeset_acquire_init(&ctx, 0);
++
++	state = drm_atomic_state_alloc(dev);
++	if (!state)
++		return -ENOMEM;
++	state->acquire_ctx = &ctx;
++retry:
++	if (prop == state->dev->mode_config.dpms_property) {
++		if (obj->type != DRM_MODE_OBJECT_CONNECTOR) {
++			ret = -EINVAL;
++			goto out;
++		}
++
++		ret = drm_atomic_connector_commit_dpms(state,
++						       obj_to_connector(obj),
++						       prop_value);
++	} else {
++		ret = drm_atomic_set_property(state, obj, prop, prop_value);
++		if (ret)
++			goto out;
++		ret = drm_atomic_commit(state);
++	}
++out:
++	if (ret == -EDEADLK) {
++		drm_atomic_state_clear(state);
++		drm_modeset_backoff(&ctx);
++		goto retry;
++	}
++
++	drm_atomic_state_put(state);
++
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++
++	return ret;
++}
++
+ int drm_mode_obj_set_property_ioctl(struct drm_device *dev, void *data,
+ 				    struct drm_file *file_priv)
+ {
+@@ -399,18 +476,13 @@ int drm_mode_obj_set_property_ioctl(stru
+ 	struct drm_mode_object *arg_obj;
+ 	struct drm_property *property;
+ 	int ret = -EINVAL;
+-	struct drm_mode_object *ref;
+ 
+ 	if (!drm_core_check_feature(dev, DRIVER_MODESET))
+ 		return -EINVAL;
+ 
+-	drm_modeset_lock_all(dev);
+-
+ 	arg_obj = drm_mode_object_find(dev, arg->obj_id, arg->obj_type);
+-	if (!arg_obj) {
+-		ret = -ENOENT;
+-		goto out;
+-	}
++	if (!arg_obj)
++		return -ENOENT;
+ 
+ 	if (!arg_obj->properties)
+ 		goto out_unref;
+@@ -419,28 +491,12 @@ int drm_mode_obj_set_property_ioctl(stru
+ 	if (!property)
+ 		goto out_unref;
+ 
+-	if (!drm_property_change_valid_get(property, arg->value, &ref))
+-		goto out_unref;
+-
+-	switch (arg_obj->type) {
+-	case DRM_MODE_OBJECT_CONNECTOR:
+-		ret = drm_mode_connector_set_obj_prop(arg_obj, property,
+-						      arg->value);
+-		break;
+-	case DRM_MODE_OBJECT_CRTC:
+-		ret = drm_mode_crtc_set_obj_prop(arg_obj, property, arg->value);
+-		break;
+-	case DRM_MODE_OBJECT_PLANE:
+-		ret = drm_mode_plane_set_obj_prop(obj_to_plane(arg_obj),
+-						  property, arg->value);
+-		break;
+-	}
+-
+-	drm_property_change_valid_put(property, ref);
++	if (drm_drv_uses_atomic_modeset(property->dev))
++		ret = set_property_atomic(arg_obj, property, arg->value);
++	else
++		ret = set_property_legacy(arg_obj, property, arg->value);
+ 
+ out_unref:
+ 	drm_mode_object_put(arg_obj);
+-out:
+-	drm_modeset_unlock_all(dev);
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/drm_plane.c
++++ b/drivers/gpu/drm/drm_plane.c
+@@ -448,7 +448,7 @@ int drm_mode_plane_set_obj_prop(struct d
+ 
+ 	if (plane->funcs->set_property)
+ 		ret = plane->funcs->set_property(plane, property, value);
+-	if (!ret && !drm_drv_uses_atomic_modeset(property->dev))
++	if (!ret)
+ 		drm_object_property_set_value(obj, property, value);
+ 
+ 	return ret;
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -383,8 +383,8 @@ struct drm_connector_funcs {
+ 	 * implement the 4 level DPMS support on the connector any more, but
+ 	 * instead only have an on/off "ACTIVE" property on the CRTC object.
+ 	 *
+-	 * Drivers implementing atomic modeset should use
+-	 * drm_atomic_helper_connector_dpms() to implement this hook.
++	 * This hook is not used by atomic drivers, remapping of the legacy DPMS
++	 * property is entirely handled in the DRM core.
+ 	 *
+ 	 * RETURNS:
+ 	 *
+@@ -481,11 +481,9 @@ struct drm_connector_funcs {
+ 	 * This is the legacy entry point to update a property attached to the
+ 	 * connector.
+ 	 *
+-	 * Drivers implementing atomic modeset should use
+-	 * drm_atomic_helper_connector_set_property() to implement this hook.
+-	 *
+ 	 * This callback is optional if the driver does not support any legacy
+-	 * driver-private properties.
++	 * driver-private properties. For atomic drivers it is not used because
++	 * property handling is done entirely in the DRM core.
+ 	 *
+ 	 * RETURNS:
+ 	 *
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -481,11 +481,9 @@ struct drm_crtc_funcs {
+ 	 * This is the legacy entry point to update a property attached to the
+ 	 * CRTC.
+ 	 *
+-	 * Drivers implementing atomic modeset should use
+-	 * drm_atomic_helper_crtc_set_property() to implement this hook.
+-	 *
+ 	 * This callback is optional if the driver does not support any legacy
+-	 * driver-private properties.
++	 * driver-private properties. For atomic drivers it is not used because
++	 * property handling is done entirely in the DRM core.
+ 	 *
+ 	 * RETURNS:
+ 	 *
+--- a/include/drm/drm_plane.h
++++ b/include/drm/drm_plane.h
+@@ -233,11 +233,9 @@ struct drm_plane_funcs {
+ 	 * This is the legacy entry point to update a property attached to the
+ 	 * plane.
+ 	 *
+-	 * Drivers implementing atomic modeset should use
+-	 * drm_atomic_helper_plane_set_property() to implement this hook.
+-	 *
+ 	 * This callback is optional if the driver does not support any legacy
+-	 * driver-private properties.
++	 * driver-private properties. For atomic drivers it is not used because
++	 * property handling is done entirely in the DRM core.
+ 	 *
+ 	 * RETURNS:
+ 	 *
