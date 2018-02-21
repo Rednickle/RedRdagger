@@ -1,0 +1,751 @@
+From f8a58d639dd95b0188862b4c1c1cc81c737db612 Mon Sep 17 00:00:00 2001
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Fri, 26 May 2017 11:13:25 +0000
+Subject: [PATCH] drm/i915/guc: Introduce buffer based cmd transport
+Git-commit: f8a58d639dd95b0188862b4c1c1cc81c737db612
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+Buffer based command transport can replace MMIO based mechanism.
+It may be used to perform host-2-guc and guc-to-host communication.
+
+Portions of this patch are based on work by:
+ Michel Thierry <michel.thierry@intel.com>
+ Robert Beckett <robert.beckett@intel.com>
+ Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+
+V2: use gem_object_pin_map (Chris)    don't use DEBUG_RATELIMITED (Chris)    don't track action stats (Chris)    simplify next fence (Chris)    use READ_ONCE (Chris)    move blob allocation to new function (Chris)
+
+V3: use static owner id (Daniele)
+V4: but keep channel initialization generic (Daniele)    and introduce owner_sub_id (Daniele)
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: Oscar Mateo <oscar.mateo@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170526111326.87280-3-michal.wajdeczko@intel.com
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/Makefile         |    1 
+ drivers/gpu/drm/i915/i915_drv.h       |    2 
+ drivers/gpu/drm/i915/intel_guc_ct.c   |  461 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_guc_ct.h   |   86 ++++++
+ drivers/gpu/drm/i915/intel_guc_fwif.h |   43 +++
+ drivers/gpu/drm/i915/intel_uc.c       |   19 +
+ drivers/gpu/drm/i915/intel_uc.h       |    3 
+ 7 files changed, 613 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/intel_guc_ct.c
+ create mode 100644 drivers/gpu/drm/i915/intel_guc_ct.h
+
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -58,6 +58,7 @@ i915-y += i915_cmd_parser.o \
+ 
+ # general-purpose microcontroller (GuC) support
+ i915-y += intel_uc.o \
++	  intel_guc_ct.o \
+ 	  intel_guc_log.o \
+ 	  intel_guc_loader.o \
+ 	  intel_huc.o \
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -761,6 +761,7 @@ struct intel_csr {
+ 	func(has_gmbus_irq); \
+ 	func(has_gmch_display); \
+ 	func(has_guc); \
++	func(has_guc_ct); \
+ 	func(has_hotplug); \
+ 	func(has_l3_dpf); \
+ 	func(has_llc); \
+@@ -2948,6 +2949,7 @@ intel_info(const struct drm_i915_private
+  * properties, so we have separate macros to test them.
+  */
+ #define HAS_GUC(dev_priv)	((dev_priv)->info.has_guc)
++#define HAS_GUC_CT(dev_priv)	((dev_priv)->info.has_guc_ct)
+ #define HAS_GUC_UCODE(dev_priv)	(HAS_GUC(dev_priv))
+ #define HAS_GUC_SCHED(dev_priv)	(HAS_GUC(dev_priv))
+ #define HAS_HUC_UCODE(dev_priv)	(HAS_GUC(dev_priv))
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_guc_ct.c
+@@ -0,0 +1,461 @@
++/*
++ * Copyright © 2016-2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#include "i915_drv.h"
++#include "intel_guc_ct.h"
++
++enum { CTB_SEND = 0, CTB_RECV = 1 };
++
++enum { CTB_OWNER_HOST = 0 };
++
++void intel_guc_ct_init_early(struct intel_guc_ct *ct)
++{
++	/* we're using static channel owners */
++	ct->host_channel.owner = CTB_OWNER_HOST;
++}
++
++static inline const char *guc_ct_buffer_type_to_str(u32 type)
++{
++	switch (type) {
++	case INTEL_GUC_CT_BUFFER_TYPE_SEND:
++		return "SEND";
++	case INTEL_GUC_CT_BUFFER_TYPE_RECV:
++		return "RECV";
++	default:
++		return "<invalid>";
++	}
++}
++
++static void guc_ct_buffer_desc_init(struct guc_ct_buffer_desc *desc,
++				    u32 cmds_addr, u32 size, u32 owner)
++{
++	DRM_DEBUG_DRIVER("CT: desc %p init addr=%#x size=%u owner=%u\n",
++			 desc, cmds_addr, size, owner);
++	memset(desc, 0, sizeof(*desc));
++	desc->addr = cmds_addr;
++	desc->size = size;
++	desc->owner = owner;
++}
++
++static void guc_ct_buffer_desc_reset(struct guc_ct_buffer_desc *desc)
++{
++	DRM_DEBUG_DRIVER("CT: desc %p reset head=%u tail=%u\n",
++			 desc, desc->head, desc->tail);
++	desc->head = 0;
++	desc->tail = 0;
++	desc->is_in_error = 0;
++}
++
++static int guc_action_register_ct_buffer(struct intel_guc *guc,
++					 u32 desc_addr,
++					 u32 type)
++{
++	u32 action[] = {
++		INTEL_GUC_ACTION_REGISTER_COMMAND_TRANSPORT_BUFFER,
++		desc_addr,
++		sizeof(struct guc_ct_buffer_desc),
++		type
++	};
++	int err;
++
++	/* Can't use generic send(), CT registration must go over MMIO */
++	err = intel_guc_send_mmio(guc, action, ARRAY_SIZE(action));
++	if (err)
++		DRM_ERROR("CT: register %s buffer failed; err=%d\n",
++			  guc_ct_buffer_type_to_str(type), err);
++	return err;
++}
++
++static int guc_action_deregister_ct_buffer(struct intel_guc *guc,
++					   u32 owner,
++					   u32 type)
++{
++	u32 action[] = {
++		INTEL_GUC_ACTION_DEREGISTER_COMMAND_TRANSPORT_BUFFER,
++		owner,
++		type
++	};
++	int err;
++
++	/* Can't use generic send(), CT deregistration must go over MMIO */
++	err = intel_guc_send_mmio(guc, action, ARRAY_SIZE(action));
++	if (err)
++		DRM_ERROR("CT: deregister %s buffer failed; owner=%d err=%d\n",
++			  guc_ct_buffer_type_to_str(type), owner, err);
++	return err;
++}
++
++static bool ctch_is_open(struct intel_guc_ct_channel *ctch)
++{
++	return ctch->vma != NULL;
++}
++
++static int ctch_init(struct intel_guc *guc,
++		     struct intel_guc_ct_channel *ctch)
++{
++	struct i915_vma *vma;
++	void *blob;
++	int err;
++	int i;
++
++	GEM_BUG_ON(ctch->vma);
++
++	/* We allocate 1 page to hold both descriptors and both buffers.
++	 *       ___________.....................
++	 *      |desc (SEND)|                   :
++	 *      |___________|                   PAGE/4
++	 *      :___________....................:
++	 *      |desc (RECV)|                   :
++	 *      |___________|                   PAGE/4
++	 *      :_______________________________:
++	 *      |cmds (SEND)                    |
++	 *      |                               PAGE/4
++	 *      |_______________________________|
++	 *      |cmds (RECV)                    |
++	 *      |                               PAGE/4
++	 *      |_______________________________|
++	 *
++	 * Each message can use a maximum of 32 dwords and we don't expect to
++	 * have more than 1 in flight at any time, so we have enough space.
++	 * Some logic further ahead will rely on the fact that there is only 1
++	 * page and that it is always mapped, so if the size is changed the
++	 * other code will need updating as well.
++	 */
++
++	/* allocate vma */
++	vma = intel_guc_allocate_vma(guc, PAGE_SIZE);
++	if (IS_ERR(vma)) {
++		err = PTR_ERR(vma);
++		goto err_out;
++	}
++	ctch->vma = vma;
++
++	/* map first page */
++	blob = i915_gem_object_pin_map(vma->obj, I915_MAP_WB);
++	if (IS_ERR(blob)) {
++		err = PTR_ERR(blob);
++		goto err_vma;
++	}
++	DRM_DEBUG_DRIVER("CT: vma base=%#x\n", guc_ggtt_offset(ctch->vma));
++
++	/* store pointers to desc and cmds */
++	for (i = 0; i < ARRAY_SIZE(ctch->ctbs); i++) {
++		GEM_BUG_ON((i != CTB_SEND) && (i != CTB_RECV));
++		ctch->ctbs[i].desc = blob + PAGE_SIZE/4 * i;
++		ctch->ctbs[i].cmds = blob + PAGE_SIZE/4 * i + PAGE_SIZE/2;
++	}
++
++	return 0;
++
++err_vma:
++	i915_vma_unpin_and_release(&ctch->vma);
++err_out:
++	DRM_DEBUG_DRIVER("CT: channel %d initialization failed; err=%d\n",
++			 ctch->owner, err);
++	return err;
++}
++
++static void ctch_fini(struct intel_guc *guc,
++		      struct intel_guc_ct_channel *ctch)
++{
++	GEM_BUG_ON(!ctch->vma);
++
++	i915_gem_object_unpin_map(ctch->vma->obj);
++	i915_vma_unpin_and_release(&ctch->vma);
++}
++
++static int ctch_open(struct intel_guc *guc,
++		     struct intel_guc_ct_channel *ctch)
++{
++	u32 base;
++	int err;
++	int i;
++
++	DRM_DEBUG_DRIVER("CT: channel %d reopen=%s\n",
++			 ctch->owner, yesno(ctch_is_open(ctch)));
++
++	if (!ctch->vma) {
++		err = ctch_init(guc, ctch);
++		if (unlikely(err))
++			goto err_out;
++	}
++
++	/* vma should be already allocated and map'ed */
++	base = guc_ggtt_offset(ctch->vma);
++
++	/* (re)initialize descriptors
++	 * cmds buffers are in the second half of the blob page
++	 */
++	for (i = 0; i < ARRAY_SIZE(ctch->ctbs); i++) {
++		GEM_BUG_ON((i != CTB_SEND) && (i != CTB_RECV));
++		guc_ct_buffer_desc_init(ctch->ctbs[i].desc,
++					base + PAGE_SIZE/4 * i + PAGE_SIZE/2,
++					PAGE_SIZE/4,
++					ctch->owner);
++	}
++
++	/* register buffers, starting wirh RECV buffer
++	 * descriptors are in first half of the blob
++	 */
++	err = guc_action_register_ct_buffer(guc,
++					    base + PAGE_SIZE/4 * CTB_RECV,
++					    INTEL_GUC_CT_BUFFER_TYPE_RECV);
++	if (unlikely(err))
++		goto err_fini;
++
++	err = guc_action_register_ct_buffer(guc,
++					    base + PAGE_SIZE/4 * CTB_SEND,
++					    INTEL_GUC_CT_BUFFER_TYPE_SEND);
++	if (unlikely(err))
++		goto err_deregister;
++
++	return 0;
++
++err_deregister:
++	guc_action_deregister_ct_buffer(guc,
++					ctch->owner,
++					INTEL_GUC_CT_BUFFER_TYPE_RECV);
++err_fini:
++	ctch_fini(guc, ctch);
++err_out:
++	DRM_ERROR("CT: can't open channel %d; err=%d\n", ctch->owner, err);
++	return err;
++}
++
++static void ctch_close(struct intel_guc *guc,
++		       struct intel_guc_ct_channel *ctch)
++{
++	GEM_BUG_ON(!ctch_is_open(ctch));
++
++	guc_action_deregister_ct_buffer(guc,
++					ctch->owner,
++					INTEL_GUC_CT_BUFFER_TYPE_SEND);
++	guc_action_deregister_ct_buffer(guc,
++					ctch->owner,
++					INTEL_GUC_CT_BUFFER_TYPE_RECV);
++	ctch_fini(guc, ctch);
++}
++
++static u32 ctch_get_next_fence(struct intel_guc_ct_channel *ctch)
++{
++	/* For now it's trivial */
++	return ++ctch->next_fence;
++}
++
++static int ctb_write(struct intel_guc_ct_buffer *ctb,
++		     const u32 *action,
++		     u32 len /* in dwords */,
++		     u32 fence)
++{
++	struct guc_ct_buffer_desc *desc = ctb->desc;
++	u32 head = desc->head / 4;	/* in dwords */
++	u32 tail = desc->tail / 4;	/* in dwords */
++	u32 size = desc->size / 4;	/* in dwords */
++	u32 used;			/* in dwords */
++	u32 header;
++	u32 *cmds = ctb->cmds;
++	unsigned int i;
++
++	GEM_BUG_ON(desc->size % 4);
++	GEM_BUG_ON(desc->head % 4);
++	GEM_BUG_ON(desc->tail % 4);
++	GEM_BUG_ON(tail >= size);
++
++	/*
++	 * tail == head condition indicates empty. GuC FW does not support
++	 * using up the entire buffer to get tail == head meaning full.
++	 */
++	if (tail < head)
++		used = (size - head) + tail;
++	else
++		used = tail - head;
++
++	/* make sure there is a space including extra dw for the fence */
++	if (unlikely(used + len + 1 >= size))
++		return -ENOSPC;
++
++	/* Write the message. The format is the following:
++	 * DW0: header (including action code)
++	 * DW1: fence
++	 * DW2+: action data
++	 */
++	header = (len << GUC_CT_MSG_LEN_SHIFT) |
++		 (GUC_CT_MSG_WRITE_FENCE_TO_DESC) |
++		 (action[0] << GUC_CT_MSG_ACTION_SHIFT);
++
++	cmds[tail] = header;
++	tail = (tail + 1) % size;
++
++	cmds[tail] = fence;
++	tail = (tail + 1) % size;
++
++	for (i = 1; i < len; i++) {
++		cmds[tail] = action[i];
++		tail = (tail + 1) % size;
++	}
++
++	/* now update desc tail (back in bytes) */
++	desc->tail = tail * 4;
++	GEM_BUG_ON(desc->tail > desc->size);
++
++	return 0;
++}
++
++/* Wait for the response from the GuC.
++ * @fence:	response fence
++ * @status:	placeholder for status
++ * return:	0 response received (status is valid)
++ *		-ETIMEDOUT no response within hardcoded timeout
++ *		-EPROTO no response, ct buffer was in error
++ */
++static int wait_for_response(struct guc_ct_buffer_desc *desc,
++			     u32 fence,
++			     u32 *status)
++{
++	int err;
++
++	/*
++	 * Fast commands should complete in less than 10us, so sample quickly
++	 * up to that length of time, then switch to a slower sleep-wait loop.
++	 * No GuC command should ever take longer than 10ms.
++	 */
++#define done (READ_ONCE(desc->fence) == fence)
++	err = wait_for_us(done, 10);
++	if (err)
++		err = wait_for(done, 10);
++#undef done
++
++	if (unlikely(err)) {
++		DRM_ERROR("CT: fence %u failed; reported fence=%u\n",
++			  fence, desc->fence);
++
++		if (WARN_ON(desc->is_in_error)) {
++			/* Something went wrong with the messaging, try to reset
++			 * the buffer and hope for the best
++			 */
++			guc_ct_buffer_desc_reset(desc);
++			err = -EPROTO;
++		}
++	}
++
++	*status = desc->status;
++	return err;
++}
++
++static int ctch_send(struct intel_guc *guc,
++		     struct intel_guc_ct_channel *ctch,
++		     const u32 *action,
++		     u32 len,
++		     u32 *status)
++{
++	struct intel_guc_ct_buffer *ctb = &ctch->ctbs[CTB_SEND];
++	struct guc_ct_buffer_desc *desc = ctb->desc;
++	u32 fence;
++	int err;
++
++	GEM_BUG_ON(!ctch_is_open(ctch));
++	GEM_BUG_ON(!len);
++	GEM_BUG_ON(len & ~GUC_CT_MSG_LEN_MASK);
++
++	fence = ctch_get_next_fence(ctch);
++	err = ctb_write(ctb, action, len, fence);
++	if (unlikely(err))
++		return err;
++
++	intel_guc_notify(guc);
++
++	err = wait_for_response(desc, fence, status);
++	if (unlikely(err))
++		return err;
++	if (*status != INTEL_GUC_STATUS_SUCCESS)
++		return -EIO;
++	return 0;
++}
++
++/*
++ * Command Transport (CT) buffer based GuC send function.
++ */
++static int intel_guc_send_ct(struct intel_guc *guc, const u32 *action, u32 len)
++{
++	struct intel_guc_ct_channel *ctch = &guc->ct.host_channel;
++	u32 status = ~0; /* undefined */
++	int err;
++
++	mutex_lock(&guc->send_mutex);
++
++	err = ctch_send(guc, ctch, action, len, &status);
++	if (unlikely(err)) {
++		DRM_ERROR("CT: send action %#X failed; err=%d status=%#X\n",
++			  action[0], err, status);
++	}
++
++	mutex_unlock(&guc->send_mutex);
++	return err;
++}
++
++/**
++ * Enable buffer based command transport
++ * Shall only be called for platforms with HAS_GUC_CT.
++ * @guc:	the guc
++ * return:	0 on success
++ *		non-zero on failure
++ */
++int intel_guc_enable_ct(struct intel_guc *guc)
++{
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++	struct intel_guc_ct_channel *ctch = &guc->ct.host_channel;
++	int err;
++
++	GEM_BUG_ON(!HAS_GUC_CT(dev_priv));
++
++	err = ctch_open(guc, ctch);
++	if (unlikely(err))
++		return err;
++
++	/* Switch into cmd transport buffer based send() */
++	guc->send = intel_guc_send_ct;
++	DRM_INFO("CT: %s\n", enableddisabled(true));
++	return 0;
++}
++
++/**
++ * Disable buffer based command transport.
++ * Shall only be called for platforms with HAS_GUC_CT.
++ * @guc: the guc
++ */
++void intel_guc_disable_ct(struct intel_guc *guc)
++{
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++	struct intel_guc_ct_channel *ctch = &guc->ct.host_channel;
++
++	GEM_BUG_ON(!HAS_GUC_CT(dev_priv));
++
++	if (!ctch_is_open(ctch))
++		return;
++
++	ctch_close(guc, ctch);
++
++	/* Disable send */
++	guc->send = intel_guc_send_nop;
++	DRM_INFO("CT: %s\n", enableddisabled(false));
++}
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_guc_ct.h
+@@ -0,0 +1,86 @@
++/*
++ * Copyright © 2016-2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#ifndef _INTEL_GUC_CT_H_
++#define _INTEL_GUC_CT_H_
++
++struct intel_guc;
++struct i915_vma;
++
++#include "intel_guc_fwif.h"
++
++/**
++ * DOC: Command Transport (CT).
++ *
++ * Buffer based command transport is a replacement for MMIO based mechanism.
++ * It can be used to perform both host-2-guc and guc-to-host communication.
++ */
++
++/** Represents single command transport buffer.
++ *
++ * A single command transport buffer consists of two parts, the header
++ * record (command transport buffer descriptor) and the actual buffer which
++ * holds the commands.
++ *
++ * @desc: pointer to the buffer descriptor
++ * @cmds: pointer to the commands buffer
++ */
++struct intel_guc_ct_buffer {
++	struct guc_ct_buffer_desc *desc;
++	u32 *cmds;
++};
++
++/** Represents pair of command transport buffers.
++ *
++ * Buffers go in pairs to allow bi-directional communication.
++ * To simplify the code we place both of them in the same vma.
++ * Buffers from the same pair must share unique owner id.
++ *
++ * @vma: pointer to the vma with pair of CT buffers
++ * @ctbs: buffers for sending(0) and receiving(1) commands
++ * @owner: unique identifier
++ * @next_fence: fence to be used with next send command
++ */
++struct intel_guc_ct_channel {
++	struct i915_vma *vma;
++	struct intel_guc_ct_buffer ctbs[2];
++	u32 owner;
++	u32 next_fence;
++};
++
++/** Holds all command transport channels.
++ *
++ * @host_channel: main channel used by the host
++ */
++struct intel_guc_ct {
++	struct intel_guc_ct_channel host_channel;
++	/* other channels are tbd */
++};
++
++void intel_guc_ct_init_early(struct intel_guc_ct *ct);
++
++/* XXX: move to intel_uc.h ? don't fit there either */
++int intel_guc_enable_ct(struct intel_guc *guc);
++void intel_guc_disable_ct(struct intel_guc *guc);
++
++#endif /* _INTEL_GUC_CT_H_ */
+--- a/drivers/gpu/drm/i915/intel_guc_fwif.h
++++ b/drivers/gpu/drm/i915/intel_guc_fwif.h
+@@ -331,6 +331,47 @@ struct guc_stage_desc {
+ 	u64 desc_private;
+ } __packed;
+ 
++/*
++ * Describes single command transport buffer.
++ * Used by both guc-master and clients.
++ */
++struct guc_ct_buffer_desc {
++	u32 addr;		/* gfx address */
++	u64 host_private;	/* host private data */
++	u32 size;		/* size in bytes */
++	u32 head;		/* offset updated by GuC*/
++	u32 tail;		/* offset updated by owner */
++	u32 is_in_error;	/* error indicator */
++	u32 fence;		/* fence updated by GuC */
++	u32 status;		/* status updated by GuC */
++	u32 owner;		/* id of the channel owner */
++	u32 owner_sub_id;	/* owner-defined field for extra tracking */
++	u32 reserved[5];
++} __packed;
++
++/* Type of command transport buffer */
++#define INTEL_GUC_CT_BUFFER_TYPE_SEND	0x0u
++#define INTEL_GUC_CT_BUFFER_TYPE_RECV	0x1u
++
++/*
++ * Definition of the command transport message header (DW0)
++ *
++ * bit[4..0]	message len (in dwords)
++ * bit[7..5]	reserved
++ * bit[8]	write fence to desc
++ * bit[9]	write status to H2G buff
++ * bit[10]	send status (via G2H)
++ * bit[15..11]	reserved
++ * bit[31..16]	action code
++ */
++#define GUC_CT_MSG_LEN_SHIFT			0
++#define GUC_CT_MSG_LEN_MASK			0x1F
++#define GUC_CT_MSG_WRITE_FENCE_TO_DESC		(1 << 8)
++#define GUC_CT_MSG_WRITE_STATUS_TO_BUFF		(1 << 9)
++#define GUC_CT_MSG_SEND_STATUS			(1 << 10)
++#define GUC_CT_MSG_ACTION_SHIFT			16
++#define GUC_CT_MSG_ACTION_MASK			0xFFFF
++
+ #define GUC_FORCEWAKE_RENDER	(1 << 0)
+ #define GUC_FORCEWAKE_MEDIA	(1 << 1)
+ 
+@@ -515,6 +556,8 @@ enum intel_guc_action {
+ 	INTEL_GUC_ACTION_EXIT_S_STATE = 0x502,
+ 	INTEL_GUC_ACTION_SLPC_REQUEST = 0x3003,
+ 	INTEL_GUC_ACTION_AUTHENTICATE_HUC = 0x4000,
++	INTEL_GUC_ACTION_REGISTER_COMMAND_TRANSPORT_BUFFER = 0x4505,
++	INTEL_GUC_ACTION_DEREGISTER_COMMAND_TRANSPORT_BUFFER = 0x4506,
+ 	INTEL_GUC_ACTION_UK_LOG_ENABLE_LOGGING = 0x0E000,
+ 	INTEL_GUC_ACTION_LIMIT
+ };
+--- a/drivers/gpu/drm/i915/intel_uc.c
++++ b/drivers/gpu/drm/i915/intel_uc.c
+@@ -105,6 +105,8 @@ void intel_uc_init_early(struct drm_i915
+ {
+ 	struct intel_guc *guc = &dev_priv->guc;
+ 
++	intel_guc_ct_init_early(&guc->ct);
++
+ 	mutex_init(&guc->send_mutex);
+ 	guc->send = intel_guc_send_nop;
+ 	guc->notify = guc_write_irq_trigger;
+@@ -288,14 +290,24 @@ static void guc_init_send_regs(struct in
+ 
+ static int guc_enable_communication(struct intel_guc *guc)
+ {
+-	/* XXX: placeholder for alternate setup */
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++
+ 	guc_init_send_regs(guc);
++
++	if (HAS_GUC_CT(dev_priv))
++		return intel_guc_enable_ct(guc);
++
+ 	guc->send = intel_guc_send_mmio;
+ 	return 0;
+ }
+ 
+ static void guc_disable_communication(struct intel_guc *guc)
+ {
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++
++	if (HAS_GUC_CT(dev_priv))
++		intel_guc_disable_ct(guc);
++
+ 	guc->send = intel_guc_send_nop;
+ }
+ 
+@@ -442,6 +454,11 @@ int intel_guc_send_mmio(struct intel_guc
+ 	GEM_BUG_ON(!len);
+ 	GEM_BUG_ON(len > guc->send_regs.count);
+ 
++	/* If CT is available, we expect to use MMIO only during init/fini */
++	GEM_BUG_ON(HAS_GUC_CT(dev_priv) &&
++		*action != INTEL_GUC_ACTION_REGISTER_COMMAND_TRANSPORT_BUFFER &&
++		*action != INTEL_GUC_ACTION_DEREGISTER_COMMAND_TRANSPORT_BUFFER);
++
+ 	mutex_lock(&guc->send_mutex);
+ 	intel_uncore_forcewake_get(dev_priv, guc->send_regs.fw_domains);
+ 
+--- a/drivers/gpu/drm/i915/intel_uc.h
++++ b/drivers/gpu/drm/i915/intel_uc.h
+@@ -27,7 +27,7 @@
+ #include "intel_guc_fwif.h"
+ #include "i915_guc_reg.h"
+ #include "intel_ringbuffer.h"
+-
++#include "intel_guc_ct.h"
+ #include "i915_vma.h"
+ 
+ struct drm_i915_gem_request;
+@@ -173,6 +173,7 @@ struct intel_guc_log {
+ struct intel_guc {
+ 	struct intel_uc_fw fw;
+ 	struct intel_guc_log log;
++	struct intel_guc_ct ct;
+ 
+ 	/* intel_guc_recv interrupt related state */
+ 	bool interrupts_enabled;
