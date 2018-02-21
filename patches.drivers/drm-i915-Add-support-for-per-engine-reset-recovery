@@ -1,0 +1,272 @@
+From a1ef70e144534777965426393dcaa1721e908e83 Mon Sep 17 00:00:00 2001
+From: Michel Thierry <michel.thierry@intel.com>
+Date: Tue, 20 Jun 2017 10:57:47 +0100
+Subject: [PATCH] drm/i915: Add support for per engine reset recovery
+Git-commit: a1ef70e144534777965426393dcaa1721e908e83
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+This change implements support for per-engine reset as an initial, less
+intrusive hang recovery option to be attempted before falling back to the
+legacy full GPU reset recovery mode if necessary. This is only supported
+from Gen8 onwards.
+
+Hangchecker determines which engines are hung and invokes error handler to
+recover from it. Error handler schedules recovery for each of those engines
+that are hung. The recovery procedure is as follows,
+ - identifies the request that caused the hang and it is dropped
+ - force engine to idle: this is done by issuing a reset request
+ - reset the engine
+ - re-init the engine to resume submissions.
+
+If engine reset fails then we fall back to heavy weight full gpu reset
+which resets all engines and reinitiazes complete state of HW and SW.
+
+V2: Rebase.
+V3: s/*engine_reset*/*reset_engine*/; freeze engine and irqs before
+calling i915_gem_reset_engine (Chris).
+V4: Rebase, modify i915_gem_reset_prepare to use a ring mask and
+reuse the function for reset_engine.
+V5: intel_reset_engine_start/cancel instead of request/unrequest_reset.
+V6: Clean up reset_engine function to not require mutex, i.e. no need to call
+revoke/restore_fences and _retire_requests (Chris).
+V7: Remove leftovers from v5, i.e. no need to disable irq, hold
+forcewake or wakeup the handoff bit (Chris).
+V8: engine_retire_requests should be (and it was) static; explain that
+we have to re-init the engine after reset, which is why the init_hw call
+is needed; check reset-in-progress flag (Chris).
+V9: Rebase, include code to pass the active request to gem_reset_engine
+(as it is already done in full reset). Remove unnecessary
+intel_reset_engine_start/cancel, these are executed as part of the
+reset.
+V10: Rebase, use the right I915_RESET_ENGINE flag.
+V11: Fixup to call reset_finish_engine even on error.
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Signed-off-by: Tomas Elf <tomas.elf@intel.com>
+Signed-off-by: Arun Siluvery <arun.siluvery@linux.intel.com>
+Signed-off-by: Michel Thierry <michel.thierry@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170615201828.23144-6-michel.thierry@intel.com
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170620095751.13127-6-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.c |   50 ++++++++++++++++++++-
+ drivers/gpu/drm/i915/i915_drv.h |    5 ++
+ drivers/gpu/drm/i915/i915_gem.c |   93 ++++++++++++++++++++++++----------------
+ 3 files changed, 110 insertions(+), 38 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1921,11 +1921,57 @@ error:
+  *
+  * Reset a specific GPU engine. Useful if a hang is detected.
+  * Returns zero on successful reset or otherwise an error code.
++ *
++ * Procedure is:
++ *  - identifies the request that caused the hang and it is dropped
++ *  - reset engine (which will force the engine to idle)
++ *  - re-init/configure engine
+  */
+ int i915_reset_engine(struct intel_engine_cs *engine)
+ {
+-	/* FIXME: replace me with engine reset sequence */
+-	return -ENODEV;
++	struct i915_gpu_error *error = &engine->i915->gpu_error;
++	struct drm_i915_gem_request *active_request;
++	int ret;
++
++	GEM_BUG_ON(!test_bit(I915_RESET_ENGINE + engine->id, &error->flags));
++
++	DRM_DEBUG_DRIVER("resetting %s\n", engine->name);
++
++	active_request = i915_gem_reset_prepare_engine(engine);
++	if (IS_ERR(active_request)) {
++		DRM_DEBUG_DRIVER("Previous reset failed, promote to full reset\n");
++		ret = PTR_ERR(active_request);
++		goto out;
++	}
++
++	/*
++	 * The request that caused the hang is stuck on elsp, we know the
++	 * active request and can drop it, adjust head to skip the offending
++	 * request to resume executing remaining requests in the queue.
++	 */
++	i915_gem_reset_engine(engine, active_request);
++
++	/* Finally, reset just this engine. */
++	ret = intel_gpu_reset(engine->i915, intel_engine_flag(engine));
++
++	i915_gem_reset_finish_engine(engine);
++
++	if (ret) {
++		/* If we fail here, we expect to fallback to a global reset */
++		DRM_DEBUG_DRIVER("Failed to reset %s, ret=%d\n",
++				 engine->name, ret);
++		goto out;
++	}
++
++	/*
++	 * The engine and its registers (and workarounds in case of render)
++	 * have been reset to their default values. Follow the init_ring
++	 * process to program RING_MODE, HWSP and re-enable submission.
++	 */
++	ret = engine->init_hw(engine);
++
++out:
++	return ret;
+ }
+ 
+ static int i915_pm_suspend(struct device *kdev)
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3473,11 +3473,16 @@ static inline u32 i915_reset_count(struc
+ 	return READ_ONCE(error->reset_count);
+ }
+ 
++struct drm_i915_gem_request *
++i915_gem_reset_prepare_engine(struct intel_engine_cs *engine);
+ int i915_gem_reset_prepare(struct drm_i915_private *dev_priv);
+ void i915_gem_reset(struct drm_i915_private *dev_priv);
++void i915_gem_reset_finish_engine(struct intel_engine_cs *engine);
+ void i915_gem_reset_finish(struct drm_i915_private *dev_priv);
+ void i915_gem_set_wedged(struct drm_i915_private *dev_priv);
+ bool i915_gem_unset_wedged(struct drm_i915_private *dev_priv);
++void i915_gem_reset_engine(struct intel_engine_cs *engine,
++			   struct drm_i915_gem_request *request);
+ 
+ void i915_gem_init_mmio(struct drm_i915_private *i915);
+ int __must_check i915_gem_init(struct drm_i915_private *dev_priv);
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2831,45 +2831,61 @@ static bool engine_stalled(struct intel_
+ 	return true;
+ }
+ 
++/*
++ * Ensure irq handler finishes, and not run again.
++ * Also return the active request so that we only search for it once.
++ */
++struct drm_i915_gem_request *
++i915_gem_reset_prepare_engine(struct intel_engine_cs *engine)
++{
++	struct drm_i915_gem_request *request = NULL;
++
++	/* Prevent the signaler thread from updating the request
++	 * state (by calling dma_fence_signal) as we are processing
++	 * the reset. The write from the GPU of the seqno is
++	 * asynchronous and the signaler thread may see a different
++	 * value to us and declare the request complete, even though
++	 * the reset routine have picked that request as the active
++	 * (incomplete) request. This conflict is not handled
++	 * gracefully!
++	 */
++	kthread_park(engine->breadcrumbs.signaler);
++
++	/* Prevent request submission to the hardware until we have
++	 * completed the reset in i915_gem_reset_finish(). If a request
++	 * is completed by one engine, it may then queue a request
++	 * to a second via its engine->irq_tasklet *just* as we are
++	 * calling engine->init_hw() and also writing the ELSP.
++	 * Turning off the engine->irq_tasklet until the reset is over
++	 * prevents the race.
++	 */
++	tasklet_kill(&engine->irq_tasklet);
++	tasklet_disable(&engine->irq_tasklet);
++
++	if (engine->irq_seqno_barrier)
++		engine->irq_seqno_barrier(engine);
++
++	if (engine_stalled(engine)) {
++		request = i915_gem_find_active_request(engine);
++		if (request && request->fence.error == -EIO)
++			request = ERR_PTR(-EIO); /* Previous reset failed! */
++	}
++
++	return request;
++}
++
+ int i915_gem_reset_prepare(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_engine_cs *engine;
++	struct drm_i915_gem_request *request;
+ 	enum intel_engine_id id;
+ 	int err = 0;
+ 
+-	/* Ensure irq handler finishes, and not run again. */
+ 	for_each_engine(engine, dev_priv, id) {
+-		struct drm_i915_gem_request *request = NULL;
+-
+-		/* Prevent the signaler thread from updating the request
+-		 * state (by calling dma_fence_signal) as we are processing
+-		 * the reset. The write from the GPU of the seqno is
+-		 * asynchronous and the signaler thread may see a different
+-		 * value to us and declare the request complete, even though
+-		 * the reset routine have picked that request as the active
+-		 * (incomplete) request. This conflict is not handled
+-		 * gracefully!
+-		 */
+-		kthread_park(engine->breadcrumbs.signaler);
+-
+-		/* Prevent request submission to the hardware until we have
+-		 * completed the reset in i915_gem_reset_finish(). If a request
+-		 * is completed by one engine, it may then queue a request
+-		 * to a second via its engine->irq_tasklet *just* as we are
+-		 * calling engine->init_hw() and also writing the ELSP.
+-		 * Turning off the engine->irq_tasklet until the reset is over
+-		 * prevents the race.
+-		 */
+-		tasklet_kill(&engine->irq_tasklet);
+-		tasklet_disable(&engine->irq_tasklet);
+-
+-		if (engine->irq_seqno_barrier)
+-			engine->irq_seqno_barrier(engine);
+-
+-		if (engine_stalled(engine)) {
+-			request = i915_gem_find_active_request(engine);
+-			if (request && request->fence.error == -EIO)
+-				err = -EIO; /* Previous reset failed! */
++		request = i915_gem_reset_prepare_engine(engine);
++		if (IS_ERR(request)) {
++			err = PTR_ERR(request);
++			continue;
+ 		}
+ 
+ 		engine->hangcheck.active_request = request;
+@@ -2960,8 +2976,8 @@ static bool i915_gem_reset_request(struc
+ 	return guilty;
+ }
+ 
+-static void i915_gem_reset_engine(struct intel_engine_cs *engine,
+-				  struct drm_i915_gem_request *request)
++void i915_gem_reset_engine(struct intel_engine_cs *engine,
++			   struct drm_i915_gem_request *request)
+ {
+ 	if (request && i915_gem_reset_request(request)) {
+ 		DRM_DEBUG_DRIVER("resetting %s to restart from tail of request 0x%x\n",
+@@ -3004,6 +3020,12 @@ void i915_gem_reset(struct drm_i915_priv
+ 	}
+ }
+ 
++void i915_gem_reset_finish_engine(struct intel_engine_cs *engine)
++{
++	tasklet_enable(&engine->irq_tasklet);
++	kthread_unpark(engine->breadcrumbs.signaler);
++}
++
+ void i915_gem_reset_finish(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_engine_cs *engine;
+@@ -3013,8 +3035,7 @@ void i915_gem_reset_finish(struct drm_i9
+ 
+ 	for_each_engine(engine, dev_priv, id) {
+ 		engine->hangcheck.active_request = NULL;
+-		tasklet_enable(&engine->irq_tasklet);
+-		kthread_unpark(engine->breadcrumbs.signaler);
++		i915_gem_reset_finish_engine(engine);
+ 	}
+ }
+ 
