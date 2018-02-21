@@ -1,0 +1,224 @@
+From 9db529aac9381e746f31f8109fdb186b69157661 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Tue, 8 Aug 2017 10:08:28 +0200
+Subject: [PATCH] drm/i915: More surgically unbreak the modeset vs reset deadlock
+Git-commit: 9db529aac9381e746f31f8109fdb186b69157661
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+There's no reason to entirely wedge the gpu, for the minimal deadlock
+bugfix we only need to unbreak/decouple the atomic commit from the gpu
+reset. The simplest way to fix that is by replacing the
+unconditional fence wait a the top of commit_tail by a wait which
+completes either when the fences are done (normal case, or when a
+reset doesn't need to touch the display state). Or when the gpu reset
+needs to force-unblock all pending modeset states.
+
+The lesser source of deadlocks is when we try to pin a new framebuffer
+and run into a stall. There's a bunch of places this can happen, like
+eviction, changing the caching mode, acquiring a fence on older
+platforms. And we can't just break the depency loop and keep going,
+the only way would be to break out and restart. But the problem with
+that approach is that we must stall for the reset to complete before
+we grab any locks, and with the atomic infrastructure that's a bit
+tricky. The only place is the ioctl code, and we don't want to insert
+code into e.g. the BUSY ioctl. Hence for that problem just create a
+critical section, and if any code is in there, wedge the GPU. For the
+steady-state this should never be a problem.
+
+Note that in both cases TDR itself keeps working, so from a userspace
+pov this trickery isn't observable. Users themselvs might spot a short
+glitch while the rendering is catching up again, but that's still
+better than pre-TDR where we've thrown away all the rendering,
+including innocent batches. Also, this fixes the regression TDR
+introduced of making gpu resets deadlock-prone when we do need to
+touch the display.
+
+One thing I noticed is that gpu_error.flags seems to use both our own
+wait-queue in gpu_error.wait_queue, and the generic wait_on_bit
+facilities. Not entirely sure why this inconsistency exists, I just
+picked one style.
+
+A possible future avenue could be to insert the gpu reset in-between
+ongoing modeset changes, which would avoid the momentary glitch. But
+that's a lot more work to implement in the atomic commit machinery,
+and given that we only need this for pre-g4x hw, of questionable
+utility just for the sake of polishing gpu reset even more on those
+old boxes. It might be useful for other features though.
+
+V2: Rebase onto 4.13 with a s/wait_queue_t/struct wait_queue_entry/.
+
+V3: Really emabarrassing fixup, I checked the wrong bit and broke the
+unbreak/wakeup logic.
+
+V4: Also handle deadlocks in pin_to_display.
+
+V5: Review from Michel:
+- Fixup the BUILD_BUG_ON
+- Don't forget about the overlay
+
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com> (v2)
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170808080828.23650-3-daniel.vetter@ffwll.ch
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    3 ++
+ drivers/gpu/drm/i915/i915_irq.c      |    2 -
+ drivers/gpu/drm/i915/intel_display.c |   46 +++++++++++++++++++++++++++++------
+ drivers/gpu/drm/i915/intel_overlay.c |   11 ++++++--
+ 4 files changed, 52 insertions(+), 10 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1528,6 +1528,8 @@ struct i915_gpu_error {
+ 	/* Protected by the above dev->gpu_error.lock. */
+ 	struct i915_gpu_state *first_error;
+ 
++	atomic_t pending_fb_pin;
++
+ 	unsigned long missed_irq_rings;
+ 
+ 	/**
+@@ -1587,6 +1589,7 @@ struct i915_gpu_error {
+ 	unsigned long flags;
+ #define I915_RESET_BACKOFF	0
+ #define I915_RESET_HANDOFF	1
++#define I915_RESET_MODESET	2
+ #define I915_WEDGED		(BITS_PER_LONG - 1)
+ #define I915_RESET_ENGINE	(I915_WEDGED - I915_NUM_ENGINES)
+ 
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2669,7 +2669,7 @@ void i915_handle_error(struct drm_i915_p
+ 	 */
+ 	if (intel_has_reset_engine(dev_priv)) {
+ 		for_each_engine_masked(engine, dev_priv, engine_mask, tmp) {
+-			BUILD_BUG_ON(I915_RESET_HANDOFF >= I915_RESET_ENGINE);
++			BUILD_BUG_ON(I915_RESET_MODESET >= I915_RESET_ENGINE);
+ 			if (test_and_set_bit(I915_RESET_ENGINE + engine->id,
+ 					     &dev_priv->gpu_error.flags))
+ 				continue;
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2196,6 +2196,8 @@ intel_pin_and_fence_fb_obj(struct drm_fr
+ 	 */
+ 	intel_runtime_pm_get(dev_priv);
+ 
++	atomic_inc(&dev_priv->gpu_error.pending_fb_pin);
++
+ 	vma = i915_gem_object_pin_to_display_plane(obj, alignment, &view);
+ 	if (IS_ERR(vma))
+ 		goto err;
+@@ -2223,6 +2225,8 @@ intel_pin_and_fence_fb_obj(struct drm_fr
+ 
+ 	i915_vma_get(vma);
+ err:
++	atomic_dec(&dev_priv->gpu_error.pending_fb_pin);
++
+ 	intel_runtime_pm_put(dev_priv);
+ 	return vma;
+ }
+@@ -3681,12 +3685,14 @@ void intel_prepare_reset(struct drm_i915
+ 	    !gpu_reset_clobbers_display(dev_priv))
+ 		return;
+ 
+-	/* We have a modeset vs reset deadlock, defensively unbreak it.
+-	 *
+-	 * FIXME: We can do a _lot_ better, this is just a first iteration.
+-	 */
+-	i915_gem_set_wedged(dev_priv);
+-	DRM_DEBUG_DRIVER("Wedging GPU to avoid deadlocks with pending modeset updates\n");
++	/* We have a modeset vs reset deadlock, defensively unbreak it. */
++	set_bit(I915_RESET_MODESET, &dev_priv->gpu_error.flags);
++	wake_up_all(&dev_priv->gpu_error.wait_queue);
++
++	if (atomic_read(&dev_priv->gpu_error.pending_fb_pin)) {
++		DRM_DEBUG_KMS("Modeset potentially stuck, unbreaking through wedging\n");
++		i915_gem_set_wedged(dev_priv);
++	}
+ 
+ 	/*
+ 	 * Need mode_config.mutex so that we don't
+@@ -3774,6 +3780,8 @@ unlock:
+ 	drm_modeset_drop_locks(ctx);
+ 	drm_modeset_acquire_fini(ctx);
+ 	mutex_unlock(&dev->mode_config.mutex);
++
++	clear_bit(I915_RESET_MODESET, &dev_priv->gpu_error.flags);
+ }
+ 
+ static void intel_update_pipe_config(struct intel_crtc *crtc,
+@@ -12298,6 +12306,30 @@ static void intel_atomic_helper_free_sta
+ 	intel_atomic_helper_free_state(dev_priv);
+ }
+ 
++static void intel_atomic_commit_fence_wait(struct intel_atomic_state *intel_state)
++{
++	struct wait_queue_entry wait_fence, wait_reset;
++	struct drm_i915_private *dev_priv = to_i915(intel_state->base.dev);
++
++	init_wait_entry(&wait_fence, 0);
++	init_wait_entry(&wait_reset, 0);
++	for (;;) {
++		prepare_to_wait(&intel_state->commit_ready.wait,
++				&wait_fence, TASK_UNINTERRUPTIBLE);
++		prepare_to_wait(&dev_priv->gpu_error.wait_queue,
++				&wait_reset, TASK_UNINTERRUPTIBLE);
++
++
++		if (i915_sw_fence_done(&intel_state->commit_ready)
++		    || test_bit(I915_RESET_MODESET, &dev_priv->gpu_error.flags))
++			break;
++
++		schedule();
++	}
++	finish_wait(&intel_state->commit_ready.wait, &wait_fence);
++	finish_wait(&dev_priv->gpu_error.wait_queue, &wait_reset);
++}
++
+ static void intel_atomic_commit_tail(struct drm_atomic_state *state)
+ {
+ 	struct drm_device *dev = state->dev;
+@@ -12311,7 +12343,7 @@ static void intel_atomic_commit_tail(str
+ 	unsigned crtc_vblank_mask = 0;
+ 	int i;
+ 
+-	i915_sw_fence_wait(&intel_state->commit_ready);
++	intel_atomic_commit_fence_wait(intel_state);
+ 
+ 	drm_atomic_helper_wait_for_dependencies(state);
+ 
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -799,9 +799,13 @@ static int intel_overlay_do_put_image(st
+ 	if (ret != 0)
+ 		return ret;
+ 
++	atomic_inc(&dev_priv->gpu_error.pending_fb_pin);
++
+ 	vma = i915_gem_object_pin_to_display_plane(new_bo, 0, NULL);
+-	if (IS_ERR(vma))
+-		return PTR_ERR(vma);
++	if (IS_ERR(vma)) {
++		ret = PTR_ERR(vma);
++		goto out_pin_section;
++	}
+ 
+ 	ret = i915_vma_put_fence(vma);
+ 	if (ret)
+@@ -886,6 +890,9 @@ static int intel_overlay_do_put_image(st
+ 
+ out_unpin:
+ 	i915_gem_object_unpin_from_display_plane(vma);
++out_pin_section:
++	atomic_dec(&dev_priv->gpu_error.pending_fb_pin);
++
+ 	return ret;
+ }
+ 
