@@ -1,0 +1,158 @@
+From c03e53b030025e9243b6e5cb717ad143f3a442ce Mon Sep 17 00:00:00 2001
+From: Puthikorn Voravootivat <puthik@chromium.org>
+Date: Thu, 22 Jun 2017 12:03:37 -0700
+Subject: [PATCH] drm/i915: Set PWM divider to match desired frequency in vbt
+Git-commit: c03e53b030025e9243b6e5cb717ad143f3a442ce
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+Read desired PWM frequency from panel vbt and calculate the
+value for divider in DPCD address 0x724 and 0x728 to have
+as many bits as possible for PWM duty cyle for granularity of
+brightness adjustment while the frequency divisor is still
+within 25% of the desired value.
+
+Signed-off-by: Puthikorn Voravootivat <puthik@chromium.org>
+Reviewed-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170622190339.142671-2-puthik@chromium.org
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/intel_dp_aux_backlight.c |   98 +++++++++++++++++++++++---
+ 1 file changed, 90 insertions(+), 8 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_dp_aux_backlight.c
++++ b/drivers/gpu/drm/i915/intel_dp_aux_backlight.c
+@@ -102,6 +102,81 @@ intel_dp_aux_set_backlight(const struct
+ 	}
+ }
+ 
++/*
++ * Set PWM Frequency divider to match desired frequency in vbt.
++ * The PWM Frequency is calculated as 27Mhz / (F x P).
++ * - Where F = PWM Frequency Pre-Divider value programmed by field 7:0 of the
++ *             EDP_BACKLIGHT_FREQ_SET register (DPCD Address 00728h)
++ * - Where P = 2^Pn, where Pn is the value programmed by field 4:0 of the
++ *             EDP_PWMGEN_BIT_COUNT register (DPCD Address 00724h)
++ */
++static bool intel_dp_aux_set_pwm_freq(struct intel_connector *connector)
++{
++	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
++	struct intel_dp *intel_dp = enc_to_intel_dp(&connector->encoder->base);
++	int freq, fxp, fxp_min, fxp_max, fxp_actual, f = 1;
++	u8 pn, pn_min, pn_max;
++
++	/* Find desired value of (F x P)
++	 * Note that, if F x P is out of supported range, the maximum value or
++	 * minimum value will applied automatically. So no need to check that.
++	 */
++	freq = dev_priv->vbt.backlight.pwm_freq_hz;
++	DRM_DEBUG_KMS("VBT defined backlight frequency %u Hz\n", freq);
++	if (!freq) {
++		DRM_DEBUG_KMS("Use panel default backlight frequency\n");
++		return false;
++	}
++
++	fxp = DIV_ROUND_CLOSEST(KHz(DP_EDP_BACKLIGHT_FREQ_BASE_KHZ), freq);
++
++	/* Use highest possible value of Pn for more granularity of brightness
++	 * adjustment while satifying the conditions below.
++	 * - Pn is in the range of Pn_min and Pn_max
++	 * - F is in the range of 1 and 255
++	 * - FxP is within 25% of desired value.
++	 *   Note: 25% is arbitrary value and may need some tweak.
++	 */
++	if (drm_dp_dpcd_readb(&intel_dp->aux,
++			       DP_EDP_PWMGEN_BIT_COUNT_CAP_MIN, &pn_min) != 1) {
++		DRM_DEBUG_KMS("Failed to read pwmgen bit count cap min\n");
++		return false;
++	}
++	if (drm_dp_dpcd_readb(&intel_dp->aux,
++			       DP_EDP_PWMGEN_BIT_COUNT_CAP_MAX, &pn_max) != 1) {
++		DRM_DEBUG_KMS("Failed to read pwmgen bit count cap max\n");
++		return false;
++	}
++	pn_min &= DP_EDP_PWMGEN_BIT_COUNT_MASK;
++	pn_max &= DP_EDP_PWMGEN_BIT_COUNT_MASK;
++
++	fxp_min = DIV_ROUND_CLOSEST(fxp * 3, 4);
++	fxp_max = DIV_ROUND_CLOSEST(fxp * 5, 4);
++	if (fxp_min < (1 << pn_min) || (255 << pn_max) < fxp_max) {
++		DRM_DEBUG_KMS("VBT defined backlight frequency out of range\n");
++		return false;
++	}
++
++	for (pn = pn_max; pn >= pn_min; pn--) {
++		f = clamp(DIV_ROUND_CLOSEST(fxp, 1 << pn), 1, 255);
++		fxp_actual = f << pn;
++		if (fxp_min <= fxp_actual && fxp_actual <= fxp_max)
++			break;
++	}
++
++	if (drm_dp_dpcd_writeb(&intel_dp->aux,
++			       DP_EDP_PWMGEN_BIT_COUNT, pn) < 0) {
++		DRM_DEBUG_KMS("Failed to write aux pwmgen bit count\n");
++		return false;
++	}
++	if (drm_dp_dpcd_writeb(&intel_dp->aux,
++			       DP_EDP_BACKLIGHT_FREQ_SET, (u8) f) < 0) {
++		DRM_DEBUG_KMS("Failed to write aux backlight freq\n");
++		return false;
++	}
++	return true;
++}
++
+ static void intel_dp_aux_enable_backlight(const struct intel_crtc_state *crtc_state,
+ 					  const struct drm_connector_state *conn_state)
+ {
+@@ -111,8 +186,7 @@ static void intel_dp_aux_enable_backligh
+ 	 * intel_dp_aux_setup_backlight()
+ 	 */
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(&connector->encoder->base);
+-	uint8_t dpcd_buf = 0;
+-	uint8_t edp_backlight_mode = 0;
++	uint8_t dpcd_buf, new_dpcd_buf, edp_backlight_mode;
+ 
+ 	if (drm_dp_dpcd_readb(&intel_dp->aux,
+ 			DP_EDP_BACKLIGHT_MODE_SET_REGISTER, &dpcd_buf) != 1) {
+@@ -121,18 +195,15 @@ static void intel_dp_aux_enable_backligh
+ 		return;
+ 	}
+ 
++	new_dpcd_buf = dpcd_buf;
+ 	edp_backlight_mode = dpcd_buf & DP_EDP_BACKLIGHT_CONTROL_MODE_MASK;
+ 
+ 	switch (edp_backlight_mode) {
+ 	case DP_EDP_BACKLIGHT_CONTROL_MODE_PWM:
+ 	case DP_EDP_BACKLIGHT_CONTROL_MODE_PRESET:
+ 	case DP_EDP_BACKLIGHT_CONTROL_MODE_PRODUCT:
+-		dpcd_buf &= ~DP_EDP_BACKLIGHT_CONTROL_MODE_MASK;
+-		dpcd_buf |= DP_EDP_BACKLIGHT_CONTROL_MODE_DPCD;
+-		if (drm_dp_dpcd_writeb(&intel_dp->aux,
+-			DP_EDP_BACKLIGHT_MODE_SET_REGISTER, dpcd_buf) < 0) {
+-			DRM_DEBUG_KMS("Failed to write aux backlight mode\n");
+-		}
++		new_dpcd_buf &= ~DP_EDP_BACKLIGHT_CONTROL_MODE_MASK;
++		new_dpcd_buf |= DP_EDP_BACKLIGHT_CONTROL_MODE_DPCD;
+ 		break;
+ 
+ 	/* Do nothing when it is already DPCD mode */
+@@ -141,6 +212,17 @@ static void intel_dp_aux_enable_backligh
+ 		break;
+ 	}
+ 
++	if (intel_dp->edp_dpcd[2] & DP_EDP_BACKLIGHT_FREQ_AUX_SET_CAP)
++		if (intel_dp_aux_set_pwm_freq(connector))
++			new_dpcd_buf |= DP_EDP_BACKLIGHT_FREQ_AUX_SET_ENABLE;
++
++	if (new_dpcd_buf != dpcd_buf) {
++		if (drm_dp_dpcd_writeb(&intel_dp->aux,
++			DP_EDP_BACKLIGHT_MODE_SET_REGISTER, new_dpcd_buf) < 0) {
++			DRM_DEBUG_KMS("Failed to write aux backlight mode\n");
++		}
++	}
++
+ 	set_aux_backlight_enable(intel_dp, true);
+ 	intel_dp_aux_set_backlight(conn_state, connector->panel.backlight.level);
+ }
