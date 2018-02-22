@@ -1,0 +1,334 @@
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Thu, 22 Jun 2017 19:44:05 +0200
+Subject: crush: implement weight and id overrides for straw2
+Git-commit: 069f3222ca96acfe8c59937e98c401bda5475b48
+Patch-mainline: v4.13-rc1
+References: FATE#324714
+
+bucket_straw2_choose needs to use weights that may be different from
+weight_items. For instance to compensate for an uneven distribution
+caused by a low number of values. Or to fix the probability biais
+introduced by conditional probabilities (see
+http://tracker.ceph.com/issues/15653 for more information).
+
+We introduce a weight_set for each straw2 bucket to set the desired
+weight for a given item at a given position. The weight of a given item
+when picking the first replica (first position) may be different from
+the weight the second replica (second position). For instance the weight
+matrix for a given bucket containing items 3, 7 and 13 could be as
+follows:
+
+          position 0   position 1
+
+item 3     0x10000      0x100000
+item 7     0x40000       0x10000
+item 13    0x40000       0x10000
+
+When crush_do_rule picks the first of two replicas (position 0), item 7,
+3 are four times more likely to be choosen by bucket_straw2_choose than
+item 13. When choosing the second replica (position 1), item 3 is ten
+times more likely to be choosen than item 7, 13.
+
+By default the weight_set of each bucket exactly matches the content of
+item_weights for each position to ensure backward compatibility.
+
+bucket_straw2_choose compares items by using their id. The same ids are
+also used to index buckets and they must be unique. For each item in a
+bucket an array of ids can be provided for placement purposes and they
+are used instead of the ids. If no replacement ids are provided, the
+legacy behavior is preserved.
+
+Reflects ceph.git commit 19537a450fd5c5a0bb8b7830947507a76db2ceca.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ include/linux/crush/crush.h  | 58 ++++++++++++++++++++++++++++++++++
+ include/linux/crush/mapper.h |  9 +++---
+ net/ceph/crush/mapper.c      | 74 +++++++++++++++++++++++++++++++++-----------
+ net/ceph/osdmap.c            |  2 +-
+ 4 files changed, 119 insertions(+), 24 deletions(-)
+
+diff --git a/include/linux/crush/crush.h b/include/linux/crush/crush.h
+index fbecbd089d75..d8676e56fa23 100644
+--- a/include/linux/crush/crush.h
++++ b/include/linux/crush/crush.h
+@@ -137,6 +137,64 @@ struct crush_bucket {
+ 
+ };
+ 
++/** @ingroup API
++ *
++ * Replacement weights for each item in a bucket. The size of the
++ * array must be exactly the size of the straw2 bucket, just as the
++ * item_weights array.
++ *
++ */
++struct crush_weight_set {
++	__u32 *weights; /*!< 16.16 fixed point weights
++                             in the same order as items */
++	__u32 size;     /*!< size of the __weights__ array */
++};
++
++/** @ingroup API
++ *
++ * Replacement weights and ids for a given straw2 bucket, for
++ * placement purposes.
++ *
++ * When crush_do_rule() chooses the Nth item from a straw2 bucket, the
++ * replacement weights found at __weight_set[N]__ are used instead of
++ * the weights from __item_weights__. If __N__ is greater than
++ * __weight_set_size__, the weights found at __weight_set_size-1__ are
++ * used instead. For instance if __weight_set__ is:
++ *
++ *    [ [ 0x10000, 0x20000 ],   // position 0
++ *      [ 0x20000, 0x40000 ] ]  // position 1
++ *
++ * choosing the 0th item will use position 0 weights [ 0x10000, 0x20000 ]
++ * choosing the 1th item will use position 1 weights [ 0x20000, 0x40000 ]
++ * choosing the 2th item will use position 1 weights [ 0x20000, 0x40000 ]
++ * etc.
++ *
++ */
++struct crush_choose_arg {
++	__s32 *ids;            /*!< values to use instead of items */
++	__u32 ids_size;        /*!< size of the __ids__ array */
++	struct crush_weight_set *weight_set; /*!< weight replacements for
++                                                  a given position */
++	__u32 weight_set_size; /*!< size of the __weight_set__ array */
++};
++
++/** @ingroup API
++ *
++ * Replacement weights and ids for each bucket in the crushmap. The
++ * __size__ of the __args__ array must be exactly the same as the
++ * __map->max_buckets__.
++ *
++ * The __crush_choose_arg__ at index N will be used when choosing
++ * an item from the bucket __map->buckets[N]__ bucket, provided it
++ * is a straw2 bucket.
++ *
++ */
++struct crush_choose_arg_map {
++	struct crush_choose_arg *args; /*!< replacement for each bucket
++                                            in the crushmap */
++	__u32 size;                    /*!< size of the __args__ array */
++};
++
+ struct crush_bucket_uniform {
+ 	struct crush_bucket h;
+ 	__u32 item_weight;  /* 16-bit fixed point; all items equally weighted */
+diff --git a/include/linux/crush/mapper.h b/include/linux/crush/mapper.h
+index c95e19e1ff11..141edabb947e 100644
+--- a/include/linux/crush/mapper.h
++++ b/include/linux/crush/mapper.h
+@@ -11,11 +11,10 @@
+ #include "crush.h"
+ 
+ extern int crush_find_rule(const struct crush_map *map, int ruleset, int type, int size);
+-extern int crush_do_rule(const struct crush_map *map,
+-			 int ruleno,
+-			 int x, int *result, int result_max,
+-			 const __u32 *weights, int weight_max,
+-			 void *cwin);
++int crush_do_rule(const struct crush_map *map,
++		  int ruleno, int x, int *result, int result_max,
++		  const __u32 *weight, int weight_max,
++		  void *cwin, const struct crush_choose_arg *choose_args);
+ 
+ /*
+  * Returns the exact amount of workspace that will need to be used
+diff --git a/net/ceph/crush/mapper.c b/net/ceph/crush/mapper.c
+index b5cd8c21bfdf..0b2646a9cc50 100644
+--- a/net/ceph/crush/mapper.c
++++ b/net/ceph/crush/mapper.c
+@@ -302,19 +302,42 @@ static __u64 crush_ln(unsigned int xin)
+  *
+  */
+ 
++static __u32 *get_choose_arg_weights(const struct crush_bucket_straw2 *bucket,
++				     const struct crush_choose_arg *arg,
++				     int position)
++{
++	if (!arg || !arg->weight_set || arg->weight_set_size == 0)
++		return bucket->item_weights;
++
++	if (position >= arg->weight_set_size)
++		position = arg->weight_set_size - 1;
++	return arg->weight_set[position].weights;
++}
++
++static __s32 *get_choose_arg_ids(const struct crush_bucket_straw2 *bucket,
++				 const struct crush_choose_arg *arg)
++{
++	if (!arg || !arg->ids)
++		return bucket->h.items;
++
++	return arg->ids;
++}
++
+ static int bucket_straw2_choose(const struct crush_bucket_straw2 *bucket,
+-				int x, int r)
++				int x, int r,
++				const struct crush_choose_arg *arg,
++				int position)
+ {
+ 	unsigned int i, high = 0;
+ 	unsigned int u;
+-	unsigned int w;
+ 	__s64 ln, draw, high_draw = 0;
++	__u32 *weights = get_choose_arg_weights(bucket, arg, position);
++	__s32 *ids = get_choose_arg_ids(bucket, arg);
+ 
+ 	for (i = 0; i < bucket->h.size; i++) {
+-		w = bucket->item_weights[i];
+-		if (w) {
+-			u = crush_hash32_3(bucket->h.hash, x,
+-					   bucket->h.items[i], r);
++		dprintk("weight 0x%x item %d\n", weights[i], ids[i]);
++		if (weights[i]) {
++			u = crush_hash32_3(bucket->h.hash, x, ids[i], r);
+ 			u &= 0xffff;
+ 
+ 			/*
+@@ -335,7 +358,7 @@ static int bucket_straw2_choose(const struct crush_bucket_straw2 *bucket,
+ 			 * weight means a larger (less negative) value
+ 			 * for draw.
+ 			 */
+-			draw = div64_s64(ln, w);
++			draw = div64_s64(ln, weights[i]);
+ 		} else {
+ 			draw = S64_MIN;
+ 		}
+@@ -352,7 +375,9 @@ static int bucket_straw2_choose(const struct crush_bucket_straw2 *bucket,
+ 
+ static int crush_bucket_choose(const struct crush_bucket *in,
+ 			       struct crush_work_bucket *work,
+-			       int x, int r)
++			       int x, int r,
++			       const struct crush_choose_arg *arg,
++			       int position)
+ {
+ 	dprintk(" crush_bucket_choose %d x=%d r=%d\n", in->id, x, r);
+ 	BUG_ON(in->size == 0);
+@@ -374,7 +399,7 @@ static int crush_bucket_choose(const struct crush_bucket *in,
+ 	case CRUSH_BUCKET_STRAW2:
+ 		return bucket_straw2_choose(
+ 			(const struct crush_bucket_straw2 *)in,
+-			x, r);
++			x, r, arg, position);
+ 	default:
+ 		dprintk("unknown bucket %d alg %d\n", in->id, in->alg);
+ 		return in->items[0];
+@@ -436,7 +461,8 @@ static int crush_choose_firstn(const struct crush_map *map,
+ 			       unsigned int vary_r,
+ 			       unsigned int stable,
+ 			       int *out2,
+-			       int parent_r)
++			       int parent_r,
++			       const struct crush_choose_arg *choose_args)
+ {
+ 	int rep;
+ 	unsigned int ftotal, flocal;
+@@ -486,7 +512,10 @@ static int crush_choose_firstn(const struct crush_map *map,
+ 				else
+ 					item = crush_bucket_choose(
+ 						in, work->work[-1-in->id],
+-						x, r);
++						x, r,
++						(choose_args ?
++						 &choose_args[-1-in->id] : 0),
++						outpos);
+ 				if (item >= map->max_devices) {
+ 					dprintk("   bad item %d\n", item);
+ 					skip_rep = 1;
+@@ -543,7 +572,8 @@ static int crush_choose_firstn(const struct crush_map *map,
+ 							    vary_r,
+ 							    stable,
+ 							    NULL,
+-							    sub_r) <= outpos)
++							    sub_r,
++							    choose_args) <= outpos)
+ 							/* didn't get leaf */
+ 							reject = 1;
+ 					} else {
+@@ -620,7 +650,8 @@ static void crush_choose_indep(const struct crush_map *map,
+ 			       unsigned int recurse_tries,
+ 			       int recurse_to_leaf,
+ 			       int *out2,
+-			       int parent_r)
++			       int parent_r,
++			       const struct crush_choose_arg *choose_args)
+ {
+ 	const struct crush_bucket *in = bucket;
+ 	int endpos = outpos + left;
+@@ -692,7 +723,10 @@ static void crush_choose_indep(const struct crush_map *map,
+ 
+ 				item = crush_bucket_choose(
+ 					in, work->work[-1-in->id],
+-					x, r);
++					x, r,
++					(choose_args ?
++					 &choose_args[-1-in->id] : 0),
++					outpos);
+ 				if (item >= map->max_devices) {
+ 					dprintk("   bad item %d\n", item);
+ 					out[rep] = CRUSH_ITEM_NONE;
+@@ -746,7 +780,8 @@ static void crush_choose_indep(const struct crush_map *map,
+ 							x, 1, numrep, 0,
+ 							out2, rep,
+ 							recurse_tries, 0,
+-							0, NULL, r);
++							0, NULL, r,
++							choose_args);
+ 						if (out2[rep] == CRUSH_ITEM_NONE) {
+ 							/* placed nothing; no leaf */
+ 							break;
+@@ -854,11 +889,12 @@ void crush_init_workspace(const struct crush_map *map, void *v)
+  * @weight: weight vector (for map leaves)
+  * @weight_max: size of weight vector
+  * @cwin: pointer to at least crush_work_size() bytes of memory
++ * @choose_args: weights and ids for each known bucket
+  */
+ int crush_do_rule(const struct crush_map *map,
+ 		  int ruleno, int x, int *result, int result_max,
+ 		  const __u32 *weight, int weight_max,
+-		  void *cwin)
++		  void *cwin, const struct crush_choose_arg *choose_args)
+ {
+ 	int result_len;
+ 	struct crush_work *cw = cwin;
+@@ -1013,7 +1049,8 @@ int crush_do_rule(const struct crush_map *map,
+ 						vary_r,
+ 						stable,
+ 						c+osize,
+-						0);
++						0,
++						choose_args);
+ 				} else {
+ 					out_size = ((numrep < (result_max-osize)) ?
+ 						    numrep : (result_max-osize));
+@@ -1030,7 +1067,8 @@ int crush_do_rule(const struct crush_map *map,
+ 						   choose_leaf_tries : 1,
+ 						recurse_to_leaf,
+ 						c+osize,
+-						0);
++						0,
++						choose_args);
+ 					osize += out_size;
+ 				}
+ 			}
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 93baa69407c5..9da0ee61aca5 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -2111,7 +2111,7 @@ static int do_crush(struct ceph_osdmap *map, int ruleno, int x,
+ 
+ 	mutex_lock(&map->crush_workspace_mutex);
+ 	r = crush_do_rule(map->crush, ruleno, x, result, result_max,
+-			  weight, weight_max, map->crush_workspace);
++			  weight, weight_max, map->crush_workspace, NULL);
+ 	mutex_unlock(&map->crush_workspace_mutex);
+ 
+ 	return r;
+

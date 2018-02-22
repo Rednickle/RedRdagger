@@ -1,0 +1,146 @@
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Thu, 15 Jun 2017 16:30:54 +0200
+Subject: libceph: resend on PG splits if OSD has RESEND_ON_SPLIT
+Git-commit: 7de030d6b10a56e991312a978ace6be3c090097c
+Patch-mainline: v4.13-rc1
+References: FATE#324714
+
+Note that ceph_osd_request_target fields are updated regardless of
+RESEND_ON_SPLIT.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ include/linux/ceph/osdmap.h |  2 ++
+ net/ceph/osd_client.c       | 21 ++++++++++++++-------
+ net/ceph/osdmap.c           |  7 +++----
+ 3 files changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index 66447fc7f334..63fb073a3355 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -249,6 +249,8 @@ static inline void ceph_osds_init(struct ceph_osds *set)
+ 
+ void ceph_osds_copy(struct ceph_osds *dest, const struct ceph_osds *src);
+ 
++bool ceph_pg_is_split(const struct ceph_pg *pgid, u32 old_pg_num,
++		      u32 new_pg_num);
+ bool ceph_is_new_interval(const struct ceph_osds *old_acting,
+ 			  const struct ceph_osds *new_acting,
+ 			  const struct ceph_osds *old_up,
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 4143f73590f3..518dbac599d0 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1319,6 +1319,7 @@ enum calc_target_result {
+ 
+ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 					   struct ceph_osd_request_target *t,
++					   struct ceph_connection *con,
+ 					   bool any_change)
+ {
+ 	struct ceph_pg_pool_info *pi;
+@@ -1327,6 +1328,7 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 	bool force_resend = false;
+ 	bool unpaused = false;
+ 	bool legacy_change;
++	bool split = false;
+ 	bool need_check_tiering = false;
+ 	bool sort_bitwise = ceph_osdmap_flag(osdc, CEPH_OSDMAP_SORTBITWISE);
+ 	enum calc_target_result ct_res;
+@@ -1398,8 +1400,10 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 	}
+ 	legacy_change = ceph_pg_compare(&t->pgid, &pgid) ||
+ 			ceph_osds_changed(&t->acting, &acting, any_change);
++	if (t->pg_num)
++		split = ceph_pg_is_split(&last_pgid, t->pg_num, pi->pg_num);
+ 
+-	if (legacy_change || force_resend) {
++	if (legacy_change || force_resend || split) {
+ 		t->pgid = pgid; /* struct */
+ 		ceph_pg_to_primary_shard(osdc->osdmap, &pgid, &t->spgid);
+ 		ceph_osds_copy(&t->acting, &acting);
+@@ -1413,7 +1417,9 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 		t->osd = acting.primary;
+ 	}
+ 
+-	if (unpaused || legacy_change || force_resend)
++	if (unpaused || legacy_change || force_resend ||
++	    (split && con && CEPH_HAVE_FEATURE(con->peer_features,
++					       RESEND_ON_SPLIT)))
+ 		ct_res = CALC_TARGET_NEED_RESEND;
+ 	else
+ 		ct_res = CALC_TARGET_NO_ACTION;
+@@ -1765,7 +1771,7 @@ static void __submit_request(struct ceph_osd_request *req, bool wrlocked)
+ 	dout("%s req %p wrlocked %d\n", __func__, req, wrlocked);
+ 
+ again:
+-	ct_res = calc_target(osdc, &req->r_t, false);
++	ct_res = calc_target(osdc, &req->r_t, NULL, false);
+ 	if (ct_res == CALC_TARGET_POOL_DNE && !wrlocked)
+ 		goto promote;
+ 
+@@ -2561,7 +2567,7 @@ static void linger_submit(struct ceph_osd_linger_request *lreq)
+ 	struct ceph_osd_client *osdc = lreq->osdc;
+ 	struct ceph_osd *osd;
+ 
+-	calc_target(osdc, &lreq->t, false);
++	calc_target(osdc, &lreq->t, NULL, false);
+ 	osd = lookup_create_osd(osdc, lreq->t.osd, true);
+ 	link_linger(osd, lreq);
+ 
+@@ -3179,7 +3185,7 @@ recalc_linger_target(struct ceph_osd_linger_request *lreq)
+ 	struct ceph_osd_client *osdc = lreq->osdc;
+ 	enum calc_target_result ct_res;
+ 
+-	ct_res = calc_target(osdc, &lreq->t, true);
++	ct_res = calc_target(osdc, &lreq->t, NULL, true);
+ 	if (ct_res == CALC_TARGET_NEED_RESEND) {
+ 		struct ceph_osd *osd;
+ 
+@@ -3250,7 +3256,8 @@ static void scan_requests(struct ceph_osd *osd,
+ 		n = rb_next(n); /* unlink_request(), check_pool_dne() */
+ 
+ 		dout("%s req %p tid %llu\n", __func__, req, req->r_tid);
+-		ct_res = calc_target(osdc, &req->r_t, false);
++		ct_res = calc_target(osdc, &req->r_t, &req->r_osd->o_con,
++				     false);
+ 		switch (ct_res) {
+ 		case CALC_TARGET_NO_ACTION:
+ 			force_resend_writes = cleared_full ||
+@@ -3359,7 +3366,7 @@ static void kick_requests(struct ceph_osd_client *osdc,
+ 		erase_request(need_resend, req); /* before link_request() */
+ 
+ 		WARN_ON(req->r_osd);
+-		calc_target(osdc, &req->r_t, false);
++		calc_target(osdc, &req->r_t, NULL, false);
+ 		osd = lookup_create_osd(osdc, req->r_t.osd, true);
+ 		link_request(osd, req);
+ 		if (!req->r_linger) {
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index a4155620eace..367879afed58 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1753,9 +1753,8 @@ void ceph_osds_copy(struct ceph_osds *dest, const struct ceph_osds *src)
+ 	dest->primary = src->primary;
+ }
+ 
+-static bool is_split(const struct ceph_pg *pgid,
+-		     u32 old_pg_num,
+-		     u32 new_pg_num)
++bool ceph_pg_is_split(const struct ceph_pg *pgid, u32 old_pg_num,
++		      u32 new_pg_num)
+ {
+ 	int old_bits = calc_bits_of(old_pg_num);
+ 	int old_mask = (1 << old_bits) - 1;
+@@ -1800,7 +1799,7 @@ bool ceph_is_new_interval(const struct ceph_osds *old_acting,
+ 	       !osds_equal(old_up, new_up) ||
+ 	       old_size != new_size ||
+ 	       old_min_size != new_min_size ||
+-	       is_split(pgid, old_pg_num, new_pg_num) ||
++	       ceph_pg_is_split(pgid, old_pg_num, new_pg_num) ||
+ 	       old_sort_bitwise != new_sort_bitwise;
+ }
+ 
+

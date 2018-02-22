@@ -1,0 +1,165 @@
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Thu, 15 Jun 2017 16:30:53 +0200
+Subject: libceph: introduce ceph_spg, ceph_pg_to_primary_shard()
+Git-commit: dc98ff7230e5ccf11c621dff0d590e83574a7184
+Patch-mainline: v4.13-rc1
+References: FATE#324714
+
+Store both raw pgid and actual spgid in ceph_osd_request_target.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ include/linux/ceph/osd_client.h |  3 ++-
+ include/linux/ceph/osdmap.h     | 10 ++++++++++
+ net/ceph/debugfs.c              | 11 ++++++++++-
+ net/ceph/osd_client.c           |  7 +++++--
+ net/ceph/osdmap.c               | 33 +++++++++++++++++++++++++++++++++
+ 5 files changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index ef630ebd1169..6114f7b02135 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -136,7 +136,8 @@ struct ceph_osd_request_target {
+ 	struct ceph_object_id target_oid;
+ 	struct ceph_object_locator target_oloc;
+ 
+-	struct ceph_pg pgid;
++	struct ceph_pg pgid;               /* last raw pg we mapped to */
++	struct ceph_spg spgid;             /* last actual spg we mapped to */
+ 	u32 pg_num;
+ 	u32 pg_num_mask;
+ 	struct ceph_osds acting;
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index 938656f70807..7ae5b416b4b6 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -24,6 +24,13 @@ struct ceph_pg {
+ 	uint32_t seed;
+ };
+ 
++#define CEPH_SPG_NOSHARD	-1
++
++struct ceph_spg {
++	struct ceph_pg pgid;
++	s8 shard;
++};
++
+ int ceph_pg_compare(const struct ceph_pg *lhs, const struct ceph_pg *rhs);
+ 
+ #define CEPH_POOL_FLAG_HASHPSPOOL	(1ULL << 0) /* hash pg seed and pool id
+@@ -271,6 +278,9 @@ void ceph_pg_to_up_acting_osds(struct ceph_osdmap *osdmap,
+ 			       const struct ceph_pg *raw_pgid,
+ 			       struct ceph_osds *up,
+ 			       struct ceph_osds *acting);
++bool ceph_pg_to_primary_shard(struct ceph_osdmap *osdmap,
++			      const struct ceph_pg *raw_pgid,
++			      struct ceph_spg *spgid);
+ int ceph_pg_to_acting_primary(struct ceph_osdmap *osdmap,
+ 			      const struct ceph_pg *raw_pgid);
+ 
+diff --git a/net/ceph/debugfs.c b/net/ceph/debugfs.c
+index 71ba13927b3d..50ab1bdb16e2 100644
+--- a/net/ceph/debugfs.c
++++ b/net/ceph/debugfs.c
+@@ -147,11 +147,20 @@ static int monc_show(struct seq_file *s, void *p)
+ 	return 0;
+ }
+ 
++static void dump_spgid(struct seq_file *s, const struct ceph_spg *spgid)
++{
++	seq_printf(s, "%llu.%x", spgid->pgid.pool, spgid->pgid.seed);
++	if (spgid->shard != CEPH_SPG_NOSHARD)
++		seq_printf(s, "s%d", spgid->shard);
++}
++
+ static void dump_target(struct seq_file *s, struct ceph_osd_request_target *t)
+ {
+ 	int i;
+ 
+-	seq_printf(s, "osd%d\t%llu.%x\t[", t->osd, t->pgid.pool, t->pgid.seed);
++	seq_printf(s, "osd%d\t%llu.%x\t", t->osd, t->pgid.pool, t->pgid.seed);
++	dump_spgid(s, &t->spgid);
++	seq_puts(s, "\t[");
+ 	for (i = 0; i < t->up.size; i++)
+ 		seq_printf(s, "%s%d", (!i ? "" : ","), t->up.osds[i]);
+ 	seq_printf(s, "]/%d\t[", t->up.primary);
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index aca6319b99b6..66509414f4c8 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -373,6 +373,7 @@ static void target_copy(struct ceph_osd_request_target *dest,
+ 	ceph_oloc_copy(&dest->target_oloc, &src->target_oloc);
+ 
+ 	dest->pgid = src->pgid; /* struct */
++	dest->spgid = src->spgid; /* struct */
+ 	dest->pg_num = src->pg_num;
+ 	dest->pg_num_mask = src->pg_num_mask;
+ 	ceph_osds_copy(&dest->acting, &src->acting);
+@@ -1394,6 +1395,7 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 	    ceph_osds_changed(&t->acting, &acting, any_change) ||
+ 	    force_resend) {
+ 		t->pgid = pgid; /* struct */
++		ceph_pg_to_primary_shard(osdc->osdmap, &pgid, &t->spgid);
+ 		ceph_osds_copy(&t->acting, &acting);
+ 		ceph_osds_copy(&t->up, &up);
+ 		t->size = pi->size;
+@@ -1595,9 +1597,10 @@ static void send_request(struct ceph_osd_request *req)
+ 
+ 	encode_request(req, req->r_request);
+ 
+-	dout("%s req %p tid %llu to pg %llu.%x osd%d flags 0x%x attempt %d\n",
++	dout("%s req %p tid %llu to pgid %llu.%x spgid %llu.%xs%d osd%d flags 0x%x attempt %d\n",
+ 	     __func__, req, req->r_tid, req->r_t.pgid.pool, req->r_t.pgid.seed,
+-	     req->r_t.osd, req->r_flags, req->r_attempts);
++	     req->r_t.spgid.pgid.pool, req->r_t.spgid.pgid.seed,
++	     req->r_t.spgid.shard, osd->o_osd, req->r_flags, req->r_attempts);
+ 
+ 	req->r_t.paused = false;
+ 	req->r_stamp = jiffies;
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 710ee3dc01b9..a4155620eace 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -2265,6 +2265,39 @@ void ceph_pg_to_up_acting_osds(struct ceph_osdmap *osdmap,
+ 	WARN_ON(!osds_valid(up) || !osds_valid(acting));
+ }
+ 
++bool ceph_pg_to_primary_shard(struct ceph_osdmap *osdmap,
++			      const struct ceph_pg *raw_pgid,
++			      struct ceph_spg *spgid)
++{
++	struct ceph_pg_pool_info *pi;
++	struct ceph_pg pgid;
++	struct ceph_osds up, acting;
++	int i;
++
++	pi = ceph_pg_pool_by_id(osdmap, raw_pgid->pool);
++	if (!pi)
++		return false;
++
++	raw_pg_to_pg(pi, raw_pgid, &pgid);
++
++	if (ceph_can_shift_osds(pi)) {
++		spgid->pgid = pgid; /* struct */
++		spgid->shard = CEPH_SPG_NOSHARD;
++		return true;
++	}
++
++	ceph_pg_to_up_acting_osds(osdmap, &pgid, &up, &acting);
++	for (i = 0; i < acting.size; i++) {
++		if (acting.osds[i] == acting.primary) {
++			spgid->pgid = pgid; /* struct */
++			spgid->shard = i;
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ /*
+  * Return acting primary for given PG, or -1 if none.
+  */
+
