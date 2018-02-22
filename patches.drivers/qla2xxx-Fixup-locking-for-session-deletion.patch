@@ -1,0 +1,210 @@
+From: Hannes Reinecke <hare@suse.de>
+Date: Wed, 21 Feb 2018 11:16:18 +0100
+Subject: [PATCH] qla2xxx: Fixup locking for session deletion
+References: bsc#1081681
+Patch-Mainline: submitted linux-scsi 2018/01/22
+
+Commit d8630bb95f46 ('Serialize session deletion by using work_lock') tries
+to fixup a deadlock when deleting sessions, but fails to take
+into account the locking rules. This patch resolves the situation
+by introducing a separate lock for processing the GNLIST response, and
+ensures that sess_lock is released before calling
+qlt_schedule_sess_delete().
+
+Fixes: d8630bb95f46 ('scsi: qla2xxx: Serialize session deletion by using work_lock')
+Signed-off-by: Hannes Reinecke <hare@suse.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/qla2xxx/qla_def.h    |  4 ++--
+ drivers/scsi/qla2xxx/qla_init.c   | 24 +++++++++++++++---------
+ drivers/scsi/qla2xxx/qla_os.c     |  7 ++++++-
+ drivers/scsi/qla2xxx/qla_target.c | 17 ++++++-----------
+ 4 files changed, 29 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index be7d6824581a..3ca4b6a5eddd 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -261,9 +261,9 @@
+ struct name_list_extended {
+ 	struct get_name_list_extended *l;
+ 	dma_addr_t		ldma;
+-	struct list_head 	fcports;	/* protect by sess_list */
++	struct list_head	fcports;
++	spinlock_t		fcports_lock;
+ 	u32			size;
+-	u8			sent;
+ };
+ /*
+  * Timeout timer counts in seconds
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index 7f271b3be7f1..c9f902127ba3 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -660,8 +660,7 @@ qla24xx_async_gnl_sp_done(void *s, int res)
+ 		    (loop_id & 0x7fff));
+ 	}
+ 
+-	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+-	vha->gnl.sent = 0;
++	spin_lock_irqsave(&vha->gnl.fcports_lock, flags);
+ 
+ 	INIT_LIST_HEAD(&h);
+ 	fcport = tf = NULL;
+@@ -670,12 +669,16 @@ qla24xx_async_gnl_sp_done(void *s, int res)
+ 
+ 	list_for_each_entry_safe(fcport, tf, &h, gnl_entry) {
+ 		list_del_init(&fcport->gnl_entry);
++		spin_lock(&vha->hw->tgt.sess_lock);
+ 		fcport->flags &= ~(FCF_ASYNC_SENT | FCF_ASYNC_ACTIVE);
++		spin_unlock(&vha->hw->tgt.sess_lock);
+ 		ea.fcport = fcport;
+ 
+ 		qla2x00_fcport_event_handler(vha, &ea);
+ 	}
++	spin_unlock_irqrestore(&vha->gnl.fcports_lock, flags);
+ 
++	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+ 	/* create new fcport if fw has knowledge of new sessions */
+ 	for (i = 0; i < n; i++) {
+ 		port_id_t id;
+@@ -727,18 +730,21 @@ int qla24xx_async_gnl(struct scsi_qla_host *vha, fc_port_t *fcport)
+ 	ql_dbg(ql_dbg_disc, vha, 0x20d9,
+ 	    "Async-gnlist WWPN %8phC \n", fcport->port_name);
+ 
+-	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
++	spin_lock_irqsave(&vha->gnl.fcports_lock, flags);
++	if (!list_empty(&fcport->gnl_entry)) {
++		spin_unlock_irqrestore(&vha->gnl.fcports_lock, flags);
++		rval = QLA_SUCCESS;
++		goto done;
++	}
++
++	spin_lock(&vha->hw->tgt.sess_lock);
+ 	fcport->disc_state = DSC_GNL;
+ 	fcport->last_rscn_gen = fcport->rscn_gen;
+ 	fcport->last_login_gen = fcport->login_gen;
++	spin_unlock(&vha->hw->tgt.sess_lock);
+ 
+ 	list_add_tail(&fcport->gnl_entry, &vha->gnl.fcports);
+-	if (vha->gnl.sent) {
+-		spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+-		return QLA_SUCCESS;
+-	}
+-	vha->gnl.sent = 1;
+-	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++	spin_unlock_irqrestore(&vha->gnl.fcports_lock, flags);
+ 
+ 	sp = qla2x00_get_sp(vha, fcport, GFP_KERNEL);
+ 	if (!sp)
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index aeda3e59eaf5..39f949a23e8a 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -4576,6 +4576,7 @@ struct scsi_qla_host *qla2x00_create_host(struct scsi_host_template *sht,
+ 
+ 	spin_lock_init(&vha->work_lock);
+ 	spin_lock_init(&vha->cmd_list_lock);
++	spin_lock_init(&vha->gnl.fcports_lock);
+ 	init_waitqueue_head(&vha->fcport_waitQ);
+ 	init_waitqueue_head(&vha->vref_waitq);
+ 
+@@ -4876,6 +4877,8 @@ void qla24xx_create_new_sess(struct scsi_qla_host *vha, struct qla_work_evt *e)
+ 			}
+ 			qlt_plogi_ack_unref(vha, pla);
+ 		} else {
++			fc_port_t *dfcp = NULL;
++
+ 			spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+ 			tfcp = qla2x00_find_fcport_by_nportid(vha,
+ 			    &e->u.new_sess.id, 1);
+@@ -4898,11 +4901,13 @@ void qla24xx_create_new_sess(struct scsi_qla_host *vha, struct qla_work_evt *e)
+ 				default:
+ 					fcport->login_pause = 1;
+ 					tfcp->conflict = fcport;
+-					qlt_schedule_sess_for_deletion(tfcp);
++					dfcp = tfcp;
+ 					break;
+ 				}
+ 			}
+ 			spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++			if (dfcp)
++				qlt_schedule_sess_for_deletion(tfcp);
+ 
+ 			wwn = wwn_to_u64(fcport->node_name);
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 139fc66225e8..853154fd7b0a 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -1223,10 +1223,10 @@ static void qla24xx_chk_fcp_state(struct fc_port *sess)
+ 	}
+ }
+ 
+-/* ha->tgt.sess_lock supposed to be held on entry */
+ void qlt_schedule_sess_for_deletion(struct fc_port *sess)
+ {
+ 	struct qla_tgt *tgt = sess->tgt;
++	struct qla_hw_data *ha = sess->vha->hw;
+ 	unsigned long flags;
+ 
+ 	if (sess->disc_state == DSC_DELETE_PEND)
+@@ -1243,16 +1243,16 @@ void qlt_schedule_sess_for_deletion(struct fc_port *sess)
+ 			return;
+ 	}
+ 
++	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+ 	if (sess->deleted == QLA_SESS_DELETED)
+ 		sess->logout_on_delete = 0;
+ 
+-	spin_lock_irqsave(&sess->vha->work_lock, flags);
+ 	if (sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
+-		spin_unlock_irqrestore(&sess->vha->work_lock, flags);
++		spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+ 		return;
+ 	}
+ 	sess->deleted = QLA_SESS_DELETION_IN_PROGRESS;
+-	spin_unlock_irqrestore(&sess->vha->work_lock, flags);
++	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+ 
+ 	sess->disc_state = DSC_DELETE_PEND;
+ 
+@@ -1261,13 +1261,10 @@ void qlt_schedule_sess_for_deletion(struct fc_port *sess)
+ 	ql_dbg(ql_dbg_tgt, sess->vha, 0xe001,
+ 	    "Scheduling sess %p for deletion\n", sess);
+ 
+-	/* use cancel to push work element through before re-queue */
+-	cancel_work_sync(&sess->del_work);
+ 	INIT_WORK(&sess->del_work, qla24xx_delete_sess_fn);
+-	queue_work(sess->vha->hw->wq, &sess->del_work);
++	WARN_ON(!queue_work(sess->vha->hw->wq, &sess->del_work));
+ }
+ 
+-/* ha->tgt.sess_lock supposed to be held on entry */
+ static void qlt_clear_tgt_db(struct qla_tgt *tgt)
+ {
+ 	struct fc_port *sess;
+@@ -1450,8 +1447,8 @@ qlt_fc_port_deleted(struct scsi_qla_host *vha, fc_port_t *fcport, int max_gen)
+ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf008, "qla_tgt_fc_port_deleted %p", sess);
+ 
+ 	sess->local = 1;
+-	qlt_schedule_sess_for_deletion(sess);
+ 	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++	qlt_schedule_sess_for_deletion(sess);
+ }
+ 
+ static inline int test_tgt_sess_count(struct qla_tgt *tgt)
+@@ -1511,10 +1508,8 @@ int qlt_stop_phase1(struct qla_tgt *tgt)
+ 	 * Lock is needed, because we still can get an incoming packet.
+ 	 */
+ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
+-	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+ 	tgt->tgt_stop = 1;
+ 	qlt_clear_tgt_db(tgt);
+-	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
+ 	mutex_unlock(&qla_tgt_mutex);
+ 
+-- 
+2.12.3
+
