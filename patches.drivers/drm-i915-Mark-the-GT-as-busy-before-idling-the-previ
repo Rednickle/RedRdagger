@@ -1,0 +1,174 @@
+From 636918f130296fac1ab195ba087688f91bd627f8 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 17 Aug 2017 15:47:19 +0100
+Subject: [PATCH] drm/i915: Mark the GT as busy before idling the previous request
+Git-commit: 636918f130296fac1ab195ba087688f91bd627f8
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+In a synchronous setup, we may retire the last request before we
+complete allocating the next request. As the last request is retired, we
+queue a timer to mark the device as idle, and promptly have to execute
+ad cancel that timer once we complete allocating the request and need to
+keep the device awake. If we rearrange the mark_busy() to occur before
+we retire the previous request, we can skip this ping-pong.
+
+V2: Joonas pointed out that unreserve_seqno() was now doing more than
+doing seqno handling and should be renamed to reflect its wider purpose.
+That also highlighted the new asymmetry with reserve_seqno(), so fixup
+that and rename both to [un]reserve_engine().
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170817144719.10968-1-chris@chris-wilson.co.uk
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_gem_request.c |   88 ++++++++++++++++----------------
+ 1 file changed, 45 insertions(+), 43 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -244,27 +244,60 @@ int i915_gem_set_global_seqno(struct drm
+ 	return reset_all_global_seqno(dev_priv, seqno - 1);
+ }
+ 
+-static int reserve_seqno(struct intel_engine_cs *engine)
++static void mark_busy(struct drm_i915_private *i915)
+ {
++	if (i915->gt.awake)
++		return;
++
++	GEM_BUG_ON(!i915->gt.active_requests);
++
++	intel_runtime_pm_get_noresume(i915);
++	i915->gt.awake = true;
++
++	intel_enable_gt_powersave(i915);
++	i915_update_gfx_val(i915);
++	if (INTEL_GEN(i915) >= 6)
++		gen6_rps_busy(i915);
++
++	queue_delayed_work(i915->wq,
++			   &i915->gt.retire_work,
++			   round_jiffies_up_relative(HZ));
++}
++
++static int reserve_engine(struct intel_engine_cs *engine)
++{
++	struct drm_i915_private *i915 = engine->i915;
+ 	u32 active = ++engine->timeline->inflight_seqnos;
+ 	u32 seqno = engine->timeline->seqno;
+ 	int ret;
+ 
+ 	/* Reservation is fine until we need to wrap around */
+-	if (likely(!add_overflows(seqno, active)))
+-		return 0;
+-
+-	ret = reset_all_global_seqno(engine->i915, 0);
+-	if (ret) {
+-		engine->timeline->inflight_seqnos--;
+-		return ret;
++	if (unlikely(add_overflows(seqno, active))) {
++		ret = reset_all_global_seqno(i915, 0);
++		if (ret) {
++			engine->timeline->inflight_seqnos--;
++			return ret;
++		}
+ 	}
+ 
++	if (!i915->gt.active_requests++)
++		mark_busy(i915);
++
+ 	return 0;
+ }
+ 
+-static void unreserve_seqno(struct intel_engine_cs *engine)
++static void unreserve_engine(struct intel_engine_cs *engine)
+ {
++	struct drm_i915_private *i915 = engine->i915;
++
++	if (!--i915->gt.active_requests) {
++		/* Cancel the mark_busy() from our reserve_engine() */
++		GEM_BUG_ON(!i915->gt.awake);
++		mod_delayed_work(i915->wq,
++				 &i915->gt.idle_work,
++				 msecs_to_jiffies(100));
++	}
++
+ 	GEM_BUG_ON(!engine->timeline->inflight_seqnos);
+ 	engine->timeline->inflight_seqnos--;
+ }
+@@ -325,13 +358,7 @@ static void i915_gem_request_retire(stru
+ 	list_del_init(&request->link);
+ 	spin_unlock_irq(&engine->timeline->lock);
+ 
+-	if (!--request->i915->gt.active_requests) {
+-		GEM_BUG_ON(!request->i915->gt.awake);
+-		mod_delayed_work(request->i915->wq,
+-				 &request->i915->gt.idle_work,
+-				 msecs_to_jiffies(100));
+-	}
+-	unreserve_seqno(request->engine);
++	unreserve_engine(request->engine);
+ 	advance_ring(request);
+ 
+ 	free_capture_list(request);
+@@ -567,7 +594,7 @@ i915_gem_request_alloc(struct intel_engi
+ 		return ERR_CAST(ring);
+ 	GEM_BUG_ON(!ring);
+ 
+-	ret = reserve_seqno(engine);
++	ret = reserve_engine(engine);
+ 	if (ret)
+ 		goto err_unpin;
+ 
+@@ -673,7 +700,7 @@ err_ctx:
+ 
+ 	kmem_cache_free(dev_priv->requests, req);
+ err_unreserve:
+-	unreserve_seqno(engine);
++	unreserve_engine(engine);
+ err_unpin:
+ 	engine->context_unpin(engine, ctx);
+ 	return ERR_PTR(ret);
+@@ -855,28 +882,6 @@ i915_gem_request_await_object(struct drm
+ 	return ret;
+ }
+ 
+-static void i915_gem_mark_busy(const struct intel_engine_cs *engine)
+-{
+-	struct drm_i915_private *dev_priv = engine->i915;
+-
+-	if (dev_priv->gt.awake)
+-		return;
+-
+-	GEM_BUG_ON(!dev_priv->gt.active_requests);
+-
+-	intel_runtime_pm_get_noresume(dev_priv);
+-	dev_priv->gt.awake = true;
+-
+-	intel_enable_gt_powersave(dev_priv);
+-	i915_update_gfx_val(dev_priv);
+-	if (INTEL_GEN(dev_priv) >= 6)
+-		gen6_rps_busy(dev_priv);
+-
+-	queue_delayed_work(dev_priv->wq,
+-			   &dev_priv->gt.retire_work,
+-			   round_jiffies_up_relative(HZ));
+-}
+-
+ /*
+  * NB: This function is not allowed to fail. Doing so would mean the the
+  * request is not being tracked for completion but the work itself is
+@@ -958,9 +963,6 @@ void __i915_add_request(struct drm_i915_
+ 	list_add_tail(&request->ring_link, &ring->request_list);
+ 	request->emitted_jiffies = jiffies;
+ 
+-	if (!request->i915->gt.active_requests++)
+-		i915_gem_mark_busy(engine);
+-
+ 	/* Let the backend know a new request has arrived that may need
+ 	 * to adjust the existing execution schedule due to a high priority
+ 	 * request - i.e. we may want to preempt the current request in order

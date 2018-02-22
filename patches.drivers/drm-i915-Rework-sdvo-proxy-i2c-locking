@@ -1,0 +1,229 @@
+From a85066840d29fc68d95ce7dbd6bcf15ef2775d66 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 26 Jul 2017 15:26:47 +0200
+Subject: [PATCH] drm/i915: Rework sdvo proxy i2c locking
+Git-commit: a85066840d29fc68d95ce7dbd6bcf15ef2775d66
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+lockdep complaints about a locking recursion for the i2c bus lock
+because both the sdvo ddc proxy bus and the gmbus nested within use
+the same locking class. It's not really a deadlock since we never nest
+the other way round, but it's annoying.
+
+Fix it by pulling the gmbus locking into the i2c lock_ops for both
+i2c_adapater and making sure that the ddc_proxy_xfer function is
+entirely lockless.
+
+Re-layouting the extracted function resulted in some whitespace
+cleanups, I figured we might as well keep them.
+
+V2: Review from Chris:
+- s/locked/unlocked/ since I got the naming backwards
+- Use the vfuncs of the proxied adatper instead of re-rolling copies.
+  That's more consistent with the other proxying we're doing.
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170726132647.31833-1-daniel.vetter@ffwll.ch
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/intel_i2c.c  |   36 ++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_sdvo.c |   62 ++++++++++++++++++++++++++++++--------
+ 2 files changed, 84 insertions(+), 14 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_i2c.c
++++ b/drivers/gpu/drm/i915/intel_i2c.c
+@@ -592,7 +592,6 @@ gmbus_xfer(struct i2c_adapter *adapter,
+ 	int ret;
+ 
+ 	intel_display_power_get(dev_priv, POWER_DOMAIN_GMBUS);
+-	mutex_lock(&dev_priv->gmbus_mutex);
+ 
+ 	if (bus->force_bit) {
+ 		ret = i2c_bit_algo.master_xfer(adapter, msgs, num);
+@@ -604,7 +603,6 @@ gmbus_xfer(struct i2c_adapter *adapter,
+ 			bus->force_bit |= GMBUS_FORCE_BIT_RETRY;
+ 	}
+ 
+-	mutex_unlock(&dev_priv->gmbus_mutex);
+ 	intel_display_power_put(dev_priv, POWER_DOMAIN_GMBUS);
+ 
+ 	return ret;
+@@ -624,6 +622,39 @@ static const struct i2c_algorithm gmbus_
+ 	.functionality	= gmbus_func
+ };
+ 
++static void gmbus_lock_bus(struct i2c_adapter *adapter,
++			   unsigned int flags)
++{
++	struct intel_gmbus *bus = to_intel_gmbus(adapter);
++	struct drm_i915_private *dev_priv = bus->dev_priv;
++
++	mutex_lock(&dev_priv->gmbus_mutex);
++}
++
++static int gmbus_trylock_bus(struct i2c_adapter *adapter,
++			     unsigned int flags)
++{
++	struct intel_gmbus *bus = to_intel_gmbus(adapter);
++	struct drm_i915_private *dev_priv = bus->dev_priv;
++
++	return mutex_trylock(&dev_priv->gmbus_mutex);
++}
++
++static void gmbus_unlock_bus(struct i2c_adapter *adapter,
++			     unsigned int flags)
++{
++	struct intel_gmbus *bus = to_intel_gmbus(adapter);
++	struct drm_i915_private *dev_priv = bus->dev_priv;
++
++	mutex_unlock(&dev_priv->gmbus_mutex);
++}
++
++const struct i2c_lock_operations gmbus_lock_ops = {
++	.lock_bus =    gmbus_lock_bus,
++	.trylock_bus = gmbus_trylock_bus,
++	.unlock_bus =  gmbus_unlock_bus,
++};
++
+ /**
+  * intel_gmbus_setup - instantiate all Intel i2c GMBuses
+  * @dev_priv: i915 device private
+@@ -665,6 +696,7 @@ int intel_setup_gmbus(struct drm_i915_pr
+ 		bus->dev_priv = dev_priv;
+ 
+ 		bus->adapter.algo = &gmbus_algorithm;
++		bus->adapter.lock_ops = &gmbus_lock_ops;
+ 
+ 		/*
+ 		 * We wish to retry with bit banging
+--- a/drivers/gpu/drm/i915/intel_sdvo.c
++++ b/drivers/gpu/drm/i915/intel_sdvo.c
+@@ -451,23 +451,24 @@ static const char * const cmd_status_nam
+ 	"Scaling not supported"
+ };
+ 
+-static bool intel_sdvo_write_cmd(struct intel_sdvo *intel_sdvo, u8 cmd,
+-				 const void *args, int args_len)
++static bool __intel_sdvo_write_cmd(struct intel_sdvo *intel_sdvo, u8 cmd,
++				   const void *args, int args_len,
++				   bool unlocked)
+ {
+ 	u8 *buf, status;
+ 	struct i2c_msg *msgs;
+ 	int i, ret = true;
+ 
+-        /* Would be simpler to allocate both in one go ? */        
++	/* Would be simpler to allocate both in one go ? */
+ 	buf = kzalloc(args_len * 2 + 2, GFP_KERNEL);
+ 	if (!buf)
+ 		return false;
+ 
+ 	msgs = kcalloc(args_len + 3, sizeof(*msgs), GFP_KERNEL);
+ 	if (!msgs) {
+-	        kfree(buf);
++		kfree(buf);
+ 		return false;
+-        }
++	}
+ 
+ 	intel_sdvo_debug_write(intel_sdvo, cmd, args, args_len);
+ 
+@@ -498,7 +499,10 @@ static bool intel_sdvo_write_cmd(struct
+ 	msgs[i+2].len = 1;
+ 	msgs[i+2].buf = &status;
+ 
+-	ret = i2c_transfer(intel_sdvo->i2c, msgs, i+3);
++	if (unlocked)
++		ret = i2c_transfer(intel_sdvo->i2c, msgs, i+3);
++	else
++		ret = __i2c_transfer(intel_sdvo->i2c, msgs, i+3);
+ 	if (ret < 0) {
+ 		DRM_DEBUG_KMS("I2c transfer returned %d\n", ret);
+ 		ret = false;
+@@ -516,6 +520,12 @@ out:
+ 	return ret;
+ }
+ 
++static bool intel_sdvo_write_cmd(struct intel_sdvo *intel_sdvo, u8 cmd,
++				 const void *args, int args_len)
++{
++	return __intel_sdvo_write_cmd(intel_sdvo, cmd, args, args_len, true);
++}
++
+ static bool intel_sdvo_read_response(struct intel_sdvo *intel_sdvo,
+ 				     void *response, int response_len)
+ {
+@@ -602,13 +612,13 @@ static int intel_sdvo_get_pixel_multipli
+ 		return 4;
+ }
+ 
+-static bool intel_sdvo_set_control_bus_switch(struct intel_sdvo *intel_sdvo,
+-					      u8 ddc_bus)
++static bool __intel_sdvo_set_control_bus_switch(struct intel_sdvo *intel_sdvo,
++						u8 ddc_bus)
+ {
+ 	/* This must be the immediately preceding write before the i2c xfer */
+-	return intel_sdvo_write_cmd(intel_sdvo,
+-				    SDVO_CMD_SET_CONTROL_BUS_SWITCH,
+-				    &ddc_bus, 1);
++	return __intel_sdvo_write_cmd(intel_sdvo,
++				      SDVO_CMD_SET_CONTROL_BUS_SWITCH,
++				      &ddc_bus, 1, false);
+ }
+ 
+ static bool intel_sdvo_set_value(struct intel_sdvo *intel_sdvo, u8 cmd, const void *data, int len)
+@@ -2926,7 +2936,7 @@ static int intel_sdvo_ddc_proxy_xfer(str
+ {
+ 	struct intel_sdvo *sdvo = adapter->algo_data;
+ 
+-	if (!intel_sdvo_set_control_bus_switch(sdvo, sdvo->ddc_bus))
++	if (!__intel_sdvo_set_control_bus_switch(sdvo, sdvo->ddc_bus))
+ 		return -EIO;
+ 
+ 	return sdvo->i2c->algo->master_xfer(sdvo->i2c, msgs, num);
+@@ -2943,6 +2953,33 @@ static const struct i2c_algorithm intel_
+ 	.functionality	= intel_sdvo_ddc_proxy_func
+ };
+ 
++static void proxy_lock_bus(struct i2c_adapter *adapter,
++			   unsigned int flags)
++{
++	struct intel_sdvo *sdvo = adapter->algo_data;
++	sdvo->i2c->lock_ops->lock_bus(sdvo->i2c, flags);
++}
++
++static int proxy_trylock_bus(struct i2c_adapter *adapter,
++			     unsigned int flags)
++{
++	struct intel_sdvo *sdvo = adapter->algo_data;
++	return sdvo->i2c->lock_ops->trylock_bus(sdvo->i2c, flags);
++}
++
++static void proxy_unlock_bus(struct i2c_adapter *adapter,
++			     unsigned int flags)
++{
++	struct intel_sdvo *sdvo = adapter->algo_data;
++	sdvo->i2c->lock_ops->unlock_bus(sdvo->i2c, flags);
++}
++
++const struct i2c_lock_operations proxy_lock_ops = {
++	.lock_bus =    proxy_lock_bus,
++	.trylock_bus = proxy_trylock_bus,
++	.unlock_bus =  proxy_unlock_bus,
++};
++
+ static bool
+ intel_sdvo_init_ddc_proxy(struct intel_sdvo *sdvo,
+ 			  struct drm_i915_private *dev_priv)
+@@ -2955,6 +2992,7 @@ intel_sdvo_init_ddc_proxy(struct intel_s
+ 	sdvo->ddc.dev.parent = &pdev->dev;
+ 	sdvo->ddc.algo_data = sdvo;
+ 	sdvo->ddc.algo = &intel_sdvo_ddc_proxy;
++	sdvo->ddc.lock_ops = &proxy_lock_ops;
+ 
+ 	return i2c_add_adapter(&sdvo->ddc) == 0;
+ }

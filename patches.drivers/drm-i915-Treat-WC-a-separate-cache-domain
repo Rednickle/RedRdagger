@@ -1,0 +1,223 @@
+From e22d8e3c69a9f432b40baaaf3f894a128fdc2222 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 12 Apr 2017 12:01:11 +0100
+Subject: [PATCH] drm/i915: Treat WC a separate cache domain
+Git-commit: e22d8e3c69a9f432b40baaaf3f894a128fdc2222
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+When discussing a new WC mmap, we based the interface upon the
+assumption that GTT was fully coherent. How naive! Commits 3b5724d702ef
+("drm/i915: Wait for writes through the GTT to land before reading
+back") and ed4596ea992d ("drm/i915/guc: WA to address the Ringbuffer
+coherency issue") demonstrate that writes through the GTT are indeed
+delayed and may be overtaken by direct WC access. To be safe, if
+userspace is mixing WC mmaps with other potential GTT access (pwrite,
+GTT mmaps) it should use set_domain(WC).
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=96563
+Testcase: igt/gem_pwrite/small-gtt*
+Testcase: igt/drv_selftest/coherency
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170412110111.26626-2-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h                     |    5 -
+ drivers/gpu/drm/i915/i915_gem.c                     |   76 ++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_guc_log.c                |    6 +
+ drivers/gpu/drm/i915/selftests/i915_gem_coherency.c |   10 --
+ drivers/gpu/drm/i915/selftests/i915_gem_request.c   |    2 
+ include/uapi/drm/i915_drm.h                         |    2 
+ 6 files changed, 85 insertions(+), 16 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3464,8 +3464,9 @@ int i915_gem_object_wait_priority(struct
+ #define I915_PRIORITY_DISPLAY I915_PRIORITY_MAX
+ 
+ int __must_check
+-i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj,
+-				  bool write);
++i915_gem_object_set_to_wc_domain(struct drm_i915_gem_object *obj, bool write);
++int __must_check
++i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write);
+ int __must_check
+ i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj, bool write);
+ struct i915_vma * __must_check
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1637,10 +1637,12 @@ i915_gem_set_domain_ioctl(struct drm_dev
+ 	if (err)
+ 		goto out_unpin;
+ 
+-	if (read_domains & I915_GEM_DOMAIN_GTT)
+-		err = i915_gem_object_set_to_gtt_domain(obj, write_domain != 0);
++	if (read_domains & I915_GEM_DOMAIN_WC)
++		err = i915_gem_object_set_to_wc_domain(obj, write_domain);
++	else if (read_domains & I915_GEM_DOMAIN_GTT)
++		err = i915_gem_object_set_to_gtt_domain(obj, write_domain);
+ 	else
+-		err = i915_gem_object_set_to_cpu_domain(obj, write_domain != 0);
++		err = i915_gem_object_set_to_cpu_domain(obj, write_domain);
+ 
+ 	/* And bump the LRU for this access */
+ 	i915_gem_object_bump_inactive_ggtt(obj);
+@@ -1784,6 +1786,9 @@ static unsigned int tile_row_pages(struc
+  *     into userspace. (This view is aligned and sized appropriately for
+  *     fenced access.)
+  *
++ * 2 - Recognise WC as a separate cache domain so that we can flush the
++ *     delayed writes via GTT before performing direct access via WC.
++ *
+  * Restrictions:
+  *
+  *  * snoopable objects cannot be accessed via the GTT. It can cause machine
+@@ -1811,7 +1816,7 @@ static unsigned int tile_row_pages(struc
+  */
+ int i915_gem_mmap_gtt_version(void)
+ {
+-	return 1;
++	return 2;
+ }
+ 
+ static inline struct i915_ggtt_view
+@@ -3411,6 +3416,69 @@ void i915_gem_object_flush_if_display(st
+ }
+ 
+ /**
++ * Moves a single object to the WC read, and possibly write domain.
++ * @obj: object to act on
++ * @write: ask for write access or read only
++ *
++ * This function returns when the move is complete, including waiting on
++ * flushes to occur.
++ */
++int
++i915_gem_object_set_to_wc_domain(struct drm_i915_gem_object *obj, bool write)
++{
++	int ret;
++
++	lockdep_assert_held(&obj->base.dev->struct_mutex);
++
++	ret = i915_gem_object_wait(obj,
++				   I915_WAIT_INTERRUPTIBLE |
++				   I915_WAIT_LOCKED |
++				   (write ? I915_WAIT_ALL : 0),
++				   MAX_SCHEDULE_TIMEOUT,
++				   NULL);
++	if (ret)
++		return ret;
++
++	if (obj->base.write_domain == I915_GEM_DOMAIN_WC)
++		return 0;
++
++	/* Flush and acquire obj->pages so that we are coherent through
++	 * direct access in memory with previous cached writes through
++	 * shmemfs and that our cache domain tracking remains valid.
++	 * For example, if the obj->filp was moved to swap without us
++	 * being notified and releasing the pages, we would mistakenly
++	 * continue to assume that the obj remained out of the CPU cached
++	 * domain.
++	 */
++	ret = i915_gem_object_pin_pages(obj);
++	if (ret)
++		return ret;
++
++	flush_write_domain(obj, ~I915_GEM_DOMAIN_WC);
++
++	/* Serialise direct access to this object with the barriers for
++	 * coherent writes from the GPU, by effectively invalidating the
++	 * WC domain upon first access.
++	 */
++	if ((obj->base.read_domains & I915_GEM_DOMAIN_WC) == 0)
++		mb();
++
++	/* It should now be out of any other write domains, and we can update
++	 * the domain values for our changes.
++	 */
++	GEM_BUG_ON((obj->base.write_domain & ~I915_GEM_DOMAIN_WC) != 0);
++	obj->base.read_domains |= I915_GEM_DOMAIN_WC;
++	if (write) {
++		obj->base.read_domains = I915_GEM_DOMAIN_WC;
++		obj->base.write_domain = I915_GEM_DOMAIN_WC;
++		obj->mm.dirty = true;
++	}
++
++	i915_gem_object_unpin_pages(obj);
++	return 0;
++}
++
++/**
+  * Moves a single object to the GTT read, and possibly write domain.
+  * @obj: object to act on
+  * @write: ask for write access or read only
+--- a/drivers/gpu/drm/i915/intel_guc_log.c
++++ b/drivers/gpu/drm/i915/intel_guc_log.c
+@@ -359,12 +359,16 @@ static int guc_log_runtime_create(struct
+ 	void *vaddr;
+ 	struct rchan *guc_log_relay_chan;
+ 	size_t n_subbufs, subbuf_size;
+-	int ret = 0;
++	int ret;
+ 
+ 	lockdep_assert_held(&dev_priv->drm.struct_mutex);
+ 
+ 	GEM_BUG_ON(guc_log_has_runtime(guc));
+ 
++	ret = i915_gem_object_set_to_wc_domain(guc->log.vma->obj, true);
++	if (ret)
++		return ret;
++
+ 	/* Create a WC (Uncached for read) vmalloc mapping of log
+ 	 * buffer pages, so that we can directly get the data
+ 	 * (up-to-date) from memory.
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_coherency.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_coherency.c
+@@ -138,10 +138,7 @@ static int wc_set(struct drm_i915_gem_ob
+ 	typeof(v) *map;
+ 	int err;
+ 
+-	/* XXX GTT write followed by WC write go missing */
+-	flush_write_domain(obj, ~0);
+-
+-	err = i915_gem_object_set_to_gtt_domain(obj, true);
++	err = i915_gem_object_set_to_wc_domain(obj, true);
+ 	if (err)
+ 		return err;
+ 
+@@ -162,10 +159,7 @@ static int wc_get(struct drm_i915_gem_ob
+ 	typeof(v) map;
+ 	int err;
+ 
+-	/* XXX WC write followed by GTT write go missing */
+-	flush_write_domain(obj, ~0);
+-
+-	err = i915_gem_object_set_to_gtt_domain(obj, false);
++	err = i915_gem_object_set_to_wc_domain(obj, false);
+ 	if (err)
+ 		return err;
+ 
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_request.c
+@@ -580,7 +580,7 @@ static struct i915_vma *recursive_batch(
+ 	if (err)
+ 		goto err;
+ 
+-	err = i915_gem_object_set_to_gtt_domain(obj, true);
++	err = i915_gem_object_set_to_wc_domain(obj, true);
+ 	if (err)
+ 		goto err;
+ 
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -666,6 +666,8 @@ struct drm_i915_gem_relocation_entry {
+ #define I915_GEM_DOMAIN_VERTEX		0x00000020
+ /** GTT domain - aperture and scanout */
+ #define I915_GEM_DOMAIN_GTT		0x00000040
++/** WC domain - uncached access */
++#define I915_GEM_DOMAIN_WC		0x00000080
+ /** @} */
+ 
+ struct drm_i915_gem_exec_object {

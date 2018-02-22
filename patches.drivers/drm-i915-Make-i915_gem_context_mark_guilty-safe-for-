@@ -1,0 +1,176 @@
+From 77b25a972b5d4ed93b8a86d3e383ec2092fd89b1 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 21 Jul 2017 13:32:30 +0100
+Subject: [PATCH] drm/i915: Make i915_gem_context_mark_guilty() safe for unlocked updates
+Git-commit: 77b25a972b5d4ed93b8a86d3e383ec2092fd89b1
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+Since we make call i915_gem_context_mark_guilty() concurrently when
+resetting different engines in parallel, we need to make sure that our
+updates are safe for the unlocked access.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170721123238.16428-12-chris@chris-wilson.co.uk
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    2 +-
+ drivers/gpu/drm/i915/i915_gem.c         |   32 ++++++++++++++++++--------------
+ drivers/gpu/drm/i915/i915_gem_context.c |    6 +++---
+ drivers/gpu/drm/i915/i915_gem_context.h |    6 +++---
+ drivers/gpu/drm/i915/i915_gem_request.c |    3 +--
+ drivers/gpu/drm/i915/i915_gpu_error.c   |    8 ++++----
+ 6 files changed, 30 insertions(+), 27 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -602,7 +602,7 @@ struct drm_i915_file_private {
+  * to limit the badly behaving clients access to gpu.
+  */
+ #define I915_MAX_CLIENT_CONTEXT_BANS 3
+-	int context_bans;
++	atomic_t context_bans;
+ };
+ 
+ /* Used by dp and fdi links */
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2739,34 +2739,38 @@ i915_gem_object_pwrite_gtt(struct drm_i9
+ 	return 0;
+ }
+ 
+-static bool ban_context(const struct i915_gem_context *ctx)
++static bool ban_context(const struct i915_gem_context *ctx,
++			unsigned int score)
+ {
+ 	return (i915_gem_context_is_bannable(ctx) &&
+-		ctx->ban_score >= CONTEXT_SCORE_BAN_THRESHOLD);
++		score >= CONTEXT_SCORE_BAN_THRESHOLD);
+ }
+ 
+ static void i915_gem_context_mark_guilty(struct i915_gem_context *ctx)
+ {
+-	ctx->guilty_count++;
+-	ctx->ban_score += CONTEXT_SCORE_GUILTY;
+-	if (ban_context(ctx))
+-		i915_gem_context_set_banned(ctx);
++	unsigned int score;
++	bool banned;
+ 
+-	DRM_DEBUG_DRIVER("context %s marked guilty (score %d) banned? %s\n",
+-			 ctx->name, ctx->ban_score,
+-			 yesno(i915_gem_context_is_banned(ctx)));
++	atomic_inc(&ctx->guilty_count);
+ 
+-	if (!i915_gem_context_is_banned(ctx) || IS_ERR_OR_NULL(ctx->file_priv))
++	score = atomic_add_return(CONTEXT_SCORE_GUILTY, &ctx->ban_score);
++	banned = ban_context(ctx, score);
++	DRM_DEBUG_DRIVER("context %s marked guilty (score %d) banned? %s\n",
++			 ctx->name, score, yesno(banned));
++	if (!banned)
+ 		return;
+ 
+-	ctx->file_priv->context_bans++;
+-	DRM_DEBUG_DRIVER("client %s has had %d context banned\n",
+-			 ctx->name, ctx->file_priv->context_bans);
++	i915_gem_context_set_banned(ctx);
++	if (!IS_ERR_OR_NULL(ctx->file_priv)) {
++		atomic_inc(&ctx->file_priv->context_bans);
++		DRM_DEBUG_DRIVER("client %s has had %d context banned\n",
++				 ctx->name, atomic_read(&ctx->file_priv->context_bans));
++	}
+ }
+ 
+ static void i915_gem_context_mark_innocent(struct i915_gem_context *ctx)
+ {
+-	ctx->active_count++;
++	atomic_inc(&ctx->active_count);
+ }
+ 
+ struct drm_i915_gem_request *
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -978,7 +978,7 @@ int i915_gem_switch_to_kernel_context(st
+ 
+ static bool client_is_banned(struct drm_i915_file_private *file_priv)
+ {
+-	return file_priv->context_bans > I915_MAX_CLIENT_CONTEXT_BANS;
++	return atomic_read(&file_priv->context_bans) > I915_MAX_CLIENT_CONTEXT_BANS;
+ }
+ 
+ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+@@ -1180,8 +1180,8 @@ int i915_gem_context_reset_stats_ioctl(s
+ 	else
+ 		args->reset_count = 0;
+ 
+-	args->batch_active = READ_ONCE(ctx->guilty_count);
+-	args->batch_pending = READ_ONCE(ctx->active_count);
++	args->batch_active = atomic_read(&ctx->guilty_count);
++	args->batch_pending = atomic_read(&ctx->active_count);
+ 
+ 	ret = 0;
+ out:
+--- a/drivers/gpu/drm/i915/i915_gem_context.h
++++ b/drivers/gpu/drm/i915/i915_gem_context.h
+@@ -191,17 +191,17 @@ struct i915_gem_context {
+ 	u32 desc_template;
+ 
+ 	/** guilty_count: How many times this context has caused a GPU hang. */
+-	unsigned int guilty_count;
++	atomic_t guilty_count;
+ 	/**
+ 	 * @active_count: How many times this context was active during a GPU
+ 	 * hang, but did not cause it.
+ 	 */
+-	unsigned int active_count;
++	atomic_t active_count;
+ 
+ #define CONTEXT_SCORE_GUILTY		10
+ #define CONTEXT_SCORE_BAN_THRESHOLD	40
+ 	/** ban_score: Accumulated score of all hangs caused by this context. */
+-	int ban_score;
++	atomic_t ban_score;
+ 
+ 	/** remap_slice: Bitmask of cache lines that need remapping */
+ 	u8 remap_slice;
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -366,8 +366,7 @@ static void i915_gem_request_retire(stru
+ 	i915_gem_request_remove_from_client(request);
+ 
+ 	/* Retirement decays the ban score as it is a sign of ctx progress */
+-	if (request->ctx->ban_score > 0)
+-		request->ctx->ban_score--;
++	atomic_dec_if_positive(&request->ctx->ban_score);
+ 
+ 	/* The backing object for the context is done after switching to the
+ 	 * *next* context. Therefore we cannot retire the previous context until
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -1266,7 +1266,7 @@ static void record_request(struct drm_i9
+ 			   struct drm_i915_error_request *erq)
+ {
+ 	erq->context = request->ctx->hw_id;
+-	erq->ban_score = request->ctx->ban_score;
++	erq->ban_score = atomic_read(&request->ctx->ban_score);
+ 	erq->seqno = request->global_seqno;
+ 	erq->jiffies = request->emitted_jiffies;
+ 	erq->head = request->head;
+@@ -1357,9 +1357,9 @@ static void record_context(struct drm_i9
+ 
+ 	e->handle = ctx->user_handle;
+ 	e->hw_id = ctx->hw_id;
+-	e->ban_score = ctx->ban_score;
+-	e->guilty = ctx->guilty_count;
+-	e->active = ctx->active_count;
++	e->ban_score = atomic_read(&ctx->ban_score);
++	e->guilty = atomic_read(&ctx->guilty_count);
++	e->active = atomic_read(&ctx->active_count);
+ }
+ 
+ static void request_record_user_bo(struct drm_i915_gem_request *request,

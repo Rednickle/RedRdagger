@@ -1,0 +1,191 @@
+From 4fafba2d73fcaf1b433c26e753a98ad4b231754a Mon Sep 17 00:00:00 2001
+From: Zhenyu Wang <zhenyuw@linux.intel.com>
+Date: Mon, 18 Dec 2017 11:58:46 +0800
+Subject: [PATCH] drm/i915/gvt: move write protect handler out of mmio emulation function
+Git-commit: 4fafba2d73fcaf1b433c26e753a98ad4b231754a
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+It's a bit confusing that page write protect handler is live in
+mmio emulation handler. This moves it to stand alone gvt ops.
+
+Also remove unnecessary check of write protected page access
+in mmio read handler and cleanup handling of failsafe case.
+
+V2: rebase
+
+Reviewed-by: Xiong Zhang <xiong.y.zhang@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/gtt.c   |   33 ++++++++++++++++++++++++
+ drivers/gpu/drm/i915/gvt/gtt.h   |    3 ++
+ drivers/gpu/drm/i915/gvt/gvt.c   |    1 
+ drivers/gpu/drm/i915/gvt/gvt.h   |    2 +
+ drivers/gpu/drm/i915/gvt/kvmgt.c |    4 +-
+ drivers/gpu/drm/i915/gvt/mmio.c  |   53 ---------------------------------------
+ 6 files changed, 41 insertions(+), 55 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/gtt.c
++++ b/drivers/gpu/drm/i915/gvt/gtt.c
+@@ -1968,6 +1968,39 @@ int intel_vgpu_emulate_gtt_mmio_write(st
+ 	return ret;
+ }
+ 
++int intel_vgpu_write_protect_handler(struct intel_vgpu *vgpu, u64 pa,
++				     void *p_data, unsigned int bytes)
++{
++	struct intel_gvt *gvt = vgpu->gvt;
++	int ret = 0;
++
++	if (atomic_read(&vgpu->gtt.n_tracked_guest_page)) {
++		struct intel_vgpu_page_track *t;
++
++		mutex_lock(&gvt->lock);
++
++		t = intel_vgpu_find_tracked_page(vgpu, pa >> PAGE_SHIFT);
++		if (t) {
++			if (unlikely(vgpu->failsafe)) {
++				/* remove write protection to prevent furture traps */
++				intel_vgpu_clean_page_track(vgpu, t);
++			} else {
++				ret = t->handler(t, pa, p_data, bytes);
++				if (ret) {
++					gvt_err("guest page write error %d, "
++						"gfn 0x%lx, pa 0x%llx, "
++						"var 0x%x, len %d\n",
++						ret, t->gfn, pa,
++						*(u32 *)p_data, bytes);
++				}
++			}
++		}
++		mutex_unlock(&gvt->lock);
++	}
++	return ret;
++}
++
++
+ static int alloc_scratch_pages(struct intel_vgpu *vgpu,
+ 		intel_gvt_gtt_type_t type)
+ {
+--- a/drivers/gpu/drm/i915/gvt/gtt.h
++++ b/drivers/gpu/drm/i915/gvt/gtt.h
+@@ -308,4 +308,7 @@ int intel_vgpu_emulate_gtt_mmio_read(str
+ int intel_vgpu_emulate_gtt_mmio_write(struct intel_vgpu *vgpu,
+ 	unsigned int off, void *p_data, unsigned int bytes);
+ 
++int intel_vgpu_write_protect_handler(struct intel_vgpu *vgpu, u64 pa,
++				     void *p_data, unsigned int bytes);
++
+ #endif /* _GVT_GTT_H_ */
+--- a/drivers/gpu/drm/i915/gvt/gvt.c
++++ b/drivers/gpu/drm/i915/gvt/gvt.c
+@@ -181,6 +181,7 @@ static const struct intel_gvt_ops intel_
+ 	.vgpu_deactivate = intel_gvt_deactivate_vgpu,
+ 	.gvt_find_vgpu_type = intel_gvt_find_vgpu_type,
+ 	.get_gvt_attrs = intel_get_gvt_attrs,
++	.write_protect_handler = intel_vgpu_write_protect_handler,
+ };
+ 
+ /**
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -535,6 +535,8 @@ struct intel_gvt_ops {
+ 			const char *name);
+ 	bool (*get_gvt_attrs)(struct attribute ***type_attrs,
+ 			struct attribute_group ***intel_vgpu_type_groups);
++	int (*write_protect_handler)(struct intel_vgpu *, u64, void *,
++				     unsigned int);
+ };
+ 
+ 
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@ -1312,8 +1312,8 @@ static void kvmgt_page_track_write(struc
+ 					struct kvmgt_guest_info, track_node);
+ 
+ 	if (kvmgt_gfn_is_write_protected(info, gpa_to_gfn(gpa)))
+-		intel_gvt_ops->emulate_mmio_write(info->vgpu, gpa,
+-					(void *)val, len);
++		intel_gvt_ops->write_protect_handler(info->vgpu, gpa,
++						     (void *)val, len);
+ }
+ 
+ static void kvmgt_page_track_flush_slot(struct kvm *kvm,
+--- a/drivers/gpu/drm/i915/gvt/mmio.c
++++ b/drivers/gpu/drm/i915/gvt/mmio.c
+@@ -117,25 +117,6 @@ static void failsafe_emulate_mmio_rw(str
+ 		else
+ 			memcpy(pt, p_data, bytes);
+ 
+-	} else if (atomic_read(&vgpu->gtt.n_tracked_guest_page)) {
+-		struct intel_vgpu_page_track *t;
+-
+-		/* Since we enter the failsafe mode early during guest boot,
+-		 * guest may not have chance to set up its ppgtt table, so
+-		 * there should not be any wp pages for guest. Keep the wp
+-		 * related code here in case we need to handle it in furture.
+-		 */
+-		t = intel_vgpu_find_tracked_page(vgpu, pa >> PAGE_SHIFT);
+-		if (t) {
+-			/* remove write protection to prevent furture traps */
+-			intel_vgpu_clean_page_track(vgpu, t);
+-			if (read)
+-				intel_gvt_hypervisor_read_gpa(vgpu, pa,
+-						p_data, bytes);
+-			else
+-				intel_gvt_hypervisor_write_gpa(vgpu, pa,
+-						p_data, bytes);
+-		}
+ 	}
+ 	mutex_unlock(&gvt->lock);
+ }
+@@ -168,23 +149,6 @@ int intel_vgpu_emulate_mmio_read(struct
+ 		goto out;
+ 	}
+ 
+-	if (atomic_read(&vgpu->gtt.n_tracked_guest_page)) {
+-		struct intel_vgpu_page_track *t;
+-
+-		t = intel_vgpu_find_tracked_page(vgpu, pa >> PAGE_SHIFT);
+-		if (t) {
+-			ret = intel_gvt_hypervisor_read_gpa(vgpu, pa,
+-					p_data, bytes);
+-			if (ret) {
+-				gvt_vgpu_err("guest page read error %d, "
+-					"gfn 0x%lx, pa 0x%llx, var 0x%x, len %d\n",
+-					ret, t->gfn, pa, *(u32 *)p_data,
+-					bytes);
+-			}
+-			goto out;
+-		}
+-	}
+-
+ 	offset = intel_vgpu_gpa_to_mmio_offset(vgpu, pa);
+ 
+ 	if (WARN_ON(bytes > 8))
+@@ -263,23 +227,6 @@ int intel_vgpu_emulate_mmio_write(struct
+ 		goto out;
+ 	}
+ 
+-	if (atomic_read(&vgpu->gtt.n_tracked_guest_page)) {
+-		struct intel_vgpu_page_track *t;
+-
+-		t = intel_vgpu_find_tracked_page(vgpu, pa >> PAGE_SHIFT);
+-		if (t) {
+-			ret = t->handler(t, pa, p_data, bytes);
+-			if (ret) {
+-				gvt_err("guest page write error %d, "
+-					"gfn 0x%lx, pa 0x%llx, "
+-					"var 0x%x, len %d\n",
+-					ret, t->gfn, pa,
+-					*(u32 *)p_data, bytes);
+-			}
+-			goto out;
+-		}
+-	}
+-
+ 	offset = intel_vgpu_gpa_to_mmio_offset(vgpu, pa);
+ 
+ 	if (WARN_ON(bytes > 8))

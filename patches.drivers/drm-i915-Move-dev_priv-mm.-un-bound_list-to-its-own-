@@ -1,0 +1,599 @@
+From f2123818ffad0332e03c266ca73fe116e8ea5354 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 16 Oct 2017 12:40:37 +0100
+Subject: [PATCH] drm/i915: Move dev_priv->mm.[un]bound_list to its own lock
+Git-commit: f2123818ffad0332e03c266ca73fe116e8ea5354
+Patch-mainline: v4.15-rc1
+References: FATE#322643 bsc#1055900
+
+Remove the struct_mutex requirement around dev_priv->mm.bound_list and
+dev_priv->mm.unbound_list by giving it its own spinlock. This reduces
+one more requirement for struct_mutex and in the process gives us
+slightly more accurate unbound_list tracking, which should improve the
+shrinker - but the drawback is that we drop the retirement before
+counting so i915_gem_object_is_active() may be stale and lead us to
+underestimate the number of objects that may be shrunk (see commit
+bed50aea61df ("drm/i915/shrinker: Flush active on objects before
+counting")).
+
+V2: Crosslink the spinlock to the lists it protects, and btw this
+changes s/obj->global_link/obj->mm.link/
+V3: Fix decoupling of old links in i915_gem_object_attach_phys()
+V3.1: Fix the fix, only unlink if it was linked
+V3.2: Use a local for to_i915(obj->base.dev)->mm.obj_lock
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171016114037.5556-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_debugfs.c               |   39 +++++++++++--
+ drivers/gpu/drm/i915/i915_drv.h                   |    3 +
+ drivers/gpu/drm/i915/i915_gem.c                   |   54 +++++++++++++++---
+ drivers/gpu/drm/i915/i915_gem_gtt.c               |    3 -
+ drivers/gpu/drm/i915/i915_gem_object.h            |    7 ++
+ drivers/gpu/drm/i915/i915_gem_shrinker.c          |   64 ++++++++--------------
+ drivers/gpu/drm/i915/i915_gem_stolen.c            |    5 +
+ drivers/gpu/drm/i915/i915_vma.c                   |   16 ++++-
+ drivers/gpu/drm/i915/selftests/i915_gem_context.c |    2 
+ drivers/gpu/drm/i915/selftests/i915_gem_evict.c   |    8 +-
+ 10 files changed, 134 insertions(+), 67 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -239,7 +239,9 @@ static int i915_gem_stolen_list_info(str
+ 		goto out;
+ 
+ 	total_obj_size = total_gtt_size = count = 0;
+-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_link) {
++
++	spin_lock(&dev_priv->mm.obj_lock);
++	list_for_each_entry(obj, &dev_priv->mm.bound_list, mm.link) {
+ 		if (count == total)
+ 			break;
+ 
+@@ -251,7 +253,7 @@ static int i915_gem_stolen_list_info(str
+ 		total_gtt_size += i915_gem_obj_total_ggtt_size(obj);
+ 
+ 	}
+-	list_for_each_entry(obj, &dev_priv->mm.unbound_list, global_link) {
++	list_for_each_entry(obj, &dev_priv->mm.unbound_list, mm.link) {
+ 		if (count == total)
+ 			break;
+ 
+@@ -261,6 +263,7 @@ static int i915_gem_stolen_list_info(str
+ 		objects[count++] = obj;
+ 		total_obj_size += obj->base.size;
+ 	}
++	spin_unlock(&dev_priv->mm.obj_lock);
+ 
+ 	sort(objects, count, sizeof(*objects), obj_rank_by_stolen, NULL);
+ 
+@@ -419,7 +422,9 @@ static int i915_gem_object_info(struct s
+ 	size = count = 0;
+ 	mapped_size = mapped_count = 0;
+ 	purgeable_size = purgeable_count = 0;
+-	list_for_each_entry(obj, &dev_priv->mm.unbound_list, global_link) {
++
++	spin_lock(&dev_priv->mm.obj_lock);
++	list_for_each_entry(obj, &dev_priv->mm.unbound_list, mm.link) {
+ 		size += obj->base.size;
+ 		++count;
+ 
+@@ -436,7 +441,7 @@ static int i915_gem_object_info(struct s
+ 	seq_printf(m, "%u unbound objects, %llu bytes\n", count, size);
+ 
+ 	size = count = dpy_size = dpy_count = 0;
+-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_link) {
++	list_for_each_entry(obj, &dev_priv->mm.bound_list, mm.link) {
+ 		size += obj->base.size;
+ 		++count;
+ 
+@@ -455,6 +460,8 @@ static int i915_gem_object_info(struct s
+ 			mapped_size += obj->base.size;
+ 		}
+ 	}
++	spin_unlock(&dev_priv->mm.obj_lock);
++
+ 	seq_printf(m, "%u bound objects, %llu bytes\n",
+ 		   count, size);
+ 	seq_printf(m, "%u purgeable objects, %llu bytes\n",
+@@ -514,28 +521,46 @@ static int i915_gem_gtt_info(struct seq_
+ 	struct drm_info_node *node = m->private;
+ 	struct drm_i915_private *dev_priv = node_to_i915(node);
+ 	struct drm_device *dev = &dev_priv->drm;
++	struct drm_i915_gem_object **objects;
+ 	struct drm_i915_gem_object *obj;
+ 	u64 total_obj_size, total_gtt_size;
++	unsigned long nobject, n;
+ 	int count, ret;
+ 
++	nobject = READ_ONCE(dev_priv->mm.object_count);
++	objects = kvmalloc_array(nobject, sizeof(*objects), GFP_KERNEL);
++	if (!objects)
++		return -ENOMEM;
++
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+ 	if (ret)
+ 		return ret;
+ 
+-	total_obj_size = total_gtt_size = count = 0;
+-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_link) {
++	count = 0;
++	spin_lock(&dev_priv->mm.obj_lock);
++	list_for_each_entry(obj, &dev_priv->mm.bound_list, mm.link) {
++		objects[count++] = obj;
++		if (count == nobject)
++			break;
++	}
++	spin_unlock(&dev_priv->mm.obj_lock);
++
++	total_obj_size = total_gtt_size = 0;
++	for (n = 0;  n < count; n++) {
++		obj = objects[n];
++
+ 		seq_puts(m, "   ");
+ 		describe_obj(m, obj);
+ 		seq_putc(m, '\n');
+ 		total_obj_size += obj->base.size;
+ 		total_gtt_size += i915_gem_obj_total_ggtt_size(obj);
+-		count++;
+ 	}
+ 
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	seq_printf(m, "Total %d objects, %llu bytes, %llu GTT size\n",
+ 		   count, total_obj_size, total_gtt_size);
++	kvfree(objects);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1488,6 +1488,9 @@ struct i915_gem_mm {
+ 	 * always the inner lock when overlapping with struct_mutex. */
+ 	struct mutex stolen_lock;
+ 
++	/* Protects bound_list/unbound_list and #drm_i915_gem_object.mm.link */
++	spinlock_t obj_lock;
++
+ 	/** List of all objects in gtt_space. Used to restore gtt
+ 	 * mappings on resume */
+ 	struct list_head bound_list;
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1532,6 +1532,8 @@ static void i915_gem_object_bump_inactiv
+ 	struct list_head *list;
+ 	struct i915_vma *vma;
+ 
++	GEM_BUG_ON(!i915_gem_object_has_pinned_pages(obj));
++
+ 	list_for_each_entry(vma, &obj->vma_list, obj_link) {
+ 		if (!i915_vma_is_ggtt(vma))
+ 			break;
+@@ -1546,8 +1548,10 @@ static void i915_gem_object_bump_inactiv
+ 	}
+ 
+ 	i915 = to_i915(obj->base.dev);
++	spin_lock(&i915->mm.obj_lock);
+ 	list = obj->bind_count ? &i915->mm.bound_list : &i915->mm.unbound_list;
+-	list_move_tail(&obj->global_link, list);
++	list_move_tail(&obj->mm.link, list);
++	spin_unlock(&i915->mm.obj_lock);
+ }
+ 
+ /**
+@@ -2250,6 +2254,7 @@ static void __i915_gem_object_reset_page
+ void __i915_gem_object_put_pages(struct drm_i915_gem_object *obj,
+ 				 enum i915_mm_subclass subclass)
+ {
++	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+ 	struct sg_table *pages;
+ 
+ 	if (i915_gem_object_has_pinned_pages(obj))
+@@ -2270,6 +2275,10 @@ void __i915_gem_object_put_pages(struct
+ 	pages = fetch_and_zero(&obj->mm.pages);
+ 	GEM_BUG_ON(!pages);
+ 
++	spin_lock(&i915->mm.obj_lock);
++	list_del(&obj->mm.link);
++	spin_unlock(&i915->mm.obj_lock);
++
+ 	if (obj->mm.mapping) {
+ 		void *ptr;
+ 
+@@ -2485,6 +2494,8 @@ err_pages:
+ void __i915_gem_object_set_pages(struct drm_i915_gem_object *obj,
+ 				 struct sg_table *pages)
+ {
++	struct drm_i915_private *i915 = to_i915(obj->base.dev);
++
+ 	lockdep_assert_held(&obj->mm.lock);
+ 
+ 	obj->mm.get_page.sg_pos = pages->sgl;
+@@ -2493,11 +2504,15 @@ void __i915_gem_object_set_pages(struct
+ 	obj->mm.pages = pages;
+ 
+ 	if (i915_gem_object_is_tiled(obj) &&
+-	    to_i915(obj->base.dev)->quirks & QUIRK_PIN_SWIZZLED_PAGES) {
++	    i915->quirks & QUIRK_PIN_SWIZZLED_PAGES) {
+ 		GEM_BUG_ON(obj->mm.quirked);
+ 		__i915_gem_object_pin_pages(obj);
+ 		obj->mm.quirked = true;
+ 	}
++
++	spin_lock(&i915->mm.obj_lock);
++	list_add(&obj->mm.link, &i915->mm.unbound_list);
++	spin_unlock(&i915->mm.obj_lock);
+ }
+ 
+ static int ____i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
+@@ -4295,7 +4310,6 @@ void i915_gem_object_init(struct drm_i91
+ {
+ 	mutex_init(&obj->mm.lock);
+ 
+-	INIT_LIST_HEAD(&obj->global_link);
+ 	INIT_LIST_HEAD(&obj->vma_list);
+ 	INIT_LIST_HEAD(&obj->lut_list);
+ 	INIT_LIST_HEAD(&obj->batch_pool_link);
+@@ -4443,7 +4457,18 @@ static void __i915_gem_free_objects(stru
+ 		GEM_BUG_ON(!list_empty(&obj->vma_list));
+ 		GEM_BUG_ON(!RB_EMPTY_ROOT(&obj->vma_tree));
+ 
+-		list_del(&obj->global_link);
++		/* This serializes freeing with the shrinker. Since the free
++		 * is delayed, first by RCU then by the workqueue, we want the
++		 * shrinker to be able to free pages of unreferenced objects,
++		 * or else we may oom whilst there are plenty of deferred
++		 * freed objects.
++		 */
++		if (i915_gem_object_has_pages(obj)) {
++			spin_lock(&i915->mm.obj_lock);
++			list_del_init(&obj->mm.link);
++			spin_unlock(&i915->mm.obj_lock);
++		}
++
+ 	}
+ 	intel_runtime_pm_put(i915);
+ 	mutex_unlock(&i915->drm.struct_mutex);
+@@ -4973,11 +4998,14 @@ i915_gem_load_init(struct drm_i915_priva
+ 		goto err_priorities;
+ 
+ 	INIT_WORK(&dev_priv->mm.free_work, __i915_gem_free_work);
++
++	spin_lock_init(&dev_priv->mm.obj_lock);
+ 	init_llist_head(&dev_priv->mm.free_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.unbound_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.bound_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.userfault_list);
++
+ 	INIT_DELAYED_WORK(&dev_priv->gt.retire_work,
+ 			  i915_gem_retire_work_handler);
+ 	INIT_DELAYED_WORK(&dev_priv->gt.idle_work,
+@@ -5065,12 +5093,12 @@ int i915_gem_freeze_late(struct drm_i915
+ 	i915_gem_shrink(dev_priv, -1UL, I915_SHRINK_UNBOUND);
+ 	i915_gem_drain_freed_objects(dev_priv);
+ 
+-	mutex_lock(&dev_priv->drm.struct_mutex);
++	spin_lock(&dev_priv->mm.obj_lock);
+ 	for (p = phases; *p; p++) {
+-		list_for_each_entry(obj, *p, global_link)
++		list_for_each_entry(obj, *p, mm.link)
+ 			__start_cpu_write(obj);
+ 	}
+-	mutex_unlock(&dev_priv->drm.struct_mutex);
++	spin_unlock(&dev_priv->mm.obj_lock);
+ 
+ 	return 0;
+ }
+@@ -5389,7 +5417,17 @@ int i915_gem_object_attach_phys(struct d
+ 		goto err_unlock;
+ 	}
+ 
+-	pages = obj->mm.pages;
++	pages = fetch_and_zero(&obj->mm.pages);
++	if (pages) {
++		struct drm_i915_private *i915 = to_i915(obj->base.dev);
++
++		__i915_gem_object_reset_page_iter(obj);
++
++		spin_lock(&i915->mm.obj_lock);
++		list_del(&obj->mm.link);
++		spin_unlock(&i915->mm.obj_lock);
++	}
++
+ 	obj->ops = &i915_gem_phys_ops;
+ 
+ 	err = ____i915_gem_object_get_pages(obj);
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -3396,8 +3396,7 @@ void i915_gem_restore_gtt_mappings(struc
+ 	ggtt->base.closed = true; /* skip rewriting PTE on VMA unbind */
+ 
+ 	/* clflush objects bound into the GGTT and rebind them. */
+-	list_for_each_entry_safe(obj, on,
+-				 &dev_priv->mm.bound_list, global_link) {
++	list_for_each_entry_safe(obj, on, &dev_priv->mm.bound_list, mm.link) {
+ 		bool ggtt_bound = false;
+ 		struct i915_vma *vma;
+ 
+--- a/drivers/gpu/drm/i915/i915_gem_object.h
++++ b/drivers/gpu/drm/i915/i915_gem_object.h
+@@ -114,7 +114,6 @@ struct drm_i915_gem_object {
+ 
+ 	/** Stolen memory for this object, instead of being backed by shmem. */
+ 	struct drm_mm_node *stolen;
+-	struct list_head global_link;
+ 	union {
+ 		struct rcu_head rcu;
+ 		struct llist_node freed;
+@@ -180,6 +179,12 @@ struct drm_i915_gem_object {
+ 		} get_page;
+ 
+ 		/**
++		 * Element within i915->mm.unbound_list or i915->mm.bound_list,
++		 * locked by i915->mm.obj_lock.
++		 */
++		struct list_head link;
++
++		/**
+ 		 * Advice: are the backing pages purgeable?
+ 		 */
+ 		unsigned int madv:2;
+--- a/drivers/gpu/drm/i915/i915_gem_shrinker.c
++++ b/drivers/gpu/drm/i915/i915_gem_shrinker.c
+@@ -78,9 +78,6 @@ static bool swap_available(void)
+ 
+ static bool can_release_pages(struct drm_i915_gem_object *obj)
+ {
+-	if (!i915_gem_object_has_pages(obj))
+-		return false;
+-
+ 	/* Consider only shrinkable ojects. */
+ 	if (!i915_gem_object_is_shrinkable(obj))
+ 		return false;
+@@ -102,7 +99,7 @@ static bool can_release_pages(struct drm
+ 	 * To simplify the scan, and to avoid walking the list of vma under the
+ 	 * object, we just check the count of its permanently pinned.
+ 	 */
+-	if (obj->pin_global)
++	if (READ_ONCE(obj->pin_global))
+ 		return false;
+ 
+ 	/* We can only return physical pages to the system if we can either
+@@ -200,15 +197,20 @@ i915_gem_shrink(struct drm_i915_private
+ 			continue;
+ 
+ 		INIT_LIST_HEAD(&still_in_list);
++
++		/*
++		 * We serialize our access to unreferenced objects through
++		 * the use of the struct_mutex. While the objects are not
++		 * yet freed (due to RCU then a workqueue) we still want
++		 * to be able to shrink their pages, so they remain on
++		 * the unbound/bound list until actually freed.
++		 */
++		spin_lock(&dev_priv->mm.obj_lock);
+ 		while (count < target &&
+ 		       (obj = list_first_entry_or_null(phase->list,
+ 						       typeof(*obj),
+-						       global_link))) {
+-			list_move_tail(&obj->global_link, &still_in_list);
+-			if (!obj->mm.pages) {
+-				list_del_init(&obj->global_link);
+-				continue;
+-			}
++						       mm.link))) {
++			list_move_tail(&obj->mm.link, &still_in_list);
+ 
+ 			if (flags & I915_SHRINK_PURGEABLE &&
+ 			    obj->mm.madv != I915_MADV_DONTNEED)
+@@ -226,19 +228,23 @@ i915_gem_shrink(struct drm_i915_private
+ 			if (!can_release_pages(obj))
+ 				continue;
+ 
++			spin_unlock(&dev_priv->mm.obj_lock);
++
+ 			if (unsafe_drop_pages(obj)) {
+ 				/* May arrive from get_pages on another bo */
+ 				mutex_lock_nested(&obj->mm.lock,
+ 						  I915_MM_SHRINKER);
+ 				if (!i915_gem_object_has_pages(obj)) {
+ 					__i915_gem_object_invalidate(obj);
+-					list_del_init(&obj->global_link);
+ 					count += obj->base.size >> PAGE_SHIFT;
+ 				}
+ 				mutex_unlock(&obj->mm.lock);
+ 			}
++
++			spin_lock(&dev_priv->mm.obj_lock);
+ 		}
+ 		list_splice_tail(&still_in_list, phase->list);
++		spin_unlock(&dev_priv->mm.obj_lock);
+ 	}
+ 
+ 	if (flags & I915_SHRINK_BOUND)
+@@ -285,25 +291,17 @@ i915_gem_shrinker_count(struct shrinker
+ 	struct drm_i915_private *dev_priv =
+ 		container_of(shrinker, struct drm_i915_private, mm.shrinker);
+ 	struct drm_i915_gem_object *obj;
+-	unsigned long count;
+-	bool unlock;
+-
+-	if (!shrinker_lock(dev_priv, &unlock))
+-		return 0;
+-
+-	i915_gem_retire_requests(dev_priv);
++	unsigned long count = 0;
+ 
+-	count = 0;
+-	list_for_each_entry(obj, &dev_priv->mm.unbound_list, global_link)
++	spin_lock(&dev_priv->mm.obj_lock);
++	list_for_each_entry(obj, &dev_priv->mm.unbound_list, mm.link)
+ 		if (can_release_pages(obj))
+ 			count += obj->base.size >> PAGE_SHIFT;
+ 
+-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_link) {
++	list_for_each_entry(obj, &dev_priv->mm.bound_list, mm.link)
+ 		if (!i915_gem_object_is_active(obj) && can_release_pages(obj))
+ 			count += obj->base.size >> PAGE_SHIFT;
+-	}
+-
+-	shrinker_unlock(dev_priv, unlock);
++	spin_unlock(&dev_priv->mm.obj_lock);
+ 
+ 	return count;
+ }
+@@ -375,10 +373,6 @@ i915_gem_shrinker_oom(struct notifier_bl
+ 		container_of(nb, struct drm_i915_private, mm.oom_notifier);
+ 	struct drm_i915_gem_object *obj;
+ 	unsigned long unevictable, bound, unbound, freed_pages;
+-	bool unlock;
+-
+-	if (!shrinker_lock_uninterruptible(dev_priv, &unlock, 5000))
+-		return NOTIFY_DONE;
+ 
+ 	freed_pages = i915_gem_shrink_all(dev_priv);
+ 
+@@ -387,26 +381,20 @@ i915_gem_shrinker_oom(struct notifier_bl
+ 	 * being pointed to by hardware.
+ 	 */
+ 	unbound = bound = unevictable = 0;
+-	list_for_each_entry(obj, &dev_priv->mm.unbound_list, global_link) {
+-		if (!i915_gem_object_has_pages(obj))
+-			continue;
+-
++	spin_lock(&dev_priv->mm.obj_lock);
++	list_for_each_entry(obj, &dev_priv->mm.unbound_list, mm.link) {
+ 		if (!can_release_pages(obj))
+ 			unevictable += obj->base.size >> PAGE_SHIFT;
+ 		else
+ 			unbound += obj->base.size >> PAGE_SHIFT;
+ 	}
+-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_link) {
+-		if (!i915_gem_object_has_pages(obj))
+-			continue;
+-
++	list_for_each_entry(obj, &dev_priv->mm.bound_list, mm.link) {
+ 		if (!can_release_pages(obj))
+ 			unevictable += obj->base.size >> PAGE_SHIFT;
+ 		else
+ 			bound += obj->base.size >> PAGE_SHIFT;
+ 	}
+-
+-	shrinker_unlock(dev_priv, unlock);
++	spin_unlock(&dev_priv->mm.obj_lock);
+ 
+ 	if (freed_pages || unbound || bound)
+ 		pr_info("Purging GPU memory, %lu pages freed, "
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -718,8 +718,11 @@ i915_gem_object_create_stolen_for_preall
+ 	vma->flags |= I915_VMA_GLOBAL_BIND;
+ 	__i915_vma_set_map_and_fenceable(vma);
+ 	list_move_tail(&vma->vm_link, &ggtt->base.inactive_list);
+-	list_move_tail(&obj->global_link, &dev_priv->mm.bound_list);
++
++	spin_lock(&dev_priv->mm.obj_lock);
++	list_move_tail(&obj->mm.link, &dev_priv->mm.bound_list);
+ 	obj->bind_count++;
++	spin_unlock(&dev_priv->mm.obj_lock);
+ 
+ 	return obj;
+ 
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -58,8 +58,10 @@ i915_vma_retire(struct i915_gem_active *
+ 	 * so that we don't steal from recently used but inactive objects
+ 	 * (unless we are forced to ofc!)
+ 	 */
++	spin_lock(&rq->i915->mm.obj_lock);
+ 	if (obj->bind_count)
+-		list_move_tail(&obj->global_link, &rq->i915->mm.bound_list);
++		list_move_tail(&obj->mm.link, &rq->i915->mm.bound_list);
++	spin_unlock(&rq->i915->mm.obj_lock);
+ 
+ 	obj->mm.dirty = true; /* be paranoid  */
+ 
+@@ -522,9 +524,13 @@ i915_vma_insert(struct i915_vma *vma, u6
+ 	GEM_BUG_ON(!drm_mm_node_allocated(&vma->node));
+ 	GEM_BUG_ON(!i915_gem_valid_gtt_space(vma, obj->cache_level));
+ 
+-	list_move_tail(&obj->global_link, &dev_priv->mm.bound_list);
+ 	list_move_tail(&vma->vm_link, &vma->vm->inactive_list);
++
++	spin_lock(&dev_priv->mm.obj_lock);
++	list_move_tail(&obj->mm.link, &dev_priv->mm.bound_list);
+ 	obj->bind_count++;
++	spin_unlock(&dev_priv->mm.obj_lock);
++
+ 	GEM_BUG_ON(atomic_read(&obj->mm.pages_pin_count) < obj->bind_count);
+ 
+ 	return 0;
+@@ -537,6 +543,7 @@ err_unpin:
+ static void
+ i915_vma_remove(struct i915_vma *vma)
+ {
++	struct drm_i915_private *i915 = vma->vm->i915;
+ 	struct drm_i915_gem_object *obj = vma->obj;
+ 
+ 	GEM_BUG_ON(!drm_mm_node_allocated(&vma->node));
+@@ -548,9 +555,10 @@ i915_vma_remove(struct i915_vma *vma)
+ 	/* Since the unbound list is global, only move to that list if
+ 	 * no more VMAs exist.
+ 	 */
++	spin_lock(&i915->mm.obj_lock);
+ 	if (--obj->bind_count == 0)
+-		list_move_tail(&obj->global_link,
+-			       &to_i915(obj->base.dev)->mm.unbound_list);
++		list_move_tail(&obj->mm.link, &i915->mm.unbound_list);
++	spin_unlock(&i915->mm.obj_lock);
+ 
+ 	/* And finally now the object is completely decoupled from this vma,
+ 	 * we can drop its hold on the backing storage and allow it to be
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_context.c
+@@ -417,7 +417,7 @@ static int fake_aliasing_ppgtt_enable(st
+ 	if (err)
+ 		return err;
+ 
+-	list_for_each_entry(obj, &i915->mm.bound_list, global_link) {
++	list_for_each_entry(obj, &i915->mm.bound_list, mm.link) {
+ 		struct i915_vma *vma;
+ 
+ 		vma = i915_vma_instance(obj, &i915->ggtt.base, NULL);
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_evict.c
+@@ -47,7 +47,7 @@ static int populate_ggtt(struct drm_i915
+ 
+ 	if (!list_empty(&i915->mm.unbound_list)) {
+ 		size = 0;
+-		list_for_each_entry(obj, &i915->mm.unbound_list, global_link)
++		list_for_each_entry(obj, &i915->mm.unbound_list, mm.link)
+ 			size++;
+ 
+ 		pr_err("Found %lld objects unbound!\n", size);
+@@ -74,10 +74,10 @@ static void cleanup_objects(struct drm_i
+ {
+ 	struct drm_i915_gem_object *obj, *on;
+ 
+-	list_for_each_entry_safe(obj, on, &i915->mm.unbound_list, global_link)
++	list_for_each_entry_safe(obj, on, &i915->mm.unbound_list, mm.link)
+ 		i915_gem_object_put(obj);
+ 
+-	list_for_each_entry_safe(obj, on, &i915->mm.bound_list, global_link)
++	list_for_each_entry_safe(obj, on, &i915->mm.bound_list, mm.link)
+ 		i915_gem_object_put(obj);
+ 
+ 	mutex_unlock(&i915->drm.struct_mutex);
+@@ -149,8 +149,6 @@ static int igt_overcommit(void *arg)
+ 		goto cleanup;
+ 	}
+ 
+-	list_move(&obj->global_link, &i915->mm.unbound_list);
+-
+ 	vma = i915_gem_object_ggtt_pin(obj, NULL, 0, 0, 0);
+ 	if (!IS_ERR(vma) || PTR_ERR(vma) != -ENOSPC) {
+ 		pr_err("Failed to evict+insert, i915_gem_object_ggtt_pin returned err=%d\n", (int)PTR_ERR(vma));

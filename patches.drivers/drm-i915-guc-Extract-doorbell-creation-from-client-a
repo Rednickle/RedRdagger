@@ -1,0 +1,499 @@
+From 9192d4fb811e1e7d07c8fa1a576d2935826daa91 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Micha=C5=82=20Winiarski?= <michal.winiarski@intel.com>
+Date: Wed, 13 Dec 2017 23:13:50 +0100
+Subject: [PATCH] drm/i915/guc: Extract doorbell creation from client allocation
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 9192d4fb811e1e7d07c8fa1a576d2935826daa91
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+Full GPU reset causes GuC to be reset. This means that every time we're
+doing a reset, we need to talk to GuC and tell it about doorbells.
+Let's separate the communication part (create_doorbell) from our
+internal bookkeeping (reserve_doorbell) so that we can cleanly separate
+the initialization done at module load from reinitialization done at
+reset in the following patch.
+While I'm here, let's also add a proper (although slightly asymetric)
+cleanup that doesn't try to communicate with GuC after it's already
+gone, getting rid of "expected" warnings caused by GuC action failures
+on module unload.
+
+Note that I've also removed one of the tests (bitmap out of sync), since
+it doesn't make much sense anymore - bitmaps are now not expected to
+change during the lifetime of a client.
+
+Signed-off-by: Michał Winiarski <michal.winiarski@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Michel Thierry <michel.thierry@intel.com>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171213221352.7173-5-michal.winiarski@intel.com
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/intel_guc_submission.c |  151 +++++++---------------------
+ drivers/gpu/drm/i915/selftests/intel_guc.c  |  110 ++++++++------------
+ 2 files changed, 88 insertions(+), 173 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/intel_guc_submission.c
+@@ -88,7 +88,7 @@ static inline bool is_high_priority(stru
+ 		client->priority == GUC_CLIENT_PRIORITY_HIGH);
+ }
+ 
+-static int __reserve_doorbell(struct intel_guc_client *client)
++static int reserve_doorbell(struct intel_guc_client *client)
+ {
+ 	unsigned long offset;
+ 	unsigned long end;
+@@ -120,7 +120,7 @@ static int __reserve_doorbell(struct int
+ 	return 0;
+ }
+ 
+-static void __unreserve_doorbell(struct intel_guc_client *client)
++static void unreserve_doorbell(struct intel_guc_client *client)
+ {
+ 	GEM_BUG_ON(client->doorbell_id == GUC_DOORBELL_INVALID);
+ 
+@@ -188,32 +188,21 @@ static bool has_doorbell(struct intel_gu
+ 	return test_bit(client->doorbell_id, client->guc->doorbell_bitmap);
+ }
+ 
+-static int __create_doorbell(struct intel_guc_client *client)
++static void __create_doorbell(struct intel_guc_client *client)
+ {
+ 	struct guc_doorbell_info *doorbell;
+-	int err;
+ 
+ 	doorbell = __get_doorbell(client);
+ 	doorbell->db_status = GUC_DOORBELL_ENABLED;
+ 	doorbell->cookie = 0;
+-
+-	err = __guc_allocate_doorbell(client->guc, client->stage_id);
+-	if (err) {
+-		doorbell->db_status = GUC_DOORBELL_DISABLED;
+-		DRM_ERROR("Couldn't create client %u doorbell: %d\n",
+-			  client->stage_id, err);
+-	}
+-
+-	return err;
+ }
+ 
+-static int __destroy_doorbell(struct intel_guc_client *client)
++static void __destroy_doorbell(struct intel_guc_client *client)
+ {
+ 	struct drm_i915_private *dev_priv = guc_to_i915(client->guc);
+ 	struct guc_doorbell_info *doorbell;
+ 	u16 db_id = client->doorbell_id;
+ 
+-	GEM_BUG_ON(db_id >= GUC_DOORBELL_INVALID);
+ 
+ 	doorbell = __get_doorbell(client);
+ 	doorbell->db_status = GUC_DOORBELL_DISABLED;
+@@ -225,50 +214,42 @@ static int __destroy_doorbell(struct int
+ 	 */
+ 	if (wait_for_us(!(I915_READ(GEN8_DRBREGL(db_id)) & GEN8_DRB_VALID), 10))
+ 		WARN_ONCE(true, "Doorbell never became invalid after disable\n");
+-
+-	return __guc_deallocate_doorbell(client->guc, client->stage_id);
+ }
+ 
+ static int create_doorbell(struct intel_guc_client *client)
+ {
+ 	int ret;
+ 
+-	ret = __reserve_doorbell(client);
+-	if (ret)
+-		return ret;
+-
+ 	__update_doorbell_desc(client, client->doorbell_id);
++	__create_doorbell(client);
+ 
+-	ret = __create_doorbell(client);
+-	if (ret)
+-		goto err;
++	ret = __guc_allocate_doorbell(client->guc, client->stage_id);
++	if (ret) {
++		__destroy_doorbell(client);
++		__update_doorbell_desc(client, GUC_DOORBELL_INVALID);
++		DRM_ERROR("Couldn't create client %u doorbell: %d\n",
++			  client->stage_id, ret);
++		return ret;
++	}
+ 
+ 	return 0;
+-
+-err:
+-	__update_doorbell_desc(client, GUC_DOORBELL_INVALID);
+-	__unreserve_doorbell(client);
+-	return ret;
+ }
+ 
+ static int destroy_doorbell(struct intel_guc_client *client)
+ {
+-	int err;
++	int ret;
+ 
+ 	GEM_BUG_ON(!has_doorbell(client));
+ 
+-	/* XXX: wait for any interrupts */
+-	/* XXX: wait for workqueue to drain */
+-
+-	err = __destroy_doorbell(client);
+-	if (err)
+-		return err;
++	__destroy_doorbell(client);
++	ret = __guc_deallocate_doorbell(client->guc, client->stage_id);
++	if (ret)
++		DRM_ERROR("Couldn't destroy client %u doorbell: %d\n",
++			  client->stage_id, ret);
+ 
+ 	__update_doorbell_desc(client, GUC_DOORBELL_INVALID);
+ 
+-	__unreserve_doorbell(client);
+-
+-	return 0;
++	return ret;
+ }
+ 
+ static unsigned long __select_cacheline(struct intel_guc *guc)
+@@ -839,73 +820,18 @@ static bool doorbell_ok(struct intel_guc
+ 	return false;
+ }
+ 
+-/*
+- * If the GuC thinks that the doorbell is unassigned (e.g. because we reset and
+- * reloaded the GuC FW) we can use this function to tell the GuC to reassign the
+- * doorbell to the rightful owner.
+- */
+-static int __reset_doorbell(struct intel_guc_client *client, u16 db_id)
++static int guc_clients_doorbell_init(struct intel_guc *guc)
+ {
+-	int err;
+-
+-	__update_doorbell_desc(client, db_id);
+-	err = __create_doorbell(client);
+-	if (!err)
+-		err = __destroy_doorbell(client);
+-
+-	return err;
+-}
+-
+-/*
+- * Set up & tear down each unused doorbell in turn, to ensure that all doorbell
+- * HW is (re)initialised. For that end, we might have to borrow the first
+- * client. Also, tell GuC about all the doorbells in use by all clients.
+- * We do this because the KMD, the GuC and the doorbell HW can easily go out of
+- * sync (e.g. we can reset the GuC, but not the doorbel HW).
+- */
+-static int guc_init_doorbell_hw(struct intel_guc *guc)
+-{
+-	struct intel_guc_client *client = guc->execbuf_client;
+-	bool recreate_first_client = false;
+ 	u16 db_id;
+ 	int ret;
+ 
+-	/* For unused doorbells, make sure they are disabled */
+-	for_each_clear_bit(db_id, guc->doorbell_bitmap, GUC_NUM_DOORBELLS) {
+-		if (doorbell_ok(guc, db_id))
+-			continue;
+-
+-		if (has_doorbell(client)) {
+-			/* Borrow execbuf_client (we will recreate it later) */
+-			destroy_doorbell(client);
+-			recreate_first_client = true;
+-		}
+-
+-		ret = __reset_doorbell(client, db_id);
+-		WARN(ret, "Doorbell %u reset failed, err %d\n", db_id, ret);
+-	}
+-
+-	if (recreate_first_client) {
+-		ret = __reserve_doorbell(client);
+-		if (unlikely(ret)) {
+-			DRM_ERROR("Couldn't re-reserve first client db: %d\n",
+-				  ret);
+-			return ret;
+-		}
+-
+-		__update_doorbell_desc(client, client->doorbell_id);
+-	}
+-
+-	/* Now for every client (and not only execbuf_client) make sure their
+-	 * doorbells are known by the GuC
+-	 */
+-	ret = __create_doorbell(guc->execbuf_client);
++	ret = create_doorbell(guc->execbuf_client);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = __create_doorbell(guc->preempt_client);
++	ret = create_doorbell(guc->preempt_client);
+ 	if (ret) {
+-		__destroy_doorbell(guc->execbuf_client);
++		destroy_doorbell(guc->execbuf_client);
+ 		return ret;
+ 	}
+ 
+@@ -916,6 +842,19 @@ static int guc_init_doorbell_hw(struct i
+ 	return 0;
+ }
+ 
++static void guc_clients_doorbell_fini(struct intel_guc *guc)
++{
++	/*
++	 * By the time we're here, GuC has already been reset.
++	 * Instead of trying (in vain) to communicate with it, let's just
++	 * cleanup the doorbell HW and our internal state.
++	 */
++	__destroy_doorbell(guc->preempt_client);
++	__update_doorbell_desc(guc->preempt_client, GUC_DOORBELL_INVALID);
++	__destroy_doorbell(guc->execbuf_client);
++	__update_doorbell_desc(guc->execbuf_client, GUC_DOORBELL_INVALID);
++}
++
+ /**
+  * guc_client_alloc() - Allocate an intel_guc_client
+  * @dev_priv:	driver private data structure
+@@ -991,7 +930,7 @@ guc_client_alloc(struct drm_i915_private
+ 	guc_proc_desc_init(guc, client);
+ 	guc_stage_desc_init(guc, client);
+ 
+-	ret = create_doorbell(client);
++	ret = reserve_doorbell(client);
+ 	if (ret)
+ 		goto err_vaddr;
+ 
+@@ -1015,16 +954,7 @@ err_client:
+ 
+ static void guc_client_free(struct intel_guc_client *client)
+ {
+-	/*
+-	 * XXX: wait for any outstanding submissions before freeing memory.
+-	 * Be sure to drop any locks
+-	 */
+-
+-	/* FIXME: in many cases, by the time we get here the GuC has been
+-	 * reset, so we cannot destroy the doorbell properly. Ignore the
+-	 * error message for now
+-	 */
+-	destroy_doorbell(client);
++	unreserve_doorbell(client);
+ 	guc_stage_desc_fini(client->guc, client);
+ 	i915_gem_object_unpin_map(client->vma->obj);
+ 	i915_vma_unpin_and_release(&client->vma);
+@@ -1366,7 +1296,7 @@ int intel_guc_submission_enable(struct i
+ 	if (err)
+ 		goto err_free_clients;
+ 
+-	err = guc_init_doorbell_hw(guc);
++	err = guc_clients_doorbell_init(guc);
+ 	if (err)
+ 		goto err_free_clients;
+ 
+@@ -1398,6 +1328,7 @@ void intel_guc_submission_disable(struct
+ 	GEM_BUG_ON(dev_priv->gt.awake); /* GT should be parked first */
+ 
+ 	guc_interrupts_release(dev_priv);
++	guc_clients_doorbell_fini(guc);
+ 
+ 	/* Revert back to manual ELSP submission */
+ 	intel_engines_reset_default_submission(dev_priv);
+--- a/drivers/gpu/drm/i915/selftests/intel_guc.c
++++ b/drivers/gpu/drm/i915/selftests/intel_guc.c
+@@ -85,21 +85,26 @@ static int validate_client(struct intel_
+ 		return 0;
+ }
+ 
++static bool client_doorbell_in_sync(struct intel_guc_client *client)
++{
++	return doorbell_ok(client->guc, client->doorbell_id);
++}
++
+ /*
+- * Check that guc_init_doorbell_hw is doing what it should.
++ * Check that we're able to synchronize guc_clients with their doorbells
+  *
+- * During GuC submission enable, we create GuC clients and their doorbells,
+- * but after resetting the microcontroller (resume & gpu reset), these
+- * GuC clients are still around, but the status of their doorbells may be
+- * incorrect. This is the reason behind validating that the doorbells status
+- * expected by the driver matches what the GuC/HW have.
++ * We're creating clients and reserving doorbells once, at module load. During
++ * module lifetime, GuC, doorbell HW, and i915 state may go out of sync due to
++ * GuC being reset. In other words - GuC clients are still around, but the
++ * status of their doorbells may be incorrect. This is the reason behind
++ * validating that the doorbells status expected by the driver matches what the
++ * GuC/HW have.
+  */
+-static int igt_guc_init_doorbell_hw(void *args)
++static int igt_guc_clients(void *args)
+ {
+ 	struct drm_i915_private *dev_priv = args;
+ 	struct intel_guc *guc;
+-	DECLARE_BITMAP(db_bitmap_bk, GUC_NUM_DOORBELLS);
+-	int i, err = 0;
++	int err = 0;
+ 
+ 	GEM_BUG_ON(!HAS_GUC(dev_priv));
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+@@ -148,10 +153,21 @@ static int igt_guc_init_doorbell_hw(void
+ 		goto out;
+ 	}
+ 
+-	/* each client should have received a doorbell during alloc */
++	/* each client should now have reserved a doorbell */
+ 	if (!has_doorbell(guc->execbuf_client) ||
+ 	    !has_doorbell(guc->preempt_client)) {
+-		pr_err("guc_clients_create didn't create doorbells\n");
++		pr_err("guc_clients_create didn't reserve doorbells\n");
++		err = -EINVAL;
++		goto out;
++	}
++
++	/* Now create the doorbells */
++	guc_clients_doorbell_init(guc);
++
++	/* each client should now have received a doorbell */
++	if (!client_doorbell_in_sync(guc->execbuf_client) ||
++	    !client_doorbell_in_sync(guc->preempt_client)) {
++		pr_err("failed to initialize the doorbells\n");
+ 		err = -EINVAL;
+ 		goto out;
+ 	}
+@@ -160,25 +176,26 @@ static int igt_guc_init_doorbell_hw(void
+ 	 * Basic test - an attempt to reallocate a valid doorbell to the
+ 	 * client it is currently assigned should not cause a failure.
+ 	 */
+-	err = guc_init_doorbell_hw(guc);
++	err = guc_clients_doorbell_init(guc);
+ 	if (err)
+ 		goto out;
+ 
+ 	/*
+ 	 * Negative test - a client with no doorbell (invalid db id).
+-	 * Each client gets a doorbell when it is created, after destroying
+-	 * the doorbell, the db id is changed to GUC_DOORBELL_INVALID and the
+-	 * firmware will reject any attempt to allocate a doorbell with an
+-	 * invalid id (db has to be reserved before allocation).
++	 * After destroying the doorbell, the db id is changed to
++	 * GUC_DOORBELL_INVALID and the firmware will reject any attempt to
++	 * allocate a doorbell with an invalid id (db has to be reserved before
++	 * allocation).
+ 	 */
+ 	destroy_doorbell(guc->execbuf_client);
+-	if (has_doorbell(guc->execbuf_client)) {
++	if (client_doorbell_in_sync(guc->execbuf_client)) {
+ 		pr_err("destroy db did not work\n");
+ 		err = -EINVAL;
+ 		goto out;
+ 	}
+ 
+-	err = guc_init_doorbell_hw(guc);
++	unreserve_doorbell(guc->execbuf_client);
++	err = guc_clients_doorbell_init(guc);
+ 	if (err != -EIO) {
+ 		pr_err("unexpected (err = %d)", err);
+ 		goto out;
+@@ -191,33 +208,13 @@ static int igt_guc_init_doorbell_hw(void
+ 	}
+ 
+ 	/* clean after test */
+-	err = create_doorbell(guc->execbuf_client);
+-	if (err) {
+-		pr_err("recreate doorbell failed\n");
+-		goto out;
+-	}
+-
+-	/*
+-	 * Negative test - doorbell_bitmap out of sync, will trigger a few of
+-	 * WARN_ON(!doorbell_ok(guc, db_id)) but that's ok as long as the
+-	 * doorbells from our clients don't fail.
+-	 */
+-	bitmap_copy(db_bitmap_bk, guc->doorbell_bitmap, GUC_NUM_DOORBELLS);
+-	for (i = 0; i < GUC_NUM_DOORBELLS; i++)
+-		if (i % 2)
+-			test_and_change_bit(i, guc->doorbell_bitmap);
+-
+-	err = guc_init_doorbell_hw(guc);
++	err = reserve_doorbell(guc->execbuf_client);
+ 	if (err) {
+-		pr_err("out of sync doorbell caused an error\n");
+-		goto out;
++		pr_err("failed to reserve back the doorbell back\n");
+ 	}
+-
+-	/* restore 'correct' db bitmap */
+-	bitmap_copy(guc->doorbell_bitmap, db_bitmap_bk, GUC_NUM_DOORBELLS);
+-	err = guc_init_doorbell_hw(guc);
++	err = create_doorbell(guc->execbuf_client);
+ 	if (err) {
+-		pr_err("restored doorbell caused an error\n");
++		pr_err("recreate doorbell failed\n");
+ 		goto out;
+ 	}
+ 
+@@ -226,8 +223,11 @@ out:
+ 	 * Leave clean state for other test, plus the driver always destroy the
+ 	 * clients during unload.
+ 	 */
++	destroy_doorbell(guc->execbuf_client);
++	destroy_doorbell(guc->preempt_client);
+ 	guc_clients_destroy(guc);
+ 	guc_clients_create(guc);
++	guc_clients_doorbell_init(guc);
+ unlock:
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 	return err;
+@@ -309,25 +309,7 @@ static int igt_guc_doorbells(void *arg)
+ 
+ 		db_id = clients[i]->doorbell_id;
+ 
+-		/*
+-		 * Client alloc gives us a doorbell, but we want to exercise
+-		 * this ourselves (this resembles guc_init_doorbell_hw)
+-		 */
+-		destroy_doorbell(clients[i]);
+-		if (clients[i]->doorbell_id != GUC_DOORBELL_INVALID) {
+-			pr_err("[%d] destroy db did not work!\n", i);
+-			err = -EINVAL;
+-			goto out;
+-		}
+-
+-		err = __reserve_doorbell(clients[i]);
+-		if (err) {
+-			pr_err("[%d] Failed to reserve a doorbell\n", i);
+-			goto out;
+-		}
+-
+-		__update_doorbell_desc(clients[i], clients[i]->doorbell_id);
+-		err = __create_doorbell(clients[i]);
++		err = create_doorbell(clients[i]);
+ 		if (err) {
+ 			pr_err("[%d] Failed to create a doorbell\n", i);
+ 			goto out;
+@@ -348,8 +330,10 @@ static int igt_guc_doorbells(void *arg)
+ 
+ out:
+ 	for (i = 0; i < ATTEMPTS; i++)
+-		if (!IS_ERR_OR_NULL(clients[i]))
++		if (!IS_ERR_OR_NULL(clients[i])) {
++			destroy_doorbell(clients[i]);
+ 			guc_client_free(clients[i]);
++		}
+ unlock:
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 	return err;
+@@ -358,7 +342,7 @@ unlock:
+ int intel_guc_live_selftest(struct drm_i915_private *dev_priv)
+ {
+ 	static const struct i915_subtest tests[] = {
+-		SUBTEST(igt_guc_init_doorbell_hw),
++		SUBTEST(igt_guc_clients),
+ 		SUBTEST(igt_guc_doorbells),
+ 	};
+ 

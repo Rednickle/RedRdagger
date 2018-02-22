@@ -1,0 +1,131 @@
+From 8a2421bd0d9abb3a599969d88e1910a2a101eccc Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 16 Jun 2017 15:05:22 +0100
+Subject: [PATCH] drm/i915: Wait upon userptr get-user-pages within execbuffer
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 8a2421bd0d9abb3a599969d88e1910a2a101eccc
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+This simply hides the EAGAIN caused by userptr when userspace causes
+resource contention. However, it is quite beneficial with highly
+contended userptr users as we avoid repeating the setup costs and
+kernel-user context switches.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Michał Winiarski <michal.winiarski@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.c            |    1 +
+ drivers/gpu/drm/i915/i915_drv.h            |   10 +++++++++-
+ drivers/gpu/drm/i915/i915_gem.c            |    4 +++-
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    3 +++
+ drivers/gpu/drm/i915/i915_gem_userptr.c    |   18 +++++++++++++++---
+ 5 files changed, 31 insertions(+), 5 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -579,6 +579,7 @@ static void i915_gem_fini(struct drm_i91
+ 	intel_uc_fini_hw(dev_priv);
+ 	i915_gem_cleanup_engines(dev_priv);
+ 	i915_gem_context_fini(dev_priv);
++	i915_gem_cleanup_userptr(dev_priv);
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 
+ 	i915_gem_drain_freed_objects(dev_priv);
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1454,6 +1454,13 @@ struct i915_gem_mm {
+ 	/** LRU list of objects with fence regs on them. */
+ 	struct list_head fence_list;
+ 
++	/**
++	 * Workqueue to fault in userptr pages, flushed by the execbuf
++	 * when required but otherwise left to userspace to try again
++	 * on EAGAIN.
++	 */
++	struct workqueue_struct *userptr_wq;
++
+ 	u64 unordered_timeline;
+ 
+ 	/* the indicator for dispatch video commands on two BSD rings */
+@@ -3229,7 +3236,8 @@ int i915_gem_set_tiling_ioctl(struct drm
+ 			      struct drm_file *file_priv);
+ int i915_gem_get_tiling_ioctl(struct drm_device *dev, void *data,
+ 			      struct drm_file *file_priv);
+-void i915_gem_init_userptr(struct drm_i915_private *dev_priv);
++int i915_gem_init_userptr(struct drm_i915_private *dev_priv);
++void i915_gem_cleanup_userptr(struct drm_i915_private *dev_priv);
+ int i915_gem_userptr_ioctl(struct drm_device *dev, void *data,
+ 			   struct drm_file *file);
+ int i915_gem_get_aperture_ioctl(struct drm_device *dev, void *data,
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4804,7 +4804,9 @@ int i915_gem_init(struct drm_i915_privat
+ 	 */
+ 	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
+ 
+-	i915_gem_init_userptr(dev_priv);
++	ret = i915_gem_init_userptr(dev_priv);
++	if (ret)
++		goto out_unlock;
+ 
+ 	ret = i915_gem_init_ggtt(dev_priv);
+ 	if (ret)
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1499,6 +1499,9 @@ repeat:
+ 		goto out;
+ 	}
+ 
++	/* A frequent cause for EAGAIN are currently unavailable client pages */
++	flush_workqueue(eb->i915->mm.userptr_wq);
++
+ 	err = i915_mutex_lock_interruptible(dev);
+ 	if (err) {
+ 		mutex_lock(&dev->struct_mutex);
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -378,7 +378,7 @@ __i915_mm_struct_free(struct kref *kref)
+ 	mutex_unlock(&mm->i915->mm_lock);
+ 
+ 	INIT_WORK(&mm->work, __i915_mm_struct_free__worker);
+-	schedule_work(&mm->work);
++	queue_work(mm->i915->mm.userptr_wq, &mm->work);
+ }
+ 
+ static void
+@@ -598,7 +598,7 @@ __i915_gem_userptr_get_pages_schedule(st
+ 	get_task_struct(work->task);
+ 
+ 	INIT_WORK(&work->work, __i915_gem_userptr_get_pages_worker);
+-	schedule_work(&work->work);
++	queue_work(to_i915(obj->base.dev)->mm.userptr_wq, &work->work);
+ 
+ 	return ERR_PTR(-EAGAIN);
+ }
+@@ -830,8 +830,20 @@ i915_gem_userptr_ioctl(struct drm_device
+ 	return 0;
+ }
+ 
+-void i915_gem_init_userptr(struct drm_i915_private *dev_priv)
++int i915_gem_init_userptr(struct drm_i915_private *dev_priv)
+ {
+ 	mutex_init(&dev_priv->mm_lock);
+ 	hash_init(dev_priv->mm_structs);
++
++	dev_priv->mm.userptr_wq =
++		alloc_workqueue("i915-userptr-acquire", WQ_HIGHPRI, 0);
++	if (!dev_priv->mm.userptr_wq)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void i915_gem_cleanup_userptr(struct drm_i915_private *dev_priv)
++{
++	destroy_workqueue(dev_priv->mm.userptr_wq);
+ }

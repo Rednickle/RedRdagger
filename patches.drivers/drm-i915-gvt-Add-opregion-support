@@ -1,0 +1,372 @@
+From b851adeac0858c7d257b32eee2142b1519d45ccf Mon Sep 17 00:00:00 2001
+From: Tina Zhang <tina.zhang@intel.com>
+Date: Mon, 20 Nov 2017 15:31:16 +0800
+Subject: [PATCH] drm/i915/gvt: Add opregion support
+Git-commit: b851adeac0858c7d257b32eee2142b1519d45ccf
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+Windows guest driver needs vbt in opregion, to configure the setting
+for display. Without opregion support, the display registers won't
+be set and this blocks display model to get the correct information
+of the guest display plane.
+
+This patch is to provide a virtual opregion for guest. The original
+author of this patch is Xiaoguang Chen.
+
+This patch is split from the "Dma-buf support for GVT-g" patch set,
+with being rebased to the latest gvt-staging branch.
+
+V3: 
+- add checking region index during intel_vgpu_rw. (Xiong)
+
+V2: 
+- refine intel_vgpu_reg_release_opregion. (Xiong)
+
+Here are the previous version comments:
+
+V18: 
+- unmap vgpu's opregion when destroying vgpu.
+
+V16: 
+- rebase to 4.14.0-rc6.
+
+Signed-off-by: Bing Niu <bing.niu@intel.com>
+Signed-off-by: Tina Zhang <tina.zhang@intel.com>
+Tested-by: Xiong Zhang <xiong.y.zhang@intel.com>
+Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/gvt.h       |    1 
+ drivers/gpu/drm/i915/gvt/hypercall.h |    1 
+ drivers/gpu/drm/i915/gvt/kvmgt.c     |  108 ++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/gvt/mpt.h       |   15 ++++
+ drivers/gpu/drm/i915/gvt/opregion.c  |   74 ++++++++++++++++++-----
+ drivers/gpu/drm/i915/gvt/vgpu.c      |    4 +
+ 6 files changed, 184 insertions(+), 19 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -125,6 +125,7 @@ struct intel_vgpu_irq {
+ struct intel_vgpu_opregion {
+ 	bool mapped;
+ 	void *va;
++	void *va_gopregion;
+ 	u32 gfn[INTEL_GVT_OPREGION_PAGES];
+ };
+ 
+--- a/drivers/gpu/drm/i915/gvt/hypercall.h
++++ b/drivers/gpu/drm/i915/gvt/hypercall.h
+@@ -55,6 +55,7 @@ struct intel_gvt_mpt {
+ 			      unsigned long mfn, unsigned int nr, bool map);
+ 	int (*set_trap_area)(unsigned long handle, u64 start, u64 end,
+ 			     bool map);
++	int (*set_opregion)(void *vgpu);
+ };
+ 
+ extern struct intel_gvt_mpt xengt_mpt;
+--- a/drivers/gpu/drm/i915/gvt/kvmgt.c
++++ b/drivers/gpu/drm/i915/gvt/kvmgt.c
+@@ -53,11 +53,23 @@ static const struct intel_gvt_ops *intel
+ #define VFIO_PCI_INDEX_TO_OFFSET(index) ((u64)(index) << VFIO_PCI_OFFSET_SHIFT)
+ #define VFIO_PCI_OFFSET_MASK    (((u64)(1) << VFIO_PCI_OFFSET_SHIFT) - 1)
+ 
++#define OPREGION_SIGNATURE "IntelGraphicsMem"
++
++struct vfio_region;
++struct intel_vgpu_regops {
++	size_t (*rw)(struct intel_vgpu *vgpu, char *buf,
++			size_t count, loff_t *ppos, bool iswrite);
++	void (*release)(struct intel_vgpu *vgpu,
++			struct vfio_region *region);
++};
++
+ struct vfio_region {
+ 	u32				type;
+ 	u32				subtype;
+ 	size_t				size;
+ 	u32				flags;
++	const struct intel_vgpu_regops	*ops;
++	void				*data;
+ };
+ 
+ struct kvmgt_pgfn {
+@@ -316,6 +328,87 @@ static void kvmgt_protect_table_del(stru
+ 	}
+ }
+ 
++static size_t intel_vgpu_reg_rw_opregion(struct intel_vgpu *vgpu, char *buf,
++		size_t count, loff_t *ppos, bool iswrite)
++{
++	unsigned int i = VFIO_PCI_OFFSET_TO_INDEX(*ppos) -
++			VFIO_PCI_NUM_REGIONS;
++	void *base = vgpu->vdev.region[i].data;
++	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
++
++	if (pos >= vgpu->vdev.region[i].size || iswrite) {
++		gvt_vgpu_err("invalid op or offset for Intel vgpu OpRegion\n");
++		return -EINVAL;
++	}
++	count = min(count, (size_t)(vgpu->vdev.region[i].size - pos));
++	memcpy(buf, base + pos, count);
++
++	return count;
++}
++
++static void intel_vgpu_reg_release_opregion(struct intel_vgpu *vgpu,
++		struct vfio_region *region)
++{
++}
++
++static const struct intel_vgpu_regops intel_vgpu_regops_opregion = {
++	.rw = intel_vgpu_reg_rw_opregion,
++	.release = intel_vgpu_reg_release_opregion,
++};
++
++static int intel_vgpu_register_reg(struct intel_vgpu *vgpu,
++		unsigned int type, unsigned int subtype,
++		const struct intel_vgpu_regops *ops,
++		size_t size, u32 flags, void *data)
++{
++	struct vfio_region *region;
++
++	region = krealloc(vgpu->vdev.region,
++			(vgpu->vdev.num_regions + 1) * sizeof(*region),
++			GFP_KERNEL);
++	if (!region)
++		return -ENOMEM;
++
++	vgpu->vdev.region = region;
++	vgpu->vdev.region[vgpu->vdev.num_regions].type = type;
++	vgpu->vdev.region[vgpu->vdev.num_regions].subtype = subtype;
++	vgpu->vdev.region[vgpu->vdev.num_regions].ops = ops;
++	vgpu->vdev.region[vgpu->vdev.num_regions].size = size;
++	vgpu->vdev.region[vgpu->vdev.num_regions].flags = flags;
++	vgpu->vdev.region[vgpu->vdev.num_regions].data = data;
++	vgpu->vdev.num_regions++;
++
++	return 0;
++}
++
++static int kvmgt_set_opregion(void *p_vgpu)
++{
++	struct intel_vgpu *vgpu = (struct intel_vgpu *)p_vgpu;
++	void *base;
++	int ret;
++
++	/* Each vgpu has its own opregion, although VFIO would create another
++	 * one later. This one is used to expose opregion to VFIO. And the
++	 * other one created by VFIO later, is used by guest actually.
++	 */
++	base = vgpu_opregion(vgpu)->va;
++	if (!base)
++		return -ENOMEM;
++
++	if (memcmp(base, OPREGION_SIGNATURE, 16)) {
++		memunmap(base);
++		return -EINVAL;
++	}
++
++	ret = intel_vgpu_register_reg(vgpu,
++			PCI_VENDOR_ID_INTEL | VFIO_REGION_TYPE_PCI_VENDOR_TYPE,
++			VFIO_REGION_SUBTYPE_INTEL_IGD_OPREGION,
++			&intel_vgpu_regops_opregion, OPREGION_SIZE,
++			VFIO_REGION_INFO_FLAG_READ, base);
++
++	return ret;
++}
++
+ static int intel_vgpu_create(struct kobject *kobj, struct mdev_device *mdev)
+ {
+ 	struct intel_vgpu *vgpu = NULL;
+@@ -546,7 +639,7 @@ static ssize_t intel_vgpu_rw(struct mdev
+ 	int ret = -EINVAL;
+ 
+ 
+-	if (index >= VFIO_PCI_NUM_REGIONS) {
++	if (index >= VFIO_PCI_NUM_REGIONS + vgpu->vdev.num_regions) {
+ 		gvt_vgpu_err("invalid index: %u\n", index);
+ 		return -EINVAL;
+ 	}
+@@ -574,8 +667,14 @@ static ssize_t intel_vgpu_rw(struct mdev
+ 	case VFIO_PCI_BAR5_REGION_INDEX:
+ 	case VFIO_PCI_VGA_REGION_INDEX:
+ 	case VFIO_PCI_ROM_REGION_INDEX:
++		break;
+ 	default:
+-		gvt_vgpu_err("unsupported region: %u\n", index);
++		if (index >= VFIO_PCI_NUM_REGIONS + vgpu->vdev.num_regions)
++			return -EINVAL;
++
++		index -= VFIO_PCI_NUM_REGIONS;
++		return vgpu->vdev.region[index].ops->rw(vgpu, buf, count,
++				ppos, is_write);
+ 	}
+ 
+ 	return ret == 0 ? count : ret;
+@@ -838,7 +937,8 @@ static long intel_vgpu_ioctl(struct mdev
+ 
+ 		info.flags = VFIO_DEVICE_FLAGS_PCI;
+ 		info.flags |= VFIO_DEVICE_FLAGS_RESET;
+-		info.num_regions = VFIO_PCI_NUM_REGIONS;
++		info.num_regions = VFIO_PCI_NUM_REGIONS +
++				vgpu->vdev.num_regions;
+ 		info.num_irqs = VFIO_PCI_NUM_IRQS;
+ 
+ 		return copy_to_user((void __user *)arg, &info, minsz) ?
+@@ -959,6 +1059,7 @@ static long intel_vgpu_ioctl(struct mdev
+ 		}
+ 
+ 		if (caps.size) {
++			info.flags |= VFIO_REGION_INFO_FLAG_CAPS;
+ 			if (info.argsz < sizeof(info) + caps.size) {
+ 				info.argsz = sizeof(info) + caps.size;
+ 				info.cap_offset = 0;
+@@ -1426,6 +1527,7 @@ struct intel_gvt_mpt kvmgt_mpt = {
+ 	.read_gpa = kvmgt_read_gpa,
+ 	.write_gpa = kvmgt_write_gpa,
+ 	.gfn_to_mfn = kvmgt_gfn_to_pfn,
++	.set_opregion = kvmgt_set_opregion,
+ };
+ EXPORT_SYMBOL_GPL(kvmgt_mpt);
+ 
+--- a/drivers/gpu/drm/i915/gvt/mpt.h
++++ b/drivers/gpu/drm/i915/gvt/mpt.h
+@@ -294,4 +294,19 @@ static inline int intel_gvt_hypervisor_s
+ 	return intel_gvt_host.mpt->set_trap_area(vgpu->handle, start, end, map);
+ }
+ 
++/**
++ * intel_gvt_hypervisor_set_opregion - Set opregion for guest
++ * @vgpu: a vGPU
++ *
++ * Returns:
++ * Zero on success, negative error code if failed.
++ */
++static inline int intel_gvt_hypervisor_set_opregion(struct intel_vgpu *vgpu)
++{
++	if (!intel_gvt_host.mpt->set_opregion)
++		return 0;
++
++	return intel_gvt_host.mpt->set_opregion(vgpu);
++}
++
+ #endif /* _GVT_MPT_H_ */
+--- a/drivers/gpu/drm/i915/gvt/opregion.c
++++ b/drivers/gpu/drm/i915/gvt/opregion.c
+@@ -297,19 +297,41 @@ static int map_vgpu_opregion(struct inte
+  */
+ int intel_vgpu_opregion_base_write_handler(struct intel_vgpu *vgpu, u32 gpa)
+ {
+-	int i, ret;
+ 
+-	/**
+-	 * Wins guest on Xengt will write this register twice: xen hvmloader and
+-	 * windows graphic driver.
+-	 */
+-	if (vgpu_opregion(vgpu)->mapped)
+-		map_vgpu_opregion(vgpu, false);
++	int i, ret = 0;
++	unsigned long pfn;
+ 
+-	for (i = 0; i < INTEL_GVT_OPREGION_PAGES; i++)
+-		vgpu_opregion(vgpu)->gfn[i] = (gpa >> PAGE_SHIFT) + i;
++	gvt_dbg_core("emulate opregion from kernel\n");
+ 
+-	ret = map_vgpu_opregion(vgpu, true);
++	switch (intel_gvt_host.hypervisor_type) {
++	case INTEL_GVT_HYPERVISOR_KVM:
++		pfn = intel_gvt_hypervisor_gfn_to_mfn(vgpu, gpa >> PAGE_SHIFT);
++		vgpu_opregion(vgpu)->va_gopregion = memremap(pfn << PAGE_SHIFT,
++						INTEL_GVT_OPREGION_SIZE,
++						MEMREMAP_WB);
++		if (!vgpu_opregion(vgpu)->va_gopregion) {
++			gvt_vgpu_err("failed to map guest opregion\n");
++			ret = -EFAULT;
++		}
++		vgpu_opregion(vgpu)->mapped = true;
++		break;
++	case INTEL_GVT_HYPERVISOR_XEN:
++		/**
++		 * Wins guest on Xengt will write this register twice: xen
++		 * hvmloader and windows graphic driver.
++		 */
++		if (vgpu_opregion(vgpu)->mapped)
++			map_vgpu_opregion(vgpu, false);
++
++		for (i = 0; i < INTEL_GVT_OPREGION_PAGES; i++)
++			vgpu_opregion(vgpu)->gfn[i] = (gpa >> PAGE_SHIFT) + i;
++
++		ret = map_vgpu_opregion(vgpu, true);
++		break;
++	default:
++		ret = -EINVAL;
++		gvt_vgpu_err("not supported hypervisor\n");
++	}
+ 
+ 	return ret;
+ }
+@@ -326,13 +348,20 @@ void intel_vgpu_clean_opregion(struct in
+ 	if (!vgpu_opregion(vgpu)->va)
+ 		return;
+ 
+-	if (vgpu_opregion(vgpu)->mapped)
+-		map_vgpu_opregion(vgpu, false);
+-
++	if (intel_gvt_host.hypervisor_type == INTEL_GVT_HYPERVISOR_XEN) {
++		if (vgpu_opregion(vgpu)->mapped)
++			map_vgpu_opregion(vgpu, false);
++	} else if (intel_gvt_host.hypervisor_type == INTEL_GVT_HYPERVISOR_KVM) {
++		if (vgpu_opregion(vgpu)->mapped) {
++			memunmap(vgpu_opregion(vgpu)->va_gopregion);
++			vgpu_opregion(vgpu)->va_gopregion = NULL;
++		}
++	}
+ 	free_pages((unsigned long)vgpu_opregion(vgpu)->va,
+-			get_order(INTEL_GVT_OPREGION_SIZE));
++		   get_order(INTEL_GVT_OPREGION_SIZE));
+ 
+ 	vgpu_opregion(vgpu)->va = NULL;
++
+ }
+ 
+ 
+@@ -454,8 +483,21 @@ int intel_vgpu_emulate_opregion_request(
+ 	u32 *scic, *parm;
+ 	u32 func, subfunc;
+ 
+-	scic = vgpu_opregion(vgpu)->va + INTEL_GVT_OPREGION_SCIC;
+-	parm = vgpu_opregion(vgpu)->va + INTEL_GVT_OPREGION_PARM;
++	switch (intel_gvt_host.hypervisor_type) {
++	case INTEL_GVT_HYPERVISOR_XEN:
++		scic = vgpu_opregion(vgpu)->va + INTEL_GVT_OPREGION_SCIC;
++		parm = vgpu_opregion(vgpu)->va + INTEL_GVT_OPREGION_PARM;
++		break;
++	case INTEL_GVT_HYPERVISOR_KVM:
++		scic = vgpu_opregion(vgpu)->va_gopregion +
++						INTEL_GVT_OPREGION_SCIC;
++		parm = vgpu_opregion(vgpu)->va_gopregion +
++						INTEL_GVT_OPREGION_PARM;
++		break;
++	default:
++		gvt_vgpu_err("not supported hypervisor\n");
++		return -EINVAL;
++	}
+ 
+ 	if (!(swsci & SWSCI_SCI_SELECT)) {
+ 		gvt_vgpu_err("requesting SMI service\n");
+--- a/drivers/gpu/drm/i915/gvt/vgpu.c
++++ b/drivers/gpu/drm/i915/gvt/vgpu.c
+@@ -390,6 +390,10 @@ static struct intel_vgpu *__intel_gvt_cr
+ 	if (ret)
+ 		goto out_clean_sched_policy;
+ 
++	ret = intel_gvt_hypervisor_set_opregion(vgpu);
++	if (ret)
++		goto out_clean_sched_policy;
++
+ 	mutex_unlock(&gvt->lock);
+ 
+ 	return vgpu;

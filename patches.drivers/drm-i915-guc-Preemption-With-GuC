@@ -1,0 +1,463 @@
+From c41937fd994a449b4e862826d7eb9f366f6d33e9 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Micha=C5=82=20Winiarski?= <michal.winiarski@intel.com>
+Date: Thu, 26 Oct 2017 15:35:58 +0200
+Subject: [PATCH] drm/i915/guc: Preemption! With GuC
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: c41937fd994a449b4e862826d7eb9f366f6d33e9
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+Pretty similar to what we have on execlists.
+We're reusing most of the GEM code, however, due to GuC quirks we need a
+couple of extra bits.
+Preemption is implemented as GuC action, and actions can be pretty slow.
+Because of that, we're using a mutex to serialize them. Since we're
+requesting preemption from the tasklet, the task of creating a workitem
+and wrapping it in GuC action is delegated to a worker.
+
+To distinguish that preemption has finished, we're using additional
+piece of HWSP, and since we're not getting context switch interrupts,
+we're also adding a user interrupt.
+
+The fact that our special preempt context has completed unfortunately
+doesn't mean that we're ready to submit new work. We also need to wait
+for GuC to finish its own processing.
+
+V2: Don't compile out the wait for GuC, handle workqueue flush on reset,
+no need for ordered workqueue, put on a reviewer hat when looking at my own
+patches (Chris)
+Move struct work around in intel_guc, move user interruput outside of
+conditional (Michał)
+Keep ring around rather than chase though intel_context
+
+V3: Extract WA for flushing ggtt writes to a helper (Chris)
+Keep work_struct in intel_guc rather than engine (Michał)
+Use ordered workqueue for inject_preempt worker to avoid GuC quirks.
+
+V4: Drop now unused INTEL_GUC_PREEMPT_OPTION_IMMEDIATE (Daniele)
+Drop stray newlines, use container_of for intel_guc in worker,
+check for presence of workqueue when flushing it, rather than
+enable_guc_submission modparam, reorder preempt postprocessing (Chris)
+
+V5: Make wq NULL after destroying it
+
+V6: Swap struct guc_preempt_work members (Michał)
+
+Signed-off-by: Michał Winiarski <michal.winiarski@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Jeff McGee <jeff.mcgee@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Oscar Mateo <oscar.mateo@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171026133558.19580-1-michal.winiarski@intel.com
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.c            |    3 
+ drivers/gpu/drm/i915/i915_gem.c            |   10 +
+ drivers/gpu/drm/i915/i915_guc_submission.c |  208 +++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_guc.h           |    8 +
+ drivers/gpu/drm/i915/intel_lrc.c           |    4 
+ drivers/gpu/drm/i915/intel_lrc.h           |    1 
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |    6 
+ 7 files changed, 222 insertions(+), 18 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -373,8 +373,7 @@ static int i915_getparam(struct drm_devi
+ 			value |= I915_SCHEDULER_CAP_PRIORITY;
+ 
+ 			if (HAS_LOGICAL_RING_PREEMPTION(dev_priv) &&
+-			    i915_modparams.enable_execlists &&
+-			    !i915_modparams.enable_guc_submission)
++			    i915_modparams.enable_execlists)
+ 				value |= I915_SCHEDULER_CAP_PREEMPTION;
+ 		}
+ 		break;
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2880,6 +2880,16 @@ i915_gem_reset_prepare_engine(struct int
+ 	tasklet_kill(&engine->execlists.irq_tasklet);
+ 	tasklet_disable(&engine->execlists.irq_tasklet);
+ 
++	/*
++	 * We're using worker to queue preemption requests from the tasklet in
++	 * GuC submission mode.
++	 * Even though tasklet was disabled, we may still have a worker queued.
++	 * Let's make sure that all workers scheduled before disabling the
++	 * tasklet are completed before continuing with the reset.
++	 */
++	if (engine->i915->guc.preempt_wq)
++		flush_workqueue(engine->i915->guc.preempt_wq);
++
+ 	if (engine->irq_seqno_barrier)
+ 		engine->irq_seqno_barrier(engine);
+ 
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -565,6 +565,108 @@ static void guc_add_request(struct intel
+ 	spin_unlock(&client->wq_lock);
+ }
+ 
++/*
++ * When we're doing submissions using regular execlists backend, writing to
++ * ELSP from CPU side is enough to make sure that writes to ringbuffer pages
++ * pinned in mappable aperture portion of GGTT are visible to command streamer.
++ * Writes done by GuC on our behalf are not guaranteeing such ordering,
++ * therefore, to ensure the flush, we're issuing a POSTING READ.
++ */
++static void flush_ggtt_writes(struct i915_vma *vma)
++{
++	struct drm_i915_private *dev_priv = to_i915(vma->obj->base.dev);
++
++	if (i915_vma_is_map_and_fenceable(vma))
++		POSTING_READ_FW(GUC_STATUS);
++}
++
++#define GUC_PREEMPT_FINISHED 0x1
++#define GUC_PREEMPT_BREADCRUMB_DWORDS 0x8
++static void inject_preempt_context(struct work_struct *work)
++{
++	struct guc_preempt_work *preempt_work =
++		container_of(work, typeof(*preempt_work), work);
++	struct intel_engine_cs *engine = preempt_work->engine;
++	struct intel_guc *guc = container_of(preempt_work, typeof(*guc),
++					     preempt_work[engine->id]);
++	struct i915_guc_client *client = guc->preempt_client;
++	struct intel_ring *ring = client->owner->engine[engine->id].ring;
++	u32 ctx_desc = lower_32_bits(intel_lr_context_descriptor(client->owner,
++								 engine));
++	u32 *cs = ring->vaddr + ring->tail;
++	u32 data[7];
++
++	if (engine->id == RCS) {
++		cs = gen8_emit_ggtt_write_rcs(cs, GUC_PREEMPT_FINISHED,
++				intel_hws_preempt_done_address(engine));
++	} else {
++		cs = gen8_emit_ggtt_write(cs, GUC_PREEMPT_FINISHED,
++				intel_hws_preempt_done_address(engine));
++		*cs++ = MI_NOOP;
++		*cs++ = MI_NOOP;
++	}
++	*cs++ = MI_USER_INTERRUPT;
++	*cs++ = MI_NOOP;
++
++	GEM_BUG_ON(!IS_ALIGNED(ring->size,
++			       GUC_PREEMPT_BREADCRUMB_DWORDS * sizeof(u32)));
++	GEM_BUG_ON((void *)cs - (ring->vaddr + ring->tail) !=
++		   GUC_PREEMPT_BREADCRUMB_DWORDS * sizeof(u32));
++
++	ring->tail += GUC_PREEMPT_BREADCRUMB_DWORDS * sizeof(u32);
++	ring->tail &= (ring->size - 1);
++
++	flush_ggtt_writes(ring->vma);
++
++	spin_lock_irq(&client->wq_lock);
++	guc_wq_item_append(client, engine->guc_id, ctx_desc,
++			   ring->tail / sizeof(u64), 0);
++	spin_unlock_irq(&client->wq_lock);
++
++	data[0] = INTEL_GUC_ACTION_REQUEST_PREEMPTION;
++	data[1] = client->stage_id;
++	data[2] = INTEL_GUC_PREEMPT_OPTION_DROP_WORK_Q |
++		  INTEL_GUC_PREEMPT_OPTION_DROP_SUBMIT_Q;
++	data[3] = engine->guc_id;
++	data[4] = guc->execbuf_client->priority;
++	data[5] = guc->execbuf_client->stage_id;
++	data[6] = guc_ggtt_offset(guc->shared_data);
++
++	if (WARN_ON(intel_guc_send(guc, data, ARRAY_SIZE(data)))) {
++		execlists_clear_active(&engine->execlists,
++				       EXECLISTS_ACTIVE_PREEMPT);
++		tasklet_schedule(&engine->execlists.irq_tasklet);
++	}
++}
++
++/*
++ * We're using user interrupt and HWSP value to mark that preemption has
++ * finished and GPU is idle. Normally, we could unwind and continue similar to
++ * execlists submission path. Unfortunately, with GuC we also need to wait for
++ * it to finish its own postprocessing, before attempting to submit. Otherwise
++ * GuC may silently ignore our submissions, and thus we risk losing request at
++ * best, executing out-of-order and causing kernel panic at worst.
++ */
++#define GUC_PREEMPT_POSTPROCESS_DELAY_MS 10
++static void wait_for_guc_preempt_report(struct intel_engine_cs *engine)
++{
++	struct intel_guc *guc = &engine->i915->guc;
++	struct guc_shared_ctx_data *data = guc->shared_data_vaddr;
++	struct guc_ctx_report *report =
++		&data->preempt_ctx_report[engine->guc_id];
++
++	WARN_ON(wait_for_atomic(report->report_return_status ==
++				INTEL_GUC_REPORT_STATUS_COMPLETE,
++				GUC_PREEMPT_POSTPROCESS_DELAY_MS));
++	/*
++	 * GuC is expecting that we're also going to clear the affected context
++	 * counter, let's also reset the return status to not depend on GuC
++	 * resetting it after recieving another preempt action
++	 */
++	report->affected_count = 0;
++	report->report_return_status = INTEL_GUC_REPORT_STATUS_UNKNOWN;
++}
++
+ /**
+  * i915_guc_submit() - Submit commands through GuC
+  * @engine: engine associated with the commands
+@@ -574,8 +676,7 @@ static void guc_add_request(struct intel
+  */
+ static void i915_guc_submit(struct intel_engine_cs *engine)
+ {
+-	struct drm_i915_private *dev_priv = engine->i915;
+-	struct intel_guc *guc = &dev_priv->guc;
++	struct intel_guc *guc = &engine->i915->guc;
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+ 	struct execlist_port *port = execlists->port;
+ 	unsigned int n;
+@@ -588,8 +689,7 @@ static void i915_guc_submit(struct intel
+ 		if (rq && count == 0) {
+ 			port_set(&port[n], port_pack(rq, ++count));
+ 
+-			if (i915_vma_is_map_and_fenceable(rq->ring->vma))
+-				POSTING_READ_FW(GUC_STATUS);
++			flush_ggtt_writes(rq->ring->vma);
+ 
+ 			guc_add_request(guc, rq);
+ 		}
+@@ -617,13 +717,32 @@ static void i915_guc_dequeue(struct inte
+ 	bool submit = false;
+ 	struct rb_node *rb;
+ 
+-	if (port_isset(port))
+-		port++;
+-
+ 	spin_lock_irq(&engine->timeline->lock);
+ 	rb = execlists->first;
+ 	GEM_BUG_ON(rb_first(&execlists->queue) != rb);
+-	while (rb) {
++
++	if (!rb)
++		goto unlock;
++
++	if (HAS_LOGICAL_RING_PREEMPTION(engine->i915) && port_isset(port)) {
++		struct guc_preempt_work *preempt_work =
++			&engine->i915->guc.preempt_work[engine->id];
++
++		if (rb_entry(rb, struct i915_priolist, node)->priority >
++		    max(port_request(port)->priotree.priority, 0)) {
++			execlists_set_active(execlists,
++					     EXECLISTS_ACTIVE_PREEMPT);
++			queue_work(engine->i915->guc.preempt_wq,
++				   &preempt_work->work);
++			goto unlock;
++		} else if (port_isset(last_port)) {
++			goto unlock;
++		}
++
++		port++;
++	}
++
++	do {
+ 		struct i915_priolist *p = rb_entry(rb, typeof(*p), node);
+ 		struct drm_i915_gem_request *rq, *rn;
+ 
+@@ -653,7 +772,7 @@ static void i915_guc_dequeue(struct inte
+ 		INIT_LIST_HEAD(&p->requests);
+ 		if (p->priority != I915_PRIORITY_NORMAL)
+ 			kmem_cache_free(engine->i915->priorities, p);
+-	}
++	} while (rb);
+ done:
+ 	execlists->first = rb;
+ 	if (submit) {
+@@ -661,6 +780,7 @@ done:
+ 		execlists_set_active(execlists, EXECLISTS_ACTIVE_USER);
+ 		i915_guc_submit(engine);
+ 	}
++unlock:
+ 	spin_unlock_irq(&engine->timeline->lock);
+ }
+ 
+@@ -669,8 +789,6 @@ static void i915_guc_irq_handler(unsigne
+ 	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+ 	struct execlist_port *port = execlists->port;
+-	const struct execlist_port * const last_port =
+-		&execlists->port[execlists->port_mask];
+ 	struct drm_i915_gem_request *rq;
+ 
+ 	rq = port_request(&port[0]);
+@@ -685,7 +803,19 @@ static void i915_guc_irq_handler(unsigne
+ 	if (!rq)
+ 		execlists_clear_active(execlists, EXECLISTS_ACTIVE_USER);
+ 
+-	if (!port_isset(last_port))
++	if (execlists_is_active(execlists, EXECLISTS_ACTIVE_PREEMPT) &&
++	    intel_read_status_page(engine, I915_GEM_HWS_PREEMPT_INDEX) ==
++	    GUC_PREEMPT_FINISHED) {
++		execlists_cancel_port_requests(&engine->execlists);
++		execlists_unwind_incomplete_requests(execlists);
++
++		wait_for_guc_preempt_report(engine);
++
++		execlists_clear_active(execlists, EXECLISTS_ACTIVE_PREEMPT);
++		intel_write_status_page(engine, I915_GEM_HWS_PREEMPT_INDEX, 0);
++	}
++
++	if (!execlists_is_active(execlists, EXECLISTS_ACTIVE_PREEMPT))
+ 		i915_guc_dequeue(engine);
+ }
+ 
+@@ -1059,6 +1189,51 @@ static void guc_ads_destroy(struct intel
+ 	i915_vma_unpin_and_release(&guc->ads_vma);
+ }
+ 
++static int guc_preempt_work_create(struct intel_guc *guc)
++{
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++
++	/*
++	 * Even though both sending GuC action, and adding a new workitem to
++	 * GuC workqueue are serialized (each with its own locking), since
++	 * we're using mutliple engines, it's possible that we're going to
++	 * issue a preempt request with two (or more - each for different
++	 * engine) workitems in GuC queue. In this situation, GuC may submit
++	 * all of them, which will make us very confused.
++	 * Our preemption contexts may even already be complete - before we
++	 * even had the chance to sent the preempt action to GuC!. Rather
++	 * than introducing yet another lock, we can just use ordered workqueue
++	 * to make sure we're always sending a single preemption request with a
++	 * single workitem.
++	 */
++	guc->preempt_wq = alloc_ordered_workqueue("i915-guc_preempt",
++						  WQ_HIGHPRI);
++	if (!guc->preempt_wq)
++		return -ENOMEM;
++
++	for_each_engine(engine, dev_priv, id) {
++		guc->preempt_work[id].engine = engine;
++		INIT_WORK(&guc->preempt_work[id].work, inject_preempt_context);
++	}
++
++	return 0;
++}
++
++static void guc_preempt_work_destroy(struct intel_guc *guc)
++{
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++
++	for_each_engine(engine, dev_priv, id)
++		cancel_work_sync(&guc->preempt_work[id].work);
++
++	destroy_workqueue(guc->preempt_wq);
++	guc->preempt_wq = NULL;
++}
++
+ /*
+  * Set up the memory resources to be shared with the GuC (via the GGTT)
+  * at firmware loading time.
+@@ -1083,12 +1258,18 @@ int i915_guc_submission_init(struct drm_
+ 	if (ret < 0)
+ 		goto err_shared_data;
+ 
++	ret = guc_preempt_work_create(guc);
++	if (ret)
++		goto err_log;
++
+ 	ret = guc_ads_create(guc);
+ 	if (ret < 0)
+-		goto err_log;
++		goto err_wq;
+ 
+ 	return 0;
+ 
++err_wq:
++	guc_preempt_work_destroy(guc);
+ err_log:
+ 	intel_guc_log_destroy(guc);
+ err_shared_data:
+@@ -1103,6 +1284,7 @@ void i915_guc_submission_fini(struct drm
+ 	struct intel_guc *guc = &dev_priv->guc;
+ 
+ 	guc_ads_destroy(guc);
++	guc_preempt_work_destroy(guc);
+ 	intel_guc_log_destroy(guc);
+ 	guc_shared_data_destroy(guc);
+ 	guc_stage_desc_pool_destroy(guc);
+--- a/drivers/gpu/drm/i915/intel_guc.h
++++ b/drivers/gpu/drm/i915/intel_guc.h
+@@ -34,6 +34,11 @@
+ #include "i915_guc_reg.h"
+ #include "i915_vma.h"
+ 
++struct guc_preempt_work {
++	struct work_struct work;
++	struct intel_engine_cs *engine;
++};
++
+ /*
+  * Top level structure of GuC. It handles firmware loading and manages client
+  * pool and doorbells. intel_guc owns a i915_guc_client to replace the legacy
+@@ -60,6 +65,9 @@ struct intel_guc {
+ 	struct i915_guc_client *execbuf_client;
+ 	struct i915_guc_client *preempt_client;
+ 
++	struct guc_preempt_work preempt_work[I915_NUM_ENGINES];
++	struct workqueue_struct *preempt_wq;
++
+ 	DECLARE_BITMAP(doorbell_bitmap, GUC_NUM_DOORBELLS);
+ 	/* Cyclic counter mod pagesize	*/
+ 	u32 db_cacheline;
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -385,7 +385,7 @@ static void __unwind_incomplete_requests
+ 	}
+ }
+ 
+-static void
++void
+ execlists_unwind_incomplete_requests(struct intel_engine_execlists *execlists)
+ {
+ 	struct intel_engine_cs *engine =
+@@ -696,7 +696,7 @@ unlock:
+ 	}
+ }
+ 
+-static void
++void
+ execlists_cancel_port_requests(struct intel_engine_execlists * const execlists)
+ {
+ 	struct execlist_port *port = execlists->port;
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -107,7 +107,6 @@ intel_lr_context_descriptor(struct i915_
+ 	return ctx->engine[engine->id].lrc_desc;
+ }
+ 
+-
+ /* Execlists */
+ int intel_sanitize_enable_execlists(struct drm_i915_private *dev_priv,
+ 				    int enable_execlists);
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -557,6 +557,12 @@ execlists_is_active(const struct intel_e
+ 	return test_bit(bit, (unsigned long *)&execlists->active);
+ }
+ 
++void
++execlists_cancel_port_requests(struct intel_engine_execlists * const execlists);
++
++void
++execlists_unwind_incomplete_requests(struct intel_engine_execlists *execlists);
++
+ static inline unsigned int
+ execlists_num_ports(const struct intel_engine_execlists * const execlists)
+ {

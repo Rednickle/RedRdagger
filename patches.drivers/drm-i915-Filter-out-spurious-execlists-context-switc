@@ -1,0 +1,246 @@
+From 5d266692372dfb412150006df420185b666658f9 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 23 Oct 2017 22:32:36 +0100
+Subject: [PATCH] drm/i915: Filter out spurious execlists context-switch interrupts
+Git-commit: 5d266692372dfb412150006df420185b666658f9
+Patch-mainline: v4.15-rc1
+References: FATE#322643 bsc#1055900
+No-fix: 4a118ecbe99c93cf9f9582e83a88d03f18d6cb84
+
+Back in commit a4b2b01523a8 ("drm/i915: Don't mark an execlists
+context-switch when idle") we noticed the presence of late
+context-switch interrupts. We were able to filter those out by looking
+at whether the ELSP remained active, but in commit beecec901790
+("drm/i915/execlists: Preemption!") that became problematic as we now
+anticipate receiving a context-switch event for preemption while ELSP
+may be empty. To restore the spurious interrupt suppression, add a
+counter for the expected number of pending context-switches and skip if
+we do not need to handle this interrupt to make forward progress.
+
+V2: Don't forget to switch on for preempt.
+V3: Reduce the counter to a on/off boolean tracker. Declare the HW as
+active when we first submit, and idle after the final completion event
+(with which we confirm the HW says it is idle), and track each source
+of activity separately. With a finite number of sources, it should aide
+us in debugging which gets stuck.
+
+Fixes: beecec901790 ("drm/i915/execlists: Preemption!")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michal Winiarski <michal.winiarski@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Arkadiusz Hiler <arkadiusz.hiler@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171023213237.26536-3-chris@chris-wilson.co.uk
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+(cherry picked from commit 4a118ecbe99c93cf9f9582e83a88d03f18d6cb84)
+
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_guc_submission.c |    3 ++
+ drivers/gpu/drm/i915/i915_irq.c            |    6 +++--
+ drivers/gpu/drm/i915/intel_engine_cs.c     |    5 ++--
+ drivers/gpu/drm/i915/intel_lrc.c           |   27 +++++++++++++++++------
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |   34 +++++++++++++++++++++++++++--
+ 5 files changed, 62 insertions(+), 13 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_guc_submission.c
++++ b/drivers/gpu/drm/i915/i915_guc_submission.c
+@@ -610,6 +610,7 @@ done:
+ 	execlists->first = rb;
+ 	if (submit) {
+ 		port_assign(port, last);
++		execlists_set_active(execlists, EXECLISTS_ACTIVE_USER);
+ 		i915_guc_submit(engine);
+ 	}
+ 	spin_unlock_irq(&engine->timeline->lock);
+@@ -633,6 +634,8 @@ static void i915_guc_irq_handler(unsigne
+ 
+ 		rq = port_request(&port[0]);
+ 	}
++	if (!rq)
++		execlists_clear_active(execlists, EXECLISTS_ACTIVE_USER);
+ 
+ 	if (!port_isset(last_port))
+ 		i915_guc_dequeue(engine);
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1388,8 +1388,10 @@ gen8_cs_irq_handler(struct intel_engine_
+ 	bool tasklet = false;
+ 
+ 	if (iir & (GT_CONTEXT_SWITCH_INTERRUPT << test_shift)) {
+-		__set_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted);
+-		tasklet = true;
++		if (READ_ONCE(engine->execlists.active)) {
++			__set_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted);
++			tasklet = true;
++		}
+ 	}
+ 
+ 	if (iir & (GT_RENDER_USER_INTERRUPT << test_shift)) {
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -1551,8 +1551,8 @@ bool intel_engine_is_idle(struct intel_e
+ 	if (test_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted))
+ 		return false;
+ 
+-	/* Both ports drained, no more ELSP submission? */
+-	if (port_request(&engine->execlists.port[0]))
++	/* Waiting to drain ELSP? */
++	if (READ_ONCE(engine->execlists.active))
+ 		return false;
+ 
+ 	/* ELSP is empty, but there are ready requests? */
+@@ -1752,6 +1752,7 @@ void intel_engine_dump(struct intel_engi
+ 					   idx);
+ 			}
+ 		}
++		drm_printf(m, "\t\tHW active? 0x%x\n", execlists->active);
+ 		rcu_read_unlock();
+ 	} else if (INTEL_GEN(dev_priv) > 6) {
+ 		drm_printf(m, "\tPP_DIR_BASE: 0x%08x\n",
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -575,7 +575,8 @@ static void execlists_dequeue(struct int
+ 			 * the state of the GPU is known (idle).
+ 			 */
+ 			inject_preempt_context(engine);
+-			execlists->preempt = true;
++			execlists_set_active(execlists,
++					     EXECLISTS_ACTIVE_PREEMPT);
+ 			goto unlock;
+ 		} else {
+ 			/*
+@@ -683,8 +684,10 @@ done:
+ unlock:
+ 	spin_unlock_irq(&engine->timeline->lock);
+ 
+-	if (submit)
++	if (submit) {
++		execlists_set_active(execlists, EXECLISTS_ACTIVE_USER);
+ 		execlists_submit_ports(engine);
++	}
+ }
+ 
+ static void
+@@ -696,6 +699,7 @@ execlist_cancel_port_requests(struct int
+ 	while (num_ports-- && port_isset(port)) {
+ 		struct drm_i915_gem_request *rq = port_request(port);
+ 
++		GEM_BUG_ON(!execlists->active);
+ 		execlists_context_status_change(rq, INTEL_CONTEXT_SCHEDULE_PREEMPTED);
+ 		i915_gem_request_put(rq);
+ 
+@@ -861,15 +865,21 @@ static void intel_lrc_irq_handler(unsign
+ 				unwind_incomplete_requests(engine);
+ 				spin_unlock_irq(&engine->timeline->lock);
+ 
+-				GEM_BUG_ON(!execlists->preempt);
+-				execlists->preempt = false;
++				GEM_BUG_ON(!execlists_is_active(execlists,
++								EXECLISTS_ACTIVE_PREEMPT));
++				execlists_clear_active(execlists,
++						       EXECLISTS_ACTIVE_PREEMPT);
+ 				continue;
+ 			}
+ 
+ 			if (status & GEN8_CTX_STATUS_PREEMPTED &&
+-			    execlists->preempt)
++			    execlists_is_active(execlists,
++						EXECLISTS_ACTIVE_PREEMPT))
+ 				continue;
+ 
++			GEM_BUG_ON(!execlists_is_active(execlists,
++							EXECLISTS_ACTIVE_USER));
++
+ 			/* Check the context/desc id for this event matches */
+ 			GEM_DEBUG_BUG_ON(buf[2 * head + 1] != port->context_id);
+ 
+@@ -892,6 +902,9 @@ static void intel_lrc_irq_handler(unsign
+ 			/* After the final element, the hw should be idle */
+ 			GEM_BUG_ON(port_count(port) == 0 &&
+ 				   !(status & GEN8_CTX_STATUS_ACTIVE_IDLE));
++			if (port_count(port) == 0)
++				execlists_clear_active(execlists,
++						       EXECLISTS_ACTIVE_USER);
+ 		}
+ 
+ 		if (head != execlists->csb_head) {
+@@ -901,7 +914,7 @@ static void intel_lrc_irq_handler(unsign
+ 		}
+ 	}
+ 
+-	if (!execlists->preempt)
++	if (!execlists_is_active(execlists, EXECLISTS_ACTIVE_PREEMPT))
+ 		execlists_dequeue(engine);
+ 
+ 	intel_uncore_forcewake_put(dev_priv, execlists->fw_domains);
+@@ -1460,7 +1473,7 @@ static int gen8_init_common_ring(struct
+ 		   GT_CONTEXT_SWITCH_INTERRUPT << engine->irq_shift);
+ 	clear_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted);
+ 	execlists->csb_head = -1;
+-	execlists->preempt = false;
++	execlists->active = 0;
+ 
+ 	/* After a GPU reset, we may have requests to replay */
+ 	if (!i915_modparams.enable_guc_submission && execlists->first)
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -241,9 +241,17 @@ struct intel_engine_execlists {
+ 	} port[EXECLIST_MAX_PORTS];
+ 
+ 	/**
+-	 * @preempt: are we currently handling a preempting context switch?
++	 * @active: is the HW active? We consider the HW as active after
++	 * submitting any context for execution and until we have seen the
++	 * last context completion event. After that, we do not expect any
++	 * more events until we submit, and so can park the HW.
++	 *
++	 * As we have a small number of different sources from which we feed
++	 * the HW, we track the state of each inside a single bitfield.
+ 	 */
+-	bool preempt;
++	unsigned int active;
++#define EXECLISTS_ACTIVE_USER 0
++#define EXECLISTS_ACTIVE_PREEMPT 1
+ 
+ 	/**
+ 	 * @port_mask: number of execlist ports - 1
+@@ -525,6 +533,27 @@ struct intel_engine_cs {
+ 	u32 (*get_cmd_length_mask)(u32 cmd_header);
+ };
+ 
++static inline void
++execlists_set_active(struct intel_engine_execlists *execlists,
++		     unsigned int bit)
++{
++	__set_bit(bit, (unsigned long *)&execlists->active);
++}
++
++static inline void
++execlists_clear_active(struct intel_engine_execlists *execlists,
++		       unsigned int bit)
++{
++	__clear_bit(bit, (unsigned long *)&execlists->active);
++}
++
++static inline bool
++execlists_is_active(const struct intel_engine_execlists *execlists,
++		    unsigned int bit)
++{
++	return test_bit(bit, (unsigned long *)&execlists->active);
++}
++
+ static inline unsigned int
+ execlists_num_ports(const struct intel_engine_execlists * const execlists)
+ {
+@@ -538,6 +567,7 @@ execlists_port_complete(struct intel_eng
+ 	const unsigned int m = execlists->port_mask;
+ 
+ 	GEM_BUG_ON(port_index(port, execlists) != 0);
++	GEM_BUG_ON(!execlists_is_active(execlists, EXECLISTS_ACTIVE_USER));
+ 
+ 	memmove(port, port + 1, m * sizeof(struct execlist_port));
+ 	memset(port + m, 0, sizeof(struct execlist_port));
