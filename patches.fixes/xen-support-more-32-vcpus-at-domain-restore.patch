@@ -1,0 +1,237 @@
+From: Ankur Arora <ankur.a.arora@oracle.com>
+Date:   Fri Jun 2 17:05:59 2017 -0700
+Subject: xen/pvh*: Support > 32 VCPUs at domain restore
+Git-commit: 0b64ffb8db4e310f77a01079ca752d946a8526b5
+Patch-mainline: v4.13
+References: bnc#1065600
+    
+When Xen restores a PVHVM or PVH guest, its shared_info only holds
+up to 32 CPUs. The hypercall VCPUOP_register_vcpu_info allows
+us to setup per-page areas for VCPUs. This means we can boot
+PVH* guests with more than 32 VCPUs. During restore the per-cpu
+structure is allocated freshly by the hypervisor (vcpu_info_mfn is
+set to INVALID_MFN) so that the newly restored guest can make a
+VCPUOP_register_vcpu_info hypercall.
+    
+However, we end up triggering this condition in Xen:
+/* Run this command on yourself or on other offline VCPUS. */
+ if ( (v != current) && !test_bit(_VPF_down, &v->pause_flags) )
+    
+which means we are unable to setup the per-cpu VCPU structures
+for running VCPUS. The Linux PV code paths makes this work by
+iterating over cpu_possible in xen_vcpu_restore() with:
+    
+ 1) is target CPU up (VCPUOP_is_up hypercall?)
+ 2) if yes, then VCPUOP_down to pause it
+ 3) VCPUOP_register_vcpu_info
+ 4) if it was down, then VCPUOP_up to bring it back up
+    
+With Xen commit 192df6f9122d ("xen/x86: allow HVM guests to use
+hypercalls to bring up vCPUs") this is available for non-PV guests.
+As such first check if VCPUOP_is_up is actually possible before
+trying this dance.
+    
+As most of this dance code is done already in xen_vcpu_restore()
+let's make it callable on PV, PVH and PVHVM.
+    
+Based-on-patch-by: Konrad Wilk <konrad.wilk@oracle.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Signed-off-by: Ankur Arora <ankur.a.arora@oracle.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index 96b745e3f56c..276cc21619ec 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -106,6 +106,21 @@ int xen_cpuhp_setup(int (*cpu_up_prepare_cb)(unsigned int),
+ 	return rc >= 0 ? 0 : rc;
+ }
+ 
++static void xen_vcpu_setup_restore(int cpu)
++{
++	/* Any per_cpu(xen_vcpu) is stale, so reset it */
++	xen_vcpu_info_reset(cpu);
++
++	/*
++	 * For PVH and PVHVM, setup online VCPUs only. The rest will
++	 * be handled by hotplug.
++	 */
++	if (xen_pv_domain() ||
++	    (xen_hvm_domain() && cpu_online(cpu))) {
++		xen_vcpu_setup(cpu);
++	}
++}
++
+ /*
+  * On restore, set the vcpu placement up again.
+  * If it fails, then we're in a bad state, since
+@@ -117,17 +132,23 @@ void xen_vcpu_restore(void)
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		bool other_cpu = (cpu != smp_processor_id());
+-		bool is_up = HYPERVISOR_vcpu_op(VCPUOP_is_up, xen_vcpu_nr(cpu),
+-						NULL);
++		bool is_up;
++
++		if (xen_vcpu_nr(cpu) == XEN_VCPU_ID_INVALID)
++			continue;
++
++		/* Only Xen 4.5 and higher support this. */
++		is_up = HYPERVISOR_vcpu_op(VCPUOP_is_up,
++					   xen_vcpu_nr(cpu), NULL) > 0;
+ 
+ 		if (other_cpu && is_up &&
+ 		    HYPERVISOR_vcpu_op(VCPUOP_down, xen_vcpu_nr(cpu), NULL))
+ 			BUG();
+ 
+-		xen_setup_runstate_info(cpu);
++		if (xen_pv_domain() || xen_feature(XENFEAT_hvm_safe_pvclock))
++			xen_setup_runstate_info(cpu);
+ 
+-		if (xen_have_vcpu_info_placement)
+-			xen_vcpu_setup(cpu);
++		xen_vcpu_setup_restore(cpu);
+ 
+ 		if (other_cpu && is_up &&
+ 		    HYPERVISOR_vcpu_op(VCPUOP_up, xen_vcpu_nr(cpu), NULL))
+@@ -163,11 +184,11 @@ void xen_vcpu_setup(int cpu)
+ 	BUG_ON(HYPERVISOR_shared_info == &xen_dummy_shared_info);
+ 
+ 	/*
+-	 * This path is called twice on PVHVM - first during bootup via
+-	 * smp_init -> xen_hvm_cpu_notify, and then if the VCPU is being
+-	 * hotplugged: cpu_up -> xen_hvm_cpu_notify.
+-	 * As we can only do the VCPUOP_register_vcpu_info once lets
+-	 * not over-write its result.
++	 * This path is called on PVHVM at bootup (xen_hvm_smp_prepare_boot_cpu)
++	 * and at restore (xen_vcpu_restore). Also called for hotplugged
++	 * VCPUs (cpu_init -> xen_hvm_cpu_prepare_hvm).
++	 * However, the hypercall can only be done once (see below) so if a VCPU
++	 * is offlined and comes back online then let's not redo the hypercall.
+ 	 *
+ 	 * For PV it is called during restore (xen_vcpu_restore) and bootup
+ 	 * (xen_setup_vcpu_info_placement). The hotplug mechanism does not
+@@ -178,8 +199,6 @@ void xen_vcpu_setup(int cpu)
+ 			return;
+ 	}
+ 
+-	xen_vcpu_info_reset(cpu);
+-
+ 	if (xen_have_vcpu_info_placement) {
+ 		vcpup = &per_cpu(xen_vcpu_info, cpu);
+ 		info.mfn = arbitrary_virt_to_mfn(vcpup);
+@@ -214,7 +233,7 @@ void xen_vcpu_setup(int cpu)
+ 	if (!xen_have_vcpu_info_placement) {
+ 		if (cpu >= MAX_VIRT_CPUS)
+ 			clamp_max_cpus();
+-		return;
++		xen_vcpu_info_reset(cpu);
+ 	}
+ }
+ 
+diff --git a/arch/x86/xen/enlighten_hvm.c b/arch/x86/xen/enlighten_hvm.c
+index eb53da6547ee..ba1afadb2512 100644
+--- a/arch/x86/xen/enlighten_hvm.c
++++ b/arch/x86/xen/enlighten_hvm.c
+@@ -23,7 +23,6 @@
+ 
+ void xen_hvm_init_shared_info(void)
+ {
+-	int cpu;
+ 	struct xen_add_to_physmap xatp;
+ 
+ 	xatp.domid = DOMID_SELF;
+@@ -35,18 +34,6 @@ void __ref xen_hvm_init_shared_info(void)
+ 	xatp.gpfn = shared_info_pfn;
+ 	if (HYPERVISOR_memory_op(XENMEM_add_to_physmap, &xatp))
+ 		BUG();
+-
+-	/* xen_vcpu is a pointer to the vcpu_info struct in the shared_info
+-	 * page, we use it in the event channel upcall and in some pvclock
+-	 * related functions. We don't need the vcpu_info placement
+-	 * optimizations because we don't use any pv_mmu or pv_irq op on
+-	 * HVM.
+-	 * When xen_hvm_init_shared_info is run at boot time only vcpu 0 is
+-	 * online but xen_hvm_init_shared_info is run at resume time too and
+-	 * in that case multiple vcpus might be online. */
+-	for_each_online_cpu(cpu) {
+-		xen_vcpu_info_reset(cpu);
+-	}
+ }
+ 
+ static void __init reserve_shared_info(void)
+@@ -181,6 +168,13 @@ static void __init xen_hvm_guest_init(void)
+ 	reserve_shared_info();
+ 	xen_hvm_init_shared_info();
+ 
++	/*
++	 * xen_vcpu is a pointer to the vcpu_info struct in the shared_info
++	 * page, we use it in the event channel upcall and in some pvclock
++	 * related functions.
++	 */
++	xen_vcpu_info_reset(0);
++
+ 	xen_panic_handler_init();
+ 
+ 	if (xen_feature(XENFEAT_hvm_callback_vector))
+diff --git a/arch/x86/xen/smp_hvm.c b/arch/x86/xen/smp_hvm.c
+index 9e0fb9a015d4..6c8a805819ff 100644
+--- a/arch/x86/xen/smp_hvm.c
++++ b/arch/x86/xen/smp_hvm.c
+@@ -28,10 +28,20 @@ static void __init xen_hvm_smp_prepare_boot_cpu(void)
+ 
+ static void __init xen_hvm_smp_prepare_cpus(unsigned int max_cpus)
+ {
++	int cpu;
++
+ 	native_smp_prepare_cpus(max_cpus);
+ 	WARN_ON(xen_smp_intr_init(0));
+ 
+ 	xen_init_lock_cpu(0);
++
++	for_each_possible_cpu(cpu) {
++		if (cpu == 0)
++			continue;
++
++		/* Set default vcpu_id to make sure that we don't use cpu-0's */
++		per_cpu(xen_vcpu_id, cpu) = XEN_VCPU_ID_INVALID;
++	}
+ }
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+diff --git a/arch/x86/xen/suspend_hvm.c b/arch/x86/xen/suspend_hvm.c
+index 01afcadde50a..484999416d8b 100644
+--- a/arch/x86/xen/suspend_hvm.c
++++ b/arch/x86/xen/suspend_hvm.c
+@@ -8,15 +8,10 @@
+ 
+ void xen_hvm_post_suspend(int suspend_cancelled)
+ {
+-	int cpu;
+-
+-	if (!suspend_cancelled)
++	if (!suspend_cancelled) {
+ 		xen_hvm_init_shared_info();
++		xen_vcpu_restore();
++	}
+ 	xen_callback_vector();
+ 	xen_unplug_emulated_devices();
+-	if (xen_feature(XENFEAT_hvm_safe_pvclock)) {
+-		for_each_online_cpu(cpu) {
+-			xen_setup_runstate_info(cpu);
+-		}
+-	}
+ }
+diff --git a/include/xen/xen-ops.h b/include/xen/xen-ops.h
+index c44a2ee8c8f8..218e6aae5433 100644
+--- a/include/xen/xen-ops.h
++++ b/include/xen/xen-ops.h
+@@ -15,6 +15,8 @@ static inline uint32_t xen_vcpu_nr(int cpu)
+ 	return per_cpu(xen_vcpu_id, cpu);
+ }
+ 
++#define XEN_VCPU_ID_INVALID U32_MAX
++
+ void xen_arch_pre_suspend(void);
+ void xen_arch_post_suspend(int suspend_cancelled);
+ 
