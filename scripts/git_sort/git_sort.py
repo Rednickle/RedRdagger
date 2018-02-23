@@ -159,6 +159,7 @@ remotes = (
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("git://linuxtv.org/media_tree.git")),
+    Head(RepoURL("powerpc/linux.git"), "fixes"),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git"), "for-next"),
