@@ -1,0 +1,426 @@
+From: Selvin Xavier <selvin.xavier@broadcom.com>
+Date: Mon, 5 Mar 2018 21:49:28 -0800
+Subject: RDMA/bnxt_re: Avoid Hard lockup during error CQE processing
+Patch-mainline: v4.16-rc5
+Git-commit: 942c9b6ca8de5b7ad675e9b2e0e964449c10c18a
+References: bsc#1050244 FATE#322915
+
+Hitting the following hardlockup due to a race condition in
+error CQE processing.
+
+[26146.879798] bnxt_en 0000:04:00.0: QPLIB: FP: CQ Processed Req
+[26146.886346] bnxt_en 0000:04:00.0: QPLIB: wr_id[1251] = 0x0 with status 0xa
+[26156.350935] NMI watchdog: Watchdog detected hard LOCKUP on cpu 4
+[26156.357470] Modules linked in: nfsd auth_rpcgss nfs_acl lockd grace
+[26156.447957] CPU: 4 PID: 3413 Comm: kworker/4:1H Kdump: loaded
+[26156.457994] Hardware name: Dell Inc. PowerEdge R430/0CN7X8,
+[26156.466390] Workqueue: ib-comp-wq ib_cq_poll_work [ib_core]
+[26156.472639] Call Trace:
+[26156.475379]  <NMI>  [<ffffffff98d0d722>] dump_stack+0x19/0x1b
+[26156.481833]  [<ffffffff9873f775>] watchdog_overflow_callback+0x135/0x140
+[26156.489341]  [<ffffffff9877f237>] __perf_event_overflow+0x57/0x100
+[26156.496256]  [<ffffffff98787c24>] perf_event_overflow+0x14/0x20
+[26156.502887]  [<ffffffff9860a580>] intel_pmu_handle_irq+0x220/0x510
+[26156.509813]  [<ffffffff98d16031>] perf_event_nmi_handler+0x31/0x50
+[26156.516738]  [<ffffffff98d1790c>] nmi_handle.isra.0+0x8c/0x150
+[26156.523273]  [<ffffffff98d17be8>] do_nmi+0x218/0x460
+[26156.528834]  [<ffffffff98d16d79>] end_repeat_nmi+0x1e/0x7e
+[26156.534980]  [<ffffffff987089c0>] ? native_queued_spin_lock_slowpath+0x1d0/0x200
+[26156.543268]  [<ffffffff987089c0>] ? native_queued_spin_lock_slowpath+0x1d0/0x200
+[26156.551556]  [<ffffffff987089c0>] ? native_queued_spin_lock_slowpath+0x1d0/0x200
+[26156.559842]  <EOE>  [<ffffffff98d083e4>] queued_spin_lock_slowpath+0xb/0xf
+[26156.567555]  [<ffffffff98d15690>] _raw_spin_lock+0x20/0x30
+[26156.573696]  [<ffffffffc08381a1>] bnxt_qplib_lock_buddy_cq+0x31/0x40 [bnxt_re]
+[26156.581789]  [<ffffffffc083bbaa>] bnxt_qplib_poll_cq+0x43a/0xf10 [bnxt_re]
+[26156.589493]  [<ffffffffc083239b>] bnxt_re_poll_cq+0x9b/0x760 [bnxt_re]
+
+The issue happens if RQ poll_cq or SQ poll_cq or Async error event tries to
+put the error QP in flush list. Since SQ and RQ of each error qp are added
+to two different flush list, we need to protect it using locks of
+corresponding CQs. Difference in order of acquiring the lock in
+SQ poll_cq and RQ poll_cq can cause a hard lockup.
+
+Revisits the locking strategy and removes the usage of qplib_cq.hwq.lock.
+Instead of this lock, introduces qplib_cq.flush_lock to handle
+addition/deletion of QPs in flush list. Also, always invoke the flush_lock
+in order (SQ CQ lock first and then RQ CQ lock) to avoid any potential
+deadlock.
+
+Other than the poll_cq context, the movement of QP to/from flush list can
+be done in modify_qp context or from an async error event from HW.
+Synchronize these operations using the bnxt_re verbs layer CQ locks.
+To achieve this, adds a call back to the HW abstraction layer(qplib) to
+bnxt_re ib_verbs layer in case of async error event. Also, removes the
+buddy cq functions as it is no longer required.
+
+Signed-off-by: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+Signed-off-by: Somnath Kotur <somnath.kotur@broadcom.com>
+Signed-off-by: Devesh Sharma <devesh.sharma@broadcom.com>
+Signed-off-by: Selvin Xavier <selvin.xavier@broadcom.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/bnxt_re/ib_verbs.c   |   11 ++
+ drivers/infiniband/hw/bnxt_re/ib_verbs.h   |    3 
+ drivers/infiniband/hw/bnxt_re/main.c       |    7 +
+ drivers/infiniband/hw/bnxt_re/qplib_fp.c   |  109 ++++++-----------------------
+ drivers/infiniband/hw/bnxt_re/qplib_fp.h   |   12 +++
+ drivers/infiniband/hw/bnxt_re/qplib_rcfw.c |    3 
+ 6 files changed, 55 insertions(+), 90 deletions(-)
+
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -797,7 +797,7 @@ int bnxt_re_query_ah(struct ib_ah *ib_ah
+ 	return 0;
+ }
+ 
+-static unsigned long bnxt_re_lock_cqs(struct bnxt_re_qp *qp)
++unsigned long bnxt_re_lock_cqs(struct bnxt_re_qp *qp)
+ 	__acquires(&qp->scq->cq_lock) __acquires(&qp->rcq->cq_lock)
+ {
+ 	unsigned long flags;
+@@ -811,8 +811,8 @@ static unsigned long bnxt_re_lock_cqs(st
+ 	return flags;
+ }
+ 
+-static void bnxt_re_unlock_cqs(struct bnxt_re_qp *qp,
+-			       unsigned long flags)
++void bnxt_re_unlock_cqs(struct bnxt_re_qp *qp,
++			unsigned long flags)
+ 	__releases(&qp->scq->cq_lock) __releases(&qp->rcq->cq_lock)
+ {
+ 	if (qp->rcq != qp->scq)
+@@ -1621,6 +1621,7 @@ int bnxt_re_modify_qp(struct ib_qp *ib_q
+ 	int status;
+ 	union ib_gid sgid;
+ 	struct ib_gid_attr sgid_attr;
++	unsigned int flags;
+ 	u8 nw_type;
+ 
+ 	qp->qplib_qp.modify_flags = 0;
+@@ -1649,14 +1650,18 @@ int bnxt_re_modify_qp(struct ib_qp *ib_q
+ 			dev_dbg(rdev_to_dev(rdev),
+ 				"Move QP = %p to flush list\n",
+ 				qp);
++			flags = bnxt_re_lock_cqs(qp);
+ 			bnxt_qplib_add_flush_qp(&qp->qplib_qp);
++			bnxt_re_unlock_cqs(qp, flags);
+ 		}
+ 		if (!qp->sumem &&
+ 		    qp->qplib_qp.state == CMDQ_MODIFY_QP_NEW_STATE_RESET) {
+ 			dev_dbg(rdev_to_dev(rdev),
+ 				"Move QP = %p out of flush list\n",
+ 				qp);
++			flags = bnxt_re_lock_cqs(qp);
+ 			bnxt_qplib_clean_qp(&qp->qplib_qp);
++			bnxt_re_unlock_cqs(qp, flags);
+ 		}
+ 	}
+ 	if (qp_attr_mask & IB_QP_EN_SQD_ASYNC_NOTIFY) {
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.h
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.h
+@@ -222,4 +222,7 @@ struct ib_ucontext *bnxt_re_alloc_uconte
+ 					   struct ib_udata *udata);
+ int bnxt_re_dealloc_ucontext(struct ib_ucontext *context);
+ int bnxt_re_mmap(struct ib_ucontext *context, struct vm_area_struct *vma);
++
++unsigned long bnxt_re_lock_cqs(struct bnxt_re_qp *qp);
++void bnxt_re_unlock_cqs(struct bnxt_re_qp *qp, unsigned long flags);
+ #endif /* __BNXT_RE_IB_VERBS_H__ */
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -730,6 +730,13 @@ static int bnxt_re_handle_qp_async_event
+ 					 struct bnxt_re_qp *qp)
+ {
+ 	struct ib_event event;
++	unsigned int flags;
++
++	if (qp->qplib_qp.state == CMDQ_MODIFY_QP_NEW_STATE_ERR) {
++		flags = bnxt_re_lock_cqs(qp);
++		bnxt_qplib_add_flush_qp(&qp->qplib_qp);
++		bnxt_re_unlock_cqs(qp, flags);
++	}
+ 
+ 	memset(&event, 0, sizeof(event));
+ 	if (qp->qplib_qp.srq) {
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+@@ -88,75 +88,35 @@ static void __bnxt_qplib_add_flush_qp(st
+ 	}
+ }
+ 
+-void bnxt_qplib_acquire_cq_locks(struct bnxt_qplib_qp *qp,
+-				 unsigned long *flags)
+-	__acquires(&qp->scq->hwq.lock) __acquires(&qp->rcq->hwq.lock)
++static void bnxt_qplib_acquire_cq_flush_locks(struct bnxt_qplib_qp *qp,
++				       unsigned long *flags)
++	__acquires(&qp->scq->flush_lock) __acquires(&qp->rcq->flush_lock)
+ {
+-	spin_lock_irqsave(&qp->scq->hwq.lock, *flags);
++	spin_lock_irqsave(&qp->scq->flush_lock, *flags);
+ 	if (qp->scq == qp->rcq)
+-		__acquire(&qp->rcq->hwq.lock);
++		__acquire(&qp->rcq->flush_lock);
+ 	else
+-		spin_lock(&qp->rcq->hwq.lock);
++		spin_lock(&qp->rcq->flush_lock);
+ }
+ 
+-void bnxt_qplib_release_cq_locks(struct bnxt_qplib_qp *qp,
+-				 unsigned long *flags)
+-	__releases(&qp->scq->hwq.lock) __releases(&qp->rcq->hwq.lock)
++static void bnxt_qplib_release_cq_flush_locks(struct bnxt_qplib_qp *qp,
++				       unsigned long *flags)
++	__releases(&qp->scq->flush_lock) __releases(&qp->rcq->flush_lock)
+ {
+ 	if (qp->scq == qp->rcq)
+-		__release(&qp->rcq->hwq.lock);
++		__release(&qp->rcq->flush_lock);
+ 	else
+-		spin_unlock(&qp->rcq->hwq.lock);
+-	spin_unlock_irqrestore(&qp->scq->hwq.lock, *flags);
+-}
+-
+-static struct bnxt_qplib_cq *bnxt_qplib_find_buddy_cq(struct bnxt_qplib_qp *qp,
+-						      struct bnxt_qplib_cq *cq)
+-{
+-	struct bnxt_qplib_cq *buddy_cq = NULL;
+-
+-	if (qp->scq == qp->rcq)
+-		buddy_cq = NULL;
+-	else if (qp->scq == cq)
+-		buddy_cq = qp->rcq;
+-	else
+-		buddy_cq = qp->scq;
+-	return buddy_cq;
+-}
+-
+-static void bnxt_qplib_lock_buddy_cq(struct bnxt_qplib_qp *qp,
+-				     struct bnxt_qplib_cq *cq)
+-	__acquires(&buddy_cq->hwq.lock)
+-{
+-	struct bnxt_qplib_cq *buddy_cq = NULL;
+-
+-	buddy_cq = bnxt_qplib_find_buddy_cq(qp, cq);
+-	if (!buddy_cq)
+-		__acquire(&cq->hwq.lock);
+-	else
+-		spin_lock(&buddy_cq->hwq.lock);
+-}
+-
+-static void bnxt_qplib_unlock_buddy_cq(struct bnxt_qplib_qp *qp,
+-				       struct bnxt_qplib_cq *cq)
+-	__releases(&buddy_cq->hwq.lock)
+-{
+-	struct bnxt_qplib_cq *buddy_cq = NULL;
+-
+-	buddy_cq = bnxt_qplib_find_buddy_cq(qp, cq);
+-	if (!buddy_cq)
+-		__release(&cq->hwq.lock);
+-	else
+-		spin_unlock(&buddy_cq->hwq.lock);
++		spin_unlock(&qp->rcq->flush_lock);
++	spin_unlock_irqrestore(&qp->scq->flush_lock, *flags);
+ }
+ 
+ void bnxt_qplib_add_flush_qp(struct bnxt_qplib_qp *qp)
+ {
+ 	unsigned long flags;
+ 
+-	bnxt_qplib_acquire_cq_locks(qp, &flags);
++	bnxt_qplib_acquire_cq_flush_locks(qp, &flags);
+ 	__bnxt_qplib_add_flush_qp(qp);
+-	bnxt_qplib_release_cq_locks(qp, &flags);
++	bnxt_qplib_release_cq_flush_locks(qp, &flags);
+ }
+ 
+ static void __bnxt_qplib_del_flush_qp(struct bnxt_qplib_qp *qp)
+@@ -182,7 +142,7 @@ void bnxt_qplib_clean_qp(struct bnxt_qpl
+ {
+ 	unsigned long flags;
+ 
+-	bnxt_qplib_acquire_cq_locks(qp, &flags);
++	bnxt_qplib_acquire_cq_flush_locks(qp, &flags);
+ 	__clean_cq(qp->scq, (u64)(unsigned long)qp);
+ 	qp->sq.hwq.prod = 0;
+ 	qp->sq.hwq.cons = 0;
+@@ -191,7 +151,7 @@ void bnxt_qplib_clean_qp(struct bnxt_qpl
+ 	qp->rq.hwq.cons = 0;
+ 
+ 	__bnxt_qplib_del_flush_qp(qp);
+-	bnxt_qplib_release_cq_locks(qp, &flags);
++	bnxt_qplib_release_cq_flush_locks(qp, &flags);
+ }
+ 
+ static void bnxt_qpn_cqn_sched_task(struct work_struct *work)
+@@ -2113,9 +2073,6 @@ void bnxt_qplib_mark_qp_error(void *qp_h
+ 	/* Must block new posting of SQ and RQ */
+ 	qp->state = CMDQ_MODIFY_QP_NEW_STATE_ERR;
+ 	bnxt_qplib_cancel_phantom_processing(qp);
+-
+-	/* Add qp to flush list of the CQ */
+-	__bnxt_qplib_add_flush_qp(qp);
+ }
+ 
+ /* Note: SQE is valid from sw_sq_cons up to cqe_sq_cons (exclusive)
+@@ -2291,9 +2248,9 @@ static int bnxt_qplib_cq_process_req(str
+ 				sw_sq_cons, cqe->wr_id, cqe->status);
+ 			cqe++;
+ 			(*budget)--;
+-			bnxt_qplib_lock_buddy_cq(qp, cq);
+ 			bnxt_qplib_mark_qp_error(qp);
+-			bnxt_qplib_unlock_buddy_cq(qp, cq);
++			/* Add qp to flush list of the CQ */
++			bnxt_qplib_add_flush_qp(qp);
+ 		} else {
+ 			if (swq->flags & SQ_SEND_FLAGS_SIGNAL_COMP) {
+ 				/* Before we complete, do WA 9060 */
+@@ -2409,9 +2366,7 @@ static int bnxt_qplib_cq_process_res_rc(
+ 		if (hwcqe->status != CQ_RES_RC_STATUS_OK) {
+ 			qp->state = CMDQ_MODIFY_QP_NEW_STATE_ERR;
+ 			/* Add qp to flush list of the CQ */
+-			bnxt_qplib_lock_buddy_cq(qp, cq);
+-			__bnxt_qplib_add_flush_qp(qp);
+-			bnxt_qplib_unlock_buddy_cq(qp, cq);
++			bnxt_qplib_add_flush_qp(qp);
+ 		}
+ 	}
+ 
+@@ -2495,9 +2450,7 @@ static int bnxt_qplib_cq_process_res_ud(
+ 		if (hwcqe->status != CQ_RES_RC_STATUS_OK) {
+ 			qp->state = CMDQ_MODIFY_QP_NEW_STATE_ERR;
+ 			/* Add qp to flush list of the CQ */
+-			bnxt_qplib_lock_buddy_cq(qp, cq);
+-			__bnxt_qplib_add_flush_qp(qp);
+-			bnxt_qplib_unlock_buddy_cq(qp, cq);
++			bnxt_qplib_add_flush_qp(qp);
+ 		}
+ 	}
+ done:
+@@ -2507,11 +2460,9 @@ done:
+ bool bnxt_qplib_is_cq_empty(struct bnxt_qplib_cq *cq)
+ {
+ 	struct cq_base *hw_cqe, **hw_cqe_ptr;
+-	unsigned long flags;
+ 	u32 sw_cons, raw_cons;
+ 	bool rc = true;
+ 
+-	spin_lock_irqsave(&cq->hwq.lock, flags);
+ 	raw_cons = cq->hwq.cons;
+ 	sw_cons = HWQ_CMP(raw_cons, &cq->hwq);
+ 	hw_cqe_ptr = (struct cq_base **)cq->hwq.pbl_ptr;
+@@ -2519,7 +2470,6 @@ bool bnxt_qplib_is_cq_empty(struct bnxt_
+ 
+ 	 /* Check for Valid bit. If the CQE is valid, return false */
+ 	rc = !CQE_CMP_VALID(hw_cqe, raw_cons, cq->hwq.max_elements);
+-	spin_unlock_irqrestore(&cq->hwq.lock, flags);
+ 	return rc;
+ }
+ 
+@@ -2607,9 +2557,7 @@ static int bnxt_qplib_cq_process_res_raw
+ 		if (hwcqe->status != CQ_RES_RC_STATUS_OK) {
+ 			qp->state = CMDQ_MODIFY_QP_NEW_STATE_ERR;
+ 			/* Add qp to flush list of the CQ */
+-			bnxt_qplib_lock_buddy_cq(qp, cq);
+-			__bnxt_qplib_add_flush_qp(qp);
+-			bnxt_qplib_unlock_buddy_cq(qp, cq);
++			bnxt_qplib_add_flush_qp(qp);
+ 		}
+ 	}
+ 
+@@ -2724,9 +2672,7 @@ do_rq:
+ 	 */
+ 
+ 	/* Add qp to flush list of the CQ */
+-	bnxt_qplib_lock_buddy_cq(qp, cq);
+-	__bnxt_qplib_add_flush_qp(qp);
+-	bnxt_qplib_unlock_buddy_cq(qp, cq);
++	bnxt_qplib_add_flush_qp(qp);
+ done:
+ 	return rc;
+ }
+@@ -2755,7 +2701,7 @@ int bnxt_qplib_process_flush_list(struct
+ 	u32 budget = num_cqes;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&cq->hwq.lock, flags);
++	spin_lock_irqsave(&cq->flush_lock, flags);
+ 	list_for_each_entry(qp, &cq->sqf_head, sq_flush) {
+ 		dev_dbg(&cq->hwq.pdev->dev,
+ 			"QPLIB: FP: Flushing SQ QP= %p",
+@@ -2769,7 +2715,7 @@ int bnxt_qplib_process_flush_list(struct
+ 			qp);
+ 		__flush_rq(&qp->rq, qp, &cqe, &budget);
+ 	}
+-	spin_unlock_irqrestore(&cq->hwq.lock, flags);
++	spin_unlock_irqrestore(&cq->flush_lock, flags);
+ 
+ 	return num_cqes - budget;
+ }
+@@ -2778,11 +2724,9 @@ int bnxt_qplib_poll_cq(struct bnxt_qplib
+ 		       int num_cqes, struct bnxt_qplib_qp **lib_qp)
+ {
+ 	struct cq_base *hw_cqe, **hw_cqe_ptr;
+-	unsigned long flags;
+ 	u32 sw_cons, raw_cons;
+ 	int budget, rc = 0;
+ 
+-	spin_lock_irqsave(&cq->hwq.lock, flags);
+ 	raw_cons = cq->hwq.cons;
+ 	budget = num_cqes;
+ 
+@@ -2858,20 +2802,15 @@ int bnxt_qplib_poll_cq(struct bnxt_qplib
+ 		bnxt_qplib_arm_cq(cq, DBR_DBR_TYPE_CQ);
+ 	}
+ exit:
+-	spin_unlock_irqrestore(&cq->hwq.lock, flags);
+ 	return num_cqes - budget;
+ }
+ 
+ void bnxt_qplib_req_notify_cq(struct bnxt_qplib_cq *cq, u32 arm_type)
+ {
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&cq->hwq.lock, flags);
+ 	if (arm_type)
+ 		bnxt_qplib_arm_cq(cq, arm_type);
+ 	/* Using cq->arm_state variable to track whether to issue cq handler */
+ 	atomic_set(&cq->arm_state, 1);
+-	spin_unlock_irqrestore(&cq->hwq.lock, flags);
+ }
+ 
+ void bnxt_qplib_flush_cqn_wq(struct bnxt_qplib_qp *qp)
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+@@ -389,6 +389,18 @@ struct bnxt_qplib_cq {
+ 	struct list_head		sqf_head, rqf_head;
+ 	atomic_t			arm_state;
+ 	spinlock_t			compl_lock; /* synch CQ handlers */
++/* Locking Notes:
++ * QP can move to error state from modify_qp, async error event or error
++ * CQE as part of poll_cq. When QP is moved to error state, it gets added
++ * to two flush lists, one each for SQ and RQ.
++ * Each flush list is protected by qplib_cq->flush_lock. Both scq and rcq
++ * flush_locks should be acquired when QP is moved to error. The control path
++ * operations(modify_qp and async error events) are synchronized with poll_cq
++ * using upper level CQ locks (bnxt_re_cq->cq_lock) of both SCQ and RCQ.
++ * The qplib_cq->flush_lock is required to synchronize two instances of poll_cq
++ * of the same QP while manipulating the flush list.
++ */
++	spinlock_t			flush_lock; /* QP flush management */
+ };
+ 
+ #define BNXT_QPLIB_MAX_IRRQE_ENTRY_SIZE	sizeof(struct xrrq_irrq)
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+@@ -309,9 +309,8 @@ static int bnxt_qplib_process_qp_event(s
+ 			err_event->res_err_state_reason);
+ 		if (!qp)
+ 			break;
+-		bnxt_qplib_acquire_cq_locks(qp, &flags);
+ 		bnxt_qplib_mark_qp_error(qp);
+-		bnxt_qplib_release_cq_locks(qp, &flags);
++		rcfw->aeq_handler(rcfw, qp_event, qp);
+ 		break;
+ 	default:
+ 		/* Command Response */
