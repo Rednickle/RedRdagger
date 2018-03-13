@@ -1,0 +1,307 @@
+From: Josef Bacik <jbacik@fb.com>
+Date: Mon, 24 Jul 2017 15:14:25 -0400
+Subject: btrfs: fix readdir deadlock with pagefault
+Git-commit: 23b5ec74943f44378b68c0edd8e210a86318ea5e
+Patch-mainline: v4.14-rc3
+References: bsc#1083000
+
+Readdir does dir_emit while under the btree lock.  dir_emit can trigger
+the page fault which means we can deadlock.  Fix this by allocating a
+buffer on opening a directory and copying the readdir into this buffer
+and doing dir_emit from outside of the tree lock.
+
+Thread A
+readdir  <holding tree lock>
+  dir_emit
+    <page fault>
+      down_read(mmap_sem)
+
+Thread B
+mmap write
+  down_write(mmap_sem)
+    page_mkwrite
+      wait_ordered_extents
+
+Process C
+finish_ordered_extent
+  insert_reserved_file_extent
+   try to lock leaf <hang>
+
+Signed-off-by: Josef Bacik <jbacik@fb.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+[ copy the deadlock scenario to changelog ]
+Signed-off-by: David Sterba <dsterba@suse.com>
+Acked-by: Nikolay Borisov <nborisov@suse.com>
+---
+ fs/btrfs/ctree.h |    6 +++
+ fs/btrfs/file.c  |    9 ++++
+ fs/btrfs/inode.c |  106 ++++++++++++++++++++++++++++++++++++++++++++-----------
+ fs/btrfs/ioctl.c |   22 +++++++----
+ 4 files changed, 114 insertions(+), 29 deletions(-)
+
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1277,6 +1277,12 @@ struct btrfs_root {
+ 	/* For qgroup metadata space reserve */
+ 	atomic64_t qgroup_meta_rsv;
+ };
++
++struct btrfs_file_private {
++	struct btrfs_trans_handle *trans;
++	void *filldir_buf;
++};
++
+ static inline u32 btrfs_inode_sectorsize(const struct inode *inode)
+ {
+ 	return btrfs_sb(inode->i_sb)->sectorsize;
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1984,8 +1984,15 @@ out:
+ 
+ int btrfs_release_file(struct inode *inode, struct file *filp)
+ {
+-	if (filp->private_data)
++	struct btrfs_file_private *private = filp->private_data;
++
++	if (private && private->trans)
+ 		btrfs_ioctl_trans_end(filp);
++	if (private && private->filldir_buf)
++		kfree(private->filldir_buf);
++	kfree(private);
++	filp->private_data = NULL;
++
+ 	/*
+ 	 * ordered_data_close is set by settattr when we are about to truncate
+ 	 * a file from a non-zero size to a zero size.  This tries to
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -5862,26 +5862,78 @@ unsigned char btrfs_filetype_table[] = {
+ 	DT_UNKNOWN, DT_REG, DT_DIR, DT_CHR, DT_BLK, DT_FIFO, DT_SOCK, DT_LNK
+ };
+ 
++
++/*
++ * All this infrastructure exists because dir_emit can fault, and we are holding
++ * the tree lock when doing readdir.  For now just allocate a buffer and copy
++ * our information into that, and then dir_emit from the buffer.  This is
++ * similar to what NFS does, only we don't keep the buffer around in pagecache
++ * because I'm afraid I'll mess that up.  Long term we need to make filldir do
++ * copy_to_user_inatomic so we don't have to worry about page faulting under the
++ * tree lock.
++ */
++static int btrfs_opendir(struct inode *inode, struct file *file)
++{
++	struct btrfs_file_private *private;
++
++	private = kzalloc(sizeof(struct btrfs_file_private), GFP_KERNEL);
++	if (!private)
++		return -ENOMEM;
++	private->filldir_buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!private->filldir_buf) {
++		kfree(private);
++		return -ENOMEM;
++	}
++	file->private_data = private;
++	return 0;
++}
++
++struct dir_entry {
++	u64 ino;
++	u64 offset;
++	unsigned type;
++	int name_len;
++};
++
++static int btrfs_filldir(void *addr, int entries, struct dir_context *ctx)
++{
++	while (entries--) {
++		struct dir_entry *entry = addr;
++		char *name = (char *)(entry + 1);
++
++		ctx->pos = entry->offset;
++		if (!dir_emit(ctx, name, entry->name_len, entry->ino,
++			      entry->type))
++			return 1;
++		addr += sizeof(struct dir_entry) + entry->name_len;
++		ctx->pos++;
++	}
++	return 0;
++}
++
++
++
+ static int btrfs_real_readdir(struct file *file, struct dir_context *ctx)
+ {
+ 	struct inode *inode = file_inode(file);
+ 	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
++	struct btrfs_file_private *private = file->private_data;
+ 	struct btrfs_item *item;
+ 	struct btrfs_dir_item *di;
+ 	struct btrfs_key key;
+ 	struct btrfs_key found_key;
+ 	struct btrfs_path *path;
++	void *addr;
+ 	struct list_head ins_list;
+ 	struct list_head del_list;
+ 	int ret;
+ 	struct extent_buffer *leaf;
+ 	int slot;
+-	unsigned char d_type;
+-	int over = 0;
+-	char tmp_name[32];
+ 	char *name_ptr;
+ 	int name_len;
++	int entries = 0;
++	int total_len = 0;
+ 	bool put = false;
+ 	struct btrfs_key location;
+ 
+@@ -5892,12 +5944,14 @@ static int btrfs_real_readdir(struct fil
+ 	if (!path)
+ 		return -ENOMEM;
+ 
++	addr = private->filldir_buf;
+ 	path->reada = READA_FORWARD;
+ 
+ 	INIT_LIST_HEAD(&ins_list);
+ 	INIT_LIST_HEAD(&del_list);
+ 	put = btrfs_readdir_get_delayed_items(inode, &ins_list, &del_list);
+ 
++again:
+ 	key.type = BTRFS_DIR_INDEX_KEY;
+ 	key.offset = ctx->pos;
+ 	key.objectid = btrfs_ino(BTRFS_I(inode));
+@@ -5907,6 +5961,8 @@ static int btrfs_real_readdir(struct fil
+ 		goto err;
+ 
+ 	while (1) {
++		struct dir_entry *entry;
++
+ 		leaf = path->nodes[0];
+ 		slot = path->slots[0];
+ 		if (slot >= btrfs_header_nritems(leaf)) {
+@@ -5937,34 +5993,41 @@ static int btrfs_real_readdir(struct fil
+ 			goto next;
+ 
+ 		name_len = btrfs_dir_name_len(leaf, di);
+-		if (name_len <= sizeof(tmp_name)) {
+-			name_ptr = tmp_name;
+-		} else {
+-			name_ptr = kmalloc(name_len, GFP_KERNEL);
+-			if (!name_ptr) {
+-				ret = -ENOMEM;
+-				goto err;
+-			}
++		if ((total_len + sizeof(struct dir_entry) + name_len) >=
++		    PAGE_SIZE) {
++			btrfs_release_path(path);
++			ret = btrfs_filldir(private->filldir_buf, entries, ctx);
++			if (ret)
++				goto nopos;
++			addr = private->filldir_buf;
++			entries = 0;
++			total_len = 0;
++			goto again;
+ 		}
++		entry = addr;
++		entry->name_len = name_len;
++		name_ptr = (char *)(entry + 1);
+ 		read_extent_buffer(leaf, name_ptr, (unsigned long)(di + 1),
+ 				   name_len);
+ 
+-		d_type = btrfs_filetype_table[btrfs_dir_type(leaf, di)];
++		entry->type = btrfs_filetype_table[btrfs_dir_type(leaf, di)];
+ 		btrfs_dir_item_key_to_cpu(leaf, di, &location);
++		entry->ino = location.objectid;
++		entry->offset = found_key.offset;
++		entries++;
++		addr += sizeof(struct dir_entry) + name_len;
++		total_len += sizeof(struct dir_entry) + name_len;
+ 
+-		over = !dir_emit(ctx, name_ptr, name_len, location.objectid,
+-				 d_type);
+-
+-		if (name_ptr != tmp_name)
+-			kfree(name_ptr);
+-
+-		if (over)
+-			goto nopos;
+-		ctx->pos++;
+ next:
+ 		path->slots[0]++;
+ 	}
+ 
++	btrfs_release_path(path);
++
++	ret = btrfs_filldir(private->filldir_buf, entries, ctx);
++	if (ret)
++		goto nopos;
++
+ 	ret = btrfs_readdir_delayed_dir_index(ctx, &ins_list);
+ 	if (ret)
+ 		goto nopos;
+@@ -10664,6 +10727,7 @@ static const struct file_operations btrf
+ 	.llseek		= generic_file_llseek,
+ 	.read		= generic_read_dir,
+ 	.iterate_shared	= btrfs_real_readdir,
++	.open		= btrfs_opendir,
+ 	.unlocked_ioctl	= btrfs_ioctl,
+ #ifdef CONFIG_COMPAT
+ 	.compat_ioctl	= btrfs_compat_ioctl,
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -3995,6 +3995,7 @@ static long btrfs_ioctl_trans_start(stru
+ 	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+ 	struct btrfs_trans_handle *trans;
++	struct btrfs_file_private *private;
+ 	int ret;
+ 
+ 	ret = -EPERM;
+@@ -4002,8 +4003,16 @@ static long btrfs_ioctl_trans_start(stru
+ 		goto out;
+ 
+ 	ret = -EINPROGRESS;
+-	if (file->private_data)
++	private = file->private_data;
++	if (private && private->trans)
+ 		goto out;
++	if (!private) {
++		private = kzalloc(sizeof(struct btrfs_file_private),
++				  GFP_KERNEL);
++		if (!private)
++			return -ENOMEM;
++		file->private_data = private;
++	}
+ 
+ 	ret = -EROFS;
+ 	if (btrfs_root_readonly(root))
+@@ -4020,7 +4029,7 @@ static long btrfs_ioctl_trans_start(stru
+ 	if (IS_ERR(trans))
+ 		goto out_drop;
+ 
+-	file->private_data = trans;
++	private->trans = trans;
+ 	return 0;
+ 
+ out_drop:
+@@ -4275,14 +4284,13 @@ long btrfs_ioctl_trans_end(struct file *
+ {
+ 	struct inode *inode = file_inode(file);
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+-	struct btrfs_trans_handle *trans;
++	struct btrfs_file_private *private = file->private_data;
+ 
+-	trans = file->private_data;
+-	if (!trans)
++	if (!private || !private->trans)
+ 		return -EINVAL;
+-	file->private_data = NULL;
+ 
+-	btrfs_end_transaction(trans);
++	btrfs_end_transaction(private->trans);
++	private->trans = NULL;
+ 
+ 	atomic_dec(&root->fs_info->open_ioctl_trans);
+ 
