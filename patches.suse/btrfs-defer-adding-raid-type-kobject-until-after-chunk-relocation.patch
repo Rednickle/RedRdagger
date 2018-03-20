@@ -1,0 +1,209 @@
+From: Jeff Mahoney <jeffm@suse.com>
+Subject: btrfs: defer adding raid type kobject until after chunk relocation
+Patch-mainline: Submitted, linux-btrfs 20 Mar 2018
+References: bsc#1086086
+
+Any time the first block group of a new type is created, we add a new
+kobject to sysfs to hold the attributes for that type.  Kobject-internal
+allocations always use GFP_KERNEL, making them prone to fs-reclaim races.
+While it appears as if this can occur any time a block group is created,
+the only times the first block group of a new type can be created in
+memory is at mount and when we create the first new block group during
+raid conversion.
+
+This patch adds a new list to track pending kobject additions and then
+handles them after we do chunk relocation.  Between relocating the
+target chunk (or forcing allocation of a new chunk in the case of data)
+and removing the old chunk, we're in a safe place for fs-reclaim to
+occur.  We're holding the volume mutex, which is already held across
+page faults, and the delete_unused_bgs_mutex, which will only stall
+the cleaner thread.
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+---
+ fs/btrfs/ctree.h       |  6 ++++-
+ fs/btrfs/disk-io.c     |  2 ++
+ fs/btrfs/extent-tree.c | 59 +++++++++++++++++++++++++++++++++++---------------
+ fs/btrfs/sysfs.c       |  2 +-
+ fs/btrfs/volumes.c     | 12 ++++++++++
+ 5 files changed, 61 insertions(+), 20 deletions(-)
+
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index ffbb05aa66fa..75dbdf1bbead 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -381,8 +381,9 @@ struct btrfs_dev_replace {
+ 
+ /* For raid type sysfs entries */
+ struct raid_kobject {
+-	int raid_type;
++	u64 flags;
+ 	struct kobject kobj;
++	struct list_head list;
+ };
+ 
+ struct btrfs_space_info {
+@@ -938,6 +939,8 @@ struct btrfs_fs_info {
+ 	int thread_pool_size;
+ 
+ 	struct kobject *space_info_kobj;
++	struct list_head pending_raid_kobjs;
++	spinlock_t pending_raid_kobjs_lock; /* uncontended */
+ 
+ 	u64 total_pinned;
+ 
+@@ -2688,6 +2691,7 @@ int btrfs_can_relocate(struct btrfs_fs_info *fs_info, u64 bytenr);
+ 			   struct btrfs_fs_info *fs_info, u64 bytes_used,
+ 			   u64 type, u64 chunk_objectid, u64 chunk_offset,
+ 			   u64 size);
++void btrfs_add_raid_kobjects(struct btrfs_fs_info *fs_info);
+ struct btrfs_trans_handle *btrfs_start_trans_remove_block_group(
+ 				struct btrfs_fs_info *fs_info,
+ 				const u64 chunk_offset);
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index eb6bb3169a9e..d5e1c2ff71ff 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -2447,6 +2447,8 @@ int open_ctree(struct super_block *sb,
+ 	INIT_LIST_HEAD(&fs_info->delayed_iputs);
+ 	INIT_LIST_HEAD(&fs_info->delalloc_roots);
+ 	INIT_LIST_HEAD(&fs_info->caching_block_groups);
++	INIT_LIST_HEAD(&fs_info->pending_raid_kobjs);
++	spin_lock_init(&fs_info->pending_raid_kobjs_lock);
+ 	spin_lock_init(&fs_info->delalloc_root_lock);
+ 	spin_lock_init(&fs_info->trans_lock);
+ 	spin_lock_init(&fs_info->fs_roots_radix_lock);
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 0e9a21230217..bb5368faa937 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -9908,9 +9908,39 @@ int btrfs_free_block_groups(struct btrfs_fs_info *info)
+ 	return 0;
+ }
+ 
++/* link_block_group will queue up kobjects to add when we're reclaim-safe */
++void btrfs_add_raid_kobjects(struct btrfs_fs_info *fs_info)
++{
++	struct btrfs_space_info *space_info;
++	struct raid_kobject *rkobj;
++	LIST_HEAD(list);
++	int index;
++	int ret = 0;
++
++	spin_lock(&fs_info->pending_raid_kobjs_lock);
++	list_splice_init(&fs_info->pending_raid_kobjs, &list);
++	spin_unlock(&fs_info->pending_raid_kobjs_lock);
++
++	list_for_each_entry(rkobj, &list, list) {
++		space_info = __find_space_info(fs_info, rkobj->flags);
++		index = __get_raid_index(rkobj->flags);
++
++		ret = kobject_add(&rkobj->kobj, &space_info->kobj,
++				  "%s", get_raid_name(index));
++		if (ret) {
++			kobject_put(&rkobj->kobj);
++			break;
++		}
++	}
++	if (ret)
++		btrfs_warn(fs_info,
++			   "failed to add kobject for block cache, ignoring");
++}
++
+ static void link_block_group(struct btrfs_block_group_cache *cache)
+ {
+ 	struct btrfs_space_info *space_info = cache->space_info;
++	struct btrfs_fs_info *fs_info = cache->fs_info;
+ 	int index = get_block_group_index(cache);
+ 	bool first = false;
+ 
+@@ -9921,27 +9951,19 @@ static void link_block_group(struct btrfs_block_group_cache *cache)
+ 	up_write(&space_info->groups_sem);
+ 
+ 	if (first) {
+-		struct raid_kobject *rkobj;
+-		int ret;
+-
+-		rkobj = kzalloc(sizeof(*rkobj), GFP_NOFS);
+-		if (!rkobj)
+-			goto out_err;
+-		rkobj->raid_type = index;
+-		kobject_init(&rkobj->kobj, &btrfs_raid_ktype);
+-		ret = kobject_add(&rkobj->kobj, &space_info->kobj,
+-				  "%s", get_raid_name(index));
+-		if (ret) {
+-			kobject_put(&rkobj->kobj);
+-			goto out_err;
++		struct raid_kobject *rkobj = kzalloc(sizeof(*rkobj), GFP_NOFS);
++		if (!rkobj) {
++			btrfs_warn(cache->fs_info, "couldn't alloc memory for raid level kobject");
++			return;
+ 		}
++		rkobj->flags = cache->flags;
++		kobject_init(&rkobj->kobj, &btrfs_raid_ktype);
++
++		spin_lock(&fs_info->pending_raid_kobjs_lock);
++		list_add_tail(&rkobj->list, &fs_info->pending_raid_kobjs);
++		spin_unlock(&fs_info->pending_raid_kobjs_lock);
+ 		space_info->block_group_kobjs[index] = &rkobj->kobj;
+ 	}
+-
+-	return;
+-out_err:
+-	btrfs_warn(cache->fs_info,
+-		   "failed to add kobject for block cache, ignoring");
+ }
+ 
+ static struct btrfs_block_group_cache *
+@@ -10157,6 +10179,7 @@ int btrfs_read_block_groups(struct btrfs_fs_info *info)
+ 			inc_block_group_ro(cache, 1);
+ 	}
+ 
++	btrfs_add_raid_kobjects(info);
+ 	init_global_block_rsv(info);
+ 	ret = 0;
+ error:
+diff --git a/fs/btrfs/sysfs.c b/fs/btrfs/sysfs.c
+index a8bafed931f4..b975fda719e7 100644
+--- a/fs/btrfs/sysfs.c
++++ b/fs/btrfs/sysfs.c
+@@ -272,7 +272,7 @@ static ssize_t raid_bytes_show(struct kobject *kobj,
+ {
+ 	struct btrfs_space_info *sinfo = to_space_info(kobj->parent);
+ 	struct btrfs_block_group_cache *block_group;
+-	int index = to_raid_kobj(kobj)->raid_type;
++	int index = __get_raid_index(to_raid_kobj(kobj)->flags);
+ 	u64 val = 0;
+ 
+ 	down_read(&sinfo->groups_sem);
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index b2d05c6b1c56..b0cffce168cf 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -2997,6 +2997,16 @@ static int btrfs_relocate_chunk(struct btrfs_fs_info *fs_info, u64 chunk_offset)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * We add the kobjects here (and after forcing data chunk creation)
++	 * since relocation is the only place we'll create chunks of a new
++	 * type at runtime.  The only place where we'll remove the last
++	 * chunk of a type is the call immediately below this one.  Even
++	 * so, we're protected against races with the cleaner thread since
++	 * we're covered by the delete_unused_bgs_mutex.
++	 */
++	btrfs_add_raid_kobjects(fs_info);
++
+ 	trans = btrfs_start_trans_remove_block_group(root->fs_info,
+ 						     chunk_offset);
+ 	if (IS_ERR(trans)) {
+@@ -3124,6 +3134,8 @@ static int btrfs_may_alloc_data_chunk(struct btrfs_fs_info *fs_info,
+ 			if (ret < 0)
+ 				return ret;
+ 
++			btrfs_add_raid_kobjects(fs_info);
++
+ 			return 1;
+ 		}
+ 	}
+
