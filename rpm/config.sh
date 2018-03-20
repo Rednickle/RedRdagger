@@ -8,3 +8,5 @@ IBS_PROJECT=SUSE:SLE-15:GA
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="openSUSE Tumbleweed"
+# Check the sorted patches section of series.conf
+SORT_SERIES=yes
