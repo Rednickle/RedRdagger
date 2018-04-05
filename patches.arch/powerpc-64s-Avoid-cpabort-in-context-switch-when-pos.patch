@@ -1,0 +1,132 @@
+From 07d2a628bc0008f90754ac7982289f6cb0f46cf8 Mon Sep 17 00:00:00 2001
+From: Nicholas Piggin <npiggin@gmail.com>
+Date: Fri, 9 Jun 2017 01:36:09 +1000
+Subject: [PATCH] powerpc/64s: Avoid cpabort in context switch when possible
+
+References: bsc#1055117
+Patch-mainline: v4.13-rc1
+Git-commit: 07d2a628bc0008f90754ac7982289f6cb0f46cf8
+
+The ISA v3.0B copy-paste facility only requires cpabort when switching
+to a process that has foreign real addresses mapped (direct access to
+accelerators), to clear a potential copy buffer filled by a previous
+thread. There is no accelerator driver implemented yet, so cpabort can
+be removed. It can be be re-added when a driver is implemented.
+
+POWER9 DD1 requires the copy buffer to always be cleared on context
+switch, but if accelerators are not in use, then an unpaired copy from
+a dummy region is sufficient to clear data out of the copy buffer.
+
+This increases context switch performance by about 5% on POWER9.
+
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/ppc-opcode.h |  8 ++++----
+ arch/powerpc/kernel/entry_64.S        |  9 ---------
+ arch/powerpc/kernel/process.c         | 27 ++++++++++++++++++++++++++-
+ 3 files changed, 30 insertions(+), 14 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/ppc-opcode.h b/arch/powerpc/include/asm/ppc-opcode.h
+index 3a8d278e7421..3b6bbf5a8683 100644
+--- a/arch/powerpc/include/asm/ppc-opcode.h
++++ b/arch/powerpc/include/asm/ppc-opcode.h
+@@ -189,8 +189,7 @@
+ /* sorted alphabetically */
+ #define PPC_INST_BHRBE			0x7c00025c
+ #define PPC_INST_CLRBHRB		0x7c00035c
+-#define PPC_INST_COPY			0x7c00060c
+-#define PPC_INST_COPY_FIRST		0x7c20060c
++#define PPC_INST_COPY			0x7c20060c
+ #define PPC_INST_CP_ABORT		0x7c00068c
+ #define PPC_INST_DCBA			0x7c0005ec
+ #define PPC_INST_DCBA_MASK		0xfc0007fe
+@@ -223,8 +222,7 @@
+ #define PPC_INST_MSGSNDP		0x7c00011c
+ #define PPC_INST_MTTMR			0x7c0003dc
+ #define PPC_INST_NOP			0x60000000
+-#define PPC_INST_PASTE			0x7c00070c
+-#define PPC_INST_PASTE_LAST		0x7c20070d
++#define PPC_INST_PASTE			0x7c20070d
+ #define PPC_INST_POPCNTB		0x7c0000f4
+ #define PPC_INST_POPCNTB_MASK		0xfc0007fe
+ #define PPC_INST_POPCNTD		0x7c0003f4
+@@ -392,6 +390,8 @@
+ 
+ /* Deal with instructions that older assemblers aren't aware of */
+ #define	PPC_CP_ABORT		stringify_in_c(.long PPC_INST_CP_ABORT)
++#define	PPC_COPY(a, b)		stringify_in_c(.long PPC_INST_COPY | \
++					___PPC_RA(a) | ___PPC_RB(b))
+ #define	PPC_DCBAL(a, b)		stringify_in_c(.long PPC_INST_DCBAL | \
+ 					__PPC_RA(a) | __PPC_RB(b))
+ #define	PPC_DCBZL(a, b)		stringify_in_c(.long PPC_INST_DCBZL | \
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index fb143859cc68..da9486e2fd89 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -536,15 +536,6 @@ _GLOBAL(_switch)
+ 	 * which contains larx/stcx, which will clear any reservation
+ 	 * of the task being switched.
+ 	 */
+-
+-BEGIN_FTR_SECTION
+-/*
+- * A cp_abort (copy paste abort) here ensures that when context switching, a
+- * copy from one process can't leak into the paste of another.
+- */
+-	PPC_CP_ABORT
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
+-
+ #ifdef CONFIG_PPC_BOOK3S
+ /* Cancel all explict user streams as they will have no use after context
+  * switch and will stop the HW from creating streams itself
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index 45faa9a32a01..6273b5d5baec 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -1137,6 +1137,11 @@ static inline void restore_sprs(struct thread_struct *old_thread,
+ #endif
+ }
+ 
++#ifdef CONFIG_PPC_BOOK3S_64
++#define CP_SIZE 128
++static const u8 dummy_copy_buffer[CP_SIZE] __attribute__((aligned(CP_SIZE)));
++#endif
++
+ struct task_struct *__switch_to(struct task_struct *prev,
+ 	struct task_struct *new)
+ {
+@@ -1226,8 +1231,28 @@ struct task_struct *__switch_to(struct task_struct *prev,
+ 		batch->active = 1;
+ 	}
+ 
+-	if (current_thread_info()->task->thread.regs)
++	if (current_thread_info()->task->thread.regs) {
+ 		restore_math(current_thread_info()->task->thread.regs);
++
++		/*
++		 * The copy-paste buffer can only store into foreign real
++		 * addresses, so unprivileged processes can not see the
++		 * data or use it in any way unless they have foreign real
++		 * mappings. We don't have a VAS driver that allocates those
++		 * yet, so no cpabort is required.
++		 */
++		if (cpu_has_feature(CPU_FTR_POWER9_DD1)) {
++			/*
++			 * DD1 allows paste into normal system memory, so we
++			 * do an unpaired copy here to clear the buffer and
++			 * prevent a covert channel being set up.
++			 *
++			 * cpabort is not used because it is quite expensive.
++			 */
++			asm volatile(PPC_COPY(%0, %1)
++					: : "r"(dummy_copy_buffer), "r"(0));
++		}
++	}
+ #endif /* CONFIG_PPC_STD_MMU_64 */
+ 
+ 	return last;
+-- 
+2.13.6
+
