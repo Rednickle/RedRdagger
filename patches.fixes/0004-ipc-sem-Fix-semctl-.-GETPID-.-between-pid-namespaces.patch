@@ -1,0 +1,155 @@
+From 51d6f2635b39709ee5e62479be23d423b760292c Mon Sep 17 00:00:00 2001
+From: Davidlohr Bueso <dave@stgolabs.net>
+Date: Thu, 5 Apr 2018 09:31:08 -0700
+Subject: [PATCH 4/5] ipc/sem: Fix semctl(..., GETPID, ...) between pid namespaces
+Git-commit: 51d6f2635b39709ee5e62479be23d423b760292c
+Patch-mainline: v4.17-rc1
+References: bsc#1088323
+
+Today the last process to update a semaphore is remembered and
+reported in the pid namespace of that process.  If there are processes
+in any other pid namespace querying that process id with GETPID the
+result will be unusable nonsense as it does not make any
+sense in your own pid namespace.
+
+Due to ipc_update_pid I don't think you will be able to get System V
+ipc semaphores into a troublesome cache line ping-pong.  Using struct
+pids from separate process are not a problem because they do not share
+a cache line.  Using struct pid from different threads of the same
+process are unlikely to be a problem as the reference count update
+can be avoided.
+
+Further linux futexes are a much better tool for the job of mutual
+exclusion between processes than System V semaphores.  So I expect
+programs that  are performance limited by their interprocess mutual
+exclusion primitive will be using futexes.
+
+So while it is possible that enhancing the storage of the last
+rocess of a System V semaphore from an integer to a struct pid
+will cause a performance regression because of the effect
+of frequently updating the pid reference count.  I don't expect
+that to happen in practice.
+
+This change updates semctl(..., GETPID, ...) to return the
+process id of the last process to update a semphore inthe
+pid namespace of the calling process.
+
+Fixes: b488893a390e ("pid namespaces: changes to show virtual ids to user")
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+
+---
+ include/linux/sem.h |  2 +-
+ ipc/sem.c           | 20 +++++++++++---------
+ 2 files changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/sem.h b/include/linux/sem.h
+index be5cf2ea14ad..a53f3208436c 100644
+--- a/include/linux/sem.h
++++ b/include/linux/sem.h
+@@ -18,7 +18,7 @@ struct sem {
+ 	 *  - semctl, via SETVAL and SETALL.
+ 	 *  - at task exit when performing undo adjustments (see exit_sem).
+ 	 */
+-	int	sempid;
++	struct pid *sempid;
+ 	spinlock_t	lock;	/* spinlock for fine-grained semtimedop */
+ 	struct list_head pending_alter; /* pending single-sop operations */
+ 					/* that alter the semaphore */
+diff --git a/ipc/sem.c b/ipc/sem.c
+index ca9459b03dea..3db291ca4cce 100644
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@ -93,7 +93,7 @@ struct sem_queue {
+ 	struct list_head	list;	 /* queue of pending operations */
+ 	struct task_struct	*sleeper; /* this process */
+ 	struct sem_undo		*undo;	 /* undo structure */
+-	int			pid;	 /* process id of requesting process */
++	struct pid		*pid;	 /* process id of requesting process */
+ 	int			status;	 /* completion status of operation */
+ 	struct sembuf		*sops;	 /* array of pending operations */
+ 	struct sembuf		*blocking; /* the operation that blocked */
+@@ -592,7 +592,8 @@ SYSCALL_DEFINE3(semget, key_t, key, int, nsems, int, semflg)
+  */
+ static int perform_atomic_semop_slow(struct sem_array *sma, struct sem_queue *q)
+ {
+-	int result, sem_op, nsops, pid;
++	int result, sem_op, nsops;
++	struct pid *pid;
+ 	struct sembuf *sop;
+ 	struct sem *curr;
+ 	struct sembuf *sops;
+@@ -630,7 +631,7 @@ static int perform_atomic_semop_slow(struct sem_array *sma, struct sem_queue *q)
+ 	sop--;
+ 	pid = q->pid;
+ 	while (sop >= sops) {
+-		sma->sems[sop->sem_num].sempid = pid;
++		ipc_update_pid(&sma->sems[sop->sem_num].sempid, pid);
+ 		sop--;
+ 	}
+ 
+@@ -717,7 +718,7 @@ static int perform_atomic_semop(struct sem_array *sma, struct sem_queue *q)
+ 			un->semadj[sop->sem_num] = undo;
+ 		}
+ 		curr->semval += sem_op;
+-		curr->sempid = q->pid;
++		ipc_update_pid(&curr->sempid, q->pid);
+ 	}
+ 
+ 	return 0;
+@@ -1124,6 +1125,7 @@ static void freeary(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp)
+ 			unlink_queue(sma, q);
+ 			wake_up_sem_queue_prepare(q, -EIDRM, &wake_q);
+ 		}
++		ipc_update_pid(&sem->sempid, NULL);
+ 	}
+ 
+ 	/* Remove the semaphore set from the IDR */
+@@ -1329,7 +1331,7 @@ static int semctl_setval(struct ipc_namespace *ns, int semid, int semnum,
+ 		un->semadj[semnum] = 0;
+ 
+ 	curr->semval = val;
+-	curr->sempid = task_tgid_vnr(current);
++	ipc_update_pid(&curr->sempid, task_tgid(current));
+ 	sma->sem_ctime = get_seconds();
+ 	/* maybe some queued-up processes were waiting for this */
+ 	do_smart_update(sma, NULL, 0, 0, &wake_q);
+@@ -1450,7 +1452,7 @@ static int semctl_main(struct ipc_namespace *ns, int semid, int semnum,
+ 
+ 		for (i = 0; i < nsems; i++) {
+ 			sma->sems[i].semval = sem_io[i];
+-			sma->sems[i].sempid = task_tgid_vnr(current);
++			ipc_update_pid(&sma->sems[i].sempid, task_tgid(current));
+ 		}
+ 
+ 		ipc_assert_locked_object(&sma->sem_perm);
+@@ -1482,7 +1484,7 @@ static int semctl_main(struct ipc_namespace *ns, int semid, int semnum,
+ 		err = curr->semval;
+ 		goto out_unlock;
+ 	case GETPID:
+-		err = curr->sempid;
++		err = pid_vnr(curr->sempid);
+ 		goto out_unlock;
+ 	case GETNCNT:
+ 		err = count_semcnt(sma, semnum, 0);
+@@ -1900,7 +1902,7 @@ SYSCALL_DEFINE4(semtimedop, int, semid, struct sembuf __user *, tsops,
+ 	queue.sops = sops;
+ 	queue.nsops = nsops;
+ 	queue.undo = un;
+-	queue.pid = task_tgid_vnr(current);
++	queue.pid = task_tgid(current);
+ 	queue.alter = alter;
+ 	queue.dupsop = dupsop;
+ 
+@@ -2166,7 +2168,7 @@ void exit_sem(struct task_struct *tsk)
+ 					semaphore->semval = 0;
+ 				if (semaphore->semval > SEMVMX)
+ 					semaphore->semval = SEMVMX;
+-				semaphore->sempid = task_tgid_vnr(current);
++				ipc_update_pid(&semaphore->sempid, task_tgid(current));
+ 			}
+ 		}
+ 		/* maybe some queued-up processes were waiting for this */
+-- 
+2.13.6
+
