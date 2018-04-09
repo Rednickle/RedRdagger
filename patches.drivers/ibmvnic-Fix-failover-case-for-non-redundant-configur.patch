@@ -1,0 +1,140 @@
+From 5a18e1e0c193b2f6a8d4651f38aaabee58080647 Mon Sep 17 00:00:00 2001
+From: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+Date: Fri, 6 Apr 2018 18:37:05 -0500
+Subject: [PATCH] ibmvnic: Fix failover case for non-redundant configuration
+
+References: bsc#1088600
+Patch-mainline: queued
+Git-repo: https://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git
+Git-commit: 5a18e1e0c193b2f6a8d4651f38aaabee58080647
+
+There is a failover case for a non-redundant pseries VNIC
+configuration that was not being handled properly. The current
+implementation assumes that the driver will always have a redandant
+device to communicate with following a failover notification. There
+are cases, however, when a non-redundant configuration can receive
+a failover request. If that happens, the driver should wait until
+it receives a signal that the device is ready for operation.
+
+The driver is agnostic of its backing hardware configuration,
+so this fix necessarily affects all device failover management.
+The driver needs to wait until it receives a signal that the device
+is ready for resetting. A flag is introduced to track this intermediary
+state where the driver is waiting for an active device.
+
+Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ drivers/net/ethernet/ibm/ibmvnic.c | 37 +++++++++++++++++++++++++++++--------
+ drivers/net/ethernet/ibm/ibmvnic.h |  1 +
+ 2 files changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/ibm/ibmvnic.c b/drivers/net/ethernet/ibm/ibmvnic.c
+index bbcd07a02694..151542e79884 100644
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@ -325,10 +325,11 @@ static void replenish_rx_pool(struct ibmvnic_adapter *adapter,
+ 	adapter->replenish_add_buff_failure++;
+ 	atomic_add(buffers_added, &pool->available);
+ 
+-	if (lpar_rc == H_CLOSED) {
++	if (lpar_rc == H_CLOSED || adapter->failover_pending) {
+ 		/* Disable buffer pool replenishment and report carrier off if
+-		 * queue is closed. Firmware guarantees that a signal will
+-		 * be sent to the driver, triggering a reset.
++		 * queue is closed or pending failover.
++		 * Firmware guarantees that a signal will be sent to the
++		 * driver, triggering a reset.
+ 		 */
+ 		deactivate_rx_pools(adapter);
+ 		netif_carrier_off(adapter->netdev);
+@@ -1068,6 +1069,14 @@ static int ibmvnic_open(struct net_device *netdev)
+ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ 	int rc;
+ 
++	/* If device failover is pending, just set device state and return.
++	 * Device operation will be handled by reset routine.
++	 */
++	if (adapter->failover_pending) {
++		adapter->state = VNIC_OPEN;
++		return 0;
++	}
++
+ 	mutex_lock(&adapter->reset_lock);
+ 
+ 	if (adapter->state != VNIC_CLOSED) {
+@@ -1225,6 +1234,14 @@ static int ibmvnic_close(struct net_device *netdev)
+ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ 	int rc;
+ 
++	/* If device failover is pending, just set device state and return.
++	 * Device operation will be handled by reset routine.
++	 */
++	if (adapter->failover_pending) {
++		adapter->state = VNIC_CLOSED;
++		return 0;
++	}
++
+ 	mutex_lock(&adapter->reset_lock);
+ 	rc = __ibmvnic_close(netdev);
+ 	mutex_unlock(&adapter->reset_lock);
+@@ -1559,8 +1576,9 @@ static int ibmvnic_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 		dev_kfree_skb_any(skb);
+ 		tx_buff->skb = NULL;
+ 
+-		if (lpar_rc == H_CLOSED) {
+-			/* Disable TX and report carrier off if queue is closed.
++		if (lpar_rc == H_CLOSED || adapter->failover_pending) {
++			/* Disable TX and report carrier off if queue is closed
++			 * or pending failover.
+ 			 * Firmware guarantees that a signal will be sent to the
+ 			 * driver, triggering a reset or some other action.
+ 			 */
+@@ -1884,9 +1902,10 @@ static int ibmvnic_reset(struct ibmvnic_adapter *adapter,
+ 	int ret;
+ 
+ 	if (adapter->state == VNIC_REMOVING ||
+-	    adapter->state == VNIC_REMOVED) {
++	    adapter->state == VNIC_REMOVED ||
++	    adapter->failover_pending) {
+ 		ret = EBUSY;
+-		netdev_dbg(netdev, "Adapter removing, skipping reset\n");
++		netdev_dbg(netdev, "Adapter removing or pending failover, skipping reset\n");
+ 		goto err;
+ 	}
+ 
+@@ -4162,7 +4181,9 @@ static void ibmvnic_handle_crq(union ibmvnic_crq *crq,
+ 		case IBMVNIC_CRQ_INIT:
+ 			dev_info(dev, "Partner initialized\n");
+ 			adapter->from_passive_init = true;
++			adapter->failover_pending = false;
+ 			complete(&adapter->init_done);
++			ibmvnic_reset(adapter, VNIC_RESET_FAILOVER);
+ 			break;
+ 		case IBMVNIC_CRQ_INIT_COMPLETE:
+ 			dev_info(dev, "Partner initialization complete\n");
+@@ -4179,7 +4200,7 @@ static void ibmvnic_handle_crq(union ibmvnic_crq *crq,
+ 			ibmvnic_reset(adapter, VNIC_RESET_MOBILITY);
+ 		} else if (gen_crq->cmd == IBMVNIC_DEVICE_FAILOVER) {
+ 			dev_info(dev, "Backing device failover detected\n");
+-			ibmvnic_reset(adapter, VNIC_RESET_FAILOVER);
++			adapter->failover_pending = true;
+ 		} else {
+ 			/* The adapter lost the connection */
+ 			dev_err(dev, "Virtual Adapter failed (rc=%d)\n",
+diff --git a/drivers/net/ethernet/ibm/ibmvnic.h b/drivers/net/ethernet/ibm/ibmvnic.h
+index 89efe700eafe..99c0b58c2c39 100644
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@ -1108,6 +1108,7 @@ struct ibmvnic_adapter {
+ 	bool napi_enabled, from_passive_init;
+ 
+ 	bool mac_change_pending;
++	bool failover_pending;
+ 
+ 	struct ibmvnic_tunables desired;
+ 	struct ibmvnic_tunables fallback;
+-- 
+2.13.6
+
