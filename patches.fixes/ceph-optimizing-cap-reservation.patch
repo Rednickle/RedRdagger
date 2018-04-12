@@ -1,0 +1,139 @@
+From: Chengguang Xu <cgxu519@icloud.com>
+Date: Sat, 24 Feb 2018 18:36:02 +0800
+Subject: ceph: optimizing cap reservation
+Git-commit: 79cd674aed7363a043222af3c8f97d0ea0a078cf
+Patch-mainline: v4.17-rc1
+References: bsc#1089115
+
+When caps_avail_count is in a low level, most newly
+trimmed caps will probably go into ->caps_list and
+caps_avail_count will be increased. Hence after trimming,
+should recheck caps_avail_count to effectly reuse
+newly trimmed caps. Also, when releasing unnecessary
+caps follow the same rule of ceph_put_cap.
+
+Signed-off-by: Chengguang Xu <cgxu519@icloud.com>
+Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ fs/ceph/caps.c |   92 +++++++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 61 insertions(+), 31 deletions(-)
+
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -183,36 +183,54 @@ int ceph_reserve_caps(struct ceph_mds_cl
+ 					 mdsc->caps_avail_count);
+ 	spin_unlock(&mdsc->caps_list_lock);
+ 
+-	for (i = have; i < need; i++) {
+-retry:
++	for (i = have; i < need; ) {
+ 		cap = kmem_cache_alloc(ceph_cap_cachep, GFP_NOFS);
+-		if (!cap) {
+-			if (!trimmed) {
+-				for (j = 0; j < mdsc->max_sessions; j++) {
+-					s = __ceph_lookup_mds_session(mdsc, j);
+-					if (!s)
+-						continue;
+-					mutex_unlock(&mdsc->mutex);
+-
+-					mutex_lock(&s->s_mutex);
+-					max_caps = s->s_nr_caps - (need - i);
+-					ceph_trim_caps(mdsc, s, max_caps);
+-					mutex_unlock(&s->s_mutex);
+-
+-					ceph_put_mds_session(s);
+-					mutex_lock(&mdsc->mutex);
+-				}
+-				trimmed = true;
+-				goto retry;
+-			} else {
+-				pr_warn("reserve caps ctx=%p ENOMEM "
+-					"need=%d got=%d\n",
+-					ctx, need, have + alloc);
+-				goto out_nomem;
++		if (cap) {
++			list_add(&cap->caps_item, &newcaps);
++			alloc++;
++			i++;
++			continue;
++		}
++
++		if (!trimmed) {
++			for (j = 0; j < mdsc->max_sessions; j++) {
++				s = __ceph_lookup_mds_session(mdsc, j);
++				if (!s)
++					continue;
++				mutex_unlock(&mdsc->mutex);
++
++				mutex_lock(&s->s_mutex);
++				max_caps = s->s_nr_caps - (need - i);
++				ceph_trim_caps(mdsc, s, max_caps);
++				mutex_unlock(&s->s_mutex);
++
++				ceph_put_mds_session(s);
++				mutex_lock(&mdsc->mutex);
+ 			}
++			trimmed = true;
++
++			spin_lock(&mdsc->caps_list_lock);
++			if (mdsc->caps_avail_count) {
++				int more_have;
++				if (mdsc->caps_avail_count >= need - i)
++					more_have = need - i;
++				else
++					more_have = mdsc->caps_avail_count;
++
++				i += more_have;
++				have += more_have;
++				mdsc->caps_avail_count -= more_have;
++				mdsc->caps_reserve_count += more_have;
++
++			}
++			spin_unlock(&mdsc->caps_list_lock);
++
++			continue;
+ 		}
+-		list_add(&cap->caps_item, &newcaps);
+-		alloc++;
++
++		pr_warn("reserve caps ctx=%p ENOMEM need=%d got=%d\n",
++			ctx, need, have + alloc);
++		goto out_nomem;
+ 	}
+ 	BUG_ON(have + alloc != need);
+ 
+@@ -233,16 +251,28 @@ retry:
+ 	return 0;
+ 
+ out_nomem:
++
++	spin_lock(&mdsc->caps_list_lock);
++	mdsc->caps_avail_count += have;
++	mdsc->caps_reserve_count -= have;
++
+ 	while (!list_empty(&newcaps)) {
+ 		cap = list_first_entry(&newcaps,
+ 				struct ceph_cap, caps_item);
+ 		list_del(&cap->caps_item);
+-		kmem_cache_free(ceph_cap_cachep, cap);
++
++		/* Keep some preallocated caps around (ceph_min_count), to
++		 * avoid lots of free/alloc churn. */
++		if (mdsc->caps_avail_count >=
++		    mdsc->caps_reserve_count + mdsc->caps_min_count) {
++			kmem_cache_free(ceph_cap_cachep, cap);
++		} else {
++			mdsc->caps_avail_count++;
++			mdsc->caps_total_count++;
++			list_add(&cap->caps_item, &mdsc->caps_list);
++		}
+ 	}
+ 
+-	spin_lock(&mdsc->caps_list_lock);
+-	mdsc->caps_avail_count += have;
+-	mdsc->caps_reserve_count -= have;
+ 	BUG_ON(mdsc->caps_total_count != mdsc->caps_use_count +
+ 					 mdsc->caps_reserve_count +
+ 					 mdsc->caps_avail_count);
