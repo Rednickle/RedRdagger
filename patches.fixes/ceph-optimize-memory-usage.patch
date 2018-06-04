@@ -1,0 +1,633 @@
+From: Chengguang Xu <cgxu519@gmx.com>
+Date: Tue, 13 Mar 2018 10:42:44 +0800
+Subject: ceph: optimize memory usage
+Git-commit: bb48bd4dc45f9ee1e44d8e9fcb01023e0d0ba80d
+Patch-mainline: v4.17-rc1
+References: bsc#1089115
+
+In current code, regular file and directory use same struct
+ceph_file_info to store fs specific data so the struct has to
+include some fields which are only used for directory
+(e.g., readdir related info), when having plenty of regular files,
+it will lead to memory waste.
+
+This patch introduces dedicated ceph_dir_file_info cache for
+readdir related thins. So that regular file does not include those
+unused fields anymore.
+
+Signed-off-by: Chengguang Xu <cgxu519@gmx.com>
+Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ fs/ceph/dir.c                |  187 +++++++++++++++++++++----------------------
+ fs/ceph/file.c               |   88 ++++++++++++++------
+ fs/ceph/super.c              |    8 +
+ fs/ceph/super.h              |    4 
+ include/linux/ceph/libceph.h |    1 
+ 5 files changed, 170 insertions(+), 118 deletions(-)
+
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -101,18 +101,18 @@ static int fpos_cmp(loff_t l, loff_t r)
+  * regardless of what dir changes take place on the
+  * server.
+  */
+-static int note_last_dentry(struct ceph_file_info *fi, const char *name,
++static int note_last_dentry(struct ceph_dir_file_info *dfi, const char *name,
+ 		            int len, unsigned next_offset)
+ {
+ 	char *buf = kmalloc(len+1, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+-	kfree(fi->last_name);
+-	fi->last_name = buf;
+-	memcpy(fi->last_name, name, len);
+-	fi->last_name[len] = 0;
+-	fi->next_offset = next_offset;
+-	dout("note_last_dentry '%s'\n", fi->last_name);
++	kfree(dfi->last_name);
++	dfi->last_name = buf;
++	memcpy(dfi->last_name, name, len);
++	dfi->last_name[len] = 0;
++	dfi->next_offset = next_offset;
++	dout("note_last_dentry '%s'\n", dfi->last_name);
+ 	return 0;
+ }
+ 
+@@ -174,7 +174,7 @@ __dcache_find_get_entry(struct dentry *p
+ static int __dcache_readdir(struct file *file,  struct dir_context *ctx,
+ 			    int shared_gen)
+ {
+-	struct ceph_file_info *fi = file->private_data;
++	struct ceph_dir_file_info *dfi = file->private_data;
+ 	struct dentry *parent = file->f_path.dentry;
+ 	struct inode *dir = d_inode(parent);
+ 	struct dentry *dentry, *last = NULL;
+@@ -221,7 +221,7 @@ static int __dcache_readdir(struct file
+ 		bool emit_dentry = false;
+ 		dentry = __dcache_find_get_entry(parent, idx++, &cache_ctl);
+ 		if (!dentry) {
+-			fi->flags |= CEPH_F_ATEND;
++			dfi->file_info.flags |= CEPH_F_ATEND;
+ 			err = 0;
+ 			break;
+ 		}
+@@ -272,33 +272,33 @@ out:
+ 	if (last) {
+ 		int ret;
+ 		di = ceph_dentry(last);
+-		ret = note_last_dentry(fi, last->d_name.name, last->d_name.len,
++		ret = note_last_dentry(dfi, last->d_name.name, last->d_name.len,
+ 				       fpos_off(di->offset) + 1);
+ 		if (ret < 0)
+ 			err = ret;
+ 		dput(last);
+ 		/* last_name no longer match cache index */
+-		if (fi->readdir_cache_idx >= 0) {
+-			fi->readdir_cache_idx = -1;
+-			fi->dir_release_count = 0;
++		if (dfi->readdir_cache_idx >= 0) {
++			dfi->readdir_cache_idx = -1;
++			dfi->dir_release_count = 0;
+ 		}
+ 	}
+ 	return err;
+ }
+ 
+-static bool need_send_readdir(struct ceph_file_info *fi, loff_t pos)
++static bool need_send_readdir(struct ceph_dir_file_info *dfi, loff_t pos)
+ {
+-	if (!fi->last_readdir)
++	if (!dfi->last_readdir)
+ 		return true;
+ 	if (is_hash_order(pos))
+-		return !ceph_frag_contains_value(fi->frag, fpos_hash(pos));
++		return !ceph_frag_contains_value(dfi->frag, fpos_hash(pos));
+ 	else
+-		return fi->frag != fpos_frag(pos);
++		return dfi->frag != fpos_frag(pos);
+ }
+ 
+ static int ceph_readdir(struct file *file, struct dir_context *ctx)
+ {
+-	struct ceph_file_info *fi = file->private_data;
++	struct ceph_dir_file_info *dfi = file->private_data;
+ 	struct inode *inode = file_inode(file);
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+@@ -309,7 +309,7 @@ static int ceph_readdir(struct file *fil
+ 	struct ceph_mds_reply_info_parsed *rinfo;
+ 
+ 	dout("readdir %p file %p pos %llx\n", inode, file, ctx->pos);
+-	if (fi->flags & CEPH_F_ATEND)
++	if (dfi->file_info.flags & CEPH_F_ATEND)
+ 		return 0;
+ 
+ 	/* always start with . and .. */
+@@ -350,15 +350,15 @@ static int ceph_readdir(struct file *fil
+ 	/* proceed with a normal readdir */
+ more:
+ 	/* do we have the correct frag content buffered? */
+-	if (need_send_readdir(fi, ctx->pos)) {
++	if (need_send_readdir(dfi, ctx->pos)) {
+ 		struct ceph_mds_request *req;
+ 		int op = ceph_snap(inode) == CEPH_SNAPDIR ?
+ 			CEPH_MDS_OP_LSSNAP : CEPH_MDS_OP_READDIR;
+ 
+ 		/* discard old result, if any */
+-		if (fi->last_readdir) {
+-			ceph_mdsc_put_request(fi->last_readdir);
+-			fi->last_readdir = NULL;
++		if (dfi->last_readdir) {
++			ceph_mdsc_put_request(dfi->last_readdir);
++			dfi->last_readdir = NULL;
+ 		}
+ 
+ 		if (is_hash_order(ctx->pos)) {
+@@ -372,7 +372,7 @@ more:
+ 		}
+ 
+ 		dout("readdir fetching %llx.%llx frag %x offset '%s'\n",
+-		     ceph_vinop(inode), frag, fi->last_name);
++		     ceph_vinop(inode), frag, dfi->last_name);
+ 		req = ceph_mdsc_create_request(mdsc, op, USE_AUTH_MDS);
+ 		if (IS_ERR(req))
+ 			return PTR_ERR(req);
+@@ -388,8 +388,8 @@ more:
+ 			__set_bit(CEPH_MDS_R_DIRECT_IS_HASH, &req->r_req_flags);
+ 			req->r_inode_drop = CEPH_CAP_FILE_EXCL;
+ 		}
+-		if (fi->last_name) {
+-			req->r_path2 = kstrdup(fi->last_name, GFP_KERNEL);
++		if (dfi->last_name) {
++			req->r_path2 = kstrdup(dfi->last_name, GFP_KERNEL);
+ 			if (!req->r_path2) {
+ 				ceph_mdsc_put_request(req);
+ 				return -ENOMEM;
+@@ -399,10 +399,10 @@ more:
+ 				cpu_to_le32(fpos_hash(ctx->pos));
+ 		}
+ 
+-		req->r_dir_release_cnt = fi->dir_release_count;
+-		req->r_dir_ordered_cnt = fi->dir_ordered_count;
+-		req->r_readdir_cache_idx = fi->readdir_cache_idx;
+-		req->r_readdir_offset = fi->next_offset;
++		req->r_dir_release_cnt = dfi->dir_release_count;
++		req->r_dir_ordered_cnt = dfi->dir_ordered_count;
++		req->r_readdir_cache_idx = dfi->readdir_cache_idx;
++		req->r_readdir_offset = dfi->next_offset;
+ 		req->r_args.readdir.frag = cpu_to_le32(frag);
+ 		req->r_args.readdir.flags =
+ 				cpu_to_le16(CEPH_READDIR_REPLY_BITFLAGS);
+@@ -426,35 +426,35 @@ more:
+ 		if (le32_to_cpu(rinfo->dir_dir->frag) != frag) {
+ 			frag = le32_to_cpu(rinfo->dir_dir->frag);
+ 			if (!rinfo->hash_order) {
+-				fi->next_offset = req->r_readdir_offset;
++				dfi->next_offset = req->r_readdir_offset;
+ 				/* adjust ctx->pos to beginning of frag */
+ 				ctx->pos = ceph_make_fpos(frag,
+-							  fi->next_offset,
++							  dfi->next_offset,
+ 							  false);
+ 			}
+ 		}
+ 
+-		fi->frag = frag;
+-		fi->last_readdir = req;
++		dfi->frag = frag;
++		dfi->last_readdir = req;
+ 
+ 		if (test_bit(CEPH_MDS_R_DID_PREPOPULATE, &req->r_req_flags)) {
+-			fi->readdir_cache_idx = req->r_readdir_cache_idx;
+-			if (fi->readdir_cache_idx < 0) {
++			dfi->readdir_cache_idx = req->r_readdir_cache_idx;
++			if (dfi->readdir_cache_idx < 0) {
+ 				/* preclude from marking dir ordered */
+-				fi->dir_ordered_count = 0;
++				dfi->dir_ordered_count = 0;
+ 			} else if (ceph_frag_is_leftmost(frag) &&
+-				   fi->next_offset == 2) {
++				   dfi->next_offset == 2) {
+ 				/* note dir version at start of readdir so
+ 				 * we can tell if any dentries get dropped */
+-				fi->dir_release_count = req->r_dir_release_cnt;
+-				fi->dir_ordered_count = req->r_dir_ordered_cnt;
++				dfi->dir_release_count = req->r_dir_release_cnt;
++				dfi->dir_ordered_count = req->r_dir_ordered_cnt;
+ 			}
+ 		} else {
+ 			dout("readdir !did_prepopulate");
+ 			/* disable readdir cache */
+-			fi->readdir_cache_idx = -1;
++			dfi->readdir_cache_idx = -1;
+ 			/* preclude from marking dir complete */
+-			fi->dir_release_count = 0;
++			dfi->dir_release_count = 0;
+ 		}
+ 
+ 		/* note next offset and last dentry name */
+@@ -463,19 +463,19 @@ more:
+ 					rinfo->dir_entries + (rinfo->dir_nr-1);
+ 			unsigned next_offset = req->r_reply_info.dir_end ?
+ 					2 : (fpos_off(rde->offset) + 1);
+-			err = note_last_dentry(fi, rde->name, rde->name_len,
++			err = note_last_dentry(dfi, rde->name, rde->name_len,
+ 					       next_offset);
+ 			if (err)
+ 				return err;
+ 		} else if (req->r_reply_info.dir_end) {
+-			fi->next_offset = 2;
++			dfi->next_offset = 2;
+ 			/* keep last name */
+ 		}
+ 	}
+ 
+-	rinfo = &fi->last_readdir->r_reply_info;
++	rinfo = &dfi->last_readdir->r_reply_info;
+ 	dout("readdir frag %x num %d pos %llx chunk first %llx\n",
+-	     fi->frag, rinfo->dir_nr, ctx->pos,
++	     dfi->frag, rinfo->dir_nr, ctx->pos,
+ 	     rinfo->dir_nr ? rinfo->dir_entries[0].offset : 0LL);
+ 
+ 	i = 0;
+@@ -519,52 +519,55 @@ more:
+ 		ctx->pos++;
+ 	}
+ 
+-	ceph_mdsc_put_request(fi->last_readdir);
+-	fi->last_readdir = NULL;
++	ceph_mdsc_put_request(dfi->last_readdir);
++	dfi->last_readdir = NULL;
+ 
+-	if (fi->next_offset > 2) {
+-		frag = fi->frag;
++	if (dfi->next_offset > 2) {
++		frag = dfi->frag;
+ 		goto more;
+ 	}
+ 
+ 	/* more frags? */
+-	if (!ceph_frag_is_rightmost(fi->frag)) {
+-		frag = ceph_frag_next(fi->frag);
++	if (!ceph_frag_is_rightmost(dfi->frag)) {
++		frag = ceph_frag_next(dfi->frag);
+ 		if (is_hash_order(ctx->pos)) {
+ 			loff_t new_pos = ceph_make_fpos(ceph_frag_value(frag),
+-							fi->next_offset, true);
++							dfi->next_offset, true);
+ 			if (new_pos > ctx->pos)
+ 				ctx->pos = new_pos;
+ 			/* keep last_name */
+ 		} else {
+-			ctx->pos = ceph_make_fpos(frag, fi->next_offset, false);
+-			kfree(fi->last_name);
+-			fi->last_name = NULL;
++			ctx->pos = ceph_make_fpos(frag, dfi->next_offset,
++							false);
++			kfree(dfi->last_name);
++			dfi->last_name = NULL;
+ 		}
+ 		dout("readdir next frag is %x\n", frag);
+ 		goto more;
+ 	}
+-	fi->flags |= CEPH_F_ATEND;
++	dfi->file_info.flags |= CEPH_F_ATEND;
+ 
+ 	/*
+ 	 * if dir_release_count still matches the dir, no dentries
+ 	 * were released during the whole readdir, and we should have
+ 	 * the complete dir contents in our cache.
+ 	 */
+-	if (atomic64_read(&ci->i_release_count) == fi->dir_release_count) {
++	if (atomic64_read(&ci->i_release_count) ==
++					dfi->dir_release_count) {
+ 		spin_lock(&ci->i_ceph_lock);
+-		if (fi->dir_ordered_count == atomic64_read(&ci->i_ordered_count)) {
++		if (dfi->dir_ordered_count ==
++				atomic64_read(&ci->i_ordered_count)) {
+ 			dout(" marking %p complete and ordered\n", inode);
+ 			/* use i_size to track number of entries in
+ 			 * readdir cache */
+-			BUG_ON(fi->readdir_cache_idx < 0);
+-			i_size_write(inode, fi->readdir_cache_idx *
++			BUG_ON(dfi->readdir_cache_idx < 0);
++			i_size_write(inode, dfi->readdir_cache_idx *
+ 				     sizeof(struct dentry*));
+ 		} else {
+ 			dout(" marking %p complete\n", inode);
+ 		}
+-		__ceph_dir_set_complete(ci, fi->dir_release_count,
+-					fi->dir_ordered_count);
++		__ceph_dir_set_complete(ci, dfi->dir_release_count,
++					dfi->dir_ordered_count);
+ 		spin_unlock(&ci->i_ceph_lock);
+ 	}
+ 
+@@ -572,25 +575,25 @@ more:
+ 	return 0;
+ }
+ 
+-static void reset_readdir(struct ceph_file_info *fi)
++static void reset_readdir(struct ceph_dir_file_info *dfi)
+ {
+-	if (fi->last_readdir) {
+-		ceph_mdsc_put_request(fi->last_readdir);
+-		fi->last_readdir = NULL;
+-	}
+-	kfree(fi->last_name);
+-	fi->last_name = NULL;
+-	fi->dir_release_count = 0;
+-	fi->readdir_cache_idx = -1;
+-	fi->next_offset = 2;  /* compensate for . and .. */
+-	fi->flags &= ~CEPH_F_ATEND;
++	if (dfi->last_readdir) {
++		ceph_mdsc_put_request(dfi->last_readdir);
++		dfi->last_readdir = NULL;
++	}
++	kfree(dfi->last_name);
++	dfi->last_name = NULL;
++	dfi->dir_release_count = 0;
++	dfi->readdir_cache_idx = -1;
++	dfi->next_offset = 2;  /* compensate for . and .. */
++	dfi->file_info.flags &= ~CEPH_F_ATEND;
+ }
+ 
+ /*
+  * discard buffered readdir content on seekdir(0), or seek to new frag,
+  * or seek prior to current chunk
+  */
+-static bool need_reset_readdir(struct ceph_file_info *fi, loff_t new_pos)
++static bool need_reset_readdir(struct ceph_dir_file_info *dfi, loff_t new_pos)
+ {
+ 	struct ceph_mds_reply_info_parsed *rinfo;
+ 	loff_t chunk_offset;
+@@ -599,10 +602,10 @@ static bool need_reset_readdir(struct ce
+ 	if (is_hash_order(new_pos)) {
+ 		/* no need to reset last_name for a forward seek when
+ 		 * dentries are sotred in hash order */
+-	} else if (fi->frag != fpos_frag(new_pos)) {
++	} else if (dfi->frag != fpos_frag(new_pos)) {
+ 		return true;
+ 	}
+-	rinfo = fi->last_readdir ? &fi->last_readdir->r_reply_info : NULL;
++	rinfo = dfi->last_readdir ? &dfi->last_readdir->r_reply_info : NULL;
+ 	if (!rinfo || !rinfo->dir_nr)
+ 		return true;
+ 	chunk_offset = rinfo->dir_entries[0].offset;
+@@ -612,7 +615,7 @@ static bool need_reset_readdir(struct ce
+ 
+ static loff_t ceph_dir_llseek(struct file *file, loff_t offset, int whence)
+ {
+-	struct ceph_file_info *fi = file->private_data;
++	struct ceph_dir_file_info *dfi = file->private_data;
+ 	struct inode *inode = file->f_mapping->host;
+ 	loff_t retval;
+ 
+@@ -630,20 +633,20 @@ static loff_t ceph_dir_llseek(struct fil
+ 	}
+ 
+ 	if (offset >= 0) {
+-		if (need_reset_readdir(fi, offset)) {
++		if (need_reset_readdir(dfi, offset)) {
+ 			dout("dir_llseek dropping %p content\n", file);
+-			reset_readdir(fi);
++			reset_readdir(dfi);
+ 		} else if (is_hash_order(offset) && offset > file->f_pos) {
+ 			/* for hash offset, we don't know if a forward seek
+ 			 * is within same frag */
+-			fi->dir_release_count = 0;
+-			fi->readdir_cache_idx = -1;
++			dfi->dir_release_count = 0;
++			dfi->readdir_cache_idx = -1;
+ 		}
+ 
+ 		if (offset != file->f_pos) {
+ 			file->f_pos = offset;
+ 			file->f_version = 0;
+-			fi->flags &= ~CEPH_F_ATEND;
++			dfi->file_info.flags &= ~CEPH_F_ATEND;
+ 		}
+ 		retval = offset;
+ 	}
+@@ -1351,7 +1354,7 @@ static void ceph_d_prune(struct dentry *
+ static ssize_t ceph_read_dir(struct file *file, char __user *buf, size_t size,
+ 			     loff_t *ppos)
+ {
+-	struct ceph_file_info *fi = file->private_data;
++	struct ceph_dir_file_info *dfi = file->private_data;
+ 	struct inode *inode = file_inode(file);
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	int left;
+@@ -1360,12 +1363,12 @@ static ssize_t ceph_read_dir(struct file
+ 	if (!ceph_test_mount_opt(ceph_sb_to_client(inode->i_sb), DIRSTAT))
+ 		return -EISDIR;
+ 
+-	if (!fi->dir_info) {
+-		fi->dir_info = kmalloc(bufsize, GFP_KERNEL);
+-		if (!fi->dir_info)
++	if (!dfi->dir_info) {
++		dfi->dir_info = kmalloc(bufsize, GFP_KERNEL);
++		if (!dfi->dir_info)
+ 			return -ENOMEM;
+-		fi->dir_info_len =
+-			snprintf(fi->dir_info, bufsize,
++		dfi->dir_info_len =
++			snprintf(dfi->dir_info, bufsize,
+ 				"entries:   %20lld\n"
+ 				" files:    %20lld\n"
+ 				" subdirs:  %20lld\n"
+@@ -1385,10 +1388,10 @@ static ssize_t ceph_read_dir(struct file
+ 				(long)ci->i_rctime.tv_nsec);
+ 	}
+ 
+-	if (*ppos >= fi->dir_info_len)
++	if (*ppos >= dfi->dir_info_len)
+ 		return 0;
+-	size = min_t(unsigned, size, fi->dir_info_len-*ppos);
+-	left = copy_to_user(buf, fi->dir_info + *ppos, size);
++	size = min_t(unsigned, size, dfi->dir_info_len-*ppos);
++	left = copy_to_user(buf, dfi->dir_info + *ppos, size);
+ 	if (left == size)
+ 		return -EFAULT;
+ 	*ppos += (size - left);
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -160,13 +160,50 @@ out:
+ 	return req;
+ }
+ 
++static int ceph_init_file_info(struct inode *inode, struct file *file,
++					int fmode, bool isdir)
++{
++	struct ceph_file_info *fi;
++
++	dout("%s %p %p 0%o (%s)\n", __func__, inode, file,
++			inode->i_mode, isdir ? "dir" : "regular");
++	BUG_ON(inode->i_fop->release != ceph_release);
++
++	if (isdir) {
++		struct ceph_dir_file_info *dfi =
++			kmem_cache_zalloc(ceph_dir_file_cachep, GFP_KERNEL);
++		if (!dfi) {
++			ceph_put_fmode(ceph_inode(inode), fmode); /* clean up */
++			return -ENOMEM;
++		}
++
++		file->private_data = dfi;
++		fi = &dfi->file_info;
++		dfi->next_offset = 2;
++		dfi->readdir_cache_idx = -1;
++	} else {
++		fi = kmem_cache_zalloc(ceph_file_cachep, GFP_KERNEL);
++		if (!fi) {
++			ceph_put_fmode(ceph_inode(inode), fmode); /* clean up */
++			return -ENOMEM;
++		}
++
++		file->private_data = fi;
++	}
++
++	fi->fmode = fmode;
++	spin_lock_init(&fi->rw_contexts_lock);
++	INIT_LIST_HEAD(&fi->rw_contexts);
++
++	return 0;
++}
++
+ /*
+  * initialize private struct file data.
+  * if we fail, clean up by dropping fmode reference on the ceph_inode
+  */
+ static int ceph_init_file(struct inode *inode, struct file *file, int fmode)
+ {
+-	struct ceph_file_info *fi;
+ 	int ret = 0;
+ 
+ 	switch (inode->i_mode & S_IFMT) {
+@@ -174,22 +211,10 @@ static int ceph_init_file(struct inode *
+ 		ceph_fscache_register_inode_cookie(inode);
+ 		ceph_fscache_file_set_cookie(inode, file);
+ 	case S_IFDIR:
+-		dout("init_file %p %p 0%o (regular)\n", inode, file,
+-		     inode->i_mode);
+-		fi = kmem_cache_zalloc(ceph_file_cachep, GFP_KERNEL);
+-		if (!fi) {
+-			ceph_put_fmode(ceph_inode(inode), fmode); /* clean up */
+-			return -ENOMEM;
+-		}
+-		fi->fmode = fmode;
+-
+-		spin_lock_init(&fi->rw_contexts_lock);
+-		INIT_LIST_HEAD(&fi->rw_contexts);
+-
+-		fi->next_offset = 2;
+-		fi->readdir_cache_idx = -1;
+-		file->private_data = fi;
+-		BUG_ON(inode->i_fop->release != ceph_release);
++		ret = ceph_init_file_info(inode, file, fmode,
++						S_ISDIR(inode->i_mode));
++		if (ret)
++			return ret;
+ 		break;
+ 
+ 	case S_IFLNK:
+@@ -461,16 +486,27 @@ out_acl:
+ int ceph_release(struct inode *inode, struct file *file)
+ {
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
+-	struct ceph_file_info *fi = file->private_data;
+ 
+-	dout("release inode %p file %p\n", inode, file);
+-	ceph_put_fmode(ci, fi->fmode);
+-	if (fi->last_readdir)
+-		ceph_mdsc_put_request(fi->last_readdir);
+-	kfree(fi->last_name);
+-	kfree(fi->dir_info);
+-	WARN_ON(!list_empty(&fi->rw_contexts));
+-	kmem_cache_free(ceph_file_cachep, fi);
++	if (S_ISDIR(inode->i_mode)) {
++		struct ceph_dir_file_info *dfi = file->private_data;
++		dout("release inode %p dir file %p\n", inode, file);
++		WARN_ON(!list_empty(&dfi->file_info.rw_contexts));
++
++		ceph_put_fmode(ci, dfi->file_info.fmode);
++
++		if (dfi->last_readdir)
++			ceph_mdsc_put_request(dfi->last_readdir);
++		kfree(dfi->last_name);
++		kfree(dfi->dir_info);
++		kmem_cache_free(ceph_dir_file_cachep, dfi);
++	} else {
++		struct ceph_file_info *fi = file->private_data;
++		dout("release inode %p regular file %p\n", inode, file);
++		WARN_ON(!list_empty(&fi->rw_contexts));
++
++		ceph_put_fmode(ci, fi->fmode);
++		kmem_cache_free(ceph_file_cachep, fi);
++	}
+ 
+ 	/* wake up anyone waiting for caps on this inode */
+ 	wake_up_all(&ci->i_cap_wq);
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -680,6 +680,7 @@ struct kmem_cache *ceph_cap_cachep;
+ struct kmem_cache *ceph_cap_flush_cachep;
+ struct kmem_cache *ceph_dentry_cachep;
+ struct kmem_cache *ceph_file_cachep;
++struct kmem_cache *ceph_dir_file_cachep;
+ 
+ static void ceph_inode_init_once(void *foo)
+ {
+@@ -716,6 +717,10 @@ static int __init init_caches(void)
+ 	if (!ceph_file_cachep)
+ 		goto bad_file;
+ 
++	ceph_dir_file_cachep = KMEM_CACHE(ceph_dir_file_info, SLAB_MEM_SPREAD);
++	if (!ceph_dir_file_cachep)
++		goto bad_dir_file;
++
+ 	error = ceph_fscache_register();
+ 	if (error)
+ 		goto bad_fscache;
+@@ -723,6 +728,8 @@ static int __init init_caches(void)
+ 	return 0;
+ 
+ bad_fscache:
++	kmem_cache_destroy(ceph_dir_file_cachep);
++bad_dir_file:
+ 	kmem_cache_destroy(ceph_file_cachep);
+ bad_file:
+ 	kmem_cache_destroy(ceph_dentry_cachep);
+@@ -748,6 +755,7 @@ static void destroy_caches(void)
+ 	kmem_cache_destroy(ceph_cap_flush_cachep);
+ 	kmem_cache_destroy(ceph_dentry_cachep);
+ 	kmem_cache_destroy(ceph_file_cachep);
++	kmem_cache_destroy(ceph_dir_file_cachep);
+ 
+ 	ceph_fscache_unregister();
+ }
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -670,6 +670,10 @@ struct ceph_file_info {
+ 
+ 	spinlock_t rw_contexts_lock;
+ 	struct list_head rw_contexts;
++};
++
++struct ceph_dir_file_info {
++	struct ceph_file_info file_info;
+ 
+ 	/* readdir: position within the dir */
+ 	u32 frag;
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@ -261,6 +261,7 @@ extern struct kmem_cache *ceph_cap_cache
+ extern struct kmem_cache *ceph_cap_flush_cachep;
+ extern struct kmem_cache *ceph_dentry_cachep;
+ extern struct kmem_cache *ceph_file_cachep;
++extern struct kmem_cache *ceph_dir_file_cachep;
+ 
+ /* ceph_common.c */
+ extern bool libceph_compatible(void *data);
