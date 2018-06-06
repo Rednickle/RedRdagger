@@ -7,6 +7,6 @@ OBS_PROJECT=SUSE:SLE-15:GA
 IBS_PROJECT=SUSE:SLE-15:GA
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="openSUSE Tumbleweed"
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15"
 # Check the sorted patches section of series.conf
 SORT_SERIES=yes
