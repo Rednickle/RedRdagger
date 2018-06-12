@@ -1,0 +1,142 @@
+From 318716ddea0829d3be566efc69d31029c40d51e2 Mon Sep 17 00:00:00 2001
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Wed, 22 Nov 2017 14:56:12 -0500
+Subject: [PATCH] dm: safely allocate multiple bioset bios
+Git-commit: 318716ddea0829d3be566efc69d31029c40d51e2
+Patch-mainline: v4.16-rc1
+References: bsc#1093023
+
+DM targets can request multiple bios be sent to them by DM core (see:
+num_{flush,discard,write_same,write_zeroes}_bios).  But until now these
+bios were allocated in an unsafe manner than could potentially exhaust
+the DM device's bioset -- in the face of multiple threads each trying to
+do multiple allocations from the same DM device's bioset.
+
+Fix __send_duplicate_bios() by using the new alloc_multiple_bios().  The
+allocation strategy used by alloc_multiple_bios() models that used by
+dm-crypt.c:crypt_alloc_buffer().
+
+Neil Brown initially proposed this fix but the implementation has been
+revised enough that it inappropriate to attribute the entirety of it to
+him.
+
+Suggested-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/dm.c | 69 +++++++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 57 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 2480c6abe8f1..79b8f072e76a 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1264,16 +1264,17 @@ static int clone_bio(struct dm_target_io *tio, struct bio *bio,
+ 	return 0;
+ }
+ 
+-static struct dm_target_io *alloc_tio(struct clone_info *ci,
+-				      struct dm_target *ti,
+-				      unsigned target_bio_nr)
++static struct dm_target_io *alloc_tio(struct clone_info *ci, struct dm_target *ti,
++				      unsigned target_bio_nr, gfp_t gfp_mask)
+ {
+ 	struct dm_target_io *tio;
+ 	struct bio *clone;
+ 
+-	clone = bio_alloc_bioset(GFP_NOIO, 0, ci->md->bs);
+-	tio = container_of(clone, struct dm_target_io, clone);
++	clone = bio_alloc_bioset(gfp_mask, 0, ci->md->bs);
++	if (!clone)
++		return NULL;
+ 
++	tio = container_of(clone, struct dm_target_io, clone);
+ 	tio->io = ci->io;
+ 	tio->ti = ti;
+ 	tio->target_bio_nr = target_bio_nr;
+@@ -1281,11 +1282,49 @@ static struct dm_target_io *alloc_tio(struct clone_info *ci,
+ 	return tio;
+ }
+ 
++static void alloc_multiple_bios(struct bio_list *blist, struct clone_info *ci,
++				struct dm_target *ti, unsigned num_bios)
++{
++	struct dm_target_io *tio;
++	int try;
++
++	if (!num_bios)
++		return;
++
++	if (num_bios == 1) {
++		tio = alloc_tio(ci, ti, 0, GFP_NOIO);
++		bio_list_add(blist, &tio->clone);
++		return;
++	}
++
++	for (try = 0; try < 2; try++) {
++		int bio_nr;
++		struct bio *bio;
++
++		if (try)
++			mutex_lock(&ci->md->table_devices_lock);
++		for (bio_nr = 0; bio_nr < num_bios; bio_nr++) {
++			tio = alloc_tio(ci, ti, bio_nr, try ? GFP_NOIO : GFP_NOWAIT);
++			if (!tio)
++				break;
++
++			bio_list_add(blist, &tio->clone);
++		}
++		if (try)
++			mutex_unlock(&ci->md->table_devices_lock);
++		if (bio_nr == num_bios)
++			return;
++
++		while ((bio = bio_list_pop(blist))) {
++			tio = container_of(bio, struct dm_target_io, clone);
++			free_tio(tio);
++		}
++	}
++}
++
+ static void __clone_and_map_simple_bio(struct clone_info *ci,
+-				       struct dm_target *ti,
+-				       unsigned target_bio_nr, unsigned *len)
++				       struct dm_target_io *tio, unsigned *len)
+ {
+-	struct dm_target_io *tio = alloc_tio(ci, ti, target_bio_nr);
+ 	struct bio *clone = &tio->clone;
+ 
+ 	tio->len_ptr = len;
+@@ -1300,10 +1339,16 @@ static void __clone_and_map_simple_bio(struct clone_info *ci,
+ static void __send_duplicate_bios(struct clone_info *ci, struct dm_target *ti,
+ 				  unsigned num_bios, unsigned *len)
+ {
+-	unsigned target_bio_nr;
++	struct bio_list blist = BIO_EMPTY_LIST;
++	struct bio *bio;
++	struct dm_target_io *tio;
++
++	alloc_multiple_bios(&blist, ci, ti, num_bios);
+ 
+-	for (target_bio_nr = 0; target_bio_nr < num_bios; target_bio_nr++)
+-		__clone_and_map_simple_bio(ci, ti, target_bio_nr, len);
++	while ((bio = bio_list_pop(&blist))) {
++		tio = container_of(bio, struct dm_target_io, clone);
++		__clone_and_map_simple_bio(ci, tio, len);
++	}
+ }
+ 
+ static int __send_empty_flush(struct clone_info *ci)
+@@ -1325,7 +1370,7 @@ static int __clone_and_map_data_bio(struct clone_info *ci, struct dm_target *ti,
+ 	struct dm_target_io *tio;
+ 	int r;
+ 
+-	tio = alloc_tio(ci, ti, 0);
++	tio = alloc_tio(ci, ti, 0, GFP_NOIO);
+ 	tio->len_ptr = len;
+ 	r = clone_bio(tio, bio, sector, *len);
+ 	if (r < 0) {
+-- 
+2.16.3
+
