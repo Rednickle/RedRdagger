@@ -1,0 +1,213 @@
+From 539d39eb27083405b82b9e604e88af01a9a46c63 Mon Sep 17 00:00:00 2001
+From: Tang Junhui <tang.junhui@zte.com.cn>
+Date: Mon, 8 Jan 2018 12:21:22 -0800
+Subject: [PATCH] bcache: fix wrong return value in bch_debug_init()
+Git-commit: 539d39eb27083405b82b9e604e88af01a9a46c63
+Patch-mainline: v4.16-rc1
+References: bsc#1093023
+
+in bch_debug_init(), ret is always 0, and the return value is useless,
+change it to return 0 if be success after calling debugfs_create_dir(),
+else return a non-zero value.
+
+Signed-off-by: Tang Junhui <tang.junhui@zte.com.cn>
+Reviewed-by: Michael Lyle <mlyle@lyle.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/bcache/bcache.h    |   6 ---
+ drivers/md/bcache/debug.c     |   5 +-
+ drivers/md/bcache/writeback.c | 120 +++++++++++++++++++++++++++++-------------
+ drivers/md/bcache/writeback.h |   3 ++
+ 4 files changed, 87 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/md/bcache/bcache.h b/drivers/md/bcache/bcache.h
+index 843877e017e1..1784e50eb857 100644
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -323,12 +323,6 @@ struct cached_dev {
+ 	struct bch_ratelimit	writeback_rate;
+ 	struct delayed_work	writeback_rate_update;
+ 
+-	/*
+-	 * Internal to the writeback code, so read_dirty() can keep track of
+-	 * where it's at.
+-	 */
+-	sector_t		last_read;
+-
+ 	/* Limit number of writeback bios in flight */
+ 	struct semaphore	in_flight;
+ 	struct task_struct	*writeback_thread;
+diff --git a/drivers/md/bcache/debug.c b/drivers/md/bcache/debug.c
+index 879ab21074c6..af89408befe8 100644
+--- a/drivers/md/bcache/debug.c
++++ b/drivers/md/bcache/debug.c
+@@ -251,8 +251,7 @@ void bch_debug_exit(void)
+ 
+ int __init bch_debug_init(struct kobject *kobj)
+ {
+-	int ret = 0;
+-
+ 	debug = debugfs_create_dir("bcache", NULL);
+-	return ret;
++
++	return IS_ERR_OR_NULL(debug);
+ }
+diff --git a/drivers/md/bcache/writeback.c b/drivers/md/bcache/writeback.c
+index 1ac2af6128b1..479095987f22 100644
+--- a/drivers/md/bcache/writeback.c
++++ b/drivers/md/bcache/writeback.c
+@@ -237,7 +237,9 @@ static void read_dirty_submit(struct closure *cl)
+ static void read_dirty(struct cached_dev *dc)
+ {
+ 	unsigned delay = 0;
+-	struct keybuf_key *w;
++	struct keybuf_key *next, *keys[MAX_WRITEBACKS_IN_PASS], *w;
++	size_t size;
++	int nk, i;
+ 	struct dirty_io *io;
+ 	struct closure cl;
+ 
+@@ -248,45 +250,87 @@ static void read_dirty(struct cached_dev *dc)
+ 	 * mempools.
+ 	 */
+ 
+-	while (!kthread_should_stop()) {
+-
+-		w = bch_keybuf_next(&dc->writeback_keys);
+-		if (!w)
+-			break;
+-
+-		BUG_ON(ptr_stale(dc->disk.c, &w->key, 0));
+-
+-		if (KEY_START(&w->key) != dc->last_read ||
+-		    jiffies_to_msecs(delay) > 50)
+-			while (!kthread_should_stop() && delay)
+-				delay = schedule_timeout_interruptible(delay);
+-
+-		dc->last_read	= KEY_OFFSET(&w->key);
+-
+-		io = kzalloc(sizeof(struct dirty_io) + sizeof(struct bio_vec)
+-			     * DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
+-			     GFP_KERNEL);
+-		if (!io)
+-			goto err;
+-
+-		w->private	= io;
+-		io->dc		= dc;
+-
+-		dirty_init(w);
+-		bio_set_op_attrs(&io->bio, REQ_OP_READ, 0);
+-		io->bio.bi_iter.bi_sector = PTR_OFFSET(&w->key, 0);
+-		bio_set_dev(&io->bio, PTR_CACHE(dc->disk.c, &w->key, 0)->bdev);
+-		io->bio.bi_end_io	= read_dirty_endio;
+-
+-		if (bio_alloc_pages(&io->bio, GFP_KERNEL))
+-			goto err_free;
+-
+-		trace_bcache_writeback(&w->key);
++	next = bch_keybuf_next(&dc->writeback_keys);
++
++	while (!kthread_should_stop() && next) {
++		size = 0;
++		nk = 0;
++
++		do {
++			BUG_ON(ptr_stale(dc->disk.c, &next->key, 0));
++
++			/*
++			 * Don't combine too many operations, even if they
++			 * are all small.
++			 */
++			if (nk >= MAX_WRITEBACKS_IN_PASS)
++				break;
++
++			/*
++			 * If the current operation is very large, don't
++			 * further combine operations.
++			 */
++			if (size >= MAX_WRITESIZE_IN_PASS)
++				break;
++
++			/*
++			 * Operations are only eligible to be combined
++			 * if they are contiguous.
++			 *
++			 * TODO: add a heuristic willing to fire a
++			 * certain amount of non-contiguous IO per pass,
++			 * so that we can benefit from backing device
++			 * command queueing.
++			 */
++			if ((nk != 0) && bkey_cmp(&keys[nk-1]->key,
++						&START_KEY(&next->key)))
++				break;
++
++			size += KEY_SIZE(&next->key);
++			keys[nk++] = next;
++		} while ((next = bch_keybuf_next(&dc->writeback_keys)));
++
++		/* Now we have gathered a set of 1..5 keys to write back. */
++		for (i = 0; i < nk; i++) {
++			w = keys[i];
++
++			io = kzalloc(sizeof(struct dirty_io) +
++				     sizeof(struct bio_vec) *
++				     DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
++				     GFP_KERNEL);
++			if (!io)
++				goto err;
++
++			w->private	= io;
++			io->dc		= dc;
++
++			dirty_init(w);
++			bio_set_op_attrs(&io->bio, REQ_OP_READ, 0);
++			io->bio.bi_iter.bi_sector = PTR_OFFSET(&w->key, 0);
++			bio_set_dev(&io->bio,
++				    PTR_CACHE(dc->disk.c, &w->key, 0)->bdev);
++			io->bio.bi_end_io	= read_dirty_endio;
++
++			if (bio_alloc_pages(&io->bio, GFP_KERNEL))
++				goto err_free;
++
++			trace_bcache_writeback(&w->key);
++
++			down(&dc->in_flight);
++
++			/* We've acquired a semaphore for the maximum
++			 * simultaneous number of writebacks; from here
++			 * everything happens asynchronously.
++			 */
++			closure_call(&io->cl, read_dirty_submit, NULL, &cl);
++		}
+ 
+-		down(&dc->in_flight);
+-		closure_call(&io->cl, read_dirty_submit, NULL, &cl);
++		delay = writeback_delay(dc, size);
+ 
+-		delay = writeback_delay(dc, KEY_SIZE(&w->key));
++		while (!kthread_should_stop() && delay) {
++			schedule_timeout_interruptible(delay);
++			delay = writeback_delay(dc, 0);
++		}
+ 	}
+ 
+ 	if (0) {
+diff --git a/drivers/md/bcache/writeback.h b/drivers/md/bcache/writeback.h
+index a9e3ffb4b03c..6d26927267f8 100644
+--- a/drivers/md/bcache/writeback.h
++++ b/drivers/md/bcache/writeback.h
+@@ -5,6 +5,9 @@
+ #define CUTOFF_WRITEBACK	40
+ #define CUTOFF_WRITEBACK_SYNC	70
+ 
++#define MAX_WRITEBACKS_IN_PASS  5
++#define MAX_WRITESIZE_IN_PASS   5000	/* *512b */
++
+ static inline uint64_t bcache_dev_sectors_dirty(struct bcache_device *d)
+ {
+ 	uint64_t i, ret = 0;
+-- 
+2.16.3
+
