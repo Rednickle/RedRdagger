@@ -1,0 +1,204 @@
+From: Torsten Duwe <duwe@lst.de>
+Date: Fri, 4 May 2018 14:38:34 +0200
+Subject: powerpc/livepatch: Implement reliable stack tracing for the
+ consistency model
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: df78d3f6148092d33a9a24c7a9cfac3d0220b484
+Patch-mainline: v4.18-rc1
+References: bsc#1071995 bsc#1072856 bsc#1087458 bsc#1089664 bsc#1089669
+ bsc#1090522 fate#323487
+
+The "Power Architecture 64-Bit ELF V2 ABI" says in section 2.3.2.3:
+
+[...] There are several rules that must be adhered to in order to ensure
+reliable and consistent call chain backtracing:
+
+* Before a function calls any other function, it shall establish its
+  own stack frame, whose size shall be a multiple of 16 bytes.
+
+ – In instances where a function’s prologue creates a stack frame, the
+   back-chain word of the stack frame shall be updated atomically with
+   the value of the stack pointer (r1) when a back chain is implemented.
+   (This must be supported as default by all ELF V2 ABI-compliant
+   environments.)
+[...]
+ – The function shall save the link register that contains its return
+   address in the LR save doubleword of its caller’s stack frame before
+   calling another function.
+
+To me this sounds like the equivalent of HAVE_RELIABLE_STACKTRACE.
+This patch may be unneccessarily limited to ppc64le, but OTOH the only
+user of this flag so far is livepatching, which is only implemented on
+PPCs with 64-LE, a.k.a. ELF ABI v2.
+
+Feel free to add other ppc variants, but so far only ppc64le got tested.
+
+This change also implements save_stack_trace_tsk_reliable() for ppc64le
+that checks for the above conditions, where possible.
+
+Signed-off-by: Torsten Duwe <duwe@suse.de>
+Signed-off-by: Nicolai Stange <nstange@suse.de>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Acked-by: Miroslav Benes <mbenes@suse.cz>
+---
+ arch/powerpc/Kconfig             |    1 
+ arch/powerpc/kernel/stacktrace.c |  119 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 119 insertions(+), 1 deletion(-)
+
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -207,6 +207,7 @@ config PPC
+ 	select HAVE_PERF_USER_STACK_DUMP
+ 	select HAVE_RCU_TABLE_FREE		if SMP
+ 	select HAVE_REGS_AND_STACK_ACCESS_API
++	select HAVE_RELIABLE_STACKTRACE		if PPC64 && CPU_LITTLE_ENDIAN
+ 	select HAVE_SYSCALL_TRACEPOINTS
+ 	select HAVE_VIRT_CPU_ACCOUNTING
+ 	select IRQ_DOMAIN
+--- a/arch/powerpc/kernel/stacktrace.c
++++ b/arch/powerpc/kernel/stacktrace.c
+@@ -2,7 +2,7 @@
+  * Stack trace utility
+  *
+  * Copyright 2008 Christoph Hellwig, IBM Corp.
+- *
++ * Copyright 2018 SUSE Linux GmbH
+  *
+  *      This program is free software; you can redistribute it and/or
+  *      modify it under the terms of the GNU General Public License
+@@ -11,11 +11,16 @@
+  */
+ 
+ #include <linux/export.h>
++#include <linux/kallsyms.h>
++#include <linux/module.h>
+ #include <linux/sched.h>
+ #include <linux/sched/debug.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/stacktrace.h>
+ #include <asm/ptrace.h>
+ #include <asm/processor.h>
++#include <linux/ftrace.h>
++#include <asm/kprobes.h>
+ 
+ /*
+  * Save stack-backtrace addresses into a stack_trace buffer.
+@@ -76,3 +81,115 @@ save_stack_trace_regs(struct pt_regs *re
+ 	save_context_stack(trace, regs->gpr[1], current, 0);
+ }
+ EXPORT_SYMBOL_GPL(save_stack_trace_regs);
++
++#ifdef CONFIG_HAVE_RELIABLE_STACKTRACE
++int
++save_stack_trace_tsk_reliable(struct task_struct *tsk,
++				struct stack_trace *trace)
++{
++	unsigned long sp;
++	unsigned long stack_page = (unsigned long)task_stack_page(tsk);
++	unsigned long stack_end;
++	int graph_idx = 0;
++
++	/*
++	 * The last frame (unwinding first) may not yet have saved
++	 * its LR onto the stack.
++	 */
++	int firstframe = 1;
++
++	if (tsk == current)
++		sp = current_stack_pointer();
++	else
++		sp = tsk->thread.ksp;
++
++	stack_end = stack_page + THREAD_SIZE;
++	if (!is_idle_task(tsk)) {
++		/*
++		 * For user tasks, this is the SP value loaded on
++		 * kernel entry, see "PACAKSAVE(r13)" in _switch() and
++		 * system_call_common()/EXCEPTION_PROLOG_COMMON().
++		 *
++		 * Likewise for non-swapper kernel threads,
++		 * this also happens to be the top of the stack
++		 * as setup by copy_thread().
++		 *
++		 * Note that stack backlinks are not properly setup by
++		 * copy_thread() and thus, a forked task() will have
++		 * an unreliable stack trace until it's been
++		 * _switch()'ed to for the first time.
++		 */
++		stack_end -= STACK_FRAME_OVERHEAD + sizeof(struct pt_regs);
++	} else {
++		/*
++		 * idle tasks have a custom stack layout,
++		 * c.f. cpu_idle_thread_init().
++		 */
++		stack_end -= STACK_FRAME_OVERHEAD;
++	}
++
++	if (sp < stack_page + sizeof(struct thread_struct) ||
++	    sp > stack_end - STACK_FRAME_MIN_SIZE) {
++		return 1;
++	}
++
++	for (;;) {
++		unsigned long *stack = (unsigned long *) sp;
++		unsigned long newsp, ip;
++
++		/* sanity check: ABI requires SP to be aligned 16 bytes. */
++		if (sp & 0xF)
++			return 1;
++
++		/* Mark stacktraces with exception frames as unreliable. */
++		if (sp <= stack_end - STACK_INT_FRAME_SIZE &&
++		    stack[STACK_FRAME_MARKER] == STACK_FRAME_REGS_MARKER) {
++			return 1;
++		}
++
++		newsp = stack[0];
++		/* Stack grows downwards; unwinder may only go up. */
++		if (newsp <= sp)
++			return 1;
++
++		if (newsp != stack_end &&
++		    newsp > stack_end - STACK_FRAME_MIN_SIZE) {
++			return 1; /* invalid backlink, too far up. */
++		}
++
++		/* Examine the saved LR: it must point into kernel code. */
++		ip = stack[STACK_FRAME_LR_SAVE];
++		if (!firstframe && !__kernel_text_address(ip))
++			return 1;
++		firstframe = 0;
++
++		/*
++		 * FIXME: IMHO these tests do not belong in
++		 * arch-dependent code, they are generic.
++		 */
++		ip = ftrace_graph_ret_addr(tsk, &graph_idx, ip, NULL);
++
++		/*
++		 * Mark stacktraces with kretprobed functions on them
++		 * as unreliable.
++		 */
++		if (ip == (unsigned long)kretprobe_trampoline)
++			return 1;
++
++		if (!trace->skip)
++			trace->entries[trace->nr_entries++] = ip;
++		else
++			trace->skip--;
++
++		if (newsp == stack_end)
++			break;
++
++		if (trace->nr_entries >= trace->max_entries)
++			return -E2BIG;
++
++		sp = newsp;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(save_stack_trace_tsk_reliable);
++#endif /* CONFIG_HAVE_RELIABLE_STACKTRACE */
