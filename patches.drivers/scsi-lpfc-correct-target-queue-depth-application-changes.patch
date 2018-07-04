@@ -1,0 +1,255 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Mon, 9 Apr 2018 14:24:22 -0700
+Subject: scsi: lpfc: Correct target queue depth application changes
+Git-commit: f91bc594ba963a9354c9da8bb85c21606c2b6289
+Patch-mainline: v4.18-rc1
+References: bsc#1088866
+
+The max_scsicmpl_time parameter can be used to perform scsi cmd queue
+depth mgmt based on io completion time: the queue depth is reduced to
+make completion time shorter. However, as soon as an io completes and
+the completion time is within limits, the code immediately bumps the
+queue depth limit back up to the target queue depth. Thus the procedure
+restarts, effectively limiting the usefulness of adjusting queue depth
+to help completion time.
+
+This patch makes the following changes:
+
+ - Removes the code at io completion that resets the queue depth as soon
+   as within limits.
+
+ - As the code removed was where the target queue depth was first
+   applied, change target queue depth application so that it occurs when
+   the parameter is changed.
+
+ - Makes target queue depth a standard parameter: both a module
+   parameter and a sysfs parameter.
+
+ - Optimizes the command pending count by using atomics rather than
+   locks.
+
+ - Updates the debugfs nodelist stats to allow better debugging of
+   pending command counts.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <james.smart@broadcom.com>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/scsi/lpfc/lpfc.h         |  2 --
+ drivers/scsi/lpfc/lpfc_attr.c    | 45 ++++++++++++++++++++++++++++++++++++++--
+ drivers/scsi/lpfc/lpfc_debugfs.c | 20 ++++++++++++++++--
+ drivers/scsi/lpfc/lpfc_scsi.c    | 19 +++++------------
+ 4 files changed, 66 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc.h b/drivers/scsi/lpfc/lpfc.h
+index 6c0d351c0d0d..be4abe52f289 100644
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -64,8 +64,6 @@ struct lpfc_sli2_slim;
+ #define LPFC_IOCB_LIST_CNT	2250	/* list of IOCBs for fast-path usage. */
+ #define LPFC_Q_RAMP_UP_INTERVAL 120     /* lun q_depth ramp up interval */
+ #define LPFC_VNAME_LEN		100	/* vport symbolic name length */
+-#define LPFC_TGTQ_INTERVAL	40000	/* Min amount of time between tgt
+-					   queue depth change in millisecs */
+ #define LPFC_TGTQ_RAMPUP_PCENT	5	/* Target queue rampup in percentage */
+ #define LPFC_MIN_TGT_QDEPTH	10
+ #define LPFC_MAX_TGT_QDEPTH	0xFFFF
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index 2ac1d21c553f..c89ffad1f43d 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -3469,8 +3469,49 @@ LPFC_VPORT_ATTR_R(lun_queue_depth, 30, 1, 512,
+ # tgt_queue_depth:  This parameter is used to limit the number of outstanding
+ # commands per target port. Value range is [10,65535]. Default value is 65535.
+ */
+-LPFC_VPORT_ATTR_RW(tgt_queue_depth, 65535, 10, 65535,
+-		   "Max number of FCP commands we can queue to a specific target port");
++static uint lpfc_tgt_queue_depth = LPFC_MAX_TGT_QDEPTH;
++module_param(lpfc_tgt_queue_depth, uint, 0444);
++MODULE_PARM_DESC(lpfc_tgt_queue_depth, "Set max Target queue depth");
++lpfc_vport_param_show(tgt_queue_depth);
++lpfc_vport_param_init(tgt_queue_depth, LPFC_MAX_TGT_QDEPTH,
++		      LPFC_MIN_TGT_QDEPTH, LPFC_MAX_TGT_QDEPTH);
++
++/**
++ * lpfc_tgt_queue_depth_store: Sets an attribute value.
++ * @phba: pointer the the adapter structure.
++ * @val: integer attribute value.
++ *
++ * Description: Sets the parameter to the new value.
++ *
++ * Returns:
++ * zero on success
++ * -EINVAL if val is invalid
++ */
++static int
++lpfc_tgt_queue_depth_set(struct lpfc_vport *vport, uint val)
++{
++	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
++	struct lpfc_nodelist *ndlp;
++
++	if (!lpfc_rangecheck(val, LPFC_MIN_TGT_QDEPTH, LPFC_MAX_TGT_QDEPTH))
++		return -EINVAL;
++
++	if (val == vport->cfg_tgt_queue_depth)
++		return 0;
++
++	spin_lock_irq(shost->host_lock);
++	vport->cfg_tgt_queue_depth = val;
++
++	/* Next loop thru nodelist and change cmd_qdepth */
++	list_for_each_entry(ndlp, &vport->fc_nodes, nlp_listp)
++		ndlp->cmd_qdepth = vport->cfg_tgt_queue_depth;
++
++	spin_unlock_irq(shost->host_lock);
++	return 0;
++}
++
++lpfc_vport_param_store(tgt_queue_depth);
++static DEVICE_ATTR_RW(lpfc_tgt_queue_depth);
+ 
+ /*
+ # hba_queue_depth:  This parameter is used to limit the number of outstanding
+diff --git a/drivers/scsi/lpfc/lpfc_debugfs.c b/drivers/scsi/lpfc/lpfc_debugfs.c
+index fb0dc2aeed91..50c11acf73a8 100644
+--- a/drivers/scsi/lpfc/lpfc_debugfs.c
++++ b/drivers/scsi/lpfc/lpfc_debugfs.c
+@@ -544,7 +544,7 @@ static int
+ lpfc_debugfs_nodelist_data(struct lpfc_vport *vport, char *buf, int size)
+ {
+ 	int len = 0;
+-	int cnt;
++	int i, iocnt, outio, cnt;
+ 	struct Scsi_Host *shost = lpfc_shost_from_vport(vport);
+ 	struct lpfc_hba  *phba = vport->phba;
+ 	struct lpfc_nodelist *ndlp;
+@@ -554,10 +554,12 @@ lpfc_debugfs_nodelist_data(struct lpfc_vport *vport, char *buf, int size)
+ 	struct nvme_fc_remote_port *nrport;
+ 
+ 	cnt = (LPFC_NODELIST_SIZE / LPFC_NODELIST_ENTRY_SIZE);
++	outio = 0;
+ 
+ 	len += snprintf(buf+len, size-len, "\nFCP Nodelist Entries ...\n");
+ 	spin_lock_irq(shost->host_lock);
+ 	list_for_each_entry(ndlp, &vport->fc_nodes, nlp_listp) {
++		iocnt = 0;
+ 		if (!cnt) {
+ 			len +=  snprintf(buf+len, size-len,
+ 				"Missing Nodelist Entries\n");
+@@ -585,9 +587,11 @@ lpfc_debugfs_nodelist_data(struct lpfc_vport *vport, char *buf, int size)
+ 			break;
+ 		case NLP_STE_UNMAPPED_NODE:
+ 			statep = "UNMAP ";
++			iocnt = 1;
+ 			break;
+ 		case NLP_STE_MAPPED_NODE:
+ 			statep = "MAPPED";
++			iocnt = 1;
+ 			break;
+ 		case NLP_STE_NPR_NODE:
+ 			statep = "NPR   ";
+@@ -614,8 +618,10 @@ lpfc_debugfs_nodelist_data(struct lpfc_vport *vport, char *buf, int size)
+ 			len += snprintf(buf+len, size-len, "UNKNOWN_TYPE ");
+ 		if (ndlp->nlp_type & NLP_FC_NODE)
+ 			len += snprintf(buf+len, size-len, "FC_NODE ");
+-		if (ndlp->nlp_type & NLP_FABRIC)
++		if (ndlp->nlp_type & NLP_FABRIC) {
+ 			len += snprintf(buf+len, size-len, "FABRIC ");
++			iocnt = 0;
++		}
+ 		if (ndlp->nlp_type & NLP_FCP_TARGET)
+ 			len += snprintf(buf+len, size-len, "FCP_TGT sid:%d ",
+ 				ndlp->nlp_sid);
+@@ -632,10 +638,20 @@ lpfc_debugfs_nodelist_data(struct lpfc_vport *vport, char *buf, int size)
+ 			ndlp->nlp_usg_map);
+ 		len += snprintf(buf+len, size-len, "refcnt:%x",
+ 			kref_read(&ndlp->kref));
++		if (iocnt) {
++			i = atomic_read(&ndlp->cmd_pending);
++			len += snprintf(buf + len, size - len,
++					" OutIO:x%x Qdepth x%x",
++					i, ndlp->cmd_qdepth);
++			outio += i;
++		}
+ 		len +=  snprintf(buf+len, size-len, "\n");
+ 	}
+ 	spin_unlock_irq(shost->host_lock);
+ 
++	len += snprintf(buf + len, size - len,
++			"\nOutstanding IO x%x\n",  outio);
++
+ 	if (phba->nvmet_support && phba->targetport && (vport == phba->pport)) {
+ 		tgtp = (struct lpfc_nvmet_tgtport *)phba->targetport->private;
+ 		len += snprintf(buf + len, size - len,
+diff --git a/drivers/scsi/lpfc/lpfc_scsi.c b/drivers/scsi/lpfc/lpfc_scsi.c
+index 050f04418f5f..8570486013f3 100644
+--- a/drivers/scsi/lpfc/lpfc_scsi.c
++++ b/drivers/scsi/lpfc/lpfc_scsi.c
+@@ -3983,9 +3983,6 @@ lpfc_scsi_cmd_iocb_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *pIocbIn,
+ 	}
+ #endif
+ 
+-	if (pnode && NLP_CHK_NODE_ACT(pnode))
+-		atomic_dec(&pnode->cmd_pending);
+-
+ 	if (lpfc_cmd->status) {
+ 		if (lpfc_cmd->status == IOSTAT_LOCAL_REJECT &&
+ 		    (lpfc_cmd->result & IOERR_DRVR_MASK))
+@@ -4125,6 +4122,7 @@ lpfc_scsi_cmd_iocb_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *pIocbIn,
+ 		msecs_to_jiffies(vport->cfg_max_scsicmpl_time))) {
+ 		spin_lock_irqsave(shost->host_lock, flags);
+ 		if (pnode && NLP_CHK_NODE_ACT(pnode)) {
++			atomic_dec(&pnode->cmd_pending);
+ 			if (pnode->cmd_qdepth >
+ 				atomic_read(&pnode->cmd_pending) &&
+ 				(atomic_read(&pnode->cmd_pending) >
+@@ -4138,16 +4136,8 @@ lpfc_scsi_cmd_iocb_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *pIocbIn,
+ 		}
+ 		spin_unlock_irqrestore(shost->host_lock, flags);
+ 	} else if (pnode && NLP_CHK_NODE_ACT(pnode)) {
+-		if ((pnode->cmd_qdepth != vport->cfg_tgt_queue_depth) &&
+-		    time_after(jiffies, pnode->last_change_time +
+-			      msecs_to_jiffies(LPFC_TGTQ_INTERVAL))) {
+-			spin_lock_irqsave(shost->host_lock, flags);
+-			pnode->cmd_qdepth = vport->cfg_tgt_queue_depth;
+-			pnode->last_change_time = jiffies;
+-			spin_unlock_irqrestore(shost->host_lock, flags);
+-		}
++		atomic_dec(&pnode->cmd_pending);
+ 	}
+-
+ 	lpfc_scsi_unprep_dma_buf(phba, lpfc_cmd);
+ 
+ 	spin_lock_irqsave(&phba->hbalock, flags);
+@@ -4591,6 +4581,8 @@ lpfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
+ 				 ndlp->nlp_portname.u.wwn[7]);
+ 		goto out_tgt_busy;
+ 	}
++	atomic_inc(&ndlp->cmd_pending);
++
+ 	lpfc_cmd = lpfc_get_scsi_buf(phba, ndlp);
+ 	if (lpfc_cmd == NULL) {
+ 		lpfc_rampdown_queue_depth(phba);
+@@ -4643,11 +4635,9 @@ lpfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
+ 
+ 	lpfc_scsi_prep_cmnd(vport, lpfc_cmd, ndlp);
+ 
+-	atomic_inc(&ndlp->cmd_pending);
+ 	err = lpfc_sli_issue_iocb(phba, LPFC_FCP_RING,
+ 				  &lpfc_cmd->cur_iocbq, SLI_IOCB_RET_IOCB);
+ 	if (err) {
+-		atomic_dec(&ndlp->cmd_pending);
+ 		lpfc_printf_vlog(vport, KERN_INFO, LOG_FCP,
+ 				 "3376 FCP could not issue IOCB err %x"
+ 				 "FCP cmd x%x <%d/%llu> "
+@@ -4691,6 +4681,7 @@ lpfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
+ 	lpfc_scsi_unprep_dma_buf(phba, lpfc_cmd);
+ 	lpfc_release_scsi_buf(phba, lpfc_cmd);
+  out_host_busy:
++	atomic_dec(&ndlp->cmd_pending);
+ 	return SCSI_MLQUEUE_HOST_BUSY;
+ 
+  out_tgt_busy:
+
