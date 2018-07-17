@@ -1,0 +1,210 @@
+From: Karsten Graul <kgraul@linux.vnet.ibm.com>
+Date: Fri, 16 Mar 2018 15:06:39 +0100
+Subject: net/smc: restructure netinfo for CLC proposal msgs
+Patch-mainline: v4.17-rc1
+Git-commit: c246d942eabc3288f5d93930663411070093ac52
+References: bsc#1096003, FATE#325023, LTC#164003
+
+Introduce functions smc_clc_prfx_set to retrieve IP information for the
+CLC proposal msg and smc_clc_prfx_match to match the contents of a
+proposal message against the IP addresses of the net device. The new
+functions replace the functionality provided by smc_clc_netinfo_by_tcpsk,
+which is removed by this patch. The match functionality is extended to
+scan all ipv4 addresses of the net device for a match against the
+ipv4 subnet from the proposal msg.
+
+Signed-off-by: Karsten Graul <kgraul@linux.vnet.ibm.com>
+Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ net/smc/af_smc.c  |   14 +------
+ net/smc/smc_clc.c |  101 +++++++++++++++++++++++++++++++++++++++++-------------
+ net/smc/smc_clc.h |    4 +-
+ 3 files changed, 83 insertions(+), 36 deletions(-)
+
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -767,8 +767,6 @@ static void smc_listen_work(struct work_
+ 	struct smc_link *link;
+ 	int reason_code = 0;
+ 	int rc = 0, len;
+-	__be32 subnet;
+-	u8 prefix_len;
+ 	u8 ibport;
+ 
+ 	/* check if peer is smc capable */
+@@ -803,17 +801,11 @@ static void smc_listen_work(struct work_
+ 		goto decline_rdma;
+ 	}
+ 
+-	/* determine subnet and mask from internal TCP socket */
+-	rc = smc_clc_netinfo_by_tcpsk(newclcsock, &subnet, &prefix_len);
+-	if (rc) {
+-		reason_code = SMC_CLC_DECL_CNFERR; /* configuration error */
+-		goto decline_rdma;
+-	}
+-
+ 	pclc = (struct smc_clc_msg_proposal *)&buf;
+ 	pclc_prfx = smc_clc_proposal_get_prefix(pclc);
+-	if (pclc_prfx->outgoing_subnet != subnet ||
+-	    pclc_prfx->prefix_len != prefix_len) {
++
++	rc = smc_clc_prfx_match(newclcsock, pclc_prfx);
++	if (rc) {
+ 		reason_code = SMC_CLC_DECL_CNFERR; /* configuration error */
+ 		goto decline_rdma;
+ 	}
+--- a/net/smc/smc_clc.c
++++ b/net/smc/smc_clc.c
+@@ -73,15 +73,36 @@ static bool smc_clc_msg_hdr_valid(struct
+ 	return true;
+ }
+ 
+-/* determine subnet and mask of internal TCP socket */
+-int smc_clc_netinfo_by_tcpsk(struct socket *clcsock,
+-			     __be32 *subnet, u8 *prefix_len)
++/* find ipv4 addr on device and get the prefix len, fill CLC proposal msg */
++static int smc_clc_prfx_set4_rcu(struct dst_entry *dst, __be32 ipv4,
++				 struct smc_clc_msg_proposal_prefix *prop)
++{
++	struct in_device *in_dev = __in_dev_get_rcu(dst->dev);
++
++	if (!in_dev)
++		return -ENODEV;
++	for_ifa(in_dev) {
++		if (!inet_ifa_match(ipv4, ifa))
++			continue;
++		prop->prefix_len = inet_mask_len(ifa->ifa_mask);
++		prop->outgoing_subnet = ifa->ifa_address & ifa->ifa_mask;
++		/* prop->ipv6_prefixes_cnt = 0; already done by memset before */
++		return 0;
++	} endfor_ifa(in_dev);
++	return -ENOENT;
++}
++
++/* retrieve and set prefixes in CLC proposal msg */
++static int smc_clc_prfx_set(struct socket *clcsock,
++			    struct smc_clc_msg_proposal_prefix *prop)
+ {
+ 	struct dst_entry *dst = sk_dst_get(clcsock->sk);
+-	struct in_device *in_dev;
+-	struct sockaddr_in addr;
++	struct sockaddr_storage addrs;
++	struct sockaddr_in *addr;
+ 	int rc = -ENOENT;
++	int len = len;
+ 
++	memset(prop, 0, sizeof(*prop));
+ 	if (!dst) {
+ 		rc = -ENOTCONN;
+ 		goto out;
+@@ -90,22 +111,58 @@ int smc_clc_netinfo_by_tcpsk(struct sock
+ 		rc = -ENODEV;
+ 		goto out_rel;
+ 	}
+-
+ 	/* get address to which the internal TCP socket is bound */
+-	kernel_getsockname(clcsock, (struct sockaddr *)&addr);
+-	/* analyze IPv4 specific data of net_device belonging to TCP socket */
++	kernel_getsockname(clcsock, (struct sockaddr *)&addrs, &len);
++	/* analyze IP specific data of net_device belonging to TCP socket */
+ 	rcu_read_lock();
+-	in_dev = __in_dev_get_rcu(dst->dev);
++	if (addrs.ss_family == PF_INET) {
++		/* IPv4 */
++		addr = (struct sockaddr_in *)&addrs;
++		rc = smc_clc_prfx_set4_rcu(dst, addr->sin_addr.s_addr, prop);
++	}
++	rcu_read_unlock();
++out_rel:
++	dst_release(dst);
++out:
++	return rc;
++}
++
++/* match ipv4 addrs of dev against addr in CLC proposal */
++static int smc_clc_prfx_match4_rcu(struct net_device *dev,
++				   struct smc_clc_msg_proposal_prefix *prop)
++{
++	struct in_device *in_dev = __in_dev_get_rcu(dev);
++
++	if (!in_dev)
++		return -ENODEV;
+ 	for_ifa(in_dev) {
+-		if (!inet_ifa_match(addr.sin_addr.s_addr, ifa))
+-			continue;
+-		*prefix_len = inet_mask_len(ifa->ifa_mask);
+-		*subnet = ifa->ifa_address & ifa->ifa_mask;
+-		rc = 0;
+-		break;
++		if (prop->prefix_len == inet_mask_len(ifa->ifa_mask) &&
++		    inet_ifa_match(prop->outgoing_subnet, ifa))
++			return 0;
+ 	} endfor_ifa(in_dev);
+-	rcu_read_unlock();
+ 
++	return -ENOENT;
++}
++
++/* check if proposed prefixes match one of our device prefixes */
++int smc_clc_prfx_match(struct socket *clcsock,
++		       struct smc_clc_msg_proposal_prefix *prop)
++{
++	struct dst_entry *dst = sk_dst_get(clcsock->sk);
++	int rc = -ENOENT;
++
++	if (!dst) {
++		rc = -ENOTCONN;
++		goto out;
++	}
++	if (!dst->dev) {
++		rc = -ENODEV;
++		goto out_rel;
++	}
++	rcu_read_lock();
++	if (!prop->ipv6_prefixes_cnt)
++		rc = smc_clc_prfx_match4_rcu(dst->dev, prop);
++	rcu_read_unlock();
+ out_rel:
+ 	dst_release(dst);
+ out:
+@@ -239,6 +296,11 @@ int smc_clc_send_proposal(struct smc_soc
+ 	struct msghdr msg;
+ 	int len, plen, rc;
+ 
++	/* retrieve ip prefixes for CLC proposal msg */
++	rc = smc_clc_prfx_set(smc->clcsock, &pclc_prfx);
++	if (rc)
++		return SMC_CLC_DECL_CNFERR; /* configuration error */
++
+ 	/* send SMC Proposal CLC message */
+ 	plen = sizeof(pclc) + sizeof(pclc_prfx) + sizeof(trl);
+ 	memset(&pclc, 0, sizeof(pclc));
+@@ -251,13 +313,6 @@ int smc_clc_send_proposal(struct smc_soc
+ 	memcpy(&pclc.lcl.mac, &smcibdev->mac[ibport - 1], ETH_ALEN);
+ 	pclc.iparea_offset = htons(0);
+ 
+-	memset(&pclc_prfx, 0, sizeof(pclc_prfx));
+-	/* determine subnet and mask from internal TCP socket */
+-	rc = smc_clc_netinfo_by_tcpsk(smc->clcsock, &pclc_prfx.outgoing_subnet,
+-				      &pclc_prfx.prefix_len);
+-	if (rc)
+-		return SMC_CLC_DECL_CNFERR; /* configuration error */
+-	pclc_prfx.ipv6_prefixes_cnt = 0;
+ 	memcpy(trl.eyecatcher, SMC_EYECATCHER, sizeof(SMC_EYECATCHER));
+ 	memset(&msg, 0, sizeof(msg));
+ 	vec[0].iov_base = &pclc;
+--- a/net/smc/smc_clc.h
++++ b/net/smc/smc_clc.h
+@@ -121,8 +121,8 @@ smc_clc_proposal_get_prefix(struct smc_c
+ 	       ((u8 *)pclc + sizeof(*pclc) + ntohs(pclc->iparea_offset));
+ }
+ 
+-int smc_clc_netinfo_by_tcpsk(struct socket *clcsock, __be32 *subnet,
+-			     u8 *prefix_len);
++int smc_clc_prfx_match(struct socket *clcsock,
++		       struct smc_clc_msg_proposal_prefix *prop);
+ int smc_clc_wait_msg(struct smc_sock *smc, void *buf, int buflen,
+ 		     u8 expected_type);
+ int smc_clc_send_decline(struct smc_sock *smc, u32 peer_diag_info);
