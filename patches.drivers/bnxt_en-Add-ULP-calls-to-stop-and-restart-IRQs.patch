@@ -1,0 +1,239 @@
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Sat, 31 Mar 2018 13:54:21 -0400
+Subject: bnxt_en: Add ULP calls to stop and restart IRQs.
+Patch-mainline: v4.17-rc1
+Git-commit: ec86f14ea5064e36ee111297bdb376dda4cba264
+References: bsc#1086282 FATE#324873
+
+When the driver needs to re-initailize the IRQ vectors, we make the
+new ulp_irq_stop() call to tell the RDMA driver to disable and free
+the IRQ vectors.  After IRQ vectors have been re-initailized, we
+make the ulp_irq_restart() call to tell the RDMA driver that
+IRQs can be restarted.
+
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c     |    7 +-
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c |   81 +++++++++++++++++++++++---
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.h |   19 +++---
+ 3 files changed, 90 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -6009,8 +6009,10 @@ int bnxt_reserve_rings(struct bnxt *bp)
+ 	}
+ 	if ((bp->flags & BNXT_FLAG_NEW_RM) &&
+ 	    (bnxt_get_num_msix(bp) != bp->total_irqs)) {
++		bnxt_ulp_irq_stop(bp);
+ 		bnxt_clear_int_mode(bp);
+ 		rc = bnxt_init_int_mode(bp);
++		bnxt_ulp_irq_restart(bp, rc);
+ 		if (rc)
+ 			return rc;
+ 	}
+@@ -8484,16 +8486,15 @@ int bnxt_restore_pf_fw_resources(struct
+ 	int rc;
+ 
+ 	ASSERT_RTNL();
+-	if (bnxt_ulp_registered(bp->edev, BNXT_ROCE_ULP))
+-		return 0;
+-
+ 	bnxt_hwrm_func_qcaps(bp);
+ 
+ 	if (netif_running(bp->dev))
+ 		__bnxt_close_nic(bp, true, false);
+ 
++	bnxt_ulp_irq_stop(bp);
+ 	bnxt_clear_int_mode(bp);
+ 	rc = bnxt_init_int_mode(bp);
++	bnxt_ulp_irq_restart(bp, rc);
+ 
+ 	if (netif_running(bp->dev)) {
+ 		if (rc)
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
+@@ -1,6 +1,6 @@
+ /* Broadcom NetXtreme-C/E network driver.
+  *
+- * Copyright (c) 2016 Broadcom Limited
++ * Copyright (c) 2016-2018 Broadcom Limited
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -101,13 +101,27 @@ static int bnxt_unregister_dev(struct bn
+ 	return 0;
+ }
+ 
++static void bnxt_fill_msix_vecs(struct bnxt *bp, struct bnxt_msix_entry *ent)
++{
++	struct bnxt_en_dev *edev = bp->edev;
++	int num_msix, idx, i;
++
++	num_msix = edev->ulp_tbl[BNXT_ROCE_ULP].msix_requested;
++	idx = edev->ulp_tbl[BNXT_ROCE_ULP].msix_base;
++	for (i = 0; i < num_msix; i++) {
++		ent[i].vector = bp->irq_tbl[idx + i].vector;
++		ent[i].ring_idx = idx + i;
++		ent[i].db_offset = (idx + i) * 0x80;
++	}
++}
++
+ static int bnxt_req_msix_vecs(struct bnxt_en_dev *edev, int ulp_id,
+ 			      struct bnxt_msix_entry *ent, int num_msix)
+ {
+ 	struct net_device *dev = edev->net;
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	int max_idx, max_cp_rings;
+-	int avail_msix, i, idx;
++	int avail_msix, idx;
+ 	int rc = 0;
+ 
+ 	ASSERT_RTNL();
+@@ -154,13 +168,10 @@ static int bnxt_req_msix_vecs(struct bnx
+ 		avail_msix = hw_resc->resv_cp_rings - bp->cp_nr_rings;
+ 		edev->ulp_tbl[ulp_id].msix_requested = avail_msix;
+ 	}
+-	for (i = 0; i < avail_msix; i++) {
+-		ent[i].vector = bp->irq_tbl[idx + i].vector;
+-		ent[i].ring_idx = idx + i;
+-		ent[i].db_offset = (idx + i) * 0x80;
+-	}
++	bnxt_fill_msix_vecs(bp, ent);
+ 	bnxt_set_max_func_irqs(bp, bnxt_get_max_func_irqs(bp) - avail_msix);
+ 	bnxt_set_max_func_cp_rings(bp, max_cp_rings - avail_msix);
++	edev->flags |= BNXT_EN_FLAG_MSIX_REQUESTED;
+ 	return avail_msix;
+ }
+ 
+@@ -174,11 +185,15 @@ static int bnxt_free_msix_vecs(struct bn
+ 	if (ulp_id != BNXT_ROCE_ULP)
+ 		return -EINVAL;
+ 
++	if (!(edev->flags & BNXT_EN_FLAG_MSIX_REQUESTED))
++		return 0;
++
+ 	max_cp_rings = bnxt_get_max_func_cp_rings(bp);
+ 	msix_requested = edev->ulp_tbl[ulp_id].msix_requested;
+ 	bnxt_set_max_func_cp_rings(bp, max_cp_rings + msix_requested);
+ 	edev->ulp_tbl[ulp_id].msix_requested = 0;
+ 	bnxt_set_max_func_irqs(bp, bnxt_get_max_func_irqs(bp) + msix_requested);
++	edev->flags &= ~BNXT_EN_FLAG_MSIX_REQUESTED;
+ 	if (netif_running(dev)) {
+ 		bnxt_close_nic(bp, true, false);
+ 		bnxt_open_nic(bp, true, false);
+@@ -340,6 +355,58 @@ void bnxt_ulp_shutdown(struct bnxt *bp)
+ 	}
+ }
+ 
++void bnxt_ulp_irq_stop(struct bnxt *bp)
++{
++	struct bnxt_en_dev *edev = bp->edev;
++	struct bnxt_ulp_ops *ops;
++
++	if (!edev || !(edev->flags & BNXT_EN_FLAG_MSIX_REQUESTED))
++		return;
++
++	if (bnxt_ulp_registered(bp->edev, BNXT_ROCE_ULP)) {
++		struct bnxt_ulp *ulp = &edev->ulp_tbl[BNXT_ROCE_ULP];
++
++		if (!ulp->msix_requested)
++			return;
++
++		ops = rtnl_dereference(ulp->ulp_ops);
++		if (!ops || !ops->ulp_irq_stop)
++			return;
++		ops->ulp_irq_stop(ulp->handle);
++	}
++}
++
++void bnxt_ulp_irq_restart(struct bnxt *bp, int err)
++{
++	struct bnxt_en_dev *edev = bp->edev;
++	struct bnxt_ulp_ops *ops;
++
++	if (!edev || !(edev->flags & BNXT_EN_FLAG_MSIX_REQUESTED))
++		return;
++
++	if (bnxt_ulp_registered(bp->edev, BNXT_ROCE_ULP)) {
++		struct bnxt_ulp *ulp = &edev->ulp_tbl[BNXT_ROCE_ULP];
++		struct bnxt_msix_entry *ent = NULL;
++
++		if (!ulp->msix_requested)
++			return;
++
++		ops = rtnl_dereference(ulp->ulp_ops);
++		if (!ops || !ops->ulp_irq_restart)
++			return;
++
++		if (!err) {
++			ent = kcalloc(ulp->msix_requested, sizeof(*ent),
++				      GFP_KERNEL);
++			if (!ent)
++				return;
++			bnxt_fill_msix_vecs(bp, ent);
++		}
++		ops->ulp_irq_restart(ulp->handle, ent);
++		kfree(ent);
++	}
++}
++
+ void bnxt_ulp_async_events(struct bnxt *bp, struct hwrm_async_event_cmpl *cmpl)
+ {
+ 	u16 event_id = le16_to_cpu(cmpl->event_id);
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.h
+@@ -1,6 +1,6 @@
+ /* Broadcom NetXtreme-C/E network driver.
+  *
+- * Copyright (c) 2016 Broadcom Limited
++ * Copyright (c) 2016-2018 Broadcom Limited
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -20,6 +20,12 @@
+ struct hwrm_async_event_cmpl;
+ struct bnxt;
+ 
++struct bnxt_msix_entry {
++	u32	vector;
++	u32	ring_idx;
++	u32	db_offset;
++};
++
+ struct bnxt_ulp_ops {
+ 	/* async_notifier() cannot sleep (in BH context) */
+ 	void (*ulp_async_notifier)(void *, struct hwrm_async_event_cmpl *);
+@@ -27,12 +33,8 @@ struct bnxt_ulp_ops {
+ 	void (*ulp_start)(void *);
+ 	void (*ulp_sriov_config)(void *, int);
+ 	void (*ulp_shutdown)(void *);
+-};
+-
+-struct bnxt_msix_entry {
+-	u32	vector;
+-	u32	ring_idx;
+-	u32	db_offset;
++	void (*ulp_irq_stop)(void *);
++	void (*ulp_irq_restart)(void *, struct bnxt_msix_entry *);
+ };
+ 
+ struct bnxt_fw_msg {
+@@ -61,6 +63,7 @@ struct bnxt_en_dev {
+ 	#define BNXT_EN_FLAG_ROCEV2_CAP		0x2
+ 	#define BNXT_EN_FLAG_ROCE_CAP		(BNXT_EN_FLAG_ROCEV1_CAP | \
+ 						 BNXT_EN_FLAG_ROCEV2_CAP)
++	#define BNXT_EN_FLAG_MSIX_REQUESTED	0x4
+ 	const struct bnxt_en_ops	*en_ops;
+ 	struct bnxt_ulp			ulp_tbl[BNXT_MAX_ULP];
+ };
+@@ -92,6 +95,8 @@ void bnxt_ulp_stop(struct bnxt *bp);
+ void bnxt_ulp_start(struct bnxt *bp);
+ void bnxt_ulp_sriov_cfg(struct bnxt *bp, int num_vfs);
+ void bnxt_ulp_shutdown(struct bnxt *bp);
++void bnxt_ulp_irq_stop(struct bnxt *bp);
++void bnxt_ulp_irq_restart(struct bnxt *bp, int err);
+ void bnxt_ulp_async_events(struct bnxt *bp, struct hwrm_async_event_cmpl *cmpl);
+ struct bnxt_en_dev *bnxt_ulp_probe(struct net_device *dev);
+ 
