@@ -1,0 +1,179 @@
+From: Michal Hocko <mhocko@suse.cz> 
+Subject: pagecache limit: export debugging counters via /proc/vmstat
+Patch-mainline: never, SUSE specific
+References: bnc#924701
+
+Pagecache limit has proven to be hard to tune historically (which is not
+entirely unexpected). The primary motivation for the knob was to prevent
+from heavy pagecache users from interfering with the rest of the system
+and push out memory to the swap. There have been many changes done in
+the reclaim path to help with that but that still doesn't seem sufficient
+and some customers still seem to benefit from the pagecache_limit_mb knob.
+
+As the pagecache limit reclaim doesn't scale well with the growing of
+number of CPUs it has to be throttled in a way or another and that might
+lead to long stalls when the limit is set too low. What is too low, however,
+doesn't have a simple answer and it highly depends on the workload.
+
+This patch helps in a way by exporting 2 counters via /proc/vmstat:
+	- nr_pagecache_limit_throttled - tells administrator how many tasks
+	  are throttled because they have hit the pagecache limit. Some of
+	  those tasks will be performing pagecache limit direct reclaim
+	  before they are allowed to get a new pagecache page.
+	- nr_pagecache_limit_blocked - tells administrator how many tasks
+	  are blocked waiting for the pagecache limit reclaim to make some
+	  progress but they cannot perform the reclaim themselves.
+
+A high number of the first (throttled) signals there is a strong pressure on
+the pagecache limit. This itself doesn't imply very long stalls necessarily.
+The memory reclaim might be still effective enough to finish in a reasonable
+time and the processes will only see the throttling which is the main point
+of the pagecache_limit_mb knob.
+
+But a high number of the later (blocked) is a clear signal that the pagecache
+limit is under provisioned and the demand for the page cache is much higher
+than the system manages to reclaim. Long stalls are basically unavoidable in
+such a case. Increasing the limit in such a case is essential if the pagecache
+incurred latencies are not acceptable.
+
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+
+---
+ include/linux/vmstat.h |   12 ++++++++++++
+ mm/vmscan.c            |   45 +++++++++++++++++++++++++++++++++++++++++++--
+ mm/vmstat.c            |    7 +++++++
+ 3 files changed, 62 insertions(+), 2 deletions(-)
+
+--- a/include/linux/vmstat.h
++++ b/include/linux/vmstat.h
+@@ -380,6 +380,18 @@ static inline void __mod_zone_freepage_s
+ 		__mod_zone_page_state(zone, NR_FREE_CMA_PAGES, nr_pages);
+ }
+ 
++enum pagecache_limit_stat_item {
++	NR_PAGECACHE_LIMIT_THROTTLED,	/* Number of tasks throttled by the
++					 * page cache limit.
++					 */
++	NR_PAGECACHE_LIMIT_BLOCKED,	/* Number of tasks blocked waiting for
++					 * the page cache limit reclaim.
++					 */
++	NR_PAGECACHE_LIMIT_ITEMS,
++};
++
++void all_pagecache_limit_counters(unsigned long *);
++
+ extern const char * const vmstat_text[];
+ 
+ #endif /* _LINUX_VMSTAT_H */
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3641,6 +3641,40 @@ unsigned long shrink_all_memory(unsigned
+ #endif /* CONFIG_HIBERNATION */
+ 
+ /*
++ * This should probably go into mm/vmstat.c but there is no intention to
++ * spread any knowledge outside of this single user so let's stay here
++ * and be quiet so that nobody notices us.
++ *
++ * A new counter has to be added to enum pagecache_limit_stat_item and
++ * its name to vmstat_text.
++ *
++ * The pagecache limit reclaim is also a slow path so we can go without
++ * per-cpu accounting for now.
++ *
++ * No kernel path should _ever_ depend on these counters. They are solely
++ * for userspace debugging via /proc/vmstat
++ */
++static atomic_t pagecache_limit_stats[NR_PAGECACHE_LIMIT_ITEMS];
++
++void all_pagecache_limit_counters(unsigned long *ret)
++{
++	int i;
++
++	for (i = 0; i < NR_PAGECACHE_LIMIT_ITEMS; i++)
++		ret[i] = atomic_read(&pagecache_limit_stats[i]);
++}
++
++static void inc_pagecache_limit_stat(enum pagecache_limit_stat_item item)
++{
++	atomic_inc(&pagecache_limit_stats[item]);
++}
++
++static void dec_pagecache_limit_stat(enum pagecache_limit_stat_item item)
++{
++	atomic_dec(&pagecache_limit_stats[item]);
++}
++
++/*
+  * Returns non-zero if the lock has been acquired, false if somebody
+  * else is holding the lock.
+  */
+@@ -3808,7 +3842,9 @@ static int shrink_all_nodes(unsigned lon
+ 	 * do it if there is nothing to be done.
+ 	 */
+ 	if (!nr_locked_zones) {
++		inc_pagecache_limit_stat(NR_PAGECACHE_LIMIT_BLOCKED);
+ 		schedule();
++		dec_pagecache_limit_stat(NR_PAGECACHE_LIMIT_BLOCKED);
+ 		finish_wait(&pagecache_reclaim_wq, &wait);
+ 		goto out;
+ 	}
+@@ -3875,6 +3911,7 @@ retry:
+ 
+ 	/* But do a few at least */
+ 	nr_pages = max_t(unsigned long, nr_pages, 8*SWAP_CLUSTER_MAX);
++	inc_pagecache_limit_stat(NR_PAGECACHE_LIMIT_THROTTLED);
+ 
+ 	/*
+ 	 * Shrink the LRU in 2 passes:
+@@ -3892,12 +3929,14 @@ retry:
+ 			 * No node reclaimed because of too many reclaimers. Retry whether
+ 			 * there is still something to do
+ 			 */
+-			if (!shrink_all_nodes(nr_to_scan, pass, &sc))
++			if (!shrink_all_nodes(nr_to_scan, pass, &sc)) {
++				dec_pagecache_limit_stat(NR_PAGECACHE_LIMIT_THROTTLED);
+ 				goto retry;
++			}
+ 
+ 			ret += sc.nr_reclaimed;
+ 			if (ret >= nr_pages)
+-				return;
++				goto out;
+ 		}
+ 
+ 		if (pass == 1) {
+@@ -3908,6 +3947,8 @@ retry:
+ 				sc.may_writepage = 1;
+ 		}
+ 	}
++out:
++	dec_pagecache_limit_stat(NR_PAGECACHE_LIMIT_THROTTLED);
+ }
+ 
+ void shrink_page_cache(gfp_t mask, struct page *page)
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1208,6 +1208,10 @@ const char * const vmstat_text[] = {
+ 	"vmacache_full_flushes",
+ #endif
+ #endif /* CONFIG_VM_EVENTS_COUNTERS */
++
++	/* Pagecache limit counters */
++	"nr_pagecache_limit_throttled",
++	"nr_pagecache_limit_blocked",
+ };
+ #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA */
+ 
+@@ -1639,7 +1643,10 @@ static void *vmstat_start(struct seq_fil
+ 	all_vm_events(v);
+ 	v[PGPGIN] /= 2;		/* sectors -> kbytes */
+ 	v[PGPGOUT] /= 2;
++	v += NR_VM_EVENT_ITEMS;
+ #endif
++	all_pagecache_limit_counters(v);
++
+ 	return (unsigned long *)m->private + *pos;
+ }
+ 

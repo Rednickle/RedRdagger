@@ -1,0 +1,234 @@
+From: Michal Hocko <mhocko@suse.cz>
+Subject: pagecachelimit: reduce lru_lock contention for heavy parallel reclaim
+Patch-mainline: never, SUSE specific
+References: bnc#878509, bnc#864464
+
+mhocko@suse.com:
+move per-zone to per-node handling for SLE12-SP4 because the memory reclaim is
+per-node rather than per-zone now.
+
+More customers have started complaining about hard lockups detected during
+heavy pageche limit reclaim. 
+
+All the collected vmcore files shown us the same class of problem. There is no
+hard lockup in the system. It is just irq aware lru_lock bouncing all over the
+place like crazy. There were many CPUs fighting over the single node's lru_lock
+to isolate some pages + some other lru_lock users who try to free memory as a
+result of munmap or exit.
+
+All those systems were configured to use 4G page_cache although the machine was
+equipped with much more memory.  pagecache_over_limit tries to be clever and
+relax the limit a bit but 4G on 1TB machine still sounds like a too low and
+increases the risk of parallel page cache reclaim. If we add NUMA effects and
+hundreds of CPUs then the lock bouncing is simply unavoidable problem.
+
+This patch reduces the problem by reducing the number of the page cache
+reclaimers. Only one such reclaimer is allowed to scan one node.
+shrink_all_zones which is used only by the pagecache reclaim iterates over all
+available zones. We have added a per-node atomic counter and use it as a lock
+(we cannot use the spinlock because reclaim is a sleepable context and mutex
+sounds too heavy). Please note that a new contention might hit on
+prepare_to_wait now but this hasn't been seen in the representative SAP
+workload when testing.
+
+Only one reclaimer is allowed to lock to the node and try to reclaim it.
+Others will back off to other currently unlocked zones. If all the zones are
+locked for a reclaimer it is put into a sleep on pagecache_reclaim_wq
+waitqueue which is woken up after any of the current reclaimers is done
+with the work. Sleeper retries __shrink_page_cache along with re-evaluating
+page cache limit and attempt the new round only if it is still applicable.
+
+This patch potentially breaks kABI on some architectures but x86_64 should be
+safe because it is put before padding and after 3 ints so there should be 32b
+available even without the padding. If other architectures have a problem with
+that we can use suse_kabi_padding at the end of the structure.
+This will be sorted out before the patch gets merged into our tree.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+
+---
+ include/linux/mmzone.h |    8 ++++
+ mm/vmscan.c            |   89 ++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 88 insertions(+), 9 deletions(-)
+
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -724,6 +724,14 @@ typedef struct pglist_data {
+ 
+ 	unsigned long		flags;
+ 
++	/*
++	 * This atomic counter is set when there is pagecache limit
++	 * reclaim going on on this particular node. Other potential
++	 * reclaiers should back off to prevent from heavy lru_lock
++	 * bouncing.
++	 */
++	atomic_t		pagecache_reclaim;
++
+ 	ZONE_PADDING(_pad2_)
+ 
+ 	/* Per-node vmstats */
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3640,6 +3640,26 @@ unsigned long shrink_all_memory(unsigned
+ }
+ #endif /* CONFIG_HIBERNATION */
+ 
++/*
++ * Returns non-zero if the lock has been acquired, false if somebody
++ * else is holding the lock.
++ */
++static int pagecache_reclaim_lock_node(struct pglist_data *pgdat)
++{
++	return atomic_add_unless(&pgdat->pagecache_reclaim, 1, 1);
++}
++
++static void pagecache_reclaim_unlock_node(struct pglist_data *pgdat)
++{
++	BUG_ON(atomic_dec_return(&pgdat->pagecache_reclaim));
++}
++
++/*
++ * Potential page cache reclaimers who are not able to take
++ * reclaim lock on any node are sleeping on this waitqueue.
++ * So this is basically a congestion wait queue for them.
++ */
++DECLARE_WAIT_QUEUE_HEAD(pagecache_reclaim_wq);
+ 
+ /*
+  * Similar to shrink_node but it has a different consumer - pagecache limit
+@@ -3693,16 +3713,34 @@ static bool shrink_node_per_memcg(struct
+  *
+  * For pass > 3 we also try to shrink the LRU lists that contain a few pages
+  */
+-static void shrink_all_nodes(unsigned long nr_pages, int pass,
++static int shrink_all_nodes(unsigned long nr_pages, int pass,
+ 		struct scan_control *sc)
+ {
+ 	unsigned long nr_reclaimed = 0;
++	unsigned int nr_locked_zones = 0;
++	DEFINE_WAIT(wait);
+ 	int nid;
+ 
++	prepare_to_wait(&pagecache_reclaim_wq, &wait, TASK_INTERRUPTIBLE);
++
+ 	for_each_online_node(nid) {
+ 		struct pglist_data *pgdat = NODE_DATA(nid);
+ 		enum lru_list lru;
+ 
++		/*
++		 * Back off if somebody is already reclaiming this node
++		 * for the pagecache reclaim.
++		 */
++		if (!pagecache_reclaim_lock_node(pgdat))
++			continue;
++
++		/*
++		 * This reclaimer might scan a node so it will never
++		 * sleep on pagecache_reclaim_wq
++		 */
++		finish_wait(&pagecache_reclaim_wq, &wait);
++		nr_locked_zones++;
++
+ 		for_each_evictable_lru(lru) {
+ 			enum zone_stat_item ls = NR_LRU_BASE + lru;
+ 			unsigned long lru_pages = node_page_state(pgdat, ls);
+@@ -3744,8 +3782,8 @@ static void shrink_all_nodes(unsigned lo
+ 				 */
+ 				if (shrink_node_per_memcg(pgdat, lru,
+ 					nr_to_scan, nr_pages, &nr_reclaimed, sc)) {
+-					sc->nr_reclaimed += nr_reclaimed;
+-					return;
++					pagecache_reclaim_unlock_node(pgdat);
++					goto out_wakeup;
+ 				}
+ 
+ 				current->reclaim_state = &reclaim_state;
+@@ -3756,8 +3794,25 @@ static void shrink_all_nodes(unsigned lo
+ 				current->reclaim_state = old_rs;
+ 			}
+ 		}
++		pagecache_reclaim_unlock_node(pgdat);
+ 	}
++
++	/*
++	 * We have to go to sleep because all the zones are already reclaimed.
++	 * One of the reclaimer will wake us up or __shrink_page_cache will
++	 * do it if there is nothing to be done.
++	 */
++	if (!nr_locked_zones) {
++		schedule();
++		finish_wait(&pagecache_reclaim_wq, &wait);
++		goto out;
++	}
++
++out_wakeup:
++	wake_up_interruptible(&pagecache_reclaim_wq);
+ 	sc->nr_reclaimed += nr_reclaimed;
++out:
++	return nr_locked_zones;
+ }
+ 
+ /*
+@@ -3776,7 +3831,7 @@ static void shrink_all_nodes(unsigned lo
+ static void __shrink_page_cache(gfp_t mask)
+ {
+ 	unsigned long ret = 0;
+-	int pass;
++	int pass = 0;
+ 	struct scan_control sc = {
+ 		.gfp_mask = mask,
+ 		.may_swap = 0,
+@@ -3791,6 +3846,7 @@ static void __shrink_page_cache(gfp_t ma
+ 	 */
+ 	BUG_ON(!(mask & __GFP_DIRECT_RECLAIM));
+ 
++retry:
+ 	/* How many pages are we over the limit?
+ 	 * But don't enforce limit if there's plenty of free mem */
+ 	nr_pages = pagecache_over_limit();
+@@ -3800,9 +3856,18 @@ static void __shrink_page_cache(gfp_t ma
+ 	 * is still more than minimally needed. */
+ 	nr_pages /= 2;
+ 
+-	/* Return early if there's no work to do */
+-	if (nr_pages <= 0)
++	/*
++	 * Return early if there's no work to do.
++	 * Wake up reclaimers that couldn't scan any node due to congestion.
++	 * There is apparently nothing to do so they do not have to sleep.
++	 * This makes sure that no sleeping reclaimer will stay behind.
++	 * Allow breaching the limit if the task is on the way out.
++	 */
++	if (nr_pages <= 0 || fatal_signal_pending(current)) {
++		wake_up_interruptible(&pagecache_reclaim_wq);
+ 		return;
++	}
++
+ 	/* But do a few at least */
+ 	nr_pages = max_t(unsigned long, nr_pages, 8*SWAP_CLUSTER_MAX);
+ 
+@@ -3812,13 +3877,19 @@ static void __shrink_page_cache(gfp_t ma
+ 	 * 1 = Reclaim from active list but don't reclaim mapped (not that fast)
+ 	 * 2 = Reclaim from active list but don't reclaim mapped (2nd pass)
+ 	 */
+-	for (pass = 0; pass < 2; pass++) {
++	for (; pass < 2; pass++) {
+ 		for (sc.priority = DEF_PRIORITY; sc.priority >= 0; sc.priority--) {
+ 			unsigned long nr_to_scan = nr_pages - ret;
+ 
+ 			sc.nr_scanned = 0;
+-			/* sc.swap_cluster_max = nr_to_scan; */
+-			shrink_all_nodes(nr_to_scan, pass, &sc);
++
++			/*
++			 * No node reclaimed because of too many reclaimers. Retry whether
++			 * there is still something to do
++			 */
++			if (!shrink_all_nodes(nr_to_scan, pass, &sc))
++				goto retry;
++
+ 			ret += sc.nr_reclaimed;
+ 			if (ret >= nr_pages)
+ 				return;
