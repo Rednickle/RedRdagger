@@ -1,0 +1,253 @@
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Wed, 22 Nov 2017 10:56:40 -0800
+Subject: ixgbe: Fix limitations on macvlan so we can support up to 63
+ offloaded devices
+Patch-mainline: v4.16-rc1
+Git-commit: 4e039c1675d4ecfb8ef25a20ac686b38490b36fd
+References: bsc#1101674 FATE#325150 FATE#325151
+
+This change is a fix of the macvlan offload so that we correctly handle
+macvlan offloaded devices. Specifically we were configuring our limits based
+on the assumption that we were going to max out the RSS indices for every
+mode. As a result when we went to 15 or more macvlan interfaces we were
+forced into the 2 queue RSS mode on VFs even though they could have still
+supported 4.
+
+This change splits the logic up so that we limit either the total number of
+macvlan instances if DCB is enabled, or limit the number of RSS queues used
+per macvlan (instead of per pool) if SR-IOV is enabled. By doing this we
+can make best use of the part.
+
+In addition I have increased the maximum number of supported interfaces to
+63 with one queue per offloaded interface as this more closely reflects the
+actual values supported by the interface.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h       |    6 ++--
+ drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c   |    9 +++++-
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c  |   35 ++++++++++---------------
+ drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c |   27 ++++++-------------
+ 4 files changed, 34 insertions(+), 43 deletions(-)
+
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -395,8 +395,7 @@ enum ixgbe_ring_f_enum {
+ #define MAX_XDP_QUEUES			(IXGBE_MAX_FDIR_INDICES + 1)
+ #define IXGBE_MAX_L2A_QUEUES		4
+ #define IXGBE_BAD_L2A_QUEUE		3
+-#define IXGBE_MAX_MACVLANS		31
+-#define IXGBE_MAX_DCBMACVLANS		8
++#define IXGBE_MAX_MACVLANS		63
+ 
+ struct ixgbe_ring_feature {
+ 	u16 limit;	/* upper limit on feature indices */
+@@ -765,7 +764,8 @@ struct ixgbe_adapter {
+ #endif /*CONFIG_DEBUG_FS*/
+ 
+ 	u8 default_up;
+-	unsigned long fwd_bitmask; /* Bitmask indicating in use pools */
++	/* Bitmask indicating in use pools */
++	DECLARE_BITMAP(fwd_bitmask, IXGBE_MAX_MACVLANS + 1);
+ 
+ #define IXGBE_MAX_LINK_HANDLE 10
+ 	struct ixgbe_jump_table *jump_tables[IXGBE_MAX_LINK_HANDLE];
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_lib.c
+@@ -350,6 +350,9 @@ static bool ixgbe_set_dcb_sriov_queues(s
+ 	if (!(adapter->flags & IXGBE_FLAG_SRIOV_ENABLED))
+ 		return false;
+ 
++	/* limit VMDq instances on the PF by number of Tx queues */
++	vmdq_i = min_t(u16, vmdq_i, MAX_TX_QUEUES / tcs);
++
+ 	/* Add starting offset to total pool count */
+ 	vmdq_i += adapter->ring_feature[RING_F_VMDQ].offset;
+ 
+@@ -512,12 +515,14 @@ static bool ixgbe_set_sriov_queues(struc
+ #ifdef IXGBE_FCOE
+ 	u16 fcoe_i = 0;
+ #endif
+-	bool pools = (find_first_zero_bit(&adapter->fwd_bitmask, 32) > 1);
+ 
+ 	/* only proceed if SR-IOV is enabled */
+ 	if (!(adapter->flags & IXGBE_FLAG_SRIOV_ENABLED))
+ 		return false;
+ 
++	/* limit l2fwd RSS based on total Tx queue limit */
++	rss_i = min_t(u16, rss_i, MAX_TX_QUEUES / vmdq_i);
++
+ 	/* Add starting offset to total pool count */
+ 	vmdq_i += adapter->ring_feature[RING_F_VMDQ].offset;
+ 
+@@ -525,7 +530,7 @@ static bool ixgbe_set_sriov_queues(struc
+ 	vmdq_i = min_t(u16, IXGBE_MAX_VMDQ_INDICES, vmdq_i);
+ 
+ 	/* 64 pool mode with 2 queues per pool */
+-	if ((vmdq_i > 32) || (vmdq_i > 16 && pools)) {
++	if (vmdq_i > 32) {
+ 		vmdq_m = IXGBE_82599_VMDQ_2Q_MASK;
+ 		rss_m = IXGBE_RSS_2Q_MASK;
+ 		rss_i = min_t(u16, rss_i, 2);
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -5345,14 +5345,13 @@ static int ixgbe_fwd_ring_up(struct net_
+ 	unsigned int rxbase, txbase, queues;
+ 	int i, baseq, err = 0;
+ 
+-	if (!test_bit(accel->pool, &adapter->fwd_bitmask))
++	if (!test_bit(accel->pool, adapter->fwd_bitmask))
+ 		return 0;
+ 
+ 	baseq = accel->pool * adapter->num_rx_queues_per_pool;
+-	netdev_dbg(vdev, "pool %i:%i queues %i:%i VSI bitmask %lx\n",
++	netdev_dbg(vdev, "pool %i:%i queues %i:%i\n",
+ 		   accel->pool, adapter->num_rx_pools,
+-		   baseq, baseq + adapter->num_rx_queues_per_pool,
+-		   adapter->fwd_bitmask);
++		   baseq, baseq + adapter->num_rx_queues_per_pool);
+ 
+ 	accel->netdev = vdev;
+ 	accel->rx_base_queue = rxbase = baseq;
+@@ -6247,7 +6246,7 @@ static int ixgbe_sw_init(struct ixgbe_ad
+ 	}
+ 
+ 	/* PF holds first pool slot */
+-	set_bit(0, &adapter->fwd_bitmask);
++	set_bit(0, adapter->fwd_bitmask);
+ 	set_bit(__IXGBE_DOWN, &adapter->state);
+ 
+ 	return 0;
+@@ -8813,7 +8812,6 @@ int ixgbe_setup_tc(struct net_device *de
+ {
+ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
+ 	struct ixgbe_hw *hw = &adapter->hw;
+-	bool pools;
+ 
+ 	/* Hardware supports up to 8 traffic classes */
+ 	if (tc > adapter->dcb_cfg.num_tcs.pg_tcs)
+@@ -8822,10 +8820,6 @@ int ixgbe_setup_tc(struct net_device *de
+ 	if (hw->mac.type == ixgbe_mac_82598EB && tc && tc < MAX_TRAFFIC_CLASS)
+ 		return -EINVAL;
+ 
+-	pools = (find_first_zero_bit(&adapter->fwd_bitmask, 32) > 1);
+-	if (tc && pools && adapter->num_rx_pools > IXGBE_MAX_DCBMACVLANS)
+-		return -EBUSY;
+-
+ 	/* Hardware has to reinitialize queues and interrupts to
+ 	 * match packet buffer alignment. Unfortunately, the
+ 	 * hardware is not flexible enough to do this dynamically.
+@@ -9728,6 +9722,7 @@ static void *ixgbe_fwd_add(struct net_de
+ 	struct ixgbe_fwd_adapter *fwd_adapter = NULL;
+ 	struct ixgbe_adapter *adapter = netdev_priv(pdev);
+ 	int used_pools = adapter->num_vfs + adapter->num_rx_pools;
++	int tcs = netdev_get_num_tc(pdev) ? : 1;
+ 	unsigned int limit;
+ 	int pool, err;
+ 
+@@ -9755,7 +9750,7 @@ static void *ixgbe_fwd_add(struct net_de
+ 	}
+ 
+ 	if (((adapter->flags & IXGBE_FLAG_DCB_ENABLED) &&
+-	      adapter->num_rx_pools > IXGBE_MAX_DCBMACVLANS - 1) ||
++	      adapter->num_rx_pools >= (MAX_TX_QUEUES / tcs)) ||
+ 	    (adapter->num_rx_pools > IXGBE_MAX_MACVLANS))
+ 		return ERR_PTR(-EBUSY);
+ 
+@@ -9763,9 +9758,9 @@ static void *ixgbe_fwd_add(struct net_de
+ 	if (!fwd_adapter)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	pool = find_first_zero_bit(&adapter->fwd_bitmask, 32);
+-	set_bit(pool, &adapter->fwd_bitmask);
+-	limit = find_last_bit(&adapter->fwd_bitmask, 32);
++	pool = find_first_zero_bit(adapter->fwd_bitmask, adapter->num_rx_pools);
++	set_bit(pool, adapter->fwd_bitmask);
++	limit = find_last_bit(adapter->fwd_bitmask, adapter->num_rx_pools + 1);
+ 
+ 	/* Enable VMDq flag so device will be set in VM mode */
+ 	adapter->flags |= IXGBE_FLAG_VMDQ_ENABLED | IXGBE_FLAG_SRIOV_ENABLED;
+@@ -9791,7 +9786,7 @@ fwd_add_err:
+ 	/* unwind counter and free adapter struct */
+ 	netdev_info(pdev,
+ 		    "%s: dfwd hardware acceleration failed\n", vdev->name);
+-	clear_bit(pool, &adapter->fwd_bitmask);
++	clear_bit(pool, adapter->fwd_bitmask);
+ 	kfree(fwd_adapter);
+ 	return ERR_PTR(err);
+ }
+@@ -9802,9 +9797,9 @@ static void ixgbe_fwd_del(struct net_dev
+ 	struct ixgbe_adapter *adapter = fwd_adapter->real_adapter;
+ 	unsigned int limit;
+ 
+-	clear_bit(fwd_adapter->pool, &adapter->fwd_bitmask);
++	clear_bit(fwd_adapter->pool, adapter->fwd_bitmask);
+ 
+-	limit = find_last_bit(&adapter->fwd_bitmask, 32);
++	limit = find_last_bit(adapter->fwd_bitmask, adapter->num_rx_pools);
+ 	adapter->ring_feature[RING_F_VMDQ].limit = limit + 1;
+ 	ixgbe_fwd_ring_down(fwd_adapter->netdev, fwd_adapter);
+ 
+@@ -9819,11 +9814,11 @@ static void ixgbe_fwd_del(struct net_dev
+ 	}
+ 
+ 	ixgbe_setup_tc(pdev, netdev_get_num_tc(pdev));
+-	netdev_dbg(pdev, "pool %i:%i queues %i:%i VSI bitmask %lx\n",
++	netdev_dbg(pdev, "pool %i:%i queues %i:%i\n",
+ 		   fwd_adapter->pool, adapter->num_rx_pools,
+ 		   fwd_adapter->rx_base_queue,
+-		   fwd_adapter->rx_base_queue + adapter->num_rx_queues_per_pool,
+-		   adapter->fwd_bitmask);
++		   fwd_adapter->rx_base_queue +
++		   adapter->num_rx_queues_per_pool);
+ 	kfree(fwd_adapter);
+ }
+ 
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+@@ -290,10 +290,9 @@ static int ixgbe_pci_sriov_enable(struct
+ {
+ #ifdef CONFIG_PCI_IOV
+ 	struct ixgbe_adapter *adapter = pci_get_drvdata(dev);
+-	int err = 0;
+-	u8 num_tc;
+-	int i;
+ 	int pre_existing_vfs = pci_num_vf(dev);
++	int err = 0, num_rx_pools, i, limit;
++	u8 num_tc;
+ 
+ 	if (pre_existing_vfs && pre_existing_vfs != num_vfs)
+ 		err = ixgbe_disable_sriov(adapter);
+@@ -316,22 +315,14 @@ static int ixgbe_pci_sriov_enable(struct
+ 	 * other values out of range.
+ 	 */
+ 	num_tc = netdev_get_num_tc(adapter->netdev);
++	num_rx_pools = adapter->num_rx_pools;
++	limit = (num_tc > 4) ? IXGBE_MAX_VFS_8TC :
++		(num_tc > 1) ? IXGBE_MAX_VFS_4TC : IXGBE_MAX_VFS_1TC;
+ 
+-	if (num_tc > 4) {
+-		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_8TC) {
+-			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_8TC);
+-			return -EPERM;
+-		}
+-	} else if ((num_tc > 1) && (num_tc <= 4)) {
+-		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_4TC) {
+-			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_4TC);
+-			return -EPERM;
+-		}
+-	} else {
+-		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_1TC) {
+-			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_1TC);
+-			return -EPERM;
+-		}
++	if (num_vfs > (limit - num_rx_pools)) {
++		e_dev_err("Currently configured with %d TCs, and %d offloaded macvlans. Creating more than %d VFs is not allowed\n",
++			  num_tc, num_rx_pools - 1, limit - num_rx_pools);
++		return -EPERM;
+ 	}
+ 
+ 	err = __ixgbe_enable_sriov(adapter, num_vfs);
