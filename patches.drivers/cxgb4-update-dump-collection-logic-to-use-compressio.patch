@@ -1,0 +1,1039 @@
+From: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+Date: Wed, 17 Jan 2018 12:53:46 +0530
+Subject: cxgb4: update dump collection logic to use compression
+Patch-mainline: v4.16-rc1
+Git-commit: 56cf2635ce30febd448dc78ff5361e4d9ad2fc0e
+References: bsc#1097585 bsc#1097586 bsc#1097587 bsc#1097588 bsc#1097583 bsc#1097584
+
+Update firmware dump collection logic to use compression when available.
+Let collection logic attempt to do compression, instead of returning out
+of memory early.
+
+Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+Signed-off-by: Vishal Kulkarni <vishal@chelsio.com>
+Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c     |   24 +
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_if.h         |    3 
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c        |  280 +++++++++---------
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_lib_common.h |    7 
+ drivers/net/ethernet/chelsio/cxgb4/cudbg_zlib.h       |   27 +
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4_cudbg.c      |   13 
+ 6 files changed, 207 insertions(+), 147 deletions(-)
+ create mode 100644 drivers/net/ethernet/chelsio/cxgb4/cudbg_zlib.h
+
+--- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_common.c
+@@ -19,7 +19,8 @@
+ #include "cudbg_if.h"
+ #include "cudbg_lib_common.h"
+ 
+-int cudbg_get_buff(struct cudbg_buffer *pdbg_buff, u32 size,
++int cudbg_get_buff(struct cudbg_init *pdbg_init,
++		   struct cudbg_buffer *pdbg_buff, u32 size,
+ 		   struct cudbg_buffer *pin_buff)
+ {
+ 	u32 offset;
+@@ -28,17 +29,30 @@ int cudbg_get_buff(struct cudbg_buffer *
+ 	if (offset + size > pdbg_buff->size)
+ 		return CUDBG_STATUS_NO_MEM;
+ 
++	if (pdbg_init->compress_type != CUDBG_COMPRESSION_NONE) {
++		if (size > pdbg_init->compress_buff_size)
++			return CUDBG_STATUS_NO_MEM;
++
++		pin_buff->data = (char *)pdbg_init->compress_buff;
++		pin_buff->offset = 0;
++		pin_buff->size = size;
++		return 0;
++	}
++
+ 	pin_buff->data = (char *)pdbg_buff->data + offset;
+ 	pin_buff->offset = offset;
+ 	pin_buff->size = size;
+-	pdbg_buff->size -= size;
+ 	return 0;
+ }
+ 
+-void cudbg_put_buff(struct cudbg_buffer *pin_buff,
+-		    struct cudbg_buffer *pdbg_buff)
++void cudbg_put_buff(struct cudbg_init *pdbg_init,
++		    struct cudbg_buffer *pin_buff)
+ {
+-	pdbg_buff->size += pin_buff->size;
++	/* Clear compression buffer for re-use */
++	if (pdbg_init->compress_type != CUDBG_COMPRESSION_NONE)
++		memset(pdbg_init->compress_buff, 0,
++		       pdbg_init->compress_buff_size);
++
+ 	pin_buff->data = NULL;
+ 	pin_buff->offset = 0;
+ 	pin_buff->size = 0;
+--- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_if.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_if.h
+@@ -87,6 +87,9 @@ struct cudbg_init {
+ 	struct adapter *adap; /* Pointer to adapter structure */
+ 	void *outbuf; /* Output buffer */
+ 	u32 outbuf_size;  /* Output buffer size */
++	u8 compress_type; /* Type of compression to use */
++	void *compress_buff; /* Compression buffer */
++	u32 compress_buff_size; /* Compression buffer size */
+ };
+ 
+ static inline unsigned int cudbg_mbytes_to_bytes(unsigned int size)
+--- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib.c
+@@ -23,12 +23,57 @@
+ #include "cudbg_lib_common.h"
+ #include "cudbg_entity.h"
+ #include "cudbg_lib.h"
++#include "cudbg_zlib.h"
+ 
+-static void cudbg_write_and_release_buff(struct cudbg_buffer *pin_buff,
+-					 struct cudbg_buffer *dbg_buff)
++static int cudbg_do_compression(struct cudbg_init *pdbg_init,
++				struct cudbg_buffer *pin_buff,
++				struct cudbg_buffer *dbg_buff)
++{
++	struct cudbg_buffer temp_in_buff = { 0 };
++	int bytes_left, bytes_read, bytes;
++	u32 offset = dbg_buff->offset;
++	int rc;
++
++	temp_in_buff.offset = pin_buff->offset;
++	temp_in_buff.data = pin_buff->data;
++	temp_in_buff.size = pin_buff->size;
++
++	bytes_left = pin_buff->size;
++	bytes_read = 0;
++	while (bytes_left > 0) {
++		/* Do compression in smaller chunks */
++		bytes = min_t(unsigned long, bytes_left,
++			      (unsigned long)CUDBG_CHUNK_SIZE);
++		temp_in_buff.data = (char *)pin_buff->data + bytes_read;
++		temp_in_buff.size = bytes;
++		rc = cudbg_compress_buff(pdbg_init, &temp_in_buff, dbg_buff);
++		if (rc)
++			return rc;
++		bytes_left -= bytes;
++		bytes_read += bytes;
++	}
++
++	pin_buff->size = dbg_buff->offset - offset;
++	return 0;
++}
++
++static int cudbg_write_and_release_buff(struct cudbg_init *pdbg_init,
++					struct cudbg_buffer *pin_buff,
++					struct cudbg_buffer *dbg_buff)
+ {
+-	cudbg_update_buff(pin_buff, dbg_buff);
+-	cudbg_put_buff(pin_buff, dbg_buff);
++	int rc = 0;
++
++	if (pdbg_init->compress_type == CUDBG_COMPRESSION_NONE) {
++		cudbg_update_buff(pin_buff, dbg_buff);
++	} else {
++		rc = cudbg_do_compression(pdbg_init, pin_buff, dbg_buff);
++		if (rc)
++			goto out;
++	}
++
++out:
++	cudbg_put_buff(pdbg_init, pin_buff);
++	return rc;
+ }
+ 
+ static int is_fw_attached(struct cudbg_init *pdbg_init)
+@@ -371,12 +416,11 @@ int cudbg_collect_reg_dump(struct cudbg_
+ 	else if (is_t5(padap->params.chip) || is_t6(padap->params.chip))
+ 		buf_size = T5_REGMAP_SIZE;
+ 
+-	rc = cudbg_get_buff(dbg_buff, buf_size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, buf_size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 	t4_get_regs(padap, (void *)temp_buff.data, temp_buff.size);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_fw_devlog(struct cudbg_init *pdbg_init,
+@@ -395,7 +439,7 @@ int cudbg_collect_fw_devlog(struct cudbg
+ 	}
+ 
+ 	dparams = &padap->params.devlog;
+-	rc = cudbg_get_buff(dbg_buff, dparams->size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, dparams->size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -410,12 +454,11 @@ int cudbg_collect_fw_devlog(struct cudbg
+ 		spin_unlock(&padap->win0_lock);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_cim_la(struct cudbg_init *pdbg_init,
+@@ -436,14 +479,14 @@ int cudbg_collect_cim_la(struct cudbg_in
+ 	}
+ 
+ 	size += sizeof(cfg);
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+ 	rc = t4_cim_read(padap, UP_UP_DBG_LA_CFG_A, 1, &cfg);
+ 	if (rc) {
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+ 
+@@ -453,11 +496,10 @@ int cudbg_collect_cim_la(struct cudbg_in
+ 			    NULL);
+ 	if (rc < 0) {
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_cim_ma_la(struct cudbg_init *pdbg_init,
+@@ -469,7 +511,7 @@ int cudbg_collect_cim_ma_la(struct cudbg
+ 	int size, rc;
+ 
+ 	size = 2 * CIM_MALA_SIZE * 5 * sizeof(u32);
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -477,8 +519,7 @@ int cudbg_collect_cim_ma_la(struct cudbg
+ 			  (u32 *)temp_buff.data,
+ 			  (u32 *)((char *)temp_buff.data +
+ 				  5 * CIM_MALA_SIZE));
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_cim_qcfg(struct cudbg_init *pdbg_init,
+@@ -490,7 +531,7 @@ int cudbg_collect_cim_qcfg(struct cudbg_
+ 	struct cudbg_cim_qcfg *cim_qcfg_data;
+ 	int rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_cim_qcfg),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_cim_qcfg),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -501,7 +542,7 @@ int cudbg_collect_cim_qcfg(struct cudbg_
+ 			 ARRAY_SIZE(cim_qcfg_data->stat), cim_qcfg_data->stat);
+ 	if (rc) {
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+ 
+@@ -510,14 +551,13 @@ int cudbg_collect_cim_qcfg(struct cudbg_
+ 			 cim_qcfg_data->obq_wr);
+ 	if (rc) {
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+ 
+ 	t4_read_cimq_cfg(padap, cim_qcfg_data->base, cim_qcfg_data->size,
+ 			 cim_qcfg_data->thres);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ static int cudbg_read_cim_ibq(struct cudbg_init *pdbg_init,
+@@ -531,7 +571,7 @@ static int cudbg_read_cim_ibq(struct cud
+ 
+ 	/* collect CIM IBQ */
+ 	qsize = CIM_IBQ_SIZE * 4 * sizeof(u32);
+-	rc = cudbg_get_buff(dbg_buff, qsize, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, qsize, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -545,11 +585,10 @@ static int cudbg_read_cim_ibq(struct cud
+ 		else
+ 			rc = no_of_read_words;
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_cim_ibq_tp0(struct cudbg_init *pdbg_init,
+@@ -616,7 +655,7 @@ static int cudbg_read_cim_obq(struct cud
+ 
+ 	/* collect CIM OBQ */
+ 	qsize =  cudbg_cim_obq_size(padap, qid);
+-	rc = cudbg_get_buff(dbg_buff, qsize, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, qsize, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -630,11 +669,10 @@ static int cudbg_read_cim_obq(struct cud
+ 		else
+ 			rc = no_of_read_words;
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_cim_obq_ulp0(struct cudbg_init *pdbg_init,
+@@ -887,7 +925,7 @@ static int cudbg_read_fw_mem(struct cudb
+ 
+ 		bytes = min_t(unsigned long, bytes_left,
+ 			      (unsigned long)CUDBG_CHUNK_SIZE);
+-		rc = cudbg_get_buff(dbg_buff, bytes, &temp_buff);
++		rc = cudbg_get_buff(pdbg_init, dbg_buff, bytes, &temp_buff);
+ 		if (rc)
+ 			return rc;
+ 
+@@ -906,14 +944,19 @@ static int cudbg_read_fw_mem(struct cudb
+ 		spin_unlock(&padap->win0_lock);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 
+ skip_read:
+ 		bytes_left -= bytes;
+ 		bytes_read += bytes;
+-		cudbg_write_and_release_buff(&temp_buff, dbg_buff);
++		rc = cudbg_write_and_release_buff(pdbg_init, &temp_buff,
++						  dbg_buff);
++		if (rc) {
++			cudbg_put_buff(pdbg_init, &temp_buff);
++			return rc;
++		}
+ 	}
+ 	return rc;
+ }
+@@ -1007,18 +1050,18 @@ int cudbg_collect_rss(struct cudbg_init
+ 	int rc, nentries;
+ 
+ 	nentries = t4_chip_rss_size(padap);
+-	rc = cudbg_get_buff(dbg_buff, nentries * sizeof(u16), &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, nentries * sizeof(u16),
++			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+ 	rc = t4_read_rss(padap, (u16 *)temp_buff.data);
+ 	if (rc) {
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_rss_vf_config(struct cudbg_init *pdbg_init,
+@@ -1031,7 +1074,7 @@ int cudbg_collect_rss_vf_config(struct c
+ 	int vf, rc, vf_count;
+ 
+ 	vf_count = padap->params.arch.vfcount;
+-	rc = cudbg_get_buff(dbg_buff,
++	rc = cudbg_get_buff(pdbg_init, dbg_buff,
+ 			    vf_count * sizeof(struct cudbg_rss_vf_conf),
+ 			    &temp_buff);
+ 	if (rc)
+@@ -1041,8 +1084,7 @@ int cudbg_collect_rss_vf_config(struct c
+ 	for (vf = 0; vf < vf_count; vf++)
+ 		t4_read_rss_vf_config(padap, vf, &vfconf[vf].rss_vf_vfl,
+ 				      &vfconf[vf].rss_vf_vfh, true);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_path_mtu(struct cudbg_init *pdbg_init,
+@@ -1053,13 +1095,13 @@ int cudbg_collect_path_mtu(struct cudbg_
+ 	struct cudbg_buffer temp_buff = { 0 };
+ 	int rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, NMTUS * sizeof(u16), &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, NMTUS * sizeof(u16),
++			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+ 	t4_read_mtu_tbl(padap, (u16 *)temp_buff.data, NULL);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_pm_stats(struct cudbg_init *pdbg_init,
+@@ -1071,7 +1113,7 @@ int cudbg_collect_pm_stats(struct cudbg_
+ 	struct cudbg_pm_stats *pm_stats_buff;
+ 	int rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_pm_stats),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_pm_stats),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -1079,8 +1121,7 @@ int cudbg_collect_pm_stats(struct cudbg_
+ 	pm_stats_buff = (struct cudbg_pm_stats *)temp_buff.data;
+ 	t4_pmtx_get_stats(padap, pm_stats_buff->tx_cnt, pm_stats_buff->tx_cyc);
+ 	t4_pmrx_get_stats(padap, pm_stats_buff->rx_cnt, pm_stats_buff->rx_cyc);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_hw_sched(struct cudbg_init *pdbg_init,
+@@ -1095,7 +1136,7 @@ int cudbg_collect_hw_sched(struct cudbg_
+ 	if (!padap->params.vpd.cclk)
+ 		return CUDBG_STATUS_CCLK_NOT_DEFINED;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_hw_sched),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_hw_sched),
+ 			    &temp_buff);
+ 	hw_sched_buff = (struct cudbg_hw_sched *)temp_buff.data;
+ 	hw_sched_buff->map = t4_read_reg(padap, TP_TX_MOD_QUEUE_REQ_MAP_A);
+@@ -1104,8 +1145,7 @@ int cudbg_collect_hw_sched(struct cudbg_
+ 	for (i = 0; i < NTX_SCHED; ++i)
+ 		t4_get_tx_sched(padap, i, &hw_sched_buff->kbps[i],
+ 				&hw_sched_buff->ipg[i], true);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_tp_indirect(struct cudbg_init *pdbg_init,
+@@ -1129,7 +1169,7 @@ int cudbg_collect_tp_indirect(struct cud
+ 
+ 	n = n / (IREG_NUM_ELEM * sizeof(u32));
+ 	size = sizeof(struct ireg_buf) * n;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1218,8 +1258,7 @@ int cudbg_collect_tp_indirect(struct cud
+ 			       tp_pio->ireg_local_offset, true);
+ 		ch_tp_pio++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_sge_indirect(struct cudbg_init *pdbg_init,
+@@ -1231,7 +1270,8 @@ int cudbg_collect_sge_indirect(struct cu
+ 	struct ireg_buf *ch_sge_dbg;
+ 	int i, rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(*ch_sge_dbg) * 2, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(*ch_sge_dbg) * 2,
++			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1252,8 +1292,7 @@ int cudbg_collect_sge_indirect(struct cu
+ 				 sge_pio->ireg_local_offset);
+ 		ch_sge_dbg++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_ulprx_la(struct cudbg_init *pdbg_init,
+@@ -1265,7 +1304,7 @@ int cudbg_collect_ulprx_la(struct cudbg_
+ 	struct cudbg_ulprx_la *ulprx_la_buff;
+ 	int rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_ulprx_la),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_ulprx_la),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -1273,8 +1312,7 @@ int cudbg_collect_ulprx_la(struct cudbg_
+ 	ulprx_la_buff = (struct cudbg_ulprx_la *)temp_buff.data;
+ 	t4_ulprx_read_la(padap, (u32 *)ulprx_la_buff->data);
+ 	ulprx_la_buff->size = ULPRX_LA_SIZE;
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_tp_la(struct cudbg_init *pdbg_init,
+@@ -1287,15 +1325,14 @@ int cudbg_collect_tp_la(struct cudbg_ini
+ 	int size, rc;
+ 
+ 	size = sizeof(struct cudbg_tp_la) + TPLA_SIZE *  sizeof(u64);
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+ 	tp_la_buff = (struct cudbg_tp_la *)temp_buff.data;
+ 	tp_la_buff->mode = DBGLAMODE_G(t4_read_reg(padap, TP_DBG_LA_CONFIG_A));
+ 	t4_tp_read_la(padap, (u64 *)tp_la_buff->data, NULL);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_meminfo(struct cudbg_init *pdbg_init,
+@@ -1307,7 +1344,8 @@ int cudbg_collect_meminfo(struct cudbg_i
+ 	struct cudbg_meminfo *meminfo_buff;
+ 	int rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_meminfo), &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_meminfo),
++			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1315,12 +1353,11 @@ int cudbg_collect_meminfo(struct cudbg_i
+ 	rc = cudbg_fill_meminfo(padap, meminfo_buff);
+ 	if (rc) {
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+ 
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_cim_pif_la(struct cudbg_init *pdbg_init,
+@@ -1334,7 +1371,7 @@ int cudbg_collect_cim_pif_la(struct cudb
+ 
+ 	size = sizeof(struct cudbg_cim_pif_la) +
+ 	       2 * CIM_PIFLA_SIZE * 6 * sizeof(u32);
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1343,8 +1380,7 @@ int cudbg_collect_cim_pif_la(struct cudb
+ 	t4_cim_read_pif_la(padap, (u32 *)cim_pif_la_buff->data,
+ 			   (u32 *)cim_pif_la_buff->data + 6 * CIM_PIFLA_SIZE,
+ 			   NULL, NULL);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_clk_info(struct cudbg_init *pdbg_init,
+@@ -1360,7 +1396,7 @@ int cudbg_collect_clk_info(struct cudbg_
+ 	if (!padap->params.vpd.cclk)
+ 		return CUDBG_STATUS_CCLK_NOT_DEFINED;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_clk_info),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_clk_info),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -1392,8 +1428,7 @@ int cudbg_collect_clk_info(struct cudbg_
+ 	clk_info_buff->finwait2_timer =
+ 		tp_tick_us * t4_read_reg(padap, TP_FINWAIT2_TIMER_A);
+ 
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_pcie_indirect(struct cudbg_init *pdbg_init,
+@@ -1408,7 +1443,7 @@ int cudbg_collect_pcie_indirect(struct c
+ 
+ 	n = sizeof(t5_pcie_pdbg_array) / (IREG_NUM_ELEM * sizeof(u32));
+ 	size = sizeof(struct ireg_buf) * n * 2;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1449,8 +1484,7 @@ int cudbg_collect_pcie_indirect(struct c
+ 				 pcie_pio->ireg_local_offset);
+ 		ch_pcie++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_pm_indirect(struct cudbg_init *pdbg_init,
+@@ -1465,7 +1499,7 @@ int cudbg_collect_pm_indirect(struct cud
+ 
+ 	n = sizeof(t5_pm_rx_array) / (IREG_NUM_ELEM * sizeof(u32));
+ 	size = sizeof(struct ireg_buf) * n * 2;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1506,8 +1540,7 @@ int cudbg_collect_pm_indirect(struct cud
+ 				 pm_pio->ireg_local_offset);
+ 		ch_pm++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_tid(struct cudbg_init *pdbg_init,
+@@ -1521,7 +1554,8 @@ int cudbg_collect_tid(struct cudbg_init
+ 	u32 para[2], val[2];
+ 	int rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_tid_info_region_rev1),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff,
++			    sizeof(struct cudbg_tid_info_region_rev1),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -1544,7 +1578,7 @@ int cudbg_collect_tid(struct cudbg_init
+ 	rc = t4_query_params(padap, padap->mbox, padap->pf, 0, 2, para, val);
+ 	if (rc <  0) {
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+ 	tid->uotid_base = val[0];
+@@ -1563,7 +1597,7 @@ int cudbg_collect_tid(struct cudbg_init
+ 				     para, val);
+ 		if (rc < 0) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 		tid->hpftid_base = val[0];
+@@ -1591,8 +1625,7 @@ int cudbg_collect_tid(struct cudbg_init
+ 
+ #undef FW_PARAM_PFVF_A
+ 
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_pcie_config(struct cudbg_init *pdbg_init,
+@@ -1606,7 +1639,7 @@ int cudbg_collect_pcie_config(struct cud
+ 
+ 	size = sizeof(u32) * CUDBG_NUM_PCIE_CONFIG_REGS;
+ 	n = sizeof(t5_pcie_config_array) / (2 * sizeof(u32));
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1618,8 +1651,7 @@ int cudbg_collect_pcie_config(struct cud
+ 			value++;
+ 		}
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ static int cudbg_sge_ctxt_check_valid(u32 *buf, int type)
+@@ -1799,7 +1831,7 @@ int cudbg_collect_dump_context(struct cu
+ 		return CUDBG_STATUS_ENTITY_NOT_FOUND;
+ 
+ 	size = rc;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1813,7 +1845,7 @@ int cudbg_collect_dump_context(struct cu
+ 
+ 	ctx_buf = kvzalloc(max_ctx_size, GFP_KERNEL);
+ 	if (!ctx_buf) {
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -1876,8 +1908,7 @@ int cudbg_collect_dump_context(struct cu
+ 	 */
+ 	cudbg_get_sge_ctxt_fw(pdbg_init, max_ctx_qid, CTXT_FLM, &buff);
+ 
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ static inline void cudbg_tcamxy2valmask(u64 x, u64 y, u8 *addr, u64 *mask)
+@@ -2038,7 +2069,7 @@ int cudbg_collect_mps_tcam(struct cudbg_
+ 
+ 	n = padap->params.arch.mps_tcam_size;
+ 	size = sizeof(struct cudbg_mps_tcam) * n;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -2047,7 +2078,7 @@ int cudbg_collect_mps_tcam(struct cudbg_
+ 		rc = cudbg_collect_tcam_index(padap, tcam, i);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 		total_size += sizeof(struct cudbg_mps_tcam);
+@@ -2057,11 +2088,10 @@ int cudbg_collect_mps_tcam(struct cudbg_
+ 	if (!total_size) {
+ 		rc = CUDBG_SYSTEM_ERROR;
+ 		cudbg_err->sys_err = rc;
+-		cudbg_put_buff(&temp_buff, dbg_buff);
++		cudbg_put_buff(pdbg_init, &temp_buff);
+ 		return rc;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_vpd_data(struct cudbg_init *pdbg_init,
+@@ -2112,7 +2142,7 @@ int cudbg_collect_vpd_data(struct cudbg_
+ 	if (rc)
+ 		return rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_vpd_data),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_vpd_data),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -2128,8 +2158,7 @@ int cudbg_collect_vpd_data(struct cudbg_
+ 	vpd_data->fw_minor = FW_HDR_FW_VER_MINOR_G(fw_vers);
+ 	vpd_data->fw_micro = FW_HDR_FW_VER_MICRO_G(fw_vers);
+ 	vpd_data->fw_build = FW_HDR_FW_VER_BUILD_G(fw_vers);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ static int cudbg_read_tid(struct cudbg_init *pdbg_init, u32 tid,
+@@ -2280,7 +2309,7 @@ int cudbg_collect_le_tcam(struct cudbg_i
+ 
+ 	size = sizeof(struct cudbg_tid_data) * tcam_region.max_tid;
+ 	size += sizeof(struct cudbg_tcam);
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -2292,7 +2321,7 @@ int cudbg_collect_le_tcam(struct cudbg_i
+ 		rc = cudbg_read_tid(pdbg_init, i, tid_data);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 
+@@ -2303,8 +2332,7 @@ int cudbg_collect_le_tcam(struct cudbg_i
+ 		bytes += sizeof(struct cudbg_tid_data);
+ 	}
+ 
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_cctrl(struct cudbg_init *pdbg_init,
+@@ -2317,13 +2345,12 @@ int cudbg_collect_cctrl(struct cudbg_ini
+ 	int rc;
+ 
+ 	size = sizeof(u16) * NMTUS * NCCTRL_WIN;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+ 	t4_read_cong_tbl(padap, (void *)temp_buff.data);
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_ma_indirect(struct cudbg_init *pdbg_init,
+@@ -2341,7 +2368,7 @@ int cudbg_collect_ma_indirect(struct cud
+ 
+ 	n = sizeof(t6_ma_ireg_array) / (IREG_NUM_ELEM * sizeof(u32));
+ 	size = sizeof(struct ireg_buf) * n * 2;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -2377,8 +2404,7 @@ int cudbg_collect_ma_indirect(struct cud
+ 		}
+ 		ma_indr++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_ulptx_la(struct cudbg_init *pdbg_init,
+@@ -2391,7 +2417,7 @@ int cudbg_collect_ulptx_la(struct cudbg_
+ 	u32 i, j;
+ 	int rc;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_ulptx_la),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, sizeof(struct cudbg_ulptx_la),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -2412,8 +2438,7 @@ int cudbg_collect_ulptx_la(struct cudbg_
+ 				t4_read_reg(padap,
+ 					    ULP_TX_LA_RDDATA_0_A + 0x10 * i);
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_up_cim_indirect(struct cudbg_init *pdbg_init,
+@@ -2438,7 +2463,7 @@ int cudbg_collect_up_cim_indirect(struct
+ 		return CUDBG_STATUS_NOT_IMPLEMENTED;
+ 
+ 	size = sizeof(struct ireg_buf) * n;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -2488,14 +2513,13 @@ int cudbg_collect_up_cim_indirect(struct
+ 					 up_cim_reg->ireg_local_offset +
+ 					 (j * local_offset), local_range, buff);
+ 			if (rc) {
+-				cudbg_put_buff(&temp_buff, dbg_buff);
++				cudbg_put_buff(pdbg_init, &temp_buff);
+ 				return rc;
+ 			}
+ 		}
+ 		up_cim++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_pbt_tables(struct cudbg_init *pdbg_init,
+@@ -2508,7 +2532,8 @@ int cudbg_collect_pbt_tables(struct cudb
+ 	int i, rc;
+ 	u32 addr;
+ 
+-	rc = cudbg_get_buff(dbg_buff, sizeof(struct cudbg_pbt_tables),
++	rc = cudbg_get_buff(pdbg_init, dbg_buff,
++			    sizeof(struct cudbg_pbt_tables),
+ 			    &temp_buff);
+ 	if (rc)
+ 		return rc;
+@@ -2521,7 +2546,7 @@ int cudbg_collect_pbt_tables(struct cudb
+ 				 &pbt->pbt_dynamic[i]);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 	}
+@@ -2534,7 +2559,7 @@ int cudbg_collect_pbt_tables(struct cudb
+ 				 &pbt->pbt_static[i]);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 	}
+@@ -2546,7 +2571,7 @@ int cudbg_collect_pbt_tables(struct cudb
+ 				 &pbt->lrf_table[i]);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 	}
+@@ -2558,12 +2583,11 @@ int cudbg_collect_pbt_tables(struct cudb
+ 				 &pbt->pbt_data[i]);
+ 		if (rc) {
+ 			cudbg_err->sys_err = rc;
+-			cudbg_put_buff(&temp_buff, dbg_buff);
++			cudbg_put_buff(pdbg_init, &temp_buff);
+ 			return rc;
+ 		}
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_mbox_log(struct cudbg_init *pdbg_init,
+@@ -2584,7 +2608,7 @@ int cudbg_collect_mbox_log(struct cudbg_
+ 	log = padap->mbox_log;
+ 	mbox_cmds = padap->mbox_log->size;
+ 	size = sizeof(struct cudbg_mbox_log) * mbox_cmds;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -2607,8 +2631,7 @@ int cudbg_collect_mbox_log(struct cudbg_
+ 		}
+ 		mboxlog++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+ 
+ int cudbg_collect_hma_indirect(struct cudbg_init *pdbg_init,
+@@ -2626,7 +2649,7 @@ int cudbg_collect_hma_indirect(struct cu
+ 
+ 	n = sizeof(t6_hma_ireg_array) / (IREG_NUM_ELEM * sizeof(u32));
+ 	size = sizeof(struct ireg_buf) * n;
+-	rc = cudbg_get_buff(dbg_buff, size, &temp_buff);
++	rc = cudbg_get_buff(pdbg_init, dbg_buff, size, &temp_buff);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -2644,6 +2667,5 @@ int cudbg_collect_hma_indirect(struct cu
+ 				 hma_fli->ireg_local_offset);
+ 		hma_indr++;
+ 	}
+-	cudbg_write_and_release_buff(&temp_buff, dbg_buff);
+-	return rc;
++	return cudbg_write_and_release_buff(pdbg_init, &temp_buff, dbg_buff);
+ }
+--- a/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib_common.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_lib_common.h
+@@ -78,10 +78,11 @@ struct cudbg_error {
+ #define CDUMP_MAX_COMP_BUF_SIZE ((64 * 1024) - 1)
+ #define CUDBG_CHUNK_SIZE ((CDUMP_MAX_COMP_BUF_SIZE / 1024) * 1024)
+ 
+-int cudbg_get_buff(struct cudbg_buffer *pdbg_buff, u32 size,
++int cudbg_get_buff(struct cudbg_init *pdbg_init,
++		   struct cudbg_buffer *pdbg_buff, u32 size,
+ 		   struct cudbg_buffer *pin_buff);
+-void cudbg_put_buff(struct cudbg_buffer *pin_buff,
+-		    struct cudbg_buffer *pdbg_buff);
++void cudbg_put_buff(struct cudbg_init *pdbg_init,
++		    struct cudbg_buffer *pin_buff);
+ void cudbg_update_buff(struct cudbg_buffer *pin_buff,
+ 		       struct cudbg_buffer *pout_buff);
+ #endif /* __CUDBG_LIB_COMMON_H__ */
+--- /dev/null
++++ b/drivers/net/ethernet/chelsio/cxgb4/cudbg_zlib.h
+@@ -0,0 +1,27 @@
++/*
++ *  Copyright (C) 2018 Chelsio Communications.  All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms and conditions of the GNU General Public License,
++ *  version 2, as published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope it will be useful, but WITHOUT
++ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ *  more details.
++ *
++ *  The full GNU General Public License is included in this distribution in
++ *  the file called "COPYING".
++ *
++ */
++
++#ifndef __CUDBG_ZLIB_H__
++#define __CUDBG_ZLIB_H__
++
++static inline int cudbg_compress_buff(struct cudbg_init *pdbg_init,
++				      struct cudbg_buffer *pin_buff,
++				      struct cudbg_buffer *pout_buff)
++{
++	return 0;
++}
++#endif /* __CUDBG_ZLIB_H__ */
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_cudbg.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_cudbg.c
+@@ -341,22 +341,14 @@ static void cxgb4_cudbg_collect_entity(s
+ 				       const struct cxgb4_collect_entity *e_arr,
+ 				       u32 arr_size, void *buf, u32 *tot_size)
+ {
+-	struct adapter *adap = pdbg_init->adap;
+ 	struct cudbg_error cudbg_err = { 0 };
+ 	struct cudbg_entity_hdr *entity_hdr;
+-	u32 entity_size, i;
+-	u32 total_size = 0;
++	u32 i, total_size = 0;
+ 	int ret;
+ 
+ 	for (i = 0; i < arr_size; i++) {
+ 		const struct cxgb4_collect_entity *e = &e_arr[i];
+ 
+-		/* Skip entities that won't fit in output buffer */
+-		entity_size = cxgb4_get_entity_length(adap, e->entity);
+-		if (entity_size >
+-		    pdbg_init->outbuf_size - *tot_size - total_size)
+-			continue;
+-
+ 		entity_hdr = cudbg_get_entity_hdr(buf, e->entity);
+ 		entity_hdr->entity_type = e->entity;
+ 		entity_hdr->start_offset = dbg_buff->offset;
+@@ -408,7 +400,8 @@ int cxgb4_cudbg_collect(struct adapter *
+ 	cudbg_hdr->max_entities = CUDBG_MAX_ENTITY;
+ 	cudbg_hdr->chip_ver = adap->params.chip;
+ 	cudbg_hdr->dump_type = CUDBG_DUMP_TYPE_MINI;
+-	cudbg_hdr->compress_type = CUDBG_COMPRESSION_NONE;
++	cudbg_init.compress_type = CUDBG_COMPRESSION_NONE;
++	cudbg_hdr->compress_type = cudbg_init.compress_type;
+ 
+ 	min_size = sizeof(struct cudbg_hdr) +
+ 		   sizeof(struct cudbg_entity_hdr) *
