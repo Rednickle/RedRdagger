@@ -1,0 +1,194 @@
+From: Arjun Vynipadath <arjun@chelsio.com>
+Date: Thu, 24 May 2018 19:33:37 +0530
+Subject: cxgb4/cxgb4vf: Notify link changes to OS-dependent code
+Patch-mainline: v4.18-rc1
+Git-commit: e2f4f4e927f1356d561f612f1c55d64654f60353
+References: bsc#1097585 bsc#1097586 bsc#1097587 bsc#1097588 bsc#1097583 bsc#1097584
+
+We have a confusion of two different abstractions in the Common
+Code:  Physical Link (Port) and Logical Network Interface (Virtual
+Interface), and we haven't been properly managing the state of the
+intersection of those two abstractions.
+On the one hand we have the Physical state of the Link -- up or down --
+and on the other we have the logical state of the VI, enabled or not.
+{ethN} refers to both the Physical and Logical State. In this case,
+ifconfig only affects/interrogates the Logical State of a VI,
+and ethtool only deals with the Physical State. And these are different.
+
+So, just because we disable the VI, we don't really want to change the
+Physical Link Up/Down state.  Thus, the previous hack to set
+"lc->link_ok = 0" when we disable a VI is completely incorrect.
+
+Where we get into trouble is where the Physical Link State and the
+Logical VI State cross swords.  And that happens in
+t4_handle_get_port_info() where we need to manage/safe the Physical
+Link State, but we also need to know when the Logical VI State has
+changed and pass that back up to the OS-dependent Driver routine
+t4_os_link_changed() which is concerned about the Logical Interface.
+
+So we enable a VI and that causes Firmware to send us a new Port
+Information message, but if none of the Physical Link State
+particulars have changed, we don't call t4_os_link_changed().
+
+This fix uses the existing OS Contract APIs for the Common Code to
+inform the OS-dependent portion of the Host Driver when the "Link" (really
+Logical Network Interface) is "up" or "down". A new API
+t4_enable_pi_params() is added which calls t4_enable_vi_params() and,
+if that is successful, then calls back to the OS Contract API
+t4_os_link_changed() notifying the OS-dependent layer of the
+potential Link State change.
+
+Original Work by : Casey Leedom <leedom@chelsio.com>
+
+Signed-off-by: Santosh Rastapur <santosh@chelsio.com>
+Signed-off-by: Arjun Vynipadath <arjun@chelsio.com>
+Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4.h          |    3 ++
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c     |    5 ++-
+ drivers/net/ethernet/chelsio/cxgb4/t4_hw.c          |   28 ++++++++++++++++++++
+ drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c |    5 +--
+ drivers/net/ethernet/chelsio/cxgb4vf/t4vf_common.h  |    5 ++-
+ drivers/net/ethernet/chelsio/cxgb4vf/t4vf_hw.c      |   24 +++++++++++++++++
+ 6 files changed, 64 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -1714,6 +1714,9 @@ int t4_set_addr_hash(struct adapter *ada
+ 		     bool ucast, u64 vec, bool sleep_ok);
+ int t4_enable_vi_params(struct adapter *adap, unsigned int mbox,
+ 			unsigned int viid, bool rx_en, bool tx_en, bool dcb_en);
++int t4_enable_pi_params(struct adapter *adap, unsigned int mbox,
++			struct port_info *pi,
++			bool rx_en, bool tx_en, bool dcb_en);
+ int t4_enable_vi(struct adapter *adap, unsigned int mbox, unsigned int viid,
+ 		 bool rx_en, bool tx_en);
+ int t4_identify_port(struct adapter *adap, unsigned int mbox, unsigned int viid,
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -465,7 +465,7 @@ static int link_start(struct net_device
+ 				    &pi->link_cfg);
+ 	if (ret == 0) {
+ 		local_bh_disable();
+-		ret = t4_enable_vi_params(pi->adapter, mb, pi->viid, true,
++		ret = t4_enable_pi_params(pi->adapter, mb, pi, true,
+ 					  true, CXGB4_DCB_ENABLED);
+ 		local_bh_enable();
+ 	}
+@@ -2344,7 +2344,8 @@ static int cxgb_close(struct net_device
+ 
+ 	netif_tx_stop_all_queues(dev);
+ 	netif_carrier_off(dev);
+-	ret = t4_enable_vi(adapter, adapter->pf, pi->viid, false, false);
++	ret = t4_enable_pi_params(adapter, adapter->pf, pi,
++				  false, false, false);
+ #ifdef CONFIG_CHELSIO_T4_DCB
+ 	cxgb4_dcb_reset(dev);
+ 	dcb_tx_queue_prio_enable(dev, false);
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -7925,6 +7925,34 @@ int t4_enable_vi(struct adapter *adap, u
+ }
+ 
+ /**
++ *	t4_enable_pi_params - enable/disable a Port's Virtual Interface
++ *      @adap: the adapter
++ *      @mbox: mailbox to use for the FW command
++ *      @pi: the Port Information structure
++ *      @rx_en: 1=enable Rx, 0=disable Rx
++ *      @tx_en: 1=enable Tx, 0=disable Tx
++ *      @dcb_en: 1=enable delivery of Data Center Bridging messages.
++ *
++ *      Enables/disables a Port's Virtual Interface.  Note that setting DCB
++ *	Enable only makes sense when enabling a Virtual Interface ...
++ *	If the Virtual Interface enable/disable operation is successful,
++ *	we notify the OS-specific code of a potential Link Status change
++ *	via the OS Contract API t4_os_link_changed().
++ */
++int t4_enable_pi_params(struct adapter *adap, unsigned int mbox,
++			struct port_info *pi,
++			bool rx_en, bool tx_en, bool dcb_en)
++{
++	int ret = t4_enable_vi_params(adap, mbox, pi->viid,
++				      rx_en, tx_en, dcb_en);
++	if (ret)
++		return ret;
++	t4_os_link_changed(adap, pi->port_id,
++			   rx_en && tx_en && pi->link_cfg.link_ok);
++	return 0;
++}
++
++/**
+  *	t4_identify_port - identify a VI's port by blinking its LED
+  *	@adap: the adapter
+  *	@mbox: mailbox to use for the FW command
+--- a/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4vf/cxgb4vf_main.c
+@@ -274,7 +274,7 @@ static int link_start(struct net_device
+ 	 * is enabled on a port.
+ 	 */
+ 	if (ret == 0)
+-		ret = t4vf_enable_vi(pi->adapter, pi->viid, true, true);
++		ret = t4vf_enable_pi(pi->adapter, pi, true, true);
+ 
+ 	/* The Virtual Interfaces are connected to an internal switch on the
+ 	 * chip which allows VIs attached to the same port to talk to each
+@@ -822,8 +822,7 @@ static int cxgb4vf_stop(struct net_devic
+ 
+ 	netif_tx_stop_all_queues(dev);
+ 	netif_carrier_off(dev);
+-	t4vf_enable_vi(adapter, pi->viid, false, false);
+-	pi->link_cfg.link_ok = 0;
++	t4vf_enable_pi(adapter, pi, false, false);
+ 
+ 	clear_bit(pi->port_id, &adapter->open_device_map);
+ 	if (adapter->open_device_map == 0)
+--- a/drivers/net/ethernet/chelsio/cxgb4vf/t4vf_common.h
++++ b/drivers/net/ethernet/chelsio/cxgb4vf/t4vf_common.h
+@@ -391,7 +391,10 @@ int t4vf_config_rss_range(struct adapter
+ 
+ int t4vf_alloc_vi(struct adapter *, int);
+ int t4vf_free_vi(struct adapter *, int);
+-int t4vf_enable_vi(struct adapter *, unsigned int, bool, bool);
++int t4vf_enable_vi(struct adapter *adapter, unsigned int viid, bool rx_en,
++		   bool tx_en);
++int t4vf_enable_pi(struct adapter *adapter, struct port_info *pi, bool rx_en,
++		   bool tx_en);
+ int t4vf_identify_port(struct adapter *, unsigned int, unsigned int);
+ 
+ int t4vf_set_rxmode(struct adapter *, unsigned int, int, int, int, int, int,
+--- a/drivers/net/ethernet/chelsio/cxgb4vf/t4vf_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4vf/t4vf_hw.c
+@@ -1400,6 +1400,30 @@ int t4vf_enable_vi(struct adapter *adapt
+ }
+ 
+ /**
++ *	t4vf_enable_pi - enable/disable a Port's virtual interface
++ *	@adapter: the adapter
++ *	@pi: the Port Information structure
++ *	@rx_en: 1=enable Rx, 0=disable Rx
++ *	@tx_en: 1=enable Tx, 0=disable Tx
++ *
++ *	Enables/disables a Port's virtual interface.  If the Virtual
++ *	Interface enable/disable operation is successful, we notify the
++ *	OS-specific code of a potential Link Status change via the OS Contract
++ *	API t4vf_os_link_changed().
++ */
++int t4vf_enable_pi(struct adapter *adapter, struct port_info *pi,
++		   bool rx_en, bool tx_en)
++{
++	int ret = t4vf_enable_vi(adapter, pi->viid, rx_en, tx_en);
++
++	if (ret)
++		return ret;
++	t4vf_os_link_changed(adapter, pi->pidx,
++			     rx_en && tx_en && pi->link_cfg.link_ok);
++	return 0;
++}
++
++/**
+  *	t4vf_identify_port - identify a VI's port by blinking its LED
+  *	@adapter: the adapter
+  *	@viid: the Virtual Interface ID
