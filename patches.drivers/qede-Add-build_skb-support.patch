@@ -1,0 +1,523 @@
+From: Manish Chopra <manish.chopra@cavium.com>
+Date: Thu, 17 May 2018 12:05:00 -0700
+Subject: qede: Add build_skb() support.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v4.18-rc1
+Git-commit: 8a8633978b842c88fbcfe00d4e5dde96048f630e
+References: bsc#1086314 FATE#324886 bsc#1086313 FATE#324885 bsc#1086301 FATE#3248881
+
+This patch makes use of build_skb() throughout in driver's receieve
+data path [HW gro flow and non HW gro flow]. With this, driver can
+build skb directly from the page segments which are already mapped
+to the hardware instead of allocating new SKB via netdev_alloc_skb()
+and memcpy the data which is quite costly.
+
+This really improves performance (keeping same or slight gain in rx
+throughput) in terms of CPU utilization which is significantly reduced
+[almost half] in non HW gro flow where for every incoming MTU sized
+packet driver had to allocate skb, memcpy headers etc. Additionally
+in that flow, it also gets rid of bunch of additional overheads
+[eth_get_headlen() etc.] to split headers and data in the skb.
+
+Tested with:
+system: 2 sockets, 4 cores per socket, hyperthreading, 2x4x2=16 cores
+iperf [server]: iperf -s
+iperf [client]: iperf -c <server_ip> -t 500 -i 10 -P 32
+
+HW GRO off – w/o build_skb(), throughput: 36.8 Gbits/sec
+
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest   %idle
+Average:     all    0.59    0.00   32.93    0.00    0.00   43.07    0.00    0.00   23.42
+
+HW GRO off - with build_skb(), throughput: 36.9 Gbits/sec
+
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest   %idle
+Average:     all    0.70    0.00   31.70    0.00    0.00   25.68    0.00    0.00   41.92
+
+HW GRO on - w/o build_skb(), throughput: 36.9 Gbits/sec
+
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest   %idle
+Average:     all    0.86    0.00   24.14    0.00    0.00    6.59    0.00    0.00   68.41
+
+HW GRO on - with build_skb(), throughput: 37.5 Gbits/sec
+
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest   %idle
+Average:     all    0.87    0.00   23.75    0.00    0.00    6.19    0.00    0.00   69.19
+
+Signed-off-by: Ariel Elior <ariel.elior@cavium.com>
+Signed-off-by: Manish Chopra <manish.chopra@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qede/qede.h         |    5 
+ drivers/net/ethernet/qlogic/qede/qede_ethtool.c |    3 
+ drivers/net/ethernet/qlogic/qede/qede_fp.c      |  227 ++++++++++++------------
+ drivers/net/ethernet/qlogic/qede/qede_main.c    |   76 +-------
+ 4 files changed, 137 insertions(+), 174 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@ -289,15 +289,12 @@ struct qede_agg_info {
+ 	 * aggregation.
+ 	 */
+ 	struct sw_rx_data buffer;
+-	dma_addr_t buffer_mapping;
+-
+ 	struct sk_buff *skb;
+ 
+ 	/* We need some structs from the start cookie until termination */
+ 	u16 vlan_tag;
+-	u16 start_cqe_bd_len;
+-	u8 start_cqe_placement_offset;
+ 
++	bool tpa_start_fail;
+ 	u8 state;
+ 	u8 frag_id;
+ 
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@ -1508,7 +1508,8 @@ static int qede_selftest_receive_traffic
+ 		len =  le16_to_cpu(fp_cqe->len_on_first_bd);
+ 		data_ptr = (u8 *)(page_address(sw_rx_data->data) +
+ 				  fp_cqe->placement_offset +
+-				  sw_rx_data->page_offset);
++				  sw_rx_data->page_offset +
++				  rxq->rx_headroom);
+ 		if (ether_addr_equal(data_ptr,  edev->ndev->dev_addr) &&
+ 		    ether_addr_equal(data_ptr + ETH_ALEN,
+ 				     edev->ndev->dev_addr)) {
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@ -660,7 +660,8 @@ static int qede_fill_frag_skb(struct qed
+ 
+ 	/* Add one frag and update the appropriate fields in the skb */
+ 	skb_fill_page_desc(skb, tpa_info->frag_id++,
+-			   current_bd->data, current_bd->page_offset,
++			   current_bd->data,
++			   current_bd->page_offset + rxq->rx_headroom,
+ 			   len_on_bd);
+ 
+ 	if (unlikely(qede_realloc_rx_buffer(rxq, current_bd))) {
+@@ -671,8 +672,7 @@ static int qede_fill_frag_skb(struct qed
+ 		goto out;
+ 	}
+ 
+-	qed_chain_consume(&rxq->rx_bd_ring);
+-	rxq->sw_rx_cons++;
++	qede_rx_bd_ring_consume(rxq);
+ 
+ 	skb->data_len += len_on_bd;
+ 	skb->truesize += rxq->rx_buf_seg_size;
+@@ -721,64 +721,129 @@ static u8 qede_check_tunn_csum(u16 flag)
+ 	return QEDE_CSUM_UNNECESSARY | tcsum;
+ }
+ 
++static inline struct sk_buff *
++qede_build_skb(struct qede_rx_queue *rxq,
++	       struct sw_rx_data *bd, u16 len, u16 pad)
++{
++	struct sk_buff *skb;
++	void *buf;
++
++	buf = page_address(bd->data) + bd->page_offset;
++	skb = build_skb(buf, rxq->rx_buf_seg_size);
++
++	skb_reserve(skb, pad);
++	skb_put(skb, len);
++
++	return skb;
++}
++
++static struct sk_buff *
++qede_tpa_rx_build_skb(struct qede_dev *edev,
++		      struct qede_rx_queue *rxq,
++		      struct sw_rx_data *bd, u16 len, u16 pad,
++		      bool alloc_skb)
++{
++	struct sk_buff *skb;
++
++	skb = qede_build_skb(rxq, bd, len, pad);
++	bd->page_offset += rxq->rx_buf_seg_size;
++
++	if (bd->page_offset == PAGE_SIZE) {
++		if (unlikely(qede_alloc_rx_buffer(rxq, true))) {
++			DP_NOTICE(edev,
++				  "Failed to allocate RX buffer for tpa start\n");
++			bd->page_offset -= rxq->rx_buf_seg_size;
++			page_ref_inc(bd->data);
++			dev_kfree_skb_any(skb);
++			return NULL;
++		}
++	} else {
++		page_ref_inc(bd->data);
++		qede_reuse_page(rxq, bd);
++	}
++
++	/* We've consumed the first BD and prepared an SKB */
++	qede_rx_bd_ring_consume(rxq);
++
++	return skb;
++}
++
++static struct sk_buff *
++qede_rx_build_skb(struct qede_dev *edev,
++		  struct qede_rx_queue *rxq,
++		  struct sw_rx_data *bd, u16 len, u16 pad)
++{
++	struct sk_buff *skb = NULL;
++
++	/* For smaller frames still need to allocate skb, memcpy
++	 * data and benefit in reusing the page segment instead of
++	 * un-mapping it.
++	 */
++	if ((len + pad <= edev->rx_copybreak)) {
++		unsigned int offset = bd->page_offset + pad;
++
++		skb = netdev_alloc_skb(edev->ndev, QEDE_RX_HDR_SIZE);
++		if (unlikely(!skb))
++			return NULL;
++
++		skb_reserve(skb, pad);
++		memcpy(skb_put(skb, len),
++		       page_address(bd->data) + offset, len);
++		qede_reuse_page(rxq, bd);
++		goto out;
++	}
++
++	skb = qede_build_skb(rxq, bd, len, pad);
++
++	if (unlikely(qede_realloc_rx_buffer(rxq, bd))) {
++		/* Incr page ref count to reuse on allocation failure so
++		 * that it doesn't get freed while freeing SKB [as its
++		 * already mapped there].
++		 */
++		page_ref_inc(bd->data);
++		dev_kfree_skb_any(skb);
++		return NULL;
++	}
++out:
++	/* We've consumed the first BD and prepared an SKB */
++	qede_rx_bd_ring_consume(rxq);
++
++	return skb;
++}
++
+ static void qede_tpa_start(struct qede_dev *edev,
+ 			   struct qede_rx_queue *rxq,
+ 			   struct eth_fast_path_rx_tpa_start_cqe *cqe)
+ {
+ 	struct qede_agg_info *tpa_info = &rxq->tpa_info[cqe->tpa_agg_index];
+-	struct eth_rx_bd *rx_bd_cons = qed_chain_consume(&rxq->rx_bd_ring);
+-	struct eth_rx_bd *rx_bd_prod = qed_chain_produce(&rxq->rx_bd_ring);
+-	struct sw_rx_data *replace_buf = &tpa_info->buffer;
+-	dma_addr_t mapping = tpa_info->buffer_mapping;
+ 	struct sw_rx_data *sw_rx_data_cons;
+-	struct sw_rx_data *sw_rx_data_prod;
++	u16 pad;
+ 
+ 	sw_rx_data_cons = &rxq->sw_rx_ring[rxq->sw_rx_cons & NUM_RX_BDS_MAX];
+-	sw_rx_data_prod = &rxq->sw_rx_ring[rxq->sw_rx_prod & NUM_RX_BDS_MAX];
+-
+-	/* Use pre-allocated replacement buffer - we can't release the agg.
+-	 * start until its over and we don't want to risk allocation failing
+-	 * here, so re-allocate when aggregation will be over.
+-	 */
+-	sw_rx_data_prod->mapping = replace_buf->mapping;
+-
+-	sw_rx_data_prod->data = replace_buf->data;
+-	rx_bd_prod->addr.hi = cpu_to_le32(upper_32_bits(mapping));
+-	rx_bd_prod->addr.lo = cpu_to_le32(lower_32_bits(mapping));
+-	sw_rx_data_prod->page_offset = replace_buf->page_offset;
++	pad = cqe->placement_offset + rxq->rx_headroom;
+ 
+-	rxq->sw_rx_prod++;
++	tpa_info->skb = qede_tpa_rx_build_skb(edev, rxq, sw_rx_data_cons,
++					      le16_to_cpu(cqe->len_on_first_bd),
++					      pad, false);
++	tpa_info->buffer.page_offset = sw_rx_data_cons->page_offset;
++	tpa_info->buffer.mapping = sw_rx_data_cons->mapping;
+ 
+-	/* move partial skb from cons to pool (don't unmap yet)
+-	 * save mapping, incase we drop the packet later on.
+-	 */
+-	tpa_info->buffer = *sw_rx_data_cons;
+-	mapping = HILO_U64(le32_to_cpu(rx_bd_cons->addr.hi),
+-			   le32_to_cpu(rx_bd_cons->addr.lo));
+-
+-	tpa_info->buffer_mapping = mapping;
+-	rxq->sw_rx_cons++;
+-
+-	/* set tpa state to start only if we are able to allocate skb
+-	 * for this aggregation, otherwise mark as error and aggregation will
+-	 * be dropped
+-	 */
+-	tpa_info->skb = netdev_alloc_skb(edev->ndev,
+-					 le16_to_cpu(cqe->len_on_first_bd));
+ 	if (unlikely(!tpa_info->skb)) {
+ 		DP_NOTICE(edev, "Failed to allocate SKB for gro\n");
++
++		/* Consume from ring but do not produce since
++		 * this might be used by FW still, it will be re-used
++		 * at TPA end.
++		 */
++		tpa_info->tpa_start_fail = true;
++		qede_rx_bd_ring_consume(rxq);
+ 		tpa_info->state = QEDE_AGG_STATE_ERROR;
+ 		goto cons_buf;
+ 	}
+ 
+-	/* Start filling in the aggregation info */
+-	skb_put(tpa_info->skb, le16_to_cpu(cqe->len_on_first_bd));
+ 	tpa_info->frag_id = 0;
+ 	tpa_info->state = QEDE_AGG_STATE_START;
+ 
+-	/* Store some information from first CQE */
+-	tpa_info->start_cqe_placement_offset = cqe->placement_offset;
+-	tpa_info->start_cqe_bd_len = le16_to_cpu(cqe->len_on_first_bd);
+ 	if ((le16_to_cpu(cqe->pars_flags.flags) >>
+ 	     PARSING_AND_ERR_FLAGS_TAG8021QEXIST_SHIFT) &
+ 	    PARSING_AND_ERR_FLAGS_TAG8021QEXIST_MASK)
+@@ -899,6 +964,10 @@ static int qede_tpa_end(struct qede_dev
+ 	tpa_info = &rxq->tpa_info[cqe->tpa_agg_index];
+ 	skb = tpa_info->skb;
+ 
++	if (tpa_info->buffer.page_offset == PAGE_SIZE)
++		dma_unmap_page(rxq->dev, tpa_info->buffer.mapping,
++			       PAGE_SIZE, rxq->data_direction);
++
+ 	for (i = 0; cqe->len_list[i]; i++)
+ 		qede_fill_frag_skb(edev, rxq, cqe->tpa_agg_index,
+ 				   le16_to_cpu(cqe->len_list[i]));
+@@ -919,11 +988,6 @@ static int qede_tpa_end(struct qede_dev
+ 		       "Strange - total packet len [cqe] is %4x but SKB has len %04x\n",
+ 		       le16_to_cpu(cqe->total_packet_len), skb->len);
+ 
+-	memcpy(skb->data,
+-	       page_address(tpa_info->buffer.data) +
+-	       tpa_info->start_cqe_placement_offset +
+-	       tpa_info->buffer.page_offset, tpa_info->start_cqe_bd_len);
+-
+ 	/* Finalize the SKB */
+ 	skb->protocol = eth_type_trans(skb, edev->ndev);
+ 	skb->ip_summed = CHECKSUM_UNNECESSARY;
+@@ -940,6 +1004,12 @@ static int qede_tpa_end(struct qede_dev
+ 	return 1;
+ err:
+ 	tpa_info->state = QEDE_AGG_STATE_NONE;
++
++	if (tpa_info->tpa_start_fail) {
++		qede_reuse_page(rxq, &tpa_info->buffer);
++		tpa_info->tpa_start_fail = false;
++	}
++
+ 	dev_kfree_skb_any(tpa_info->skb);
+ 	tpa_info->skb = NULL;
+ 	return 0;
+@@ -1056,65 +1126,6 @@ static bool qede_rx_xdp(struct qede_dev
+ 	return false;
+ }
+ 
+-static struct sk_buff *qede_rx_allocate_skb(struct qede_dev *edev,
+-					    struct qede_rx_queue *rxq,
+-					    struct sw_rx_data *bd, u16 len,
+-					    u16 pad)
+-{
+-	unsigned int offset = bd->page_offset + pad;
+-	struct skb_frag_struct *frag;
+-	struct page *page = bd->data;
+-	unsigned int pull_len;
+-	struct sk_buff *skb;
+-	unsigned char *va;
+-
+-	/* Allocate a new SKB with a sufficient large header len */
+-	skb = netdev_alloc_skb(edev->ndev, QEDE_RX_HDR_SIZE);
+-	if (unlikely(!skb))
+-		return NULL;
+-
+-	/* Copy data into SKB - if it's small, we can simply copy it and
+-	 * re-use the already allcoated & mapped memory.
+-	 */
+-	if (len + pad <= edev->rx_copybreak) {
+-		skb_put_data(skb, page_address(page) + offset, len);
+-		qede_reuse_page(rxq, bd);
+-		goto out;
+-	}
+-
+-	frag = &skb_shinfo(skb)->frags[0];
+-
+-	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
+-			page, offset, len, rxq->rx_buf_seg_size);
+-
+-	va = skb_frag_address(frag);
+-	pull_len = eth_get_headlen(va, QEDE_RX_HDR_SIZE);
+-
+-	/* Align the pull_len to optimize memcpy */
+-	memcpy(skb->data, va, ALIGN(pull_len, sizeof(long)));
+-
+-	/* Correct the skb & frag sizes offset after the pull */
+-	skb_frag_size_sub(frag, pull_len);
+-	frag->page_offset += pull_len;
+-	skb->data_len -= pull_len;
+-	skb->tail += pull_len;
+-
+-	if (unlikely(qede_realloc_rx_buffer(rxq, bd))) {
+-		/* Incr page ref count to reuse on allocation failure so
+-		 * that it doesn't get freed while freeing SKB [as its
+-		 * already mapped there].
+-		 */
+-		page_ref_inc(page);
+-		dev_kfree_skb_any(skb);
+-		return NULL;
+-	}
+-
+-out:
+-	/* We've consumed the first BD and prepared an SKB */
+-	qede_rx_bd_ring_consume(rxq);
+-	return skb;
+-}
+-
+ static int qede_rx_build_jumbo(struct qede_dev *edev,
+ 			       struct qede_rx_queue *rxq,
+ 			       struct sk_buff *skb,
+@@ -1155,7 +1166,7 @@ static int qede_rx_build_jumbo(struct qe
+ 			       PAGE_SIZE, DMA_FROM_DEVICE);
+ 
+ 		skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags++,
+-				   bd->data, 0, cur_size);
++				   bd->data, rxq->rx_headroom, cur_size);
+ 
+ 		skb->truesize += PAGE_SIZE;
+ 		skb->data_len += cur_size;
+@@ -1254,7 +1265,7 @@ static int qede_rx_process_cqe(struct qe
+ 	/* Basic validation passed; Need to prepare an SKB. This would also
+ 	 * guarantee to finally consume the first BD upon success.
+ 	 */
+-	skb = qede_rx_allocate_skb(edev, rxq, bd, len, pad);
++	skb = qede_rx_build_skb(edev, rxq, bd, len, pad);
+ 	if (!skb) {
+ 		rxq->rx_alloc_errors++;
+ 		qede_recycle_rx_bd_ring(rxq, fp_cqe->bd_num);
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -1194,30 +1194,8 @@ static void qede_free_rx_buffers(struct
+ 	}
+ }
+ 
+-static void qede_free_sge_mem(struct qede_dev *edev, struct qede_rx_queue *rxq)
+-{
+-	int i;
+-
+-	if (edev->gro_disable)
+-		return;
+-
+-	for (i = 0; i < ETH_TPA_MAX_AGGS_NUM; i++) {
+-		struct qede_agg_info *tpa_info = &rxq->tpa_info[i];
+-		struct sw_rx_data *replace_buf = &tpa_info->buffer;
+-
+-		if (replace_buf->data) {
+-			dma_unmap_page(&edev->pdev->dev,
+-				       replace_buf->mapping,
+-				       PAGE_SIZE, DMA_FROM_DEVICE);
+-			__free_page(replace_buf->data);
+-		}
+-	}
+-}
+-
+ static void qede_free_mem_rxq(struct qede_dev *edev, struct qede_rx_queue *rxq)
+ {
+-	qede_free_sge_mem(edev, rxq);
+-
+ 	/* Free rx buffers */
+ 	qede_free_rx_buffers(edev, rxq);
+ 
+@@ -1229,45 +1207,15 @@ static void qede_free_mem_rxq(struct qed
+ 	edev->ops->common->chain_free(edev->cdev, &rxq->rx_comp_ring);
+ }
+ 
+-static int qede_alloc_sge_mem(struct qede_dev *edev, struct qede_rx_queue *rxq)
++static void qede_set_tpa_param(struct qede_rx_queue *rxq)
+ {
+-	dma_addr_t mapping;
+ 	int i;
+ 
+-	if (edev->gro_disable)
+-		return 0;
+-
+ 	for (i = 0; i < ETH_TPA_MAX_AGGS_NUM; i++) {
+ 		struct qede_agg_info *tpa_info = &rxq->tpa_info[i];
+-		struct sw_rx_data *replace_buf = &tpa_info->buffer;
+-
+-		replace_buf->data = alloc_pages(GFP_ATOMIC, 0);
+-		if (unlikely(!replace_buf->data)) {
+-			DP_NOTICE(edev,
+-				  "Failed to allocate TPA skb pool [replacement buffer]\n");
+-			goto err;
+-		}
+ 
+-		mapping = dma_map_page(&edev->pdev->dev, replace_buf->data, 0,
+-				       PAGE_SIZE, DMA_FROM_DEVICE);
+-		if (unlikely(dma_mapping_error(&edev->pdev->dev, mapping))) {
+-			DP_NOTICE(edev,
+-				  "Failed to map TPA replacement buffer\n");
+-			goto err;
+-		}
+-
+-		replace_buf->mapping = mapping;
+-		tpa_info->buffer.page_offset = 0;
+-		tpa_info->buffer_mapping = mapping;
+ 		tpa_info->state = QEDE_AGG_STATE_NONE;
+ 	}
+-
+-	return 0;
+-err:
+-	qede_free_sge_mem(edev, rxq);
+-	edev->gro_disable = 1;
+-	edev->ndev->features &= ~NETIF_F_GRO_HW;
+-	return -ENOMEM;
+ }
+ 
+ /* This function allocates all memory needed per Rx queue */
+@@ -1278,19 +1226,24 @@ static int qede_alloc_mem_rxq(struct qed
+ 	rxq->num_rx_buffers = edev->q_num_rx_buffers;
+ 
+ 	rxq->rx_buf_size = NET_IP_ALIGN + ETH_OVERHEAD + edev->ndev->mtu;
+-	rxq->rx_headroom = edev->xdp_prog ? XDP_PACKET_HEADROOM : 0;
++
++	rxq->rx_headroom = edev->xdp_prog ? XDP_PACKET_HEADROOM : NET_SKB_PAD;
++	size = rxq->rx_headroom +
++	       SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+ 
+ 	/* Make sure that the headroom and  payload fit in a single page */
+-	if (rxq->rx_buf_size + rxq->rx_headroom > PAGE_SIZE)
+-		rxq->rx_buf_size = PAGE_SIZE - rxq->rx_headroom;
++	if (rxq->rx_buf_size + size > PAGE_SIZE)
++		rxq->rx_buf_size = PAGE_SIZE - size;
+ 
+-	/* Segment size to spilt a page in multiple equal parts,
++	/* Segment size to spilt a page in multiple equal parts ,
+ 	 * unless XDP is used in which case we'd use the entire page.
+ 	 */
+-	if (!edev->xdp_prog)
+-		rxq->rx_buf_seg_size = roundup_pow_of_two(rxq->rx_buf_size);
+-	else
++	if (!edev->xdp_prog) {
++		size = size + rxq->rx_buf_size;
++		rxq->rx_buf_seg_size = roundup_pow_of_two(size);
++	} else {
+ 		rxq->rx_buf_seg_size = PAGE_SIZE;
++	}
+ 
+ 	/* Allocate the parallel driver ring for Rx buffers */
+ 	size = sizeof(*rxq->sw_rx_ring) * RX_RING_SIZE;
+@@ -1334,7 +1287,8 @@ static int qede_alloc_mem_rxq(struct qed
+ 		}
+ 	}
+ 
+-	rc = qede_alloc_sge_mem(edev, rxq);
++	if (!edev->gro_disable)
++		qede_set_tpa_param(rxq);
+ err:
+ 	return rc;
+ }

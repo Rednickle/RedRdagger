@@ -1,0 +1,379 @@
+From: Devesh Sharma <devesh.sharma@broadcom.com>
+Date: Fri, 25 May 2018 12:01:21 -0400
+Subject: RDMA/bnxt_re: Fix broken RoCE driver due to recent L2 driver changes
+Patch-mainline: v4.17
+Git-commit: 6e04b103568983bd699fac96b80a9b96ede68118
+References: bsc#1086283 FATE#324874
+
+The recent changes in Broadcom's ethernet driver(L2 driver) broke
+RoCE functionality in terms of MSIx vector allocation and
+de-allocation.
+
+There is a possibility that L2 driver would initiate MSIx vector
+reallocation depending upon the requests coming from administrator.
+In such cases L2 driver needs to free up all the MSIx vectors
+allocated previously and reallocate/initialize those.
+
+If RoCE driver is loaded and reshuffling is attempted, there will be
+kernel crashes because RoCE driver would still be holding the MSIx
+vectors but L2 driver would attempt to free in-use vectors. Thus
+leading to a kernel crash.
+
+Making changes in roce driver to fix crashes described above.
+As part of solution L2 driver tells RoCE driver to release
+the MSIx vector whenever there is a need. When RoCE driver
+get message it sync up with all the running tasklets and IRQ
+handlers and releases the vectors. L2 driver send one more
+message to RoCE driver to resume the MSIx vectors. L2 driver
+guarantees that RoCE vector do not change during reshuffling.
+
+Fixes: ec86f14ea506 ("bnxt_en: Add ULP calls to stop and restart IRQs.")
+Fixes: 08654eb213a8 ("bnxt_en: Change IRQ assignment for RDMA driver.")
+Signed-off-by: Devesh Sharma <devesh.sharma@broadcom.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/bnxt_re/main.c       |   55 ++++++++++++++++
+ drivers/infiniband/hw/bnxt_re/qplib_fp.c   |   94 ++++++++++++++++++-----------
+ drivers/infiniband/hw/bnxt_re/qplib_fp.h   |    3 
+ drivers/infiniband/hw/bnxt_re/qplib_rcfw.c |   61 +++++++++++++-----
+ drivers/infiniband/hw/bnxt_re/qplib_rcfw.h |    3 
+ 5 files changed, 163 insertions(+), 53 deletions(-)
+
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -185,12 +185,65 @@ static void bnxt_re_shutdown(void *p)
+ 	bnxt_re_ib_unreg(rdev, false);
+ }
+ 
++static void bnxt_re_stop_irq(void *handle)
++{
++	struct bnxt_re_dev *rdev = (struct bnxt_re_dev *)handle;
++	struct bnxt_qplib_rcfw *rcfw = &rdev->rcfw;
++	struct bnxt_qplib_nq *nq;
++	int indx;
++
++	for (indx = BNXT_RE_NQ_IDX; indx < rdev->num_msix; indx++) {
++		nq = &rdev->nq[indx - 1];
++		bnxt_qplib_nq_stop_irq(nq, false);
++	}
++
++	bnxt_qplib_rcfw_stop_irq(rcfw, false);
++}
++
++static void bnxt_re_start_irq(void *handle, struct bnxt_msix_entry *ent)
++{
++	struct bnxt_re_dev *rdev = (struct bnxt_re_dev *)handle;
++	struct bnxt_msix_entry *msix_ent = rdev->msix_entries;
++	struct bnxt_qplib_rcfw *rcfw = &rdev->rcfw;
++	struct bnxt_qplib_nq *nq;
++	int indx, rc;
++
++	if (!ent) {
++		/* Not setting the f/w timeout bit in rcfw.
++		 * During the driver unload the first command
++		 * to f/w will timeout and that will set the
++		 * timeout bit.
++		 */
++		dev_err(rdev_to_dev(rdev), "Failed to re-start IRQs\n");
++		return;
++	}
++
++	/* Vectors may change after restart, so update with new vectors
++	 * in device sctructure.
++	 */
++	for (indx = 0; indx < rdev->num_msix; indx++)
++		rdev->msix_entries[indx].vector = ent[indx].vector;
++
++	bnxt_qplib_rcfw_start_irq(rcfw, msix_ent[BNXT_RE_AEQ_IDX].vector,
++				  false);
++	for (indx = BNXT_RE_NQ_IDX ; indx < rdev->num_msix; indx++) {
++		nq = &rdev->nq[indx - 1];
++		rc = bnxt_qplib_nq_start_irq(nq, indx - 1,
++					     msix_ent[indx].vector, false);
++		if (rc)
++			dev_warn(rdev_to_dev(rdev),
++				 "Failed to reinit NQ index %d\n", indx - 1);
++	}
++}
++
+ static struct bnxt_ulp_ops bnxt_re_ulp_ops = {
+ 	.ulp_async_notifier = NULL,
+ 	.ulp_stop = bnxt_re_stop,
+ 	.ulp_start = bnxt_re_start,
+ 	.ulp_sriov_config = bnxt_re_sriov_config,
+-	.ulp_shutdown = bnxt_re_shutdown
++	.ulp_shutdown = bnxt_re_shutdown,
++	.ulp_irq_stop = bnxt_re_stop_irq,
++	.ulp_irq_restart = bnxt_re_start_irq
+ };
+ 
+ /* RoCE -> Net driver */
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+@@ -341,22 +341,32 @@ static irqreturn_t bnxt_qplib_nq_irq(int
+ 	return IRQ_HANDLED;
+ }
+ 
++void bnxt_qplib_nq_stop_irq(struct bnxt_qplib_nq *nq, bool kill)
++{
++	tasklet_disable(&nq->worker);
++	/* Mask h/w interrupt */
++	NQ_DB(nq->bar_reg_iomem, nq->hwq.cons, nq->hwq.max_elements);
++	/* Sync with last running IRQ handler */
++	synchronize_irq(nq->vector);
++	if (kill)
++		tasklet_kill(&nq->worker);
++	if (nq->requested) {
++		irq_set_affinity_hint(nq->vector, NULL);
++		free_irq(nq->vector, nq);
++		nq->requested = false;
++	}
++}
++
+ void bnxt_qplib_disable_nq(struct bnxt_qplib_nq *nq)
+ {
+ 	if (nq->cqn_wq) {
+ 		destroy_workqueue(nq->cqn_wq);
+ 		nq->cqn_wq = NULL;
+ 	}
++
+ 	/* Make sure the HW is stopped! */
+-	synchronize_irq(nq->vector);
+-	tasklet_disable(&nq->worker);
+-	tasklet_kill(&nq->worker);
++	bnxt_qplib_nq_stop_irq(nq, true);
+ 
+-	if (nq->requested) {
+-		irq_set_affinity_hint(nq->vector, NULL);
+-		free_irq(nq->vector, nq);
+-		nq->requested = false;
+-	}
+ 	if (nq->bar_reg_iomem)
+ 		iounmap(nq->bar_reg_iomem);
+ 	nq->bar_reg_iomem = NULL;
+@@ -366,6 +376,40 @@ void bnxt_qplib_disable_nq(struct bnxt_q
+ 	nq->vector = 0;
+ }
+ 
++int bnxt_qplib_nq_start_irq(struct bnxt_qplib_nq *nq, int nq_indx,
++			    int msix_vector, bool need_init)
++{
++	int rc;
++
++	if (nq->requested)
++		return -EFAULT;
++
++	nq->vector = msix_vector;
++	if (need_init)
++		tasklet_init(&nq->worker, bnxt_qplib_service_nq,
++			     (unsigned long)nq);
++	else
++		tasklet_enable(&nq->worker);
++
++	snprintf(nq->name, sizeof(nq->name), "bnxt_qplib_nq-%d", nq_indx);
++	rc = request_irq(nq->vector, bnxt_qplib_nq_irq, 0, nq->name, nq);
++	if (rc)
++		return rc;
++
++	cpumask_clear(&nq->mask);
++	cpumask_set_cpu(nq_indx, &nq->mask);
++	rc = irq_set_affinity_hint(nq->vector, &nq->mask);
++	if (rc) {
++		dev_warn(&nq->pdev->dev,
++			 "QPLIB: set affinity failed; vector: %d nq_idx: %d\n",
++			 nq->vector, nq_indx);
++	}
++	nq->requested = true;
++	NQ_DB_REARM(nq->bar_reg_iomem, nq->hwq.cons, nq->hwq.max_elements);
++
++	return rc;
++}
++
+ int bnxt_qplib_enable_nq(struct pci_dev *pdev, struct bnxt_qplib_nq *nq,
+ 			 int nq_idx, int msix_vector, int bar_reg_offset,
+ 			 int (*cqn_handler)(struct bnxt_qplib_nq *nq,
+@@ -377,41 +421,17 @@ int bnxt_qplib_enable_nq(struct pci_dev
+ 	resource_size_t nq_base;
+ 	int rc = -1;
+ 
+-	nq->pdev = pdev;
+-	nq->vector = msix_vector;
+ 	if (cqn_handler)
+ 		nq->cqn_handler = cqn_handler;
+ 
+ 	if (srqn_handler)
+ 		nq->srqn_handler = srqn_handler;
+ 
+-	tasklet_init(&nq->worker, bnxt_qplib_service_nq, (unsigned long)nq);
+-
+ 	/* Have a task to schedule CQ notifiers in post send case */
+ 	nq->cqn_wq  = create_singlethread_workqueue("bnxt_qplib_nq");
+ 	if (!nq->cqn_wq)
+-		goto fail;
+-
+-	nq->requested = false;
+-	memset(nq->name, 0, 32);
+-	sprintf(nq->name, "bnxt_qplib_nq-%d", nq_idx);
+-	rc = request_irq(nq->vector, bnxt_qplib_nq_irq, 0, nq->name, nq);
+-	if (rc) {
+-		dev_err(&nq->pdev->dev,
+-			"Failed to request IRQ for NQ: %#x", rc);
+-		goto fail;
+-	}
++		return -ENOMEM;
+ 
+-	cpumask_clear(&nq->mask);
+-	cpumask_set_cpu(nq_idx, &nq->mask);
+-	rc = irq_set_affinity_hint(nq->vector, &nq->mask);
+-	if (rc) {
+-		dev_warn(&nq->pdev->dev,
+-			 "QPLIB: set affinity failed; vector: %d nq_idx: %d\n",
+-			 nq->vector, nq_idx);
+-	}
+-
+-	nq->requested = true;
+ 	nq->bar_reg = NQ_CONS_PCI_BAR_REGION;
+ 	nq->bar_reg_off = bar_reg_offset;
+ 	nq_base = pci_resource_start(pdev, nq->bar_reg);
+@@ -424,7 +444,13 @@ int bnxt_qplib_enable_nq(struct pci_dev
+ 		rc = -ENOMEM;
+ 		goto fail;
+ 	}
+-	NQ_DB_REARM(nq->bar_reg_iomem, nq->hwq.cons, nq->hwq.max_elements);
++
++	rc = bnxt_qplib_nq_start_irq(nq, nq_idx, msix_vector, true);
++	if (rc) {
++		dev_err(&nq->pdev->dev,
++			"QPLIB: Failed to request irq for nq-idx %d", nq_idx);
++		goto fail;
++	}
+ 
+ 	return 0;
+ fail:
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+@@ -467,7 +467,10 @@ struct bnxt_qplib_nq_work {
+ 	struct bnxt_qplib_cq    *cq;
+ };
+ 
++void bnxt_qplib_nq_stop_irq(struct bnxt_qplib_nq *nq, bool kill);
+ void bnxt_qplib_disable_nq(struct bnxt_qplib_nq *nq);
++int bnxt_qplib_nq_start_irq(struct bnxt_qplib_nq *nq, int nq_indx,
++			    int msix_vector, bool need_init);
+ int bnxt_qplib_enable_nq(struct pci_dev *pdev, struct bnxt_qplib_nq *nq,
+ 			 int nq_idx, int msix_vector, int bar_reg_offset,
+ 			 int (*cqn_handler)(struct bnxt_qplib_nq *nq,
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+@@ -586,19 +586,29 @@ fail:
+ 	return -ENOMEM;
+ }
+ 
+-void bnxt_qplib_disable_rcfw_channel(struct bnxt_qplib_rcfw *rcfw)
++void bnxt_qplib_rcfw_stop_irq(struct bnxt_qplib_rcfw *rcfw, bool kill)
+ {
+-	unsigned long indx;
+-
+-	/* Make sure the HW channel is stopped! */
+-	synchronize_irq(rcfw->vector);
+ 	tasklet_disable(&rcfw->worker);
+-	tasklet_kill(&rcfw->worker);
++	/* Mask h/w interrupts */
++	CREQ_DB(rcfw->creq_bar_reg_iomem, rcfw->creq.cons,
++		rcfw->creq.max_elements);
++	/* Sync with last running IRQ-handler */
++	synchronize_irq(rcfw->vector);
++	if (kill)
++		tasklet_kill(&rcfw->worker);
+ 
+ 	if (rcfw->requested) {
+ 		free_irq(rcfw->vector, rcfw);
+ 		rcfw->requested = false;
+ 	}
++}
++
++void bnxt_qplib_disable_rcfw_channel(struct bnxt_qplib_rcfw *rcfw)
++{
++	unsigned long indx;
++
++	bnxt_qplib_rcfw_stop_irq(rcfw, true);
++
+ 	if (rcfw->cmdq_bar_reg_iomem)
+ 		iounmap(rcfw->cmdq_bar_reg_iomem);
+ 	rcfw->cmdq_bar_reg_iomem = NULL;
+@@ -618,6 +628,31 @@ void bnxt_qplib_disable_rcfw_channel(str
+ 	rcfw->vector = 0;
+ }
+ 
++int bnxt_qplib_rcfw_start_irq(struct bnxt_qplib_rcfw *rcfw, int msix_vector,
++			      bool need_init)
++{
++	int rc;
++
++	if (rcfw->requested)
++		return -EFAULT;
++
++	rcfw->vector = msix_vector;
++	if (need_init)
++		tasklet_init(&rcfw->worker,
++			     bnxt_qplib_service_creq, (unsigned long)rcfw);
++	else
++		tasklet_enable(&rcfw->worker);
++	rc = request_irq(rcfw->vector, bnxt_qplib_creq_irq, 0,
++			 "bnxt_qplib_creq", rcfw);
++	if (rc)
++		return rc;
++	rcfw->requested = true;
++	CREQ_DB_REARM(rcfw->creq_bar_reg_iomem, rcfw->creq.cons,
++		      rcfw->creq.max_elements);
++
++	return 0;
++}
++
+ int bnxt_qplib_enable_rcfw_channel(struct pci_dev *pdev,
+ 				   struct bnxt_qplib_rcfw *rcfw,
+ 				   int msix_vector,
+@@ -679,27 +714,17 @@ int bnxt_qplib_enable_rcfw_channel(struc
+ 	rcfw->creq_qp_event_processed = 0;
+ 	rcfw->creq_func_event_processed = 0;
+ 
+-	rcfw->vector = msix_vector;
+ 	if (aeq_handler)
+ 		rcfw->aeq_handler = aeq_handler;
++	init_waitqueue_head(&rcfw->waitq);
+ 
+-	tasklet_init(&rcfw->worker, bnxt_qplib_service_creq,
+-		     (unsigned long)rcfw);
+-
+-	rcfw->requested = false;
+-	rc = request_irq(rcfw->vector, bnxt_qplib_creq_irq, 0,
+-			 "bnxt_qplib_creq", rcfw);
++	rc = bnxt_qplib_rcfw_start_irq(rcfw, msix_vector, true);
+ 	if (rc) {
+ 		dev_err(&rcfw->pdev->dev,
+ 			"QPLIB: Failed to request IRQ for CREQ rc = 0x%x", rc);
+ 		bnxt_qplib_disable_rcfw_channel(rcfw);
+ 		return rc;
+ 	}
+-	rcfw->requested = true;
+-
+-	init_waitqueue_head(&rcfw->waitq);
+-
+-	CREQ_DB_REARM(rcfw->creq_bar_reg_iomem, 0, rcfw->creq.max_elements);
+ 
+ 	init.cmdq_pbl = cpu_to_le64(rcfw->cmdq.pbl[PBL_LVL_0].pg_map_arr[0]);
+ 	init.cmdq_size_cmdq_lvl = cpu_to_le16(
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
+@@ -195,7 +195,10 @@ struct bnxt_qplib_rcfw {
+ void bnxt_qplib_free_rcfw_channel(struct bnxt_qplib_rcfw *rcfw);
+ int bnxt_qplib_alloc_rcfw_channel(struct pci_dev *pdev,
+ 				  struct bnxt_qplib_rcfw *rcfw, int qp_tbl_sz);
++void bnxt_qplib_rcfw_stop_irq(struct bnxt_qplib_rcfw *rcfw, bool kill);
+ void bnxt_qplib_disable_rcfw_channel(struct bnxt_qplib_rcfw *rcfw);
++int bnxt_qplib_rcfw_start_irq(struct bnxt_qplib_rcfw *rcfw, int msix_vector,
++			      bool need_init);
+ int bnxt_qplib_enable_rcfw_channel(struct pci_dev *pdev,
+ 				   struct bnxt_qplib_rcfw *rcfw,
+ 				   int msix_vector,

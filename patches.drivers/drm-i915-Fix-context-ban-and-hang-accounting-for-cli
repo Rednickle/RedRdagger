@@ -1,0 +1,173 @@
+From bc64e05408cafe3668e7460834935ea3f1764f31 Mon Sep 17 00:00:00 2001
+From: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date: Fri, 15 Jun 2018 13:44:29 +0300
+Subject: [PATCH] drm/i915: Fix context ban and hang accounting for client
+Git-commit: bc64e05408cafe3668e7460834935ea3f1764f31
+Patch-mainline: v4.18-rc2
+No-fix: 14921f3cef85b0167a9145e5f29b9dfc3b2a84dc
+References: bsc#1051510
+
+If client is smart or lucky enough to create a new context
+after each hang, our context banning mechanism will never
+catch up, and as a result of that it will be saved from
+client banning. This can result in a never ending streak of
+gpu hangs caused by bad or malicious client, preventing
+access from other legit gpu clients.
+
+Fix this by always incrementing per client ban score if
+it hangs in short successions regardless of context ban
+scoring. The exception are non bannable contexts. They remain
+detached from client ban scoring mechanism.
+
+V2: xchg timestamp, tidyup (Chris)
+V3: comment, bannable & banned together (Chris)
+
+Fixes: b083a0870c79 ("drm/i915: Add per client max context ban limit")
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180615104429.31477-1-mika.kuoppala@linux.intel.com
+(cherry picked from commit 14921f3cef85b0167a9145e5f29b9dfc3b2a84dc)
+
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h         | 21 ++++++---
+ drivers/gpu/drm/i915/i915_gem.c         | 57 +++++++++++++++++--------
+ drivers/gpu/drm/i915/i915_gem_context.c |  2 +-
+ 3 files changed, 55 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 34c125e2d90c..7014a96546f4 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -340,14 +340,21 @@ struct drm_i915_file_private {
+ 
+ 	unsigned int bsd_engine;
+ 
+-/* Client can have a maximum of 3 contexts banned before
+- * it is denied of creating new contexts. As one context
+- * ban needs 4 consecutive hangs, and more if there is
+- * progress in between, this is a last resort stop gap measure
+- * to limit the badly behaving clients access to gpu.
++/*
++ * Every context ban increments per client ban score. Also
++ * hangs in short succession increments ban score. If ban threshold
++ * is reached, client is considered banned and submitting more work
++ * will fail. This is a stop gap measure to limit the badly behaving
++ * clients access to gpu. Note that unbannable contexts never increment
++ * the client ban score.
+  */
+-#define I915_MAX_CLIENT_CONTEXT_BANS 3
+-	atomic_t context_bans;
++#define I915_CLIENT_SCORE_HANG_FAST	1
++#define   I915_CLIENT_FAST_HANG_JIFFIES (60 * HZ)
++#define I915_CLIENT_SCORE_CONTEXT_BAN   3
++#define I915_CLIENT_SCORE_BANNED	9
++	/** ban_score: Accumulated score of all ctx bans and fast hangs. */
++	atomic_t ban_score;
++	unsigned long hang_timestamp;
+ };
+ 
+ /* Interface history:
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 3704f4c0c2c9..d44ad7bc1e94 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2933,32 +2933,54 @@ i915_gem_object_pwrite_gtt(struct drm_i915_gem_object *obj,
+ 	return 0;
+ }
+ 
++static void i915_gem_client_mark_guilty(struct drm_i915_file_private *file_priv,
++					const struct i915_gem_context *ctx)
++{
++	unsigned int score;
++	unsigned long prev_hang;
++
++	if (i915_gem_context_is_banned(ctx))
++		score = I915_CLIENT_SCORE_CONTEXT_BAN;
++	else
++		score = 0;
++
++	prev_hang = xchg(&file_priv->hang_timestamp, jiffies);
++	if (time_before(jiffies, prev_hang + I915_CLIENT_FAST_HANG_JIFFIES))
++		score += I915_CLIENT_SCORE_HANG_FAST;
++
++	if (score) {
++		atomic_add(score, &file_priv->ban_score);
++
++		DRM_DEBUG_DRIVER("client %s: gained %u ban score, now %u\n",
++				 ctx->name, score,
++				 atomic_read(&file_priv->ban_score));
++	}
++}
++
+ static void i915_gem_context_mark_guilty(struct i915_gem_context *ctx)
+ {
+-	bool banned;
++	unsigned int score;
++	bool banned, bannable;
+ 
+ 	atomic_inc(&ctx->guilty_count);
+ 
+-	banned = false;
+-	if (i915_gem_context_is_bannable(ctx)) {
+-		unsigned int score;
++	bannable = i915_gem_context_is_bannable(ctx);
++	score = atomic_add_return(CONTEXT_SCORE_GUILTY, &ctx->ban_score);
++	banned = score >= CONTEXT_SCORE_BAN_THRESHOLD;
+ 
+-		score = atomic_add_return(CONTEXT_SCORE_GUILTY,
+-					  &ctx->ban_score);
+-		banned = score >= CONTEXT_SCORE_BAN_THRESHOLD;
++	DRM_DEBUG_DRIVER("context %s: guilty %d, score %u, ban %s\n",
++			 ctx->name, atomic_read(&ctx->guilty_count),
++			 score, yesno(banned && bannable));
+ 
+-		DRM_DEBUG_DRIVER("context %s marked guilty (score %d) banned? %s\n",
+-				 ctx->name, score, yesno(banned));
+-	}
+-	if (!banned)
++	/* Cool contexts don't accumulate client ban score */
++	if (!bannable)
+ 		return;
+ 
+-	i915_gem_context_set_banned(ctx);
+-	if (!IS_ERR_OR_NULL(ctx->file_priv)) {
+-		atomic_inc(&ctx->file_priv->context_bans);
+-		DRM_DEBUG_DRIVER("client %s has had %d context banned\n",
+-				 ctx->name, atomic_read(&ctx->file_priv->context_bans));
+-	}
++	if (banned)
++		i915_gem_context_set_banned(ctx);
++
++	if (!IS_ERR_OR_NULL(ctx->file_priv))
++		i915_gem_client_mark_guilty(ctx->file_priv, ctx);
+ }
+ 
+ static void i915_gem_context_mark_innocent(struct i915_gem_context *ctx)
+@@ -5736,6 +5758,7 @@ int i915_gem_open(struct drm_i915_private *i915, struct drm_file *file)
+ 	INIT_LIST_HEAD(&file_priv->mm.request_list);
+ 
+ 	file_priv->bsd_engine = -1;
++	file_priv->hang_timestamp = jiffies;
+ 
+ 	ret = i915_gem_context_open(i915, file);
+ 	if (ret)
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 33f8a4b3c981..060335d3d9e0 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -652,7 +652,7 @@ int i915_gem_switch_to_kernel_context(struct drm_i915_private *dev_priv)
+ 
+ static bool client_is_banned(struct drm_i915_file_private *file_priv)
+ {
+-	return atomic_read(&file_priv->context_bans) > I915_MAX_CLIENT_CONTEXT_BANS;
++	return atomic_read(&file_priv->ban_score) >= I915_CLIENT_SCORE_BANNED;
+ }
+ 
+ int i915_gem_context_create_ioctl(struct drm_device *dev, void *data,
+-- 
+2.18.0
+

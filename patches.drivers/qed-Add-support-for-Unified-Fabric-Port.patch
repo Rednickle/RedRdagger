@@ -1,0 +1,654 @@
+From: Sudarsana Reddy Kalluru <sudarsana.kalluru@cavium.com>
+Date: Sat, 5 May 2018 18:43:02 -0700
+Subject: qed: Add support for Unified Fabric Port.
+Patch-mainline: v4.18-rc1
+Git-commit: cac6f691546b9efd50c31c0db97fe50d0357104a
+References: bsc#1086314 FATE#324886 bsc#1086313 FATE#324885 bsc#1086301 FATE#3248881
+
+This patch adds driver changes for supporting the Unified Fabric Port
+(UFP). This is a new paritioning mode wherein MFW provides the set of
+parameters to be used by the device such as traffic class, outer-vlan
+tag value, priority type etc. Drivers receives this info via notifications
+from mfw and configures the hardware accordingly.
+
+Signed-off-by: Sudarsana Reddy Kalluru <Sudarsana.Kalluru@cavium.com>
+Signed-off-by: Ariel Elior <ariel.elior@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qed/qed.h             |   20 +++++
+ drivers/net/ethernet/qlogic/qed/qed_dcbx.c        |   14 +++
+ drivers/net/ethernet/qlogic/qed/qed_dev.c         |   32 +++++++--
+ drivers/net/ethernet/qlogic/qed/qed_fcoe.c        |    3 
+ drivers/net/ethernet/qlogic/qed/qed_hsi.h         |   28 +++++++
+ drivers/net/ethernet/qlogic/qed/qed_ll2.c         |   40 ++++++++---
+ drivers/net/ethernet/qlogic/qed/qed_mcp.c         |   78 ++++++++++++++++++++++
+ drivers/net/ethernet/qlogic/qed/qed_mcp.h         |    8 ++
+ drivers/net/ethernet/qlogic/qed/qed_sp.h          |    9 ++
+ drivers/net/ethernet/qlogic/qed/qed_sp_commands.c |   57 +++++++++++++++-
+ drivers/scsi/qedf/qedf_fip.c                      |    7 +
+ drivers/scsi/qedf/qedf_main.c                     |    2 
+ drivers/scsi/qedi/qedi_iscsi.c                    |    2 
+ include/linux/qed/qed_ll2_if.h                    |   10 ++
+ 14 files changed, 283 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -474,6 +474,24 @@ enum qed_mf_mode_bit {
+ 	QED_MF_DSCP_TO_TC_MAP,
+ };
+ 
++enum qed_ufp_mode {
++	QED_UFP_MODE_ETS,
++	QED_UFP_MODE_VNIC_BW,
++	QED_UFP_MODE_UNKNOWN
++};
++
++enum qed_ufp_pri_type {
++	QED_UFP_PRI_OS,
++	QED_UFP_PRI_VNIC,
++	QED_UFP_PRI_UNKNOWN
++};
++
++struct qed_ufp_info {
++	enum qed_ufp_pri_type pri_type;
++	enum qed_ufp_mode mode;
++	u8 tc;
++};
++
+ enum BAR_ID {
+ 	BAR_ID_0,		/* used for GRC */
+ 	BAR_ID_1		/* Used for doorbells */
+@@ -582,6 +600,8 @@ struct qed_hwfn {
+ 
+ 	struct qed_dcbx_info		*p_dcbx_info;
+ 
++	struct qed_ufp_info		ufp_info;
++
+ 	struct qed_dmae_info		dmae_info;
+ 
+ 	/* QM init */
+--- a/drivers/net/ethernet/qlogic/qed/qed_dcbx.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dcbx.c
+@@ -274,8 +274,8 @@ qed_dcbx_process_tlv(struct qed_hwfn *p_
+ 		     u32 pri_tc_tbl, int count, u8 dcbx_version)
+ {
+ 	enum dcbx_protocol_type type;
++	bool enable, ieee, eth_tlv;
+ 	u8 tc, priority_map;
+-	bool enable, ieee;
+ 	u16 protocol_id;
+ 	int priority;
+ 	int i;
+@@ -283,6 +283,7 @@ qed_dcbx_process_tlv(struct qed_hwfn *p_
+ 	DP_VERBOSE(p_hwfn, QED_MSG_DCB, "Num APP entries = %d\n", count);
+ 
+ 	ieee = (dcbx_version == DCBX_CONFIG_VERSION_IEEE);
++	eth_tlv = false;
+ 	/* Parse APP TLV */
+ 	for (i = 0; i < count; i++) {
+ 		protocol_id = QED_MFW_GET_FIELD(p_tbl[i].entry,
+@@ -304,13 +305,22 @@ qed_dcbx_process_tlv(struct qed_hwfn *p_
+ 			 * indication, but we only got here if there was an
+ 			 * app tlv for the protocol, so dcbx must be enabled.
+ 			 */
+-			enable = !(type == DCBX_PROTOCOL_ETH);
++			if (type == DCBX_PROTOCOL_ETH) {
++				enable = false;
++				eth_tlv = true;
++			} else {
++				enable = true;
++			}
+ 
+ 			qed_dcbx_update_app_info(p_data, p_hwfn, enable,
+ 						 priority, tc, type);
+ 		}
+ 	}
+ 
++	/* If Eth TLV is not detected, use UFP TC as default TC */
++	if (test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits) && !eth_tlv)
++		p_data->arr[DCBX_PROTOCOL_ETH].tc = p_hwfn->ufp_info.tc;
++
+ 	/* Update ramrod protocol data and hw_info fields
+ 	 * with default info when corresponding APP TLV's are not detected.
+ 	 * The enabled field has a different logic for ethernet as only for
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -1499,6 +1499,11 @@ static int qed_hw_init_pf(struct qed_hwf
+ 		STORE_RT_REG(p_hwfn, NIG_REG_LLH_FUNC_TAG_EN_RT_OFFSET, 1);
+ 		STORE_RT_REG(p_hwfn, NIG_REG_LLH_FUNC_TAG_VALUE_RT_OFFSET,
+ 			     p_hwfn->hw_info.ovlan);
++
++		DP_VERBOSE(p_hwfn, NETIF_MSG_HW,
++			   "Configuring LLH_FUNC_FILTER_HDR_SEL\n");
++		STORE_RT_REG(p_hwfn, NIG_REG_LLH_FUNC_FILTER_HDR_SEL_RT_OFFSET,
++			     1);
+ 	}
+ 
+ 	/* Enable classification by MAC if needed */
+@@ -1635,6 +1640,7 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 	bool b_default_mtu = true;
+ 	struct qed_hwfn *p_hwfn;
+ 	int rc = 0, mfw_rc, i;
++	u16 ether_type;
+ 
+ 	if ((p_params->int_mode == QED_INT_MODE_MSI) && (cdev->num_hwfns > 1)) {
+ 		DP_NOTICE(cdev, "MSI mode is not supported for CMT devices\n");
+@@ -1668,16 +1674,22 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 		if (rc)
+ 			return rc;
+ 
+-		if (IS_PF(cdev) && test_bit(QED_MF_8021AD_TAGGING,
+-					    &cdev->mf_bits)) {
++		if (IS_PF(cdev) && (test_bit(QED_MF_8021Q_TAGGING,
++					     &cdev->mf_bits) ||
++				    test_bit(QED_MF_8021AD_TAGGING,
++					     &cdev->mf_bits))) {
++			if (test_bit(QED_MF_8021Q_TAGGING, &cdev->mf_bits))
++				ether_type = ETH_P_8021Q;
++			else
++				ether_type = ETH_P_8021AD;
+ 			STORE_RT_REG(p_hwfn, PRS_REG_TAG_ETHERTYPE_0_RT_OFFSET,
+-				     ETH_P_8021AD);
++				     ether_type);
+ 			STORE_RT_REG(p_hwfn, NIG_REG_TAG_ETHERTYPE_0_RT_OFFSET,
+-				     ETH_P_8021AD);
++				     ether_type);
+ 			STORE_RT_REG(p_hwfn, PBF_REG_TAG_ETHERTYPE_0_RT_OFFSET,
+-				     ETH_P_8021AD);
++				     ether_type);
+ 			STORE_RT_REG(p_hwfn, DORQ_REG_TAG1_ETHERTYPE_RT_OFFSET,
+-				     ETH_P_8021AD);
++				     ether_type);
+ 		}
+ 
+ 		qed_fill_load_req_params(&load_req_params,
+@@ -2659,6 +2671,12 @@ static int qed_hw_get_nvm_info(struct qe
+ 		case NVM_CFG1_GLOB_MF_MODE_MF_ALLOWED:
+ 			cdev->mf_bits = BIT(QED_MF_OVLAN_CLSS);
+ 			break;
++		case NVM_CFG1_GLOB_MF_MODE_UFP:
++			cdev->mf_bits = BIT(QED_MF_OVLAN_CLSS) |
++					BIT(QED_MF_LLH_PROTO_CLSS) |
++					BIT(QED_MF_UFP_SPECIFIC) |
++					BIT(QED_MF_8021Q_TAGGING);
++			break;
+ 		case NVM_CFG1_GLOB_MF_MODE_BD:
+ 			cdev->mf_bits = BIT(QED_MF_OVLAN_CLSS) |
+ 					BIT(QED_MF_LLH_PROTO_CLSS) |
+@@ -2879,6 +2897,8 @@ qed_get_hw_info(struct qed_hwfn *p_hwfn,
+ 		qed_mcp_cmd_port_init(p_hwfn, p_ptt);
+ 
+ 		qed_get_eee_caps(p_hwfn, p_ptt);
++
++		qed_mcp_read_ufp_config(p_hwfn, p_ptt);
+ 	}
+ 
+ 	if (qed_mcp_is_init(p_hwfn)) {
+--- a/drivers/net/ethernet/qlogic/qed/qed_fcoe.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_fcoe.c
+@@ -313,6 +313,9 @@ qed_sp_fcoe_conn_offload(struct qed_hwfn
+ 	p_data->d_id.addr_mid = p_conn->d_id.addr_mid;
+ 	p_data->d_id.addr_lo = p_conn->d_id.addr_lo;
+ 	p_data->flags = p_conn->flags;
++	if (test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits))
++		SET_FIELD(p_data->flags,
++			  FCOE_CONN_OFFLOAD_RAMROD_DATA_B_SINGLE_VLAN, 1);
+ 	p_data->def_q_idx = p_conn->def_q_idx;
+ 
+ 	return qed_spq_post(p_hwfn, p_ent, NULL);
+--- a/drivers/net/ethernet/qlogic/qed/qed_hsi.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+@@ -11993,6 +11993,16 @@ struct public_port {
+ #define EEE_REMOTE_TW_TX_OFFSET 0
+ #define EEE_REMOTE_TW_RX_MASK   0xffff0000
+ #define EEE_REMOTE_TW_RX_OFFSET 16
++
++	u32 oem_cfg_port;
++#define OEM_CFG_CHANNEL_TYPE_MASK                       0x00000003
++#define OEM_CFG_CHANNEL_TYPE_OFFSET                     0
++#define OEM_CFG_CHANNEL_TYPE_VLAN_PARTITION             0x1
++#define OEM_CFG_CHANNEL_TYPE_STAGGED                    0x2
++#define OEM_CFG_SCHED_TYPE_MASK                         0x0000000C
++#define OEM_CFG_SCHED_TYPE_OFFSET                       2
++#define OEM_CFG_SCHED_TYPE_ETS                          0x1
++#define OEM_CFG_SCHED_TYPE_VNIC_BW                      0x2
+ };
+ 
+ struct public_func {
+@@ -12069,6 +12079,23 @@ struct public_func {
+ #define DRV_ID_DRV_INIT_HW_MASK		0x80000000
+ #define DRV_ID_DRV_INIT_HW_SHIFT	31
+ #define DRV_ID_DRV_INIT_HW_FLAG		(1 << DRV_ID_DRV_INIT_HW_SHIFT)
++
++	u32 oem_cfg_func;
++#define OEM_CFG_FUNC_TC_MASK                    0x0000000F
++#define OEM_CFG_FUNC_TC_OFFSET                  0
++#define OEM_CFG_FUNC_TC_0                       0x0
++#define OEM_CFG_FUNC_TC_1                       0x1
++#define OEM_CFG_FUNC_TC_2                       0x2
++#define OEM_CFG_FUNC_TC_3                       0x3
++#define OEM_CFG_FUNC_TC_4                       0x4
++#define OEM_CFG_FUNC_TC_5                       0x5
++#define OEM_CFG_FUNC_TC_6                       0x6
++#define OEM_CFG_FUNC_TC_7                       0x7
++
++#define OEM_CFG_FUNC_HOST_PRI_CTRL_MASK         0x00000030
++#define OEM_CFG_FUNC_HOST_PRI_CTRL_OFFSET       4
++#define OEM_CFG_FUNC_HOST_PRI_CTRL_VNIC         0x1
++#define OEM_CFG_FUNC_HOST_PRI_CTRL_OS           0x2
+ };
+ 
+ struct mcp_mac {
+@@ -12495,6 +12522,7 @@ enum MFW_DRV_MSG_TYPE {
+ 	MFW_DRV_MSG_BW_UPDATE10,
+ 	MFW_DRV_MSG_TRANSCEIVER_STATE_CHANGE,
+ 	MFW_DRV_MSG_BW_UPDATE11,
++	MFW_DRV_MSG_OEM_CFG_UPDATE,
+ 	MFW_DRV_MSG_MAX
+ };
+ 
+--- a/drivers/net/ethernet/qlogic/qed/qed_ll2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_ll2.c
+@@ -945,6 +945,10 @@ static int qed_sp_ll2_rx_queue_start(str
+ 	p_ramrod->drop_ttl0_flg = p_ll2_conn->input.rx_drop_ttl0_flg;
+ 	p_ramrod->inner_vlan_stripping_en =
+ 		p_ll2_conn->input.rx_vlan_removal_en;
++
++	if (test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits) &&
++	    p_ll2_conn->input.conn_type == QED_LL2_TYPE_FCOE)
++		p_ramrod->report_outer_vlan = 1;
+ 	p_ramrod->queue_id = p_ll2_conn->queue_id;
+ 	p_ramrod->main_func_queue = p_ll2_conn->main_func_queue ? 1 : 0;
+ 
+@@ -1519,11 +1523,12 @@ int qed_ll2_establish_connection(void *c
+ 	qed_ll2_establish_connection_ooo(p_hwfn, p_ll2_conn);
+ 
+ 	if (p_ll2_conn->input.conn_type == QED_LL2_TYPE_FCOE) {
++		if (!test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits))
++			qed_llh_add_protocol_filter(p_hwfn, p_ptt,
++						    ETH_P_FCOE, 0,
++						    QED_LLH_FILTER_ETHERTYPE);
+ 		qed_llh_add_protocol_filter(p_hwfn, p_ptt,
+-					    0x8906, 0,
+-					    QED_LLH_FILTER_ETHERTYPE);
+-		qed_llh_add_protocol_filter(p_hwfn, p_ptt,
+-					    0x8914, 0,
++					    ETH_P_FIP, 0,
+ 					    QED_LLH_FILTER_ETHERTYPE);
+ 	}
+ 
+@@ -1679,11 +1684,16 @@ qed_ll2_prepare_tx_packet_set_bd(struct
+ 
+ 	start_bd = (struct core_tx_bd *)qed_chain_produce(p_tx_chain);
+ 	if (QED_IS_IWARP_PERSONALITY(p_hwfn) &&
+-	    p_ll2->input.conn_type == QED_LL2_TYPE_OOO)
++	    p_ll2->input.conn_type == QED_LL2_TYPE_OOO) {
+ 		start_bd->nw_vlan_or_lb_echo =
+ 		    cpu_to_le16(IWARP_LL2_IN_ORDER_TX_QUEUE);
+-	else
++	} else {
+ 		start_bd->nw_vlan_or_lb_echo = cpu_to_le16(pkt->vlan);
++		if (test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits) &&
++		    p_ll2->input.conn_type == QED_LL2_TYPE_FCOE)
++			pkt->remove_stag = true;
++	}
++
+ 	SET_FIELD(start_bd->bitfield1, CORE_TX_BD_L4_HDR_OFFSET_W,
+ 		  cpu_to_le16(pkt->l4_hdr_offset_w));
+ 	SET_FIELD(start_bd->bitfield1, CORE_TX_BD_TX_DST, tx_dest);
+@@ -1694,6 +1704,9 @@ qed_ll2_prepare_tx_packet_set_bd(struct
+ 	SET_FIELD(bd_data, CORE_TX_BD_DATA_IP_CSUM, !!(pkt->enable_ip_cksum));
+ 	SET_FIELD(bd_data, CORE_TX_BD_DATA_L4_CSUM, !!(pkt->enable_l4_cksum));
+ 	SET_FIELD(bd_data, CORE_TX_BD_DATA_IP_LEN, !!(pkt->calc_ip_len));
++	SET_FIELD(bd_data, CORE_TX_BD_DATA_DISABLE_STAG_INSERTION,
++		  !!(pkt->remove_stag));
++
+ 	start_bd->bd_data.as_bitfield = cpu_to_le16(bd_data);
+ 	DMA_REGPAIR_LE(start_bd->addr, pkt->first_frag);
+ 	start_bd->nbytes = cpu_to_le16(pkt->first_frag_len);
+@@ -1910,11 +1923,12 @@ int qed_ll2_terminate_connection(void *c
+ 		qed_ooo_release_all_isles(p_hwfn, p_hwfn->p_ooo_info);
+ 
+ 	if (p_ll2_conn->input.conn_type == QED_LL2_TYPE_FCOE) {
++		if (!test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits))
++			qed_llh_remove_protocol_filter(p_hwfn, p_ptt,
++						       ETH_P_FCOE, 0,
++						      QED_LLH_FILTER_ETHERTYPE);
+ 		qed_llh_remove_protocol_filter(p_hwfn, p_ptt,
+-					       0x8906, 0,
+-					       QED_LLH_FILTER_ETHERTYPE);
+-		qed_llh_remove_protocol_filter(p_hwfn, p_ptt,
+-					       0x8914, 0,
++					       ETH_P_FIP, 0,
+ 					       QED_LLH_FILTER_ETHERTYPE);
+ 	}
+ 
+@@ -2386,7 +2400,8 @@ fail:
+ 	return -EINVAL;
+ }
+ 
+-static int qed_ll2_start_xmit(struct qed_dev *cdev, struct sk_buff *skb)
++static int qed_ll2_start_xmit(struct qed_dev *cdev, struct sk_buff *skb,
++			      unsigned long xmit_flags)
+ {
+ 	struct qed_ll2_tx_pkt_info pkt;
+ 	const skb_frag_t *frag;
+@@ -2431,6 +2446,9 @@ static int qed_ll2_start_xmit(struct qed
+ 	pkt.first_frag = mapping;
+ 	pkt.first_frag_len = skb->len;
+ 	pkt.cookie = skb;
++	if (test_bit(QED_MF_UFP_SPECIFIC, &cdev->mf_bits) &&
++	    test_bit(QED_LL2_XMIT_FLAGS_FIP_DISCOVERY, &xmit_flags))
++		pkt.remove_stag = true;
+ 
+ 	rc = qed_ll2_prepare_tx_packet(&cdev->hwfns[0], cdev->ll2->handle,
+ 				       &pkt, 1);
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -40,6 +40,7 @@
+ #include <linux/string.h>
+ #include <linux/etherdevice.h>
+ #include "qed.h"
++#include "qed_cxt.h"
+ #include "qed_dcbx.h"
+ #include "qed_hsi.h"
+ #include "qed_hw.h"
+@@ -1486,6 +1487,80 @@ static void qed_mcp_update_stag(struct q
+ 		    &resp, &param);
+ }
+ 
++void qed_mcp_read_ufp_config(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	struct public_func shmem_info;
++	u32 port_cfg, val;
++
++	if (!test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits))
++		return;
++
++	memset(&p_hwfn->ufp_info, 0, sizeof(p_hwfn->ufp_info));
++	port_cfg = qed_rd(p_hwfn, p_ptt, p_hwfn->mcp_info->port_addr +
++			  offsetof(struct public_port, oem_cfg_port));
++	val = (port_cfg & OEM_CFG_CHANNEL_TYPE_MASK) >>
++		OEM_CFG_CHANNEL_TYPE_OFFSET;
++	if (val != OEM_CFG_CHANNEL_TYPE_STAGGED)
++		DP_NOTICE(p_hwfn, "Incorrect UFP Channel type  %d\n", val);
++
++	val = (port_cfg & OEM_CFG_SCHED_TYPE_MASK) >> OEM_CFG_SCHED_TYPE_OFFSET;
++	if (val == OEM_CFG_SCHED_TYPE_ETS) {
++		p_hwfn->ufp_info.mode = QED_UFP_MODE_ETS;
++	} else if (val == OEM_CFG_SCHED_TYPE_VNIC_BW) {
++		p_hwfn->ufp_info.mode = QED_UFP_MODE_VNIC_BW;
++	} else {
++		p_hwfn->ufp_info.mode = QED_UFP_MODE_UNKNOWN;
++		DP_NOTICE(p_hwfn, "Unknown UFP scheduling mode %d\n", val);
++	}
++
++	qed_mcp_get_shmem_func(p_hwfn, p_ptt, &shmem_info, MCP_PF_ID(p_hwfn));
++	val = (port_cfg & OEM_CFG_FUNC_TC_MASK) >> OEM_CFG_FUNC_TC_OFFSET;
++	p_hwfn->ufp_info.tc = (u8)val;
++	val = (port_cfg & OEM_CFG_FUNC_HOST_PRI_CTRL_MASK) >>
++		OEM_CFG_FUNC_HOST_PRI_CTRL_OFFSET;
++	if (val == OEM_CFG_FUNC_HOST_PRI_CTRL_VNIC) {
++		p_hwfn->ufp_info.pri_type = QED_UFP_PRI_VNIC;
++	} else if (val == OEM_CFG_FUNC_HOST_PRI_CTRL_OS) {
++		p_hwfn->ufp_info.pri_type = QED_UFP_PRI_OS;
++	} else {
++		p_hwfn->ufp_info.pri_type = QED_UFP_PRI_UNKNOWN;
++		DP_NOTICE(p_hwfn, "Unknown Host priority control %d\n", val);
++	}
++
++	DP_NOTICE(p_hwfn,
++		  "UFP shmem config: mode = %d tc = %d pri_type = %d\n",
++		  p_hwfn->ufp_info.mode,
++		  p_hwfn->ufp_info.tc, p_hwfn->ufp_info.pri_type);
++}
++
++static int
++qed_mcp_handle_ufp_event(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	qed_mcp_read_ufp_config(p_hwfn, p_ptt);
++
++	if (p_hwfn->ufp_info.mode == QED_UFP_MODE_VNIC_BW) {
++		p_hwfn->qm_info.ooo_tc = p_hwfn->ufp_info.tc;
++		p_hwfn->hw_info.offload_tc = p_hwfn->ufp_info.tc;
++
++		qed_qm_reconf(p_hwfn, p_ptt);
++	} else if (p_hwfn->ufp_info.mode == QED_UFP_MODE_ETS) {
++		/* Merge UFP TC with the dcbx TC data */
++		qed_dcbx_mib_update_event(p_hwfn, p_ptt,
++					  QED_DCBX_OPERATIONAL_MIB);
++	} else {
++		DP_ERR(p_hwfn, "Invalid sched type, discard the UFP config\n");
++		return -EINVAL;
++	}
++
++	/* update storm FW with negotiation results */
++	qed_sp_pf_update_ufp(p_hwfn);
++
++	/* update stag pcp value */
++	qed_sp_pf_update_stag(p_hwfn);
++
++	return 0;
++}
++
+ int qed_mcp_handle_events(struct qed_hwfn *p_hwfn,
+ 			  struct qed_ptt *p_ptt)
+ {
+@@ -1529,6 +1604,9 @@ int qed_mcp_handle_events(struct qed_hwf
+ 			qed_dcbx_mib_update_event(p_hwfn, p_ptt,
+ 						  QED_DCBX_OPERATIONAL_MIB);
+ 			break;
++		case MFW_DRV_MSG_OEM_CFG_UPDATE:
++			qed_mcp_handle_ufp_event(p_hwfn, p_ptt);
++			break;
+ 		case MFW_DRV_MSG_TRANSCEIVER_STATE_CHANGE:
+ 			qed_mcp_handle_transceiver_change(p_hwfn, p_ptt);
+ 			break;
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+@@ -1005,6 +1005,14 @@ int qed_mcp_get_capabilities(struct qed_
+ int qed_mcp_set_capabilities(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
+ 
+ /**
++ * @brief Read ufp config from the shared memory.
++ *
++ * @param p_hwfn
++ * @param p_ptt
++ */
++void qed_mcp_read_ufp_config(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
++
++/**
+  * @brief Populate the nvm info shadow in the given hardware function
+  *
+  * @param p_hwfn
+--- a/drivers/net/ethernet/qlogic/qed/qed_sp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_sp.h
+@@ -462,6 +462,15 @@ int qed_sp_pf_update_stag(struct qed_hwf
+  * @return int
+  */
+ 
++/**
++ * @brief qed_sp_pf_update_ufp - PF ufp update Ramrod
++ *
++ * @param p_hwfn
++ *
++ * @return int
++ */
++int qed_sp_pf_update_ufp(struct qed_hwfn *p_hwfn);
++
+ int qed_sp_pf_stop(struct qed_hwfn *p_hwfn);
+ 
+ int qed_sp_pf_update_tunn_cfg(struct qed_hwfn *p_hwfn,
+--- a/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sp_commands.c
+@@ -314,7 +314,7 @@ int qed_sp_pf_start(struct qed_hwfn *p_h
+ 	struct qed_spq_entry *p_ent = NULL;
+ 	struct qed_sp_init_data init_data;
+ 	int rc = -EINVAL;
+-	u8 page_cnt;
++	u8 page_cnt, i;
+ 
+ 	/* update initial eq producer */
+ 	qed_eq_prod_update(p_hwfn,
+@@ -345,12 +345,30 @@ int qed_sp_pf_start(struct qed_hwfn *p_h
+ 		p_ramrod->mf_mode = MF_NPAR;
+ 
+ 	p_ramrod->outer_tag_config.outer_tag.tci =
+-		cpu_to_le16(p_hwfn->hw_info.ovlan);
+-	if (test_bit(QED_MF_8021AD_TAGGING, &p_hwfn->cdev->mf_bits)) {
++				cpu_to_le16(p_hwfn->hw_info.ovlan);
++	if (test_bit(QED_MF_8021Q_TAGGING, &p_hwfn->cdev->mf_bits)) {
++		p_ramrod->outer_tag_config.outer_tag.tpid = ETH_P_8021Q;
++	} else if (test_bit(QED_MF_8021AD_TAGGING, &p_hwfn->cdev->mf_bits)) {
+ 		p_ramrod->outer_tag_config.outer_tag.tpid = ETH_P_8021AD;
+ 		p_ramrod->outer_tag_config.enable_stag_pri_change = 1;
+ 	}
+ 
++	p_ramrod->outer_tag_config.pri_map_valid = 1;
++	for (i = 0; i < QED_MAX_PFC_PRIORITIES; i++)
++		p_ramrod->outer_tag_config.inner_to_outer_pri_map[i] = i;
++
++	/* enable_stag_pri_change should be set if port is in BD mode or,
++	 * UFP with Host Control mode.
++	 */
++	if (test_bit(QED_MF_UFP_SPECIFIC, &p_hwfn->cdev->mf_bits)) {
++		if (p_hwfn->ufp_info.pri_type == QED_UFP_PRI_OS)
++			p_ramrod->outer_tag_config.enable_stag_pri_change = 1;
++		else
++			p_ramrod->outer_tag_config.enable_stag_pri_change = 0;
++
++		p_ramrod->outer_tag_config.outer_tag.tci |=
++		    cpu_to_le16(((u16)p_hwfn->ufp_info.tc << 13));
++	}
+ 
+ 	/* Place EQ address in RAMROD */
+ 	DMA_REGPAIR_LE(p_ramrod->event_ring_pbl_addr,
+@@ -430,6 +448,39 @@ int qed_sp_pf_update(struct qed_hwfn *p_
+ 
+ 	return qed_spq_post(p_hwfn, p_ent, NULL);
+ }
++
++int qed_sp_pf_update_ufp(struct qed_hwfn *p_hwfn)
++{
++	struct qed_spq_entry *p_ent = NULL;
++	struct qed_sp_init_data init_data;
++	int rc = -EOPNOTSUPP;
++
++	if (p_hwfn->ufp_info.pri_type == QED_UFP_PRI_UNKNOWN) {
++		DP_INFO(p_hwfn, "Invalid priority type %d\n",
++			p_hwfn->ufp_info.pri_type);
++		return -EINVAL;
++	}
++
++	/* Get SPQ entry */
++	memset(&init_data, 0, sizeof(init_data));
++	init_data.cid = qed_spq_get_cid(p_hwfn);
++	init_data.opaque_fid = p_hwfn->hw_info.opaque_fid;
++	init_data.comp_mode = QED_SPQ_MODE_CB;
++
++	rc = qed_sp_init_request(p_hwfn, &p_ent,
++				 COMMON_RAMROD_PF_UPDATE, PROTOCOLID_COMMON,
++				 &init_data);
++	if (rc)
++		return rc;
++
++	p_ent->ramrod.pf_update.update_enable_stag_pri_change = true;
++	if (p_hwfn->ufp_info.pri_type == QED_UFP_PRI_OS)
++		p_ent->ramrod.pf_update.enable_stag_pri_change = 1;
++	else
++		p_ent->ramrod.pf_update.enable_stag_pri_change = 0;
++
++	return qed_spq_post(p_hwfn, p_ent, NULL);
++}
+ 
+ /* Set pf update ramrod command params */
+ int qed_sp_pf_update_tunn_cfg(struct qed_hwfn *p_hwfn,
+--- a/drivers/scsi/qedf/qedf_fip.c
++++ b/drivers/scsi/qedf/qedf_fip.c
+@@ -23,6 +23,7 @@ void qedf_fcoe_send_vlan_req(struct qedf
+ 	struct fip_vlan *vlan;
+ #define MY_FIP_ALL_FCF_MACS        ((__u8[6]) { 1, 0x10, 0x18, 1, 0, 2 })
+ 	static u8 my_fcoe_all_fcfs[ETH_ALEN] = MY_FIP_ALL_FCF_MACS;
++	unsigned long flags = 0;
+ 
+ 	skb = dev_alloc_skb(sizeof(struct fip_vlan));
+ 	if (!skb)
+@@ -65,7 +66,9 @@ void qedf_fcoe_send_vlan_req(struct qedf
+ 		kfree_skb(skb);
+ 		return;
+ 	}
+-	qed_ops->ll2->start_xmit(qedf->cdev, skb);
++
++	set_bit(QED_LL2_XMIT_FLAGS_FIP_DISCOVERY, &flags);
++	qed_ops->ll2->start_xmit(qedf->cdev, skb, flags);
+ }
+ 
+ static void qedf_fcoe_process_vlan_resp(struct qedf_ctx *qedf,
+@@ -139,7 +142,7 @@ void qedf_fip_send(struct fcoe_ctlr *fip
+ 		print_hex_dump(KERN_WARNING, "fip ", DUMP_PREFIX_OFFSET, 16, 1,
+ 		    skb->data, skb->len, false);
+ 
+-	qed_ops->ll2->start_xmit(qedf->cdev, skb);
++	qed_ops->ll2->start_xmit(qedf->cdev, skb, 0);
+ }
+ 
+ /* Process incoming FIP frames. */
+--- a/drivers/scsi/qedf/qedf_main.c
++++ b/drivers/scsi/qedf/qedf_main.c
+@@ -996,7 +996,7 @@ static int qedf_xmit(struct fc_lport *lp
+ 	if (qedf_dump_frames)
+ 		print_hex_dump(KERN_WARNING, "fcoe: ", DUMP_PREFIX_OFFSET, 16,
+ 		    1, skb->data, skb->len, false);
+-	qed_ops->ll2->start_xmit(qedf->cdev, skb);
++	qed_ops->ll2->start_xmit(qedf->cdev, skb, 0);
+ 
+ 	return 0;
+ }
+--- a/drivers/scsi/qedi/qedi_iscsi.c
++++ b/drivers/scsi/qedi/qedi_iscsi.c
+@@ -1150,7 +1150,7 @@ static int qedi_data_avail(struct qedi_c
+ 	if (vlanid)
+ 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vlanid);
+ 
+-	rc = qedi_ops->ll2->start_xmit(cdev, skb);
++	rc = qedi_ops->ll2->start_xmit(cdev, skb, 0);
+ 	if (rc) {
+ 		QEDI_ERR(&qedi->dbg_ctx, "ll2 start_xmit returned %d\n",
+ 			 rc);
+--- a/include/linux/qed/qed_ll2_if.h
++++ b/include/linux/qed/qed_ll2_if.h
+@@ -202,6 +202,7 @@ struct qed_ll2_tx_pkt_info {
+ 	bool enable_ip_cksum;
+ 	bool enable_l4_cksum;
+ 	bool calc_ip_len;
++	bool remove_stag;
+ };
+ 
+ #define QED_LL2_UNUSED_HANDLE   (0xff)
+@@ -220,6 +221,11 @@ struct qed_ll2_params {
+ 	u8 ll2_mac_address[ETH_ALEN];
+ };
+ 
++enum qed_ll2_xmit_flags {
++	/* FIP discovery packet */
++	QED_LL2_XMIT_FLAGS_FIP_DISCOVERY
++};
++
+ struct qed_ll2_ops {
+ /**
+  * @brief start - initializes ll2
+@@ -245,10 +251,12 @@ struct qed_ll2_ops {
+  *
+  * @param cdev
+  * @param skb
++ * @param xmit_flags - Transmit options defined by the enum qed_ll2_xmit_flags.
+  *
+  * @return 0 on success, otherwise error value.
+  */
+-	int (*start_xmit)(struct qed_dev *cdev, struct sk_buff *skb);
++	int (*start_xmit)(struct qed_dev *cdev, struct sk_buff *skb,
++			  unsigned long xmit_flags);
+ 
+ /**
+  * @brief register_cb_ops - protocol driver register the callback for Rx/Tx
