@@ -1,0 +1,131 @@
+From: Henry Orosco <henry.orosco@intel.com>
+Date: Wed, 14 Mar 2018 14:45:23 -0500
+Subject: i40iw: Tear-down connection after CQP Modify QP failure
+Patch-mainline: v4.17-rc1
+Git-commit: 546b1452fdcccdcc98962b324cab6d74fc976fe9
+References: bsc#1058659 FATE#322535
+
+There is no explicit tear-down sequence initiated on
+connections if the Control QP OP, Modify QP to close,
+fails. Fix this by triggering a driver generated
+Asynchronous Event (AE) on Modify QP failures and
+tear-down the connection on receipt of the AE.
+
+This fix can be generalized to other Modify QP failures
+(i.e. RTS->TERM, IDLE->RTS, etc) as any modify failure
+will require a connection tear-down.
+
+Fixes: d37498417947 ("i40iw: add files for iwarp interface")
+Signed-off-by: Henry Orosco <henry.orosco@intel.com>
+Signed-off-by: Shiraz Saleem <shiraz.saleem@intel.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/i40iw/i40iw.h       |    1 
+ drivers/infiniband/hw/i40iw/i40iw_cm.c    |    2 -
+ drivers/infiniband/hw/i40iw/i40iw_hw.c    |    2 +
+ drivers/infiniband/hw/i40iw/i40iw_verbs.c |   35 ++++++++++++++++++++++--------
+ 4 files changed, 30 insertions(+), 10 deletions(-)
+
+--- a/drivers/infiniband/hw/i40iw/i40iw.h
++++ b/drivers/infiniband/hw/i40iw/i40iw.h
+@@ -559,6 +559,7 @@ void i40iw_next_iw_state(struct i40iw_qp
+ 			 u8 state, u8 del_hash,
+ 			 u8 term, u8 term_len);
+ int i40iw_send_syn(struct i40iw_cm_node *cm_node, u32 sendack);
++int i40iw_send_reset(struct i40iw_cm_node *cm_node);
+ struct i40iw_cm_node *i40iw_find_node(struct i40iw_cm_core *cm_core,
+ 				      u16 rem_port,
+ 				      u32 *rem_addr,
+--- a/drivers/infiniband/hw/i40iw/i40iw_cm.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_cm.c
+@@ -544,7 +544,7 @@ static struct i40iw_puda_buf *i40iw_form
+  * i40iw_send_reset - Send RST packet
+  * @cm_node: connection's node
+  */
+-static int i40iw_send_reset(struct i40iw_cm_node *cm_node)
++int i40iw_send_reset(struct i40iw_cm_node *cm_node)
+ {
+ 	struct i40iw_puda_buf *sqbuf;
+ 	int flags = SET_RST | SET_ACK;
+--- a/drivers/infiniband/hw/i40iw/i40iw_hw.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_hw.c
+@@ -352,6 +352,8 @@ void i40iw_process_aeq(struct i40iw_devi
+ 			else
+ 				i40iw_cm_disconn(iwqp);
+ 			break;
++		case I40IW_AE_BAD_CLOSE:
++			/* fall through */
+ 		case I40IW_AE_RESET_SENT:
+ 			i40iw_next_iw_state(iwqp, I40IW_QP_STATE_ERROR, 1, 0, 0);
+ 			i40iw_cm_disconn(iwqp);
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -848,10 +848,10 @@ static int i40iw_query_qp(struct ib_qp *
+ void i40iw_hw_modify_qp(struct i40iw_device *iwdev, struct i40iw_qp *iwqp,
+ 			struct i40iw_modify_qp_info *info, bool wait)
+ {
+-	enum i40iw_status_code status;
+ 	struct i40iw_cqp_request *cqp_request;
+ 	struct cqp_commands_info *cqp_info;
+ 	struct i40iw_modify_qp_info *m_info;
++	struct i40iw_gen_ae_info ae_info;
+ 
+ 	cqp_request = i40iw_get_cqp_request(&iwdev->cqp, wait);
+ 	if (!cqp_request)
+@@ -864,9 +864,25 @@ void i40iw_hw_modify_qp(struct i40iw_dev
+ 	cqp_info->post_sq = 1;
+ 	cqp_info->in.u.qp_modify.qp = &iwqp->sc_qp;
+ 	cqp_info->in.u.qp_modify.scratch = (uintptr_t)cqp_request;
+-	status = i40iw_handle_cqp_op(iwdev, cqp_request);
+-	if (status)
+-		i40iw_pr_err("CQP-OP Modify QP fail");
++	if (!i40iw_handle_cqp_op(iwdev, cqp_request))
++		return;
++
++	switch (m_info->next_iwarp_state) {
++	case I40IW_QP_STATE_RTS:
++		if (iwqp->iwarp_state == I40IW_QP_STATE_IDLE)
++			i40iw_send_reset(iwqp->cm_node);
++		/* fall through */
++	case I40IW_QP_STATE_IDLE:
++	case I40IW_QP_STATE_TERMINATE:
++	case I40IW_QP_STATE_CLOSING:
++		ae_info.ae_code = I40IW_AE_BAD_CLOSE;
++		ae_info.ae_source = 0;
++		i40iw_gen_ae(iwdev, &iwqp->sc_qp, &ae_info, false);
++		break;
++	case I40IW_QP_STATE_ERROR:
++	default:
++		break;
++	}
+ }
+ 
+ /**
+@@ -979,10 +995,6 @@ int i40iw_modify_qp(struct ib_qp *ibqp,
+ 
+ 		iwqp->ibqp_state = attr->qp_state;
+ 
+-		if (issue_modify_qp)
+-			iwqp->iwarp_state = info.next_iwarp_state;
+-		else
+-			info.next_iwarp_state = iwqp->iwarp_state;
+ 	}
+ 	if (attr_mask & IB_QP_ACCESS_FLAGS) {
+ 		ctx_info->iwarp_info_valid = true;
+@@ -1020,9 +1032,14 @@ int i40iw_modify_qp(struct ib_qp *ibqp,
+ 
+ 	spin_unlock_irqrestore(&iwqp->lock, flags);
+ 
+-	if (issue_modify_qp)
++	if (issue_modify_qp) {
+ 		i40iw_hw_modify_qp(iwdev, iwqp, &info, true);
+ 
++		spin_lock_irqsave(&iwqp->lock, flags);
++		iwqp->iwarp_state = info.next_iwarp_state;
++		spin_unlock_irqrestore(&iwqp->lock, flags);
++	}
++
+ 	if (issue_modify_qp && (iwqp->ibqp_state > IB_QPS_RTS)) {
+ 		if (dont_wait) {
+ 			if (iwqp->cm_id && iwqp->hw_tcp_state) {
