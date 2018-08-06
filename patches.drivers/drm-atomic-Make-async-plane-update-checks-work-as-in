@@ -1,0 +1,206 @@
+From 669c9215afea4e3684ef13e54e6908e9ae34f0ae Mon Sep 17 00:00:00 2001
+From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Date: Mon, 4 Sep 2017 12:48:38 +0200
+Subject: [PATCH] drm/atomic: Make async plane update checks work as intended, v2.
+Git-commit: 669c9215afea4e3684ef13e54e6908e9ae34f0ae
+Patch-mainline: v4.15-rc1
+References: bsc#1051510
+
+By always keeping track of the last commit in plane_state, we know
+whether there is an active update on the plane or not. With that
+information we can reject the fast update, and force the slowpath
+to be used as was originally intended.
+
+We cannot use plane_state->crtc->state here, because this only mentions
+the most recent commit for the crtc, but not the planes that were part
+of it. We specifically care about what the last commit involving this
+plane is, which can only be tracked with a pointer in the plane state.
+
+Changes since v1:
+- Clean up the whole function here, instead of partially earlier.
+- Add mention in the commit message why we need commit in plane_state.
+- Swap plane->state in intel_legacy_cursor_update, instead of
+  reassigning all variables. With this commit We know that the cursor
+  is not part of any active commits so this hack can be removed.
+
+Cc: Gustavo Padovan <gustavo.padovan@collabora.com>
+Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Gustavo Padovan <gustavo.padovan@collabora.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch> #v1
+Link: https://patchwork.freedesktop.org/patch/msgid/20170904104838.23822-7-maarten.lankhorst@linux.intel.com
+[mlankhorst: Amend commit for merge conflicts with drm-intel]
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/drm_atomic_helper.c  |   53 +++++++++--------------------------
+ drivers/gpu/drm/i915/intel_display.c |   23 +++++++++------
+ include/drm/drm_plane.h              |    5 +--
+ 3 files changed, 32 insertions(+), 49 deletions(-)
+
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -1387,35 +1387,31 @@ int drm_atomic_helper_async_check(struct
+ {
+ 	struct drm_crtc *crtc;
+ 	struct drm_crtc_state *crtc_state;
+-	struct drm_crtc_commit *commit;
+-	struct drm_plane *__plane, *plane = NULL;
+-	struct drm_plane_state *__plane_state, *plane_state = NULL;
++	struct drm_plane *plane;
++	struct drm_plane_state *old_plane_state, *new_plane_state;
+ 	const struct drm_plane_helper_funcs *funcs;
+-	int i, j, n_planes = 0;
++	int i, n_planes = 0;
+ 
+ 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+ 		if (drm_atomic_crtc_needs_modeset(crtc_state))
+ 			return -EINVAL;
+ 	}
+ 
+-	for_each_new_plane_in_state(state, __plane, __plane_state, i) {
++	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i)
+ 		n_planes++;
+-		plane = __plane;
+-		plane_state = __plane_state;
+-	}
+ 
+ 	/* FIXME: we support only single plane updates for now */
+-	if (!plane || n_planes != 1)
++	if (n_planes != 1)
+ 		return -EINVAL;
+ 
+-	if (!plane_state->crtc)
++	if (!new_plane_state->crtc)
+ 		return -EINVAL;
+ 
+ 	funcs = plane->helper_private;
+ 	if (!funcs->atomic_async_update)
+ 		return -EINVAL;
+ 
+-	if (plane_state->fence)
++	if (new_plane_state->fence)
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -1423,31 +1419,11 @@ int drm_atomic_helper_async_check(struct
+ 	 * the plane.  This prevents our async update's changes from getting
+ 	 * overridden by a previous synchronous update's state.
+ 	 */
+-	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+-		if (plane->crtc != crtc)
+-			continue;
+-
+-		spin_lock(&crtc->commit_lock);
+-		commit = list_first_entry_or_null(&crtc->commit_list,
+-						  struct drm_crtc_commit,
+-						  commit_entry);
+-		if (!commit) {
+-			spin_unlock(&crtc->commit_lock);
+-			continue;
+-		}
+-		spin_unlock(&crtc->commit_lock);
+-
+-		if (!crtc->state->state)
+-			continue;
+-
+-		for_each_plane_in_state(crtc->state->state, __plane,
+-					__plane_state, j) {
+-			if (__plane == plane)
+-				return -EINVAL;
+-		}
+-	}
++	if (old_plane_state->commit &&
++	    !try_wait_for_completion(&old_plane_state->commit->hw_done))
++		return -EBUSY;
+ 
+-	return funcs->atomic_async_check(plane, plane_state);
++	return funcs->atomic_async_check(plane, new_plane_state);
+ }
+ EXPORT_SYMBOL(drm_atomic_helper_async_check);
+ 
+@@ -1813,9 +1789,10 @@ int drm_atomic_helper_setup_commit(struc
+ 	}
+ 
+ 	for_each_oldnew_plane_in_state(state, plane, old_plane_state, new_plane_state, i) {
+-		/* commit tracked through new_crtc_state->commit, no need to do it explicitly */
+-		if (new_plane_state->crtc)
+-			continue;
++		/*
++		 * Unlike connectors, always track planes explicitly for
++		 * async pageflip support.
++		 */
+ 
+ 		/* Userspace is not allowed to get ahead of the previous
+ 		 * commit with nonblocking ones. */
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -12995,6 +12995,14 @@ intel_legacy_cursor_update(struct drm_pl
+ 		goto slow;
+ 
+ 	old_plane_state = plane->state;
++	/*
++	 * Don't do an async update if there is an outstanding commit modifying
++	 * the plane.  This prevents our async update's changes from getting
++	 * overridden by a previous synchronous update's state.
++	 */
++	if (old_plane_state->commit &&
++	    !try_wait_for_completion(&old_plane_state->commit->hw_done))
++		goto slow;
+ 
+ 	/*
+ 	 * If any parameters change that may affect watermarks,
+@@ -13054,19 +13062,12 @@ intel_legacy_cursor_update(struct drm_pl
+ 	}
+ 
+ 	old_fb = old_plane_state->fb;
+-	old_vma = to_intel_plane_state(old_plane_state)->vma;
+ 
+ 	i915_gem_track_fb(intel_fb_obj(old_fb), intel_fb_obj(fb),
+ 			  intel_plane->frontbuffer_bit);
+ 
+ 	/* Swap plane state */
+-	new_plane_state->fence = old_plane_state->fence;
+-	new_plane_state->commit = old_plane_state->commit;
+-	*to_intel_plane_state(old_plane_state) = *to_intel_plane_state(new_plane_state);
+-	new_plane_state->fence = NULL;
+-	new_plane_state->commit = NULL;
+-	new_plane_state->fb = old_fb;
+-	to_intel_plane_state(new_plane_state)->vma = NULL;
++	plane->state = new_plane_state;
+ 
+ 	if (plane->state->visible) {
+ 		trace_intel_update_plane(plane, to_intel_crtc(crtc));
+@@ -13078,13 +13079,17 @@ intel_legacy_cursor_update(struct drm_pl
+ 		intel_plane->disable_plane(intel_plane, to_intel_crtc(crtc));
+ 	}
+ 
++	old_vma = fetch_and_zero(&to_intel_plane_state(old_plane_state)->vma);
+ 	if (old_vma)
+ 		intel_unpin_fb_vma(old_vma);
+ 
+ out_unlock:
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ out_free:
+-	intel_plane_destroy_state(plane, new_plane_state);
++	if (ret)
++		intel_plane_destroy_state(plane, new_plane_state);
++	else
++		intel_plane_destroy_state(plane, old_plane_state);
+ 	return ret;
+ 
+ slow:
+--- a/include/drm/drm_plane.h
++++ b/include/drm/drm_plane.h
+@@ -124,9 +124,10 @@ struct drm_plane_state {
+ 	bool visible;
+ 
+ 	/**
+-	 * @commit: Tracks the pending commit to prevent use-after-free conditions.
++	 * @commit: Tracks the pending commit to prevent use-after-free conditions,
++	 * and for async plane updates.
+ 	 *
+-	 * Is only set when @crtc is NULL.
++	 * May be NULL.
+ 	 */
+ 	struct drm_crtc_commit *commit;
+ 
