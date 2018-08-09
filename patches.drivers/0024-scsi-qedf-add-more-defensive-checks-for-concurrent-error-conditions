@@ -1,0 +1,168 @@
+From: Chad Dupuis <chad.dupuis@cavium.com>
+Date: Wed, 25 Apr 2018 06:09:03 -0700
+Subject: scsi: qedf: Add more defensive checks for concurrent error conditions
+Git-commit: f3690a89f918031a5eed17da78af51c329efe93a
+Patch-mainline: v4.18-rc1
+References: bsc#1086317
+
+During an uplink toggle test all error handling is done via timeout and
+firmware error conditions which can occur concurrently:
+
+ - SCSI layer timeouts
+ - Error detect CQEs
+ - Firmware detected underruns
+ - ABTS timeouts
+
+All these concurrent events require more defensive checks in the driver
+including:
+
+ - Check both internally and externally generated aborts to make sure the
+   xid is not already been aborted in another context or in cleanup.
+
+ - Check back pointers in qedf_cmd_timeout to verify the context of the
+   io_req, fcport and qedf_ctx
+
+ - Check rport state in host reset handler to not reset the whole host
+   if the rport is already uploaded or in the process of relogin
+
+ - Check to state for an fcport before initiating a middle path ELS
+   request
+
+Signed-off-by: Chad Dupuis <chad.dupuis@cavium.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+
+ drivers/scsi/qedf/qedf_els.c  |   13 +++++++++++--
+ drivers/scsi/qedf/qedf_io.c   |   33 +++++++++++++++++++++++++++++++--
+ drivers/scsi/qedf/qedf_main.c |   26 ++++++++++++++++----------
+ 3 files changed, 58 insertions(+), 14 deletions(-)
+
+--- a/drivers/scsi/qedf/qedf_els.c
++++ b/drivers/scsi/qedf/qedf_els.c
+@@ -14,8 +14,8 @@ static int qedf_initiate_els(struct qedf_rport *fcport, unsigned int op,
+ 	void (*cb_func)(struct qedf_els_cb_arg *cb_arg),
+ 	struct qedf_els_cb_arg *cb_arg, uint32_t timer_msec)
+ {
+-	struct qedf_ctx *qedf = fcport->qedf;
+-	struct fc_lport *lport = qedf->lport;
++	struct qedf_ctx *qedf;
++	struct fc_lport *lport;
+ 	struct qedf_ioreq *els_req;
+ 	struct qedf_mp_req *mp_req;
+ 	struct fc_frame_header *fc_hdr;
+@@ -29,6 +29,15 @@ static int qedf_initiate_els(struct qedf_rport *fcport, unsigned int op,
+ 	unsigned long flags;
+ 	u16 sqe_idx;
+ 
++	if (!fcport) {
++		QEDF_ERR(NULL, "fcport is NULL");
++		rc = -EINVAL;
++		goto els_err;
++	}
++
++	qedf = fcport->qedf;
++	lport = qedf->lport;
++
+ 	QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_ELS, "Sending ELS\n");
+ 
+ 	rc = fc_remote_port_chkready(fcport->rport);
+
+--- a/drivers/scsi/qedf/qedf_io.c
++++ b/drivers/scsi/qedf/qedf_io.c
+@@ -23,12 +23,31 @@ static void qedf_cmd_timeout(struct work_struct *work)
+ 
+ 	struct qedf_ioreq *io_req =
+ 	    container_of(work, struct qedf_ioreq, timeout_work.work);
+-	struct qedf_ctx *qedf = io_req->fcport->qedf;
+-	struct qedf_rport *fcport = io_req->fcport;
++	struct qedf_ctx *qedf;
++	struct qedf_rport *fcport;
+ 	u8 op = 0;
+ 
++	if (io_req == NULL) {
++		QEDF_INFO(NULL, QEDF_LOG_IO, "io_req is NULL.\n");
++		return;
++	}
++
++	fcport = io_req->fcport;
++	if (io_req->fcport == NULL) {
++		QEDF_INFO(NULL, QEDF_LOG_IO,  "fcport is NULL.\n");
++		return;
++	}
++
++	qedf = fcport->qedf;
++
+ 	switch (io_req->cmd_type) {
+ 	case QEDF_ABTS:
++		if (qedf == NULL) {
++			QEDF_INFO(NULL, QEDF_LOG_IO, "qedf is NULL for xid=0x%x.\n",
++			    io_req->xid);
++			return;
++		}
++
+ 		QEDF_ERR((&qedf->dbg_ctx), "ABTS timeout, xid=0x%x.\n",
+ 		    io_req->xid);
+ 		/* Cleanup timed out ABTS */
+@@ -1565,6 +1584,16 @@ int qedf_initiate_abts(struct qedf_ioreq *io_req, bool return_scsi_cmd_on_abts)
+ 		goto out;
+ 	}
+ 
++	if (!test_bit(QEDF_CMD_OUTSTANDING, &io_req->flags) ||
++	    test_bit(QEDF_CMD_IN_CLEANUP, &io_req->flags) ||
++	    test_bit(QEDF_CMD_IN_ABORT, &io_req->flags)) {
++		QEDF_ERR(&(qedf->dbg_ctx), "io_req xid=0x%x already in "
++			  "cleanup or abort processing or already "
++			  "completed.\n", io_req->xid);
++		rc = 1;
++		goto out;
++	}
++
+ 	kref_get(&io_req->refcount);
+ 
+ 	xid = io_req->xid;
+
+--- a/drivers/scsi/qedf/qedf_main.c
++++ b/drivers/scsi/qedf/qedf_main.c
+@@ -643,16 +643,6 @@ static int qedf_eh_abort(struct scsi_cmnd *sc_cmd)
+ 		goto out;
+ 	}
+ 
+-	if (!test_bit(QEDF_CMD_OUTSTANDING, &io_req->flags) ||
+-	    test_bit(QEDF_CMD_IN_CLEANUP, &io_req->flags) ||
+-	    test_bit(QEDF_CMD_IN_ABORT, &io_req->flags)) {
+-		QEDF_ERR(&(qedf->dbg_ctx), "io_req xid=0x%x already in "
+-			  "cleanup or abort processing or already "
+-			  "completed.\n", io_req->xid);
+-		rc = SUCCESS;
+-		goto out;
+-	}
+-
+ 	QEDF_ERR(&(qedf->dbg_ctx), "Aborting io_req sc_cmd=%p xid=0x%x "
+ 		  "fp_idx=%d.\n", sc_cmd, io_req->xid, io_req->fp_idx);
+ 
+@@ -748,6 +738,22 @@ static int qedf_eh_host_reset(struct scsi_cmnd *sc_cmd)
+ {
+ 	struct fc_lport *lport;
+ 	struct qedf_ctx *qedf;
++	struct fc_rport *rport = starget_to_rport(scsi_target(sc_cmd->device));
++	struct fc_rport_libfc_priv *rp = rport->dd_data;
++	struct qedf_rport *fcport = (struct qedf_rport *)&rp[1];
++	int rval;
++
++	rval = fc_remote_port_chkready(rport);
++
++	if (rval) {
++		QEDF_ERR(NULL, "device_reset rport not ready\n");
++		return FAILED;
++	}
++
++	if (fcport == NULL) {
++		QEDF_ERR(NULL, "device_reset: rport is NULL\n");
++		return FAILED;
++	}
+ 
+ 	lport = shost_priv(sc_cmd->device->host);
+ 	qedf = lport_priv(lport);
+
+
