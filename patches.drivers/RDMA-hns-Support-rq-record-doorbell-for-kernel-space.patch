@@ -1,0 +1,256 @@
+From: Yixian Liu <liuyixian@huawei.com>
+Date: Fri, 9 Mar 2018 18:36:31 +0800
+Subject: RDMA/hns: Support rq record doorbell for kernel space
+Patch-mainline: v4.17-rc1
+Git-commit: 472bc0fbd47cb89f72607328b6b09b4a962ec200
+References: bsc#1104427 FATE#326416
+
+This patch updates to support rq record doorbell for
+the kernel space.
+
+Signed-off-by: Yixian Liu <liuyixian@huawei.com>
+Signed-off-by: Lijun Ou <oulijun@huawei.com>
+Signed-off-by: Wei Hu (Xavier) <xavier.huwei@huawei.com>
+Signed-off-by: Shaobo Xu <xushaobo2@huawei.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hns/hns_roce_db.c     |  112 ++++++++++++++++++++++++++++
+ drivers/infiniband/hw/hns/hns_roce_device.h |    6 +
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   15 ---
+ drivers/infiniband/hw/hns/hns_roce_main.c   |    5 +
+ drivers/infiniband/hw/hns/hns_roce_qp.c     |   17 ++++
+ 5 files changed, 142 insertions(+), 13 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_db.c
++++ b/drivers/infiniband/hw/hns/hns_roce_db.c
+@@ -66,3 +66,115 @@ void hns_roce_db_unmap_user(struct hns_r
+ 	mutex_unlock(&context->page_mutex);
+ }
+ EXPORT_SYMBOL(hns_roce_db_unmap_user);
++
++static struct hns_roce_db_pgdir *hns_roce_alloc_db_pgdir(
++					struct device *dma_device)
++{
++	struct hns_roce_db_pgdir *pgdir;
++
++	pgdir = kzalloc(sizeof(*pgdir), GFP_KERNEL);
++	if (!pgdir)
++		return NULL;
++
++	bitmap_fill(pgdir->order1, HNS_ROCE_DB_PER_PAGE / 2);
++	pgdir->bits[0] = pgdir->order0;
++	pgdir->bits[1] = pgdir->order1;
++	pgdir->page = dma_alloc_coherent(dma_device, PAGE_SIZE,
++					 &pgdir->db_dma, GFP_KERNEL);
++	if (!pgdir->page) {
++		kfree(pgdir);
++		return NULL;
++	}
++
++	return pgdir;
++}
++
++static int hns_roce_alloc_db_from_pgdir(struct hns_roce_db_pgdir *pgdir,
++					struct hns_roce_db *db, int order)
++{
++	int o;
++	int i;
++
++	for (o = order; o <= 1; ++o) {
++		i = find_first_bit(pgdir->bits[o], HNS_ROCE_DB_PER_PAGE >> o);
++		if (i < HNS_ROCE_DB_PER_PAGE >> o)
++			goto found;
++	}
++
++	return -ENOMEM;
++
++found:
++	clear_bit(i, pgdir->bits[o]);
++
++	i <<= o;
++
++	if (o > order)
++		set_bit(i ^ 1, pgdir->bits[order]);
++
++	db->u.pgdir	= pgdir;
++	db->index	= i;
++	db->db_record	= pgdir->page + db->index;
++	db->dma		= pgdir->db_dma  + db->index * 4;
++	db->order	= order;
++
++	return 0;
++}
++
++int hns_roce_alloc_db(struct hns_roce_dev *hr_dev, struct hns_roce_db *db,
++		      int order)
++{
++	struct hns_roce_db_pgdir *pgdir;
++	int ret = 0;
++
++	mutex_lock(&hr_dev->pgdir_mutex);
++
++	list_for_each_entry(pgdir, &hr_dev->pgdir_list, list)
++		if (!hns_roce_alloc_db_from_pgdir(pgdir, db, order))
++			goto out;
++
++	pgdir = hns_roce_alloc_db_pgdir(hr_dev->dev);
++	if (!pgdir) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	list_add(&pgdir->list, &hr_dev->pgdir_list);
++
++	/* This should never fail -- we just allocated an empty page: */
++	WARN_ON(hns_roce_alloc_db_from_pgdir(pgdir, db, order));
++
++out:
++	mutex_unlock(&hr_dev->pgdir_mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(hns_roce_alloc_db);
++
++void hns_roce_free_db(struct hns_roce_dev *hr_dev, struct hns_roce_db *db)
++{
++	int o;
++	int i;
++
++	mutex_lock(&hr_dev->pgdir_mutex);
++
++	o = db->order;
++	i = db->index;
++
++	if (db->order == 0 && test_bit(i ^ 1, db->u.pgdir->order0)) {
++		clear_bit(i ^ 1, db->u.pgdir->order0);
++		++o;
++	}
++
++	i >>= o;
++	set_bit(i, db->u.pgdir->bits[o]);
++
++	if (bitmap_full(db->u.pgdir->order1, HNS_ROCE_DB_PER_PAGE / 2)) {
++		dma_free_coherent(hr_dev->dev, PAGE_SIZE, db->u.pgdir->page,
++				  db->u.pgdir->db_dma);
++		list_del(&db->u.pgdir->list);
++		kfree(db->u.pgdir);
++	}
++
++	mutex_unlock(&hr_dev->pgdir_mutex);
++}
++EXPORT_SYMBOL_GPL(hns_roce_free_db);
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -771,6 +771,8 @@ struct hns_roce_dev {
+ 	spinlock_t		bt_cmd_lock;
+ 	struct hns_roce_ib_iboe iboe;
+ 
++	struct list_head        pgdir_list;
++	struct mutex            pgdir_mutex;
+ 	int			irq[HNS_ROCE_MAX_IRQ_NUM];
+ 	u8 __iomem		*reg_base;
+ 	struct hns_roce_caps	caps;
+@@ -980,6 +982,10 @@ int hns_roce_db_map_user(struct hns_roce
+ 			 struct hns_roce_db *db);
+ void hns_roce_db_unmap_user(struct hns_roce_ucontext *context,
+ 			    struct hns_roce_db *db);
++int hns_roce_alloc_db(struct hns_roce_dev *hr_dev, struct hns_roce_db *db,
++		      int order);
++void hns_roce_free_db(struct hns_roce_dev *hr_dev, struct hns_roce_db *db);
++
+ void hns_roce_cq_completion(struct hns_roce_dev *hr_dev, u32 cqn);
+ void hns_roce_cq_event(struct hns_roce_dev *hr_dev, u32 cqn, int event_type);
+ void hns_roce_qp_event(struct hns_roce_dev *hr_dev, u32 qpn, int event_type);
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -498,7 +498,6 @@ static int hns_roce_v2_post_recv(struct
+ 	struct hns_roce_v2_wqe_data_seg *dseg;
+ 	struct hns_roce_rinl_sge *sge_list;
+ 	struct device *dev = hr_dev->dev;
+-	struct hns_roce_v2_db rq_db;
+ 	unsigned long flags;
+ 	void *wqe = NULL;
+ 	int ret = 0;
+@@ -564,17 +563,7 @@ out:
+ 		/* Memory barrier */
+ 		wmb();
+ 
+-		rq_db.byte_4 = 0;
+-		rq_db.parameter = 0;
+-
+-		roce_set_field(rq_db.byte_4, V2_DB_BYTE_4_TAG_M,
+-			       V2_DB_BYTE_4_TAG_S, hr_qp->qpn);
+-		roce_set_field(rq_db.byte_4, V2_DB_BYTE_4_CMD_M,
+-			       V2_DB_BYTE_4_CMD_S, HNS_ROCE_V2_RQ_DB);
+-		roce_set_field(rq_db.parameter, V2_DB_PARAMETER_CONS_IDX_M,
+-			       V2_DB_PARAMETER_CONS_IDX_S, hr_qp->rq.head);
+-
+-		hns_roce_write64_k((__le32 *)&rq_db, hr_qp->rq.db_reg_l);
++		*hr_qp->rdb.db_record = hr_qp->rq.head & 0xffff;
+ 	}
+ 	spin_unlock_irqrestore(&hr_qp->rq.lock, flags);
+ 
+@@ -3476,6 +3465,8 @@ static int hns_roce_v2_destroy_qp_common
+ 		kfree(hr_qp->sq.wrid);
+ 		kfree(hr_qp->rq.wrid);
+ 		hns_roce_buf_free(hr_dev, hr_qp->buff_size, &hr_qp->hr_buf);
++		if (hr_qp->rq.wqe_cnt)
++			hns_roce_free_db(hr_dev, &hr_qp->rdb);
+ 	}
+ 
+ 	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RQ_INLINE) {
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -665,6 +665,11 @@ static int hns_roce_setup_hca(struct hns
+ 	spin_lock_init(&hr_dev->sm_lock);
+ 	spin_lock_init(&hr_dev->bt_cmd_lock);
+ 
++	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RECORD_DB) {
++		INIT_LIST_HEAD(&hr_dev->pgdir_list);
++		mutex_init(&hr_dev->pgdir_mutex);
++	}
++
+ 	ret = hns_roce_init_uar_table(hr_dev);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to initialize uar table. aborting\n");
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@ -652,6 +652,16 @@ static int hns_roce_create_qp_common(str
+ 		hr_qp->rq.db_reg_l = hr_dev->reg_base + hr_dev->odb_offset +
+ 				     DB_REG_OFFSET * hr_dev->priv_uar.index;
+ 
++		if ((hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RECORD_DB) &&
++		    hns_roce_qp_has_rq(init_attr)) {
++			ret = hns_roce_alloc_db(hr_dev, &hr_qp->rdb, 0);
++			if (ret) {
++				dev_err(dev, "rq record doorbell alloc failed!\n");
++				goto err_rq_sge_list;
++			}
++			*hr_qp->rdb.db_record = 0;
++		}
++
+ 		/* Allocate QP buf */
+ 		page_shift = PAGE_SHIFT + hr_dev->caps.mtt_buf_pg_sz;
+ 		if (hns_roce_buf_alloc(hr_dev, hr_qp->buff_size,
+@@ -659,7 +669,7 @@ static int hns_roce_create_qp_common(str
+ 				       &hr_qp->hr_buf, page_shift)) {
+ 			dev_err(dev, "hns_roce_buf_alloc error!\n");
+ 			ret = -ENOMEM;
+-			goto err_rq_sge_list;
++			goto err_db;
+ 		}
+ 
+ 		hr_qp->mtt.mtt_type = MTT_TYPE_WQE;
+@@ -768,6 +778,11 @@ err_buf:
+ 	else
+ 		hns_roce_buf_free(hr_dev, hr_qp->buff_size, &hr_qp->hr_buf);
+ 
++err_db:
++	if (!ib_pd->uobject && hns_roce_qp_has_rq(init_attr) &&
++	    (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RECORD_DB))
++		hns_roce_free_db(hr_dev, &hr_qp->rdb);
++
+ err_rq_sge_list:
+ 	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_RQ_INLINE)
+ 		kfree(hr_qp->rq_inl_buf.wqe_list[0].sg_list);

@@ -1,0 +1,436 @@
+From: "Wei Hu(Xavier)" <xavier.huwei@huawei.com>
+Date: Wed, 30 Aug 2017 17:23:05 +0800
+Subject: RDMA/hns: Add mailbox's implementation for hip08 RoCE driver
+Patch-mainline: v4.15-rc1
+Git-commit: a680f2f376fe70bad85f350059be995c9dc2a802
+References: bsc#1104427 FATE#326416
+
+In hip08 SoC, the hardware implementation of mailbox command
+has changed with hip06 SoC. As a result, it adjusts the
+architecture of the command code and implements the interfaces
+of mailbox for hip08 SoC.
+
+Signed-off-by: Lijun Ou <oulijun@huawei.com>
+Signed-off-by: Shaobo Xu <xushaobo2@huawei.com>
+Signed-off-by: Wei Hu (Xavier) <xavier.huwei@huawei.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hns/hns_roce_cmd.c    |   98 +---------------------------
+ drivers/infiniband/hw/hns/hns_roce_common.h |    1 
+ drivers/infiniband/hw/hns/hns_roce_device.h |    5 +
+ drivers/infiniband/hw/hns/hns_roce_hw_v1.c  |   75 +++++++++++++++++++++
+ drivers/infiniband/hw/hns/hns_roce_hw_v1.h  |    5 +
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   84 ++++++++++++++++++++++++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h  |   20 +++++
+ 7 files changed, 195 insertions(+), 93 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_cmd.c
++++ b/drivers/infiniband/hw/hns/hns_roce_cmd.c
+@@ -38,69 +38,7 @@
+ 
+ #define CMD_POLL_TOKEN		0xffff
+ #define CMD_MAX_NUM		32
+-#define STATUS_MASK		0xff
+ #define CMD_TOKEN_MASK		0x1f
+-#define GO_BIT_TIMEOUT_MSECS	10000
+-
+-enum {
+-	HCR_TOKEN_OFFSET	= 0x14,
+-	HCR_STATUS_OFFSET	= 0x18,
+-	HCR_GO_BIT		= 15,
+-};
+-
+-static int cmd_pending(struct hns_roce_dev *hr_dev)
+-{
+-	u32 status = readl(hr_dev->cmd.hcr + HCR_TOKEN_OFFSET);
+-
+-	return (!!(status & (1 << HCR_GO_BIT)));
+-}
+-
+-/* this function should be serialized with "hcr_mutex" */
+-static int __hns_roce_cmd_mbox_post_hw(struct hns_roce_dev *hr_dev,
+-				       u64 in_param, u64 out_param,
+-				       u32 in_modifier, u8 op_modifier, u16 op,
+-				       u16 token, int event)
+-{
+-	struct hns_roce_cmdq *cmd = &hr_dev->cmd;
+-	struct device *dev = &hr_dev->pdev->dev;
+-	u32 __iomem *hcr = (u32 *)cmd->hcr;
+-	int ret = -EAGAIN;
+-	unsigned long end;
+-	u32 val = 0;
+-
+-	end = msecs_to_jiffies(GO_BIT_TIMEOUT_MSECS) + jiffies;
+-	while (cmd_pending(hr_dev)) {
+-		if (time_after(jiffies, end)) {
+-			dev_dbg(dev, "jiffies=%d end=%d\n", (int)jiffies,
+-				(int)end);
+-			goto out;
+-		}
+-		cond_resched();
+-	}
+-
+-	roce_set_field(val, ROCEE_MB6_ROCEE_MB_CMD_M, ROCEE_MB6_ROCEE_MB_CMD_S,
+-		       op);
+-	roce_set_field(val, ROCEE_MB6_ROCEE_MB_CMD_MDF_M,
+-		       ROCEE_MB6_ROCEE_MB_CMD_MDF_S, op_modifier);
+-	roce_set_bit(val, ROCEE_MB6_ROCEE_MB_EVENT_S, event);
+-	roce_set_bit(val, ROCEE_MB6_ROCEE_MB_HW_RUN_S, 1);
+-	roce_set_field(val, ROCEE_MB6_ROCEE_MB_TOKEN_M,
+-		       ROCEE_MB6_ROCEE_MB_TOKEN_S, token);
+-
+-	__raw_writeq(cpu_to_le64(in_param), hcr + 0);
+-	__raw_writeq(cpu_to_le64(out_param), hcr + 2);
+-	__raw_writel(cpu_to_le32(in_modifier), hcr + 4);
+-	/* Memory barrier */
+-	wmb();
+-
+-	__raw_writel(cpu_to_le32(val), hcr + 5);
+-
+-	mmiowb();
+-	ret = 0;
+-
+-out:
+-	return ret;
+-}
+ 
+ static int hns_roce_cmd_mbox_post_hw(struct hns_roce_dev *hr_dev, u64 in_param,
+ 				     u64 out_param, u32 in_modifier,
+@@ -108,12 +46,11 @@ static int hns_roce_cmd_mbox_post_hw(str
+ 				     int event)
+ {
+ 	struct hns_roce_cmdq *cmd = &hr_dev->cmd;
+-	int ret = -EAGAIN;
++	int ret;
+ 
+ 	mutex_lock(&cmd->hcr_mutex);
+-	ret = __hns_roce_cmd_mbox_post_hw(hr_dev, in_param, out_param,
+-					  in_modifier, op_modifier, op, token,
+-					  event);
++	ret = hr_dev->hw->post_mbox(hr_dev, in_param, out_param, in_modifier,
++				    op_modifier, op, token, event);
+ 	mutex_unlock(&cmd->hcr_mutex);
+ 
+ 	return ret;
+@@ -126,9 +63,6 @@ static int __hns_roce_cmd_mbox_poll(stru
+ 				    unsigned long timeout)
+ {
+ 	struct device *dev = hr_dev->dev;
+-	u8 __iomem *hcr = hr_dev->cmd.hcr;
+-	unsigned long end = 0;
+-	u32 status = 0;
+ 	int ret;
+ 
+ 	ret = hns_roce_cmd_mbox_post_hw(hr_dev, in_param, out_param,
+@@ -136,29 +70,10 @@ static int __hns_roce_cmd_mbox_poll(stru
+ 					CMD_POLL_TOKEN, 0);
+ 	if (ret) {
+ 		dev_err(dev, "[cmd_poll]hns_roce_cmd_mbox_post_hw failed\n");
+-		goto out;
+-	}
+-
+-	end = msecs_to_jiffies(timeout) + jiffies;
+-	while (cmd_pending(hr_dev) && time_before(jiffies, end))
+-		cond_resched();
+-
+-	if (cmd_pending(hr_dev)) {
+-		dev_err(dev, "[cmd_poll]hw run cmd TIMEDOUT!\n");
+-		ret = -ETIMEDOUT;
+-		goto out;
+-	}
+-
+-	status = le32_to_cpu((__force __be32)
+-			      __raw_readl(hcr + HCR_STATUS_OFFSET));
+-	if ((status & STATUS_MASK) != 0x1) {
+-		dev_err(dev, "mailbox status 0x%x!\n", status);
+-		ret = -EBUSY;
+-		goto out;
++		return ret;
+ 	}
+ 
+-out:
+-	return ret;
++	return hr_dev->hw->chk_mbox(hr_dev, timeout);
+ }
+ 
+ static int hns_roce_cmd_mbox_poll(struct hns_roce_dev *hr_dev, u64 in_param,
+@@ -198,7 +113,7 @@ static int __hns_roce_cmd_mbox_wait(stru
+ 	struct hns_roce_cmdq *cmd = &hr_dev->cmd;
+ 	struct hns_roce_cmd_context *context;
+ 	struct device *dev = hr_dev->dev;
+-	int ret = 0;
++	int ret;
+ 
+ 	spin_lock(&cmd->context_lock);
+ 	WARN_ON(cmd->free_head < 0);
+@@ -280,7 +195,6 @@ int hns_roce_cmd_init(struct hns_roce_de
+ 	hr_dev->cmd.use_events = 0;
+ 	hr_dev->cmd.toggle = 1;
+ 	hr_dev->cmd.max_cmds = CMD_MAX_NUM;
+-	hr_dev->cmd.hcr = hr_dev->reg_base + ROCEE_MB1_REG;
+ 	hr_dev->cmd.pool = dma_pool_create("hns_roce_cmd", dev,
+ 					   HNS_ROCE_MAILBOX_SIZE,
+ 					   HNS_ROCE_MAILBOX_SIZE, 0);
+--- a/drivers/infiniband/hw/hns/hns_roce_common.h
++++ b/drivers/infiniband/hw/hns/hns_roce_common.h
+@@ -341,6 +341,7 @@
+ #define ROCEE_BT_CMD_L_REG			0x200
+ 
+ #define ROCEE_MB1_REG				0x210
++#define ROCEE_MB6_REG				0x224
+ #define ROCEE_DB_SQ_L_0_REG			0x230
+ #define ROCEE_DB_OTHERS_L_0_REG			0x238
+ #define ROCEE_QP1C_CFG0_0_REG			0x270
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -367,7 +367,6 @@ struct hns_roce_cmd_context {
+ 
+ struct hns_roce_cmdq {
+ 	struct dma_pool		*pool;
+-	u8 __iomem		*hcr;
+ 	struct mutex		hcr_mutex;
+ 	struct semaphore	poll_sem;
+ 	/*
+@@ -517,6 +516,10 @@ struct hns_roce_hw {
+ 	int (*hw_profile)(struct hns_roce_dev *hr_dev);
+ 	int (*hw_init)(struct hns_roce_dev *hr_dev);
+ 	void (*hw_exit)(struct hns_roce_dev *hr_dev);
++	int (*post_mbox)(struct hns_roce_dev *hr_dev, u64 in_param,
++			 u64 out_param, u32 in_modifier, u8 op_modifier, u16 op,
++			 u16 token, int event);
++	int (*chk_mbox)(struct hns_roce_dev *hr_dev, unsigned long timeout);
+ 	void (*set_gid)(struct hns_roce_dev *hr_dev, u8 port, int gid_index,
+ 			union ib_gid *gid);
+ 	void (*set_mac)(struct hns_roce_dev *hr_dev, u8 phy_port, u8 *addr);
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+@@ -1619,6 +1619,79 @@ void hns_roce_v1_exit(struct hns_roce_de
+ 	hns_roce_db_free(hr_dev);
+ }
+ 
++static int hns_roce_v1_cmd_pending(struct hns_roce_dev *hr_dev)
++{
++	u32 status = readl(hr_dev->reg_base + ROCEE_MB6_REG);
++
++	return (!!(status & (1 << HCR_GO_BIT)));
++}
++
++int hns_roce_v1_post_mbox(struct hns_roce_dev *hr_dev, u64 in_param,
++			  u64 out_param, u32 in_modifier, u8 op_modifier,
++			  u16 op, u16 token, int event)
++{
++	u32 *hcr = (u32 *)(hr_dev->reg_base + ROCEE_MB1_REG);
++	unsigned long end;
++	u32 val = 0;
++
++	end = msecs_to_jiffies(GO_BIT_TIMEOUT_MSECS) + jiffies;
++	while (hns_roce_v1_cmd_pending(hr_dev)) {
++		if (time_after(jiffies, end)) {
++			dev_err(hr_dev->dev, "jiffies=%d end=%d\n",
++				(int)jiffies, (int)end);
++			return -EAGAIN;
++		}
++		cond_resched();
++	}
++
++	roce_set_field(val, ROCEE_MB6_ROCEE_MB_CMD_M, ROCEE_MB6_ROCEE_MB_CMD_S,
++		       op);
++	roce_set_field(val, ROCEE_MB6_ROCEE_MB_CMD_MDF_M,
++		       ROCEE_MB6_ROCEE_MB_CMD_MDF_S, op_modifier);
++	roce_set_bit(val, ROCEE_MB6_ROCEE_MB_EVENT_S, event);
++	roce_set_bit(val, ROCEE_MB6_ROCEE_MB_HW_RUN_S, 1);
++	roce_set_field(val, ROCEE_MB6_ROCEE_MB_TOKEN_M,
++		       ROCEE_MB6_ROCEE_MB_TOKEN_S, token);
++
++	__raw_writeq(cpu_to_le64(in_param), hcr + 0);
++	__raw_writeq(cpu_to_le64(out_param), hcr + 2);
++	__raw_writel(cpu_to_le32(in_modifier), hcr + 4);
++	/* Memory barrier */
++	wmb();
++
++	__raw_writel(cpu_to_le32(val), hcr + 5);
++
++	mmiowb();
++
++	return 0;
++}
++
++static int hns_roce_v1_chk_mbox(struct hns_roce_dev *hr_dev,
++				unsigned long timeout)
++{
++	u8 __iomem *hcr = hr_dev->reg_base + ROCEE_MB1_REG;
++	unsigned long end = 0;
++	u32 status = 0;
++
++	end = msecs_to_jiffies(timeout) + jiffies;
++	while (hns_roce_v1_cmd_pending(hr_dev) && time_before(jiffies, end))
++		cond_resched();
++
++	if (hns_roce_v1_cmd_pending(hr_dev)) {
++		dev_err(hr_dev->dev, "[cmd_poll]hw run cmd TIMEDOUT!\n");
++		return -ETIMEDOUT;
++	}
++
++	status = le32_to_cpu((__force __be32)
++			      __raw_readl(hcr + HCR_STATUS_OFFSET));
++	if ((status & STATUS_MASK) != 0x1) {
++		dev_err(hr_dev->dev, "mailbox status 0x%x!\n", status);
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
+ void hns_roce_v1_set_gid(struct hns_roce_dev *hr_dev, u8 port, int gid_index,
+ 			 union ib_gid *gid)
+ {
+@@ -3849,6 +3922,8 @@ static const struct hns_roce_hw hns_roce
+ 	.hw_profile = hns_roce_v1_profile,
+ 	.hw_init = hns_roce_v1_init,
+ 	.hw_exit = hns_roce_v1_exit,
++	.post_mbox = hns_roce_v1_post_mbox,
++	.chk_mbox = hns_roce_v1_chk_mbox,
+ 	.set_gid = hns_roce_v1_set_gid,
+ 	.set_mac = hns_roce_v1_set_mac,
+ 	.set_mtu = hns_roce_v1_set_mtu,
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v1.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v1.h
+@@ -948,6 +948,11 @@ struct hns_roce_qp_context {
+ #define QP_CONTEXT_QPC_BYTES_188_TX_RETRY_CUR_INDEX_M   \
+ 	(((1UL << 15) - 1) << QP_CONTEXT_QPC_BYTES_188_TX_RETRY_CUR_INDEX_S)
+ 
++#define STATUS_MASK		0xff
++#define GO_BIT_TIMEOUT_MSECS	10000
++#define HCR_STATUS_OFFSET	0x18
++#define HCR_GO_BIT		15
++
+ struct hns_roce_rq_db {
+ 	u32    u32_4;
+ 	u32    u32_8;
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -553,10 +553,94 @@ static int hns_roce_v2_profile(struct hn
+ 	return 0;
+ }
+ 
++static int hns_roce_v2_cmd_pending(struct hns_roce_dev *hr_dev)
++{
++	u32 status = readl(hr_dev->reg_base + ROCEE_VF_MB_STATUS_REG);
++
++	return status >> HNS_ROCE_HW_RUN_BIT_SHIFT;
++}
++
++static int hns_roce_v2_cmd_complete(struct hns_roce_dev *hr_dev)
++{
++	u32 status = readl(hr_dev->reg_base + ROCEE_VF_MB_STATUS_REG);
++
++	return status & HNS_ROCE_HW_MB_STATUS_MASK;
++}
++
++static int hns_roce_v2_post_mbox(struct hns_roce_dev *hr_dev, u64 in_param,
++				 u64 out_param, u32 in_modifier, u8 op_modifier,
++				 u16 op, u16 token, int event)
++{
++	struct device *dev = hr_dev->dev;
++	u32 *hcr = (u32 *)(hr_dev->reg_base + ROCEE_VF_MB_CFG0_REG);
++	unsigned long end;
++	u32 val0 = 0;
++	u32 val1 = 0;
++
++	end = msecs_to_jiffies(HNS_ROCE_V2_GO_BIT_TIMEOUT_MSECS) + jiffies;
++	while (hns_roce_v2_cmd_pending(hr_dev)) {
++		if (time_after(jiffies, end)) {
++			dev_dbg(dev, "jiffies=%d end=%d\n", (int)jiffies,
++				(int)end);
++			return -EAGAIN;
++		}
++		cond_resched();
++	}
++
++	roce_set_field(val0, HNS_ROCE_VF_MB4_TAG_MASK,
++		       HNS_ROCE_VF_MB4_TAG_SHIFT, in_modifier);
++	roce_set_field(val0, HNS_ROCE_VF_MB4_CMD_MASK,
++		       HNS_ROCE_VF_MB4_CMD_SHIFT, op);
++	roce_set_field(val1, HNS_ROCE_VF_MB5_EVENT_MASK,
++		       HNS_ROCE_VF_MB5_EVENT_SHIFT, event);
++	roce_set_field(val1, HNS_ROCE_VF_MB5_TOKEN_MASK,
++		       HNS_ROCE_VF_MB5_TOKEN_SHIFT, token);
++
++	__raw_writeq(cpu_to_le64(in_param), hcr + 0);
++	__raw_writeq(cpu_to_le64(out_param), hcr + 2);
++
++	/* Memory barrier */
++	wmb();
++
++	__raw_writel(cpu_to_le32(val0), hcr + 4);
++	__raw_writel(cpu_to_le32(val1), hcr + 5);
++
++	mmiowb();
++
++	return 0;
++}
++
++static int hns_roce_v2_chk_mbox(struct hns_roce_dev *hr_dev,
++				unsigned long timeout)
++{
++	struct device *dev = hr_dev->dev;
++	unsigned long end = 0;
++	u32 status;
++
++	end = msecs_to_jiffies(timeout) + jiffies;
++	while (hns_roce_v2_cmd_pending(hr_dev) && time_before(jiffies, end))
++		cond_resched();
++
++	if (hns_roce_v2_cmd_pending(hr_dev)) {
++		dev_err(dev, "[cmd_poll]hw run cmd TIMEDOUT!\n");
++		return -ETIMEDOUT;
++	}
++
++	status = hns_roce_v2_cmd_complete(hr_dev);
++	if (status != 0x1) {
++		dev_err(dev, "mailbox status 0x%x!\n", status);
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
+ static const struct hns_roce_hw hns_roce_hw_v2 = {
+ 	.cmq_init = hns_roce_v2_cmq_init,
+ 	.cmq_exit = hns_roce_v2_cmq_exit,
+ 	.hw_profile = hns_roce_v2_profile,
++	.post_mbox = hns_roce_v2_post_mbox,
++	.chk_mbox = hns_roce_v2_chk_mbox,
+ };
+ 
+ static const struct pci_device_id hns_roce_hw_v2_pci_tbl[] = {
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -244,6 +244,26 @@ struct hns_roce_cmq_desc {
+ 	u32 data[6];
+ };
+ 
++#define ROCEE_VF_MB_CFG0_REG		0x40
++#define ROCEE_VF_MB_STATUS_REG		0x58
++
++#define HNS_ROCE_V2_GO_BIT_TIMEOUT_MSECS	10000
++
++#define HNS_ROCE_HW_RUN_BIT_SHIFT	31
++#define HNS_ROCE_HW_MB_STATUS_MASK	0xFF
++
++#define HNS_ROCE_VF_MB4_TAG_MASK	0xFFFFFF00
++#define HNS_ROCE_VF_MB4_TAG_SHIFT	8
++
++#define HNS_ROCE_VF_MB4_CMD_MASK	0xFF
++#define HNS_ROCE_VF_MB4_CMD_SHIFT	0
++
++#define HNS_ROCE_VF_MB5_EVENT_MASK	0x10000
++#define HNS_ROCE_VF_MB5_EVENT_SHIFT	16
++
++#define HNS_ROCE_VF_MB5_TOKEN_MASK	0xFFFF
++#define HNS_ROCE_VF_MB5_TOKEN_SHIFT	0
++
+ struct hns_roce_v2_cmq_ring {
+ 	dma_addr_t desc_dma_addr;
+ 	struct hns_roce_cmq_desc *desc;

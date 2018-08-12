@@ -1,0 +1,445 @@
+From: Yuval Bason <yuval.bason@cavium.com>
+Date: Sun, 3 Jun 2018 19:13:07 +0300
+Subject: qed: Add srq core support for RoCE and iWARP
+Patch-mainline: v4.18-rc1
+Git-commit: 39dbc646fd2c67ee9b71450ce172cbd714d4e7fb
+References: bsc#1086314 FATE#324886
+
+This patch adds support for configuring SRQ and provides the necessary
+APIs for rdma upper layer driver (qedr) to enable the SRQ feature.
+
+Signed-off-by: Michal Kalderon <michal.kalderon@cavium.com>
+Signed-off-by: Ariel Elior <ariel.elior@cavium.com>
+Signed-off-by: Yuval Bason <yuval.bason@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qed/qed_cxt.c   |    5 
+ drivers/net/ethernet/qlogic/qed/qed_cxt.h   |    1 
+ drivers/net/ethernet/qlogic/qed/qed_hsi.h   |    2 
+ drivers/net/ethernet/qlogic/qed/qed_iwarp.c |   23 +++
+ drivers/net/ethernet/qlogic/qed/qed_main.c  |    2 
+ drivers/net/ethernet/qlogic/qed/qed_rdma.c  |  178 +++++++++++++++++++++++++++-
+ drivers/net/ethernet/qlogic/qed/qed_rdma.h  |    2 
+ drivers/net/ethernet/qlogic/qed/qed_roce.c  |   17 ++
+ include/linux/qed/qed_rdma_if.h             |   12 +
+ 9 files changed, 234 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qed/qed_cxt.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_cxt.c
+@@ -47,6 +47,7 @@
+ #include "qed_hsi.h"
+ #include "qed_hw.h"
+ #include "qed_init_ops.h"
++#include "qed_rdma.h"
+ #include "qed_reg_addr.h"
+ #include "qed_sriov.h"
+ 
+@@ -426,7 +427,7 @@ static void qed_cxt_set_srq_count(struct
+ 	p_mgr->srq_count = num_srqs;
+ }
+ 
+-static u32 qed_cxt_get_srq_count(struct qed_hwfn *p_hwfn)
++u32 qed_cxt_get_srq_count(struct qed_hwfn *p_hwfn)
+ {
+ 	struct qed_cxt_mngr *p_mgr = p_hwfn->p_cxt_mngr;
+ 
+@@ -2071,7 +2072,7 @@ static void qed_rdma_set_pf_params(struc
+ 	u32 num_cons, num_qps, num_srqs;
+ 	enum protocol_type proto;
+ 
+-	num_srqs = min_t(u32, 32 * 1024, p_params->num_srqs);
++	num_srqs = min_t(u32, QED_RDMA_MAX_SRQS, p_params->num_srqs);
+ 
+ 	if (p_hwfn->mcp_info->func_info.protocol == QED_PCI_ETH_RDMA) {
+ 		DP_NOTICE(p_hwfn,
+--- a/drivers/net/ethernet/qlogic/qed/qed_cxt.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_cxt.h
+@@ -235,6 +235,7 @@ u32 qed_cxt_get_proto_tid_count(struct q
+ 				enum protocol_type type);
+ u32 qed_cxt_get_proto_cid_start(struct qed_hwfn *p_hwfn,
+ 				enum protocol_type type);
++u32 qed_cxt_get_srq_count(struct qed_hwfn *p_hwfn);
+ int qed_cxt_free_proto_ilt(struct qed_hwfn *p_hwfn, enum protocol_type proto);
+ 
+ #define QED_CTX_WORKING_MEM 0
+--- a/drivers/net/ethernet/qlogic/qed/qed_hsi.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+@@ -9725,6 +9725,8 @@ enum iwarp_eqe_async_opcode {
+ 	IWARP_EVENT_TYPE_ASYNC_EXCEPTION_DETECTED,
+ 	IWARP_EVENT_TYPE_ASYNC_QP_IN_ERROR_STATE,
+ 	IWARP_EVENT_TYPE_ASYNC_CQ_OVERFLOW,
++	IWARP_EVENT_TYPE_ASYNC_SRQ_EMPTY,
++	IWARP_EVENT_TYPE_ASYNC_SRQ_LIMIT,
+ 	MAX_IWARP_EQE_ASYNC_OPCODE
+ };
+ 
+--- a/drivers/net/ethernet/qlogic/qed/qed_iwarp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_iwarp.c
+@@ -271,6 +271,8 @@ int qed_iwarp_create_qp(struct qed_hwfn
+ 	p_ramrod->sq_num_pages = qp->sq_num_pages;
+ 	p_ramrod->rq_num_pages = qp->rq_num_pages;
+ 
++	p_ramrod->srq_id.srq_idx = cpu_to_le16(qp->srq_id);
++	p_ramrod->srq_id.opaque_fid = cpu_to_le16(p_hwfn->hw_info.opaque_fid);
+ 	p_ramrod->qp_handle_for_cqe.hi = cpu_to_le32(qp->qp_handle.hi);
+ 	p_ramrod->qp_handle_for_cqe.lo = cpu_to_le32(qp->qp_handle.lo);
+ 
+@@ -3004,8 +3006,11 @@ static int qed_iwarp_async_event(struct
+ 				 union event_ring_data *data,
+ 				 u8 fw_return_code)
+ {
++	struct qed_rdma_events events = p_hwfn->p_rdma_info->events;
+ 	struct regpair *fw_handle = &data->rdma_data.async_handle;
+ 	struct qed_iwarp_ep *ep = NULL;
++	u16 srq_offset;
++	u16 srq_id;
+ 	u16 cid;
+ 
+ 	ep = (struct qed_iwarp_ep *)(uintptr_t)HILO_64(fw_handle->hi,
+@@ -3067,6 +3072,24 @@ static int qed_iwarp_async_event(struct
+ 		qed_iwarp_cid_cleaned(p_hwfn, cid);
+ 
+ 		break;
++	case IWARP_EVENT_TYPE_ASYNC_SRQ_EMPTY:
++		DP_NOTICE(p_hwfn, "IWARP_EVENT_TYPE_ASYNC_SRQ_EMPTY\n");
++		srq_offset = p_hwfn->p_rdma_info->srq_id_offset;
++		/* FW assigns value that is no greater than u16 */
++		srq_id = ((u16)le32_to_cpu(fw_handle->lo)) - srq_offset;
++		events.affiliated_event(events.context,
++					QED_IWARP_EVENT_SRQ_EMPTY,
++					&srq_id);
++		break;
++	case IWARP_EVENT_TYPE_ASYNC_SRQ_LIMIT:
++		DP_NOTICE(p_hwfn, "IWARP_EVENT_TYPE_ASYNC_SRQ_LIMIT\n");
++		srq_offset = p_hwfn->p_rdma_info->srq_id_offset;
++		/* FW assigns value that is no greater than u16 */
++		srq_id = ((u16)le32_to_cpu(fw_handle->lo)) - srq_offset;
++		events.affiliated_event(events.context,
++					QED_IWARP_EVENT_SRQ_LIMIT,
++					&srq_id);
++		break;
+ 	case IWARP_EVENT_TYPE_ASYNC_CQ_OVERFLOW:
+ 		DP_NOTICE(p_hwfn, "IWARP_EVENT_TYPE_ASYNC_CQ_OVERFLOW\n");
+ 
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -64,6 +64,7 @@
+ 
+ #define QED_ROCE_QPS			(8192)
+ #define QED_ROCE_DPIS			(8)
++#define QED_RDMA_SRQS                   QED_ROCE_QPS
+ 
+ static char version[] =
+ 	"QLogic FastLinQ 4xxxx Core Module qed " DRV_MODULE_VERSION "\n";
+@@ -922,6 +923,7 @@ static void qed_update_pf_params(struct
+ 	if (IS_ENABLED(CONFIG_QED_RDMA)) {
+ 		params->rdma_pf_params.num_qps = QED_ROCE_QPS;
+ 		params->rdma_pf_params.min_dpis = QED_ROCE_DPIS;
++		params->rdma_pf_params.num_srqs = QED_RDMA_SRQS;
+ 		/* divide by 3 the MRs to avoid MF ILT overflow */
+ 		params->rdma_pf_params.gl_pi = QED_ROCE_PROTOCOL_INDEX;
+ 	}
+--- a/drivers/net/ethernet/qlogic/qed/qed_rdma.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_rdma.c
+@@ -259,15 +259,29 @@ static int qed_rdma_alloc(struct qed_hwf
+ 		goto free_cid_map;
+ 	}
+ 
++	/* Allocate bitmap for srqs */
++	p_rdma_info->num_srqs = qed_cxt_get_srq_count(p_hwfn);
++	rc = qed_rdma_bmap_alloc(p_hwfn, &p_rdma_info->srq_map,
++				 p_rdma_info->num_srqs, "SRQ");
++	if (rc) {
++		DP_VERBOSE(p_hwfn, QED_MSG_RDMA,
++			   "Failed to allocate srq bitmap, rc = %d\n", rc);
++		goto free_real_cid_map;
++	}
++
+ 	if (QED_IS_IWARP_PERSONALITY(p_hwfn))
+ 		rc = qed_iwarp_alloc(p_hwfn);
+ 
+ 	if (rc)
+-		goto free_cid_map;
++		goto free_srq_map;
+ 
+ 	DP_VERBOSE(p_hwfn, QED_MSG_RDMA, "Allocation successful\n");
+ 	return 0;
+ 
++free_srq_map:
++	kfree(p_rdma_info->srq_map.bitmap);
++free_real_cid_map:
++	kfree(p_rdma_info->real_cid_map.bitmap);
+ free_cid_map:
+ 	kfree(p_rdma_info->cid_map.bitmap);
+ free_tid_map:
+@@ -351,6 +365,8 @@ static void qed_rdma_resc_free(struct qe
+ 	qed_rdma_bmap_free(p_hwfn, &p_hwfn->p_rdma_info->cq_map, 1);
+ 	qed_rdma_bmap_free(p_hwfn, &p_hwfn->p_rdma_info->toggle_bits, 0);
+ 	qed_rdma_bmap_free(p_hwfn, &p_hwfn->p_rdma_info->tid_map, 1);
++	qed_rdma_bmap_free(p_hwfn, &p_hwfn->p_rdma_info->srq_map, 1);
++	qed_rdma_bmap_free(p_hwfn, &p_hwfn->p_rdma_info->real_cid_map, 1);
+ 
+ 	kfree(p_rdma_info->port);
+ 	kfree(p_rdma_info->dev);
+@@ -431,6 +447,12 @@ static void qed_rdma_init_devinfo(struct
+ 	if (cdev->rdma_max_sge)
+ 		dev->max_sge = min_t(u32, cdev->rdma_max_sge, dev->max_sge);
+ 
++	dev->max_srq_sge = QED_RDMA_MAX_SGE_PER_SRQ_WQE;
++	if (p_hwfn->cdev->rdma_max_srq_sge) {
++		dev->max_srq_sge = min_t(u32,
++					 p_hwfn->cdev->rdma_max_srq_sge,
++					 dev->max_srq_sge);
++	}
+ 	dev->max_inline = ROCE_REQ_MAX_INLINE_DATA_SIZE;
+ 
+ 	dev->max_inline = (cdev->rdma_max_inline) ?
+@@ -474,6 +496,8 @@ static void qed_rdma_init_devinfo(struct
+ 	dev->max_mr_mw_fmr_size = dev->max_mr_mw_fmr_pbl * PAGE_SIZE;
+ 	dev->max_pkey = QED_RDMA_MAX_P_KEY;
+ 
++	dev->max_srq = p_hwfn->p_rdma_info->num_srqs;
++	dev->max_srq_wr = QED_RDMA_MAX_SRQ_WQE_ELEM;
+ 	dev->max_qp_resp_rd_atomic_resc = RDMA_RING_PAGE_SIZE /
+ 					  (RDMA_RESP_RD_ATOMIC_ELM_SIZE * 2);
+ 	dev->max_qp_req_rd_atomic_resc = RDMA_RING_PAGE_SIZE /
+@@ -1628,6 +1652,155 @@ static void *qed_rdma_get_rdma_ctx(struc
+ 	return QED_LEADING_HWFN(cdev);
+ }
+ 
++static int qed_rdma_modify_srq(void *rdma_cxt,
++			       struct qed_rdma_modify_srq_in_params *in_params)
++{
++	struct rdma_srq_modify_ramrod_data *p_ramrod;
++	struct qed_sp_init_data init_data = {};
++	struct qed_hwfn *p_hwfn = rdma_cxt;
++	struct qed_spq_entry *p_ent;
++	u16 opaque_fid;
++	int rc;
++
++	init_data.opaque_fid = p_hwfn->hw_info.opaque_fid;
++	init_data.comp_mode = QED_SPQ_MODE_EBLOCK;
++
++	rc = qed_sp_init_request(p_hwfn, &p_ent,
++				 RDMA_RAMROD_MODIFY_SRQ,
++				 p_hwfn->p_rdma_info->proto, &init_data);
++	if (rc)
++		return rc;
++
++	p_ramrod = &p_ent->ramrod.rdma_modify_srq;
++	p_ramrod->srq_id.srq_idx = cpu_to_le16(in_params->srq_id);
++	opaque_fid = p_hwfn->hw_info.opaque_fid;
++	p_ramrod->srq_id.opaque_fid = cpu_to_le16(opaque_fid);
++	p_ramrod->wqe_limit = cpu_to_le32(in_params->wqe_limit);
++
++	rc = qed_spq_post(p_hwfn, p_ent, NULL);
++	if (rc)
++		return rc;
++
++	DP_VERBOSE(p_hwfn, QED_MSG_RDMA, "modified SRQ id = %x",
++		   in_params->srq_id);
++
++	return rc;
++}
++
++static int
++qed_rdma_destroy_srq(void *rdma_cxt,
++		     struct qed_rdma_destroy_srq_in_params *in_params)
++{
++	struct rdma_srq_destroy_ramrod_data *p_ramrod;
++	struct qed_sp_init_data init_data = {};
++	struct qed_hwfn *p_hwfn = rdma_cxt;
++	struct qed_spq_entry *p_ent;
++	struct qed_bmap *bmap;
++	u16 opaque_fid;
++	int rc;
++
++	opaque_fid = p_hwfn->hw_info.opaque_fid;
++
++	init_data.opaque_fid = opaque_fid;
++	init_data.comp_mode = QED_SPQ_MODE_EBLOCK;
++
++	rc = qed_sp_init_request(p_hwfn, &p_ent,
++				 RDMA_RAMROD_DESTROY_SRQ,
++				 p_hwfn->p_rdma_info->proto, &init_data);
++	if (rc)
++		return rc;
++
++	p_ramrod = &p_ent->ramrod.rdma_destroy_srq;
++	p_ramrod->srq_id.srq_idx = cpu_to_le16(in_params->srq_id);
++	p_ramrod->srq_id.opaque_fid = cpu_to_le16(opaque_fid);
++
++	rc = qed_spq_post(p_hwfn, p_ent, NULL);
++	if (rc)
++		return rc;
++
++	bmap = &p_hwfn->p_rdma_info->srq_map;
++
++	spin_lock_bh(&p_hwfn->p_rdma_info->lock);
++	qed_bmap_release_id(p_hwfn, bmap, in_params->srq_id);
++	spin_unlock_bh(&p_hwfn->p_rdma_info->lock);
++
++	DP_VERBOSE(p_hwfn, QED_MSG_RDMA, "SRQ destroyed Id = %x",
++		   in_params->srq_id);
++
++	return rc;
++}
++
++static int
++qed_rdma_create_srq(void *rdma_cxt,
++		    struct qed_rdma_create_srq_in_params *in_params,
++		    struct qed_rdma_create_srq_out_params *out_params)
++{
++	struct rdma_srq_create_ramrod_data *p_ramrod;
++	struct qed_sp_init_data init_data = {};
++	struct qed_hwfn *p_hwfn = rdma_cxt;
++	enum qed_cxt_elem_type elem_type;
++	struct qed_spq_entry *p_ent;
++	u16 opaque_fid, srq_id;
++	struct qed_bmap *bmap;
++	u32 returned_id;
++	int rc;
++
++	bmap = &p_hwfn->p_rdma_info->srq_map;
++	spin_lock_bh(&p_hwfn->p_rdma_info->lock);
++	rc = qed_rdma_bmap_alloc_id(p_hwfn, bmap, &returned_id);
++	spin_unlock_bh(&p_hwfn->p_rdma_info->lock);
++
++	if (rc) {
++		DP_NOTICE(p_hwfn, "failed to allocate srq id\n");
++		return rc;
++	}
++
++	elem_type = QED_ELEM_SRQ;
++	rc = qed_cxt_dynamic_ilt_alloc(p_hwfn, elem_type, returned_id);
++	if (rc)
++		goto err;
++	/* returned id is no greater than u16 */
++	srq_id = (u16)returned_id;
++	opaque_fid = p_hwfn->hw_info.opaque_fid;
++
++	opaque_fid = p_hwfn->hw_info.opaque_fid;
++	init_data.opaque_fid = opaque_fid;
++	init_data.comp_mode = QED_SPQ_MODE_EBLOCK;
++
++	rc = qed_sp_init_request(p_hwfn, &p_ent,
++				 RDMA_RAMROD_CREATE_SRQ,
++				 p_hwfn->p_rdma_info->proto, &init_data);
++	if (rc)
++		goto err;
++
++	p_ramrod = &p_ent->ramrod.rdma_create_srq;
++	DMA_REGPAIR_LE(p_ramrod->pbl_base_addr, in_params->pbl_base_addr);
++	p_ramrod->pages_in_srq_pbl = cpu_to_le16(in_params->num_pages);
++	p_ramrod->pd_id = cpu_to_le16(in_params->pd_id);
++	p_ramrod->srq_id.srq_idx = cpu_to_le16(srq_id);
++	p_ramrod->srq_id.opaque_fid = cpu_to_le16(opaque_fid);
++	p_ramrod->page_size = cpu_to_le16(in_params->page_size);
++	DMA_REGPAIR_LE(p_ramrod->producers_addr, in_params->prod_pair_addr);
++
++	rc = qed_spq_post(p_hwfn, p_ent, NULL);
++	if (rc)
++		goto err;
++
++	out_params->srq_id = srq_id;
++
++	DP_VERBOSE(p_hwfn, QED_MSG_RDMA,
++		   "SRQ created Id = %x\n", out_params->srq_id);
++
++	return rc;
++
++err:
++	spin_lock_bh(&p_hwfn->p_rdma_info->lock);
++	qed_bmap_release_id(p_hwfn, bmap, returned_id);
++	spin_unlock_bh(&p_hwfn->p_rdma_info->lock);
++
++	return rc;
++}
++
+ bool qed_rdma_allocated_qps(struct qed_hwfn *p_hwfn)
+ {
+ 	bool result;
+@@ -1773,6 +1946,9 @@ static const struct qed_rdma_ops qed_rdm
+ 	.rdma_free_tid = &qed_rdma_free_tid,
+ 	.rdma_register_tid = &qed_rdma_register_tid,
+ 	.rdma_deregister_tid = &qed_rdma_deregister_tid,
++	.rdma_create_srq = &qed_rdma_create_srq,
++	.rdma_modify_srq = &qed_rdma_modify_srq,
++	.rdma_destroy_srq = &qed_rdma_destroy_srq,
+ 	.ll2_acquire_connection = &qed_ll2_acquire_connection,
+ 	.ll2_establish_connection = &qed_ll2_establish_connection,
+ 	.ll2_terminate_connection = &qed_ll2_terminate_connection,
+--- a/drivers/net/ethernet/qlogic/qed/qed_rdma.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_rdma.h
+@@ -96,6 +96,8 @@ struct qed_rdma_info {
+ 	u8 num_cnqs;
+ 	u32 num_qps;
+ 	u32 num_mrs;
++	u32 num_srqs;
++	u16 srq_id_offset;
+ 	u16 queue_zone_base;
+ 	u16 max_queue_zones;
+ 	enum protocol_type proto;
+--- a/drivers/net/ethernet/qlogic/qed/qed_roce.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_roce.c
+@@ -65,6 +65,8 @@ qed_roce_async_event(struct qed_hwfn *p_
+ 		     u8 fw_event_code,
+ 		     u16 echo, union event_ring_data *data, u8 fw_return_code)
+ {
++	struct qed_rdma_events events = p_hwfn->p_rdma_info->events;
++
+ 	if (fw_event_code == ROCE_ASYNC_EVENT_DESTROY_QP_DONE) {
+ 		u16 icid =
+ 		    (u16)le32_to_cpu(data->rdma_data.rdma_destroy_qp_data.cid);
+@@ -75,11 +77,18 @@ qed_roce_async_event(struct qed_hwfn *p_
+ 		 */
+ 		qed_roce_free_real_icid(p_hwfn, icid);
+ 	} else {
+-		struct qed_rdma_events *events = &p_hwfn->p_rdma_info->events;
++		if (fw_event_code == ROCE_ASYNC_EVENT_SRQ_EMPTY ||
++		    fw_event_code == ROCE_ASYNC_EVENT_SRQ_LIMIT) {
++			u16 srq_id = (u16)data->rdma_data.async_handle.lo;
++
++			events.affiliated_event(events.context, fw_event_code,
++						&srq_id);
++		} else {
++			union rdma_eqe_data rdata = data->rdma_data;
+ 
+-		events->affiliated_event(p_hwfn->p_rdma_info->events.context,
+-					 fw_event_code,
+-				     (void *)&data->rdma_data.async_handle);
++			events.affiliated_event(events.context, fw_event_code,
++						(void *)&rdata.async_handle);
++		}
+ 	}
+ 
+ 	return 0;
+--- a/include/linux/qed/qed_rdma_if.h
++++ b/include/linux/qed/qed_rdma_if.h
+@@ -485,7 +485,9 @@ enum qed_iwarp_event_type {
+ 	QED_IWARP_EVENT_ACTIVE_MPA_REPLY,
+ 	QED_IWARP_EVENT_LOCAL_ACCESS_ERROR,
+ 	QED_IWARP_EVENT_REMOTE_OPERATION_ERROR,
+-	QED_IWARP_EVENT_TERMINATE_RECEIVED
++	QED_IWARP_EVENT_TERMINATE_RECEIVED,
++	QED_IWARP_EVENT_SRQ_LIMIT,
++	QED_IWARP_EVENT_SRQ_EMPTY,
+ };
+ 
+ enum qed_tcp_ip_version {
+@@ -646,6 +648,14 @@ struct qed_rdma_ops {
+ 	int (*rdma_alloc_tid)(void *rdma_cxt, u32 *itid);
+ 	void (*rdma_free_tid)(void *rdma_cxt, u32 itid);
+ 
++	int (*rdma_create_srq)(void *rdma_cxt,
++			       struct qed_rdma_create_srq_in_params *iparams,
++			       struct qed_rdma_create_srq_out_params *oparams);
++	int (*rdma_destroy_srq)(void *rdma_cxt,
++				struct qed_rdma_destroy_srq_in_params *iparams);
++	int (*rdma_modify_srq)(void *rdma_cxt,
++			       struct qed_rdma_modify_srq_in_params *iparams);
++
+ 	int (*ll2_acquire_connection)(void *rdma_cxt,
+ 				      struct qed_ll2_acquire_data *data);
+ 
