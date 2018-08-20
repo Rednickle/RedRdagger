@@ -1,0 +1,236 @@
+From 8bb705e3e79d84e77edd4499e74483dd96a4626c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 24 Oct 2017 14:40:26 -0500
+Subject: [PATCH] PCI: Add pci_resize_resource() for resizing BARs
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 8bb705e3e79d84e77edd4499e74483dd96a4626c
+Patch-mainline: v4.15-rc1
+References: bsc#1105355
+
+Add a pci_resize_resource() interface to allow device drivers to resize
+BARs of their devices.
+
+This is useful for devices with large local storage, e.g., graphics
+devices.  These devices often only expose 256MB BARs initially to be
+compatible with 32-bit systems.
+
+This function only tries to reprogram the windows of the bridge directly
+above the requesting device and only the BAR of the same type (usually mem,
+64bit, prefetchable).  This is done to avoid disturbing other drivers by
+changing the BARs of their devices.
+
+Drivers should use the following sequence to resize their BARs:
+1. Disable memory decoding of the device using the PCI cfg dword.
+2. Use pci_release_resource() to release all BARs which can move during the
+   resize, including the one you want to resize.
+3. Call pci_resize_resource() for each BAR you want to resize.
+4. Call pci_assign_unassigned_bus_resources() to reassign new locations
+   for all BARs which are not resized, but could move.
+5. If everything worked as expected, enable memory decoding in the device
+   again using the PCI cfg dword.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/pci/setup-bus.c |   98 ++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/pci/setup-res.c |   58 ++++++++++++++++++++++++++++
+ include/linux/pci.h     |    3 +
+ 3 files changed, 159 insertions(+)
+
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -2090,6 +2090,104 @@ enable_all:
+ }
+ EXPORT_SYMBOL_GPL(pci_assign_unassigned_bridge_resources);
+ 
++int pci_reassign_bridge_resources(struct pci_dev *bridge, unsigned long type)
++{
++	struct pci_dev_resource *dev_res;
++	struct pci_dev *next;
++	LIST_HEAD(saved);
++	LIST_HEAD(added);
++	LIST_HEAD(failed);
++	unsigned int i;
++	int ret;
++
++	/* Walk to the root hub, releasing bridge BARs when possible */
++	next = bridge;
++	do {
++		bridge = next;
++		for (i = PCI_BRIDGE_RESOURCES; i < PCI_BRIDGE_RESOURCE_END;
++		     i++) {
++			struct resource *res = &bridge->resource[i];
++
++			if ((res->flags ^ type) & PCI_RES_TYPE_MASK)
++				continue;
++
++			/* Ignore BARs which are still in use */
++			if (res->child)
++				continue;
++
++			ret = add_to_list(&saved, bridge, res, 0, 0);
++			if (ret)
++				goto cleanup;
++
++			dev_info(&bridge->dev, "BAR %d: releasing %pR\n",
++				 i, res);
++
++			if (res->parent)
++				release_resource(res);
++			res->start = 0;
++			res->end = 0;
++			break;
++		}
++		if (i == PCI_BRIDGE_RESOURCE_END)
++			break;
++
++		next = bridge->bus ? bridge->bus->self : NULL;
++	} while (next);
++
++	if (list_empty(&saved))
++		return -ENOENT;
++
++	__pci_bus_size_bridges(bridge->subordinate, &added);
++	__pci_bridge_assign_resources(bridge, &added, &failed);
++	BUG_ON(!list_empty(&added));
++
++	if (!list_empty(&failed)) {
++		ret = -ENOSPC;
++		goto cleanup;
++	}
++
++	list_for_each_entry(dev_res, &saved, list) {
++		/* Skip the bridge we just assigned resources for. */
++		if (bridge == dev_res->dev)
++			continue;
++
++		bridge = dev_res->dev;
++		pci_setup_bridge(bridge->subordinate);
++	}
++
++	free_list(&saved);
++	return 0;
++
++cleanup:
++	/* restore size and flags */
++	list_for_each_entry(dev_res, &failed, list) {
++		struct resource *res = dev_res->res;
++
++		res->start = dev_res->start;
++		res->end = dev_res->end;
++		res->flags = dev_res->flags;
++	}
++	free_list(&failed);
++
++	/* Revert to the old configuration */
++	list_for_each_entry(dev_res, &saved, list) {
++		struct resource *res = dev_res->res;
++
++		bridge = dev_res->dev;
++		i = res - bridge->resource;
++
++		res->start = dev_res->start;
++		res->end = dev_res->end;
++		res->flags = dev_res->flags;
++
++		pci_claim_resource(bridge, i);
++		pci_setup_bridge(bridge->subordinate);
++	}
++	free_list(&saved);
++
++	return ret;
++}
++
+ void pci_assign_unassigned_bus_resources(struct pci_bus *bus)
+ {
+ 	struct pci_dev *dev;
+--- a/drivers/pci/setup-res.c
++++ b/drivers/pci/setup-res.c
+@@ -381,6 +381,64 @@ int pci_reassign_resource(struct pci_dev
+ 	return 0;
+ }
+ 
++void pci_release_resource(struct pci_dev *dev, int resno)
++{
++	struct resource *res = dev->resource + resno;
++
++	dev_info(&dev->dev, "BAR %d: releasing %pR\n", resno, res);
++	release_resource(res);
++	res->end = resource_size(res) - 1;
++	res->start = 0;
++	res->flags |= IORESOURCE_UNSET;
++}
++EXPORT_SYMBOL(pci_release_resource);
++
++int pci_resize_resource(struct pci_dev *dev, int resno, int size)
++{
++	struct resource *res = dev->resource + resno;
++	int old, ret;
++	u32 sizes;
++	u16 cmd;
++
++	/* Make sure the resource isn't assigned before resizing it. */
++	if (!(res->flags & IORESOURCE_UNSET))
++		return -EBUSY;
++
++	pci_read_config_word(dev, PCI_COMMAND, &cmd);
++	if (cmd & PCI_COMMAND_MEMORY)
++		return -EBUSY;
++
++	sizes = pci_rebar_get_possible_sizes(dev, resno);
++	if (!sizes)
++		return -ENOTSUPP;
++
++	if (!(sizes & BIT(size)))
++		return -EINVAL;
++
++	old = pci_rebar_get_current_size(dev, resno);
++	if (old < 0)
++		return old;
++
++	ret = pci_rebar_set_size(dev, resno, size);
++	if (ret)
++		return ret;
++
++	res->end = res->start + pci_rebar_size_to_bytes(size) - 1;
++
++	/* Check if the new config works by trying to assign everything. */
++	ret = pci_reassign_bridge_resources(dev->bus->self, res->flags);
++	if (ret)
++		goto error_resize;
++
++	return 0;
++
++error_resize:
++	pci_rebar_set_size(dev, resno, old);
++	res->end = res->start + pci_rebar_size_to_bytes(old) - 1;
++	return ret;
++}
++EXPORT_SYMBOL(pci_resize_resource);
++
+ int pci_enable_resources(struct pci_dev *dev, int mask)
+ {
+ 	u16 cmd, old_cmd;
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -1080,6 +1080,8 @@ void pci_reset_bridge_secondary_bus(stru
+ void pci_update_resource(struct pci_dev *dev, int resno);
+ int __must_check pci_assign_resource(struct pci_dev *dev, int i);
+ int __must_check pci_reassign_resource(struct pci_dev *dev, int i, resource_size_t add_size, resource_size_t align);
++void pci_release_resource(struct pci_dev *dev, int resno);
++int __must_check pci_resize_resource(struct pci_dev *dev, int i, int size);
+ int pci_select_bars(struct pci_dev *dev, unsigned long flags);
+ bool pci_device_is_present(struct pci_dev *pdev);
+ void pci_ignore_hotplug(struct pci_dev *dev);
+@@ -1166,6 +1168,7 @@ void pci_assign_unassigned_resources(voi
+ void pci_assign_unassigned_bridge_resources(struct pci_dev *bridge);
+ void pci_assign_unassigned_bus_resources(struct pci_bus *bus);
+ void pci_assign_unassigned_root_bus_resources(struct pci_bus *bus);
++int pci_reassign_bridge_resources(struct pci_dev *bridge, unsigned long type);
+ void pdev_enable_device(struct pci_dev *);
+ int pci_enable_resources(struct pci_dev *, int mask);
+ void pci_fixup_irqs(u8 (*)(struct pci_dev *, u8 *),
