@@ -1,0 +1,163 @@
+From 3af71f649d22f359790b4032446456a967a81742 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 8 Aug 2018 22:08:42 +0100
+Subject: drm/i915: Restore user forcewake domains across suspend
+References: bsc#1100132
+Patch-mainline: v4.18-rc7
+Git-commit: 3af71f649d22f359790b4032446456a967a81742
+
+On suspend, we cancel the automatic forcewake and clear all other sources
+of forcewake so the machine can sleep before we do suspend. However, we
+expose the forcewake to userspace (only via debugfs, but nevertheless we
+do) and want to restore that upon resume or else our accounting will be
+off and we may not acquire the forcewake before we use it. So record
+which domains we cleared on suspend and reacquire them early on resume.
+
+v2: Hold the spinlock to appease our sanitychecks
+v3: s/fw_domains_user/fw_domains_saved/ to convey intent more clearly
+
+Backport notes:
+
+  * Adapted patch to changes in context.
+
+Reported-by: Imre Deak <imre.deak@linux.intel.com>
+Fixes: b8473050805f ("drm/i915: Fix forcewake active domain tracking")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Cc: Imre Deak <imre.deak@linux.intel.com>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180808210842.3555-1-chris@chris-wilson.co.uk
+(cherry picked from commit d60996ab430c8a6033a0944c068edc5ec5becb9b)
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+---
+ drivers/gpu/drm/i915/intel_uncore.c           |   46 ++++++++++++++------------
+ drivers/gpu/drm/i915/intel_uncore.h           |    1
+ drivers/gpu/drm/i915/selftests/intel_uncore.c |    2 -
+ 3 files changed, 28 insertions(+), 21 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -345,8 +345,8 @@ intel_uncore_fw_release_timer(struct hrt
+ 	return HRTIMER_NORESTART;
+ }
+
+-static void intel_uncore_forcewake_reset(struct drm_i915_private *dev_priv,
+-					 bool restore)
++static unsigned int
++intel_uncore_forcewake_reset(struct drm_i915_private *dev_priv)
+ {
+ 	unsigned long irqflags;
+ 	struct intel_uncore_forcewake_domain *domain;
+@@ -396,20 +396,11 @@ static void intel_uncore_forcewake_reset
+ 		dev_priv->uncore.funcs.force_wake_put(dev_priv, fw);
+
+ 	fw_domains_reset(dev_priv, dev_priv->uncore.fw_domains);
+-
+-	if (restore) { /* If reset with a user forcewake, try to restore */
+-		if (fw)
+-			dev_priv->uncore.funcs.force_wake_get(dev_priv, fw);
+-
+-		if (IS_GEN6(dev_priv) || IS_GEN7(dev_priv))
+-			dev_priv->uncore.fifo_count =
+-				fifo_free_entries(dev_priv);
+-	}
+-
+-	if (!restore)
+-		assert_forcewakes_inactive(dev_priv);
++	assert_forcewakes_inactive(dev_priv);
+
+ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++
++	return fw; /* track the lost user forcewake domains */
+ }
+
+ static u64 gen9_edram_size(struct drm_i915_private *dev_priv)
+@@ -518,7 +509,7 @@ check_for_unclaimed_mmio(struct drm_i915
+ }
+
+ static void __intel_uncore_early_sanitize(struct drm_i915_private *dev_priv,
+-					  bool restore_forcewake)
++					  unsigned int restore_forcewake)
+ {
+ 	/* clear out unclaimed reg detection bit */
+ 	if (check_for_unclaimed_mmio(dev_priv))
+@@ -532,19 +523,34 @@ static void __intel_uncore_early_sanitiz
+ 				   GT_FIFO_CTL_RC6_POLICY_STALL);
+ 	}
+
+-	intel_uncore_forcewake_reset(dev_priv, restore_forcewake);
++	intel_uncore_forcewake_reset(dev_priv);
++	if (restore_forcewake) {
++		spin_lock_irq(&dev_priv->uncore.lock);
++		dev_priv->uncore.funcs.force_wake_get(dev_priv,
++						      restore_forcewake);
++
++		if (IS_GEN6(dev_priv) || IS_GEN7(dev_priv))
++			dev_priv->uncore.fifo_count =
++				fifo_free_entries(dev_priv);
++		spin_unlock_irq(&dev_priv->uncore.lock);
++	}
+ }
+
+ void intel_uncore_suspend(struct drm_i915_private *dev_priv)
+ {
+ 	iosf_mbi_unregister_pmic_bus_access_notifier(
+ 		&dev_priv->uncore.pmic_bus_access_nb);
+-	intel_uncore_forcewake_reset(dev_priv, false);
++	dev_priv->uncore.fw_domains_saved =
++		intel_uncore_forcewake_reset(dev_priv);
+ }
+
+ void intel_uncore_resume_early(struct drm_i915_private *dev_priv)
+ {
+-	__intel_uncore_early_sanitize(dev_priv, true);
++	unsigned int restore_forcewake;
++
++	restore_forcewake = fetch_and_zero(&dev_priv->uncore.fw_domains_saved);
++	__intel_uncore_early_sanitize(dev_priv, restore_forcewake);
++
+ 	iosf_mbi_register_pmic_bus_access_notifier(
+ 		&dev_priv->uncore.pmic_bus_access_nb);
+ 	i915_check_and_clear_faults(dev_priv);
+@@ -1384,7 +1390,7 @@ void intel_uncore_init(struct drm_i915_p
+
+ 	intel_uncore_edram_detect(dev_priv);
+ 	intel_uncore_fw_domains_init(dev_priv);
+-	__intel_uncore_early_sanitize(dev_priv, false);
++	__intel_uncore_early_sanitize(dev_priv, 0);
+
+ 	dev_priv->uncore.unclaimed_mmio_check = 1;
+ 	dev_priv->uncore.pmic_bus_access_nb.notifier_call =
+@@ -1432,7 +1438,7 @@ void intel_uncore_fini(struct drm_i915_p
+
+ 	/* Paranoia: make sure we have disabled everything before we exit. */
+ 	intel_uncore_sanitize(dev_priv);
+-	intel_uncore_forcewake_reset(dev_priv, false);
++	intel_uncore_forcewake_reset(dev_priv);
+ }
+
+ static const struct reg_whitelist {
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@ -93,6 +93,7 @@ struct intel_uncore {
+
+ 	enum forcewake_domains fw_domains;
+ 	enum forcewake_domains fw_domains_active;
++	enum forcewake_domains fw_domains_saved; /* user domains saved for S3 */
+
+ 	u32 fw_set;
+ 	u32 fw_clear;
+--- a/drivers/gpu/drm/i915/selftests/intel_uncore.c
++++ b/drivers/gpu/drm/i915/selftests/intel_uncore.c
+@@ -148,7 +148,7 @@ static int intel_uncore_check_forcewake_
+ 	for_each_set_bit(offset, valid, FW_RANGE) {
+ 		i915_reg_t reg = { offset };
+
+-		intel_uncore_forcewake_reset(dev_priv, false);
++		intel_uncore_forcewake_reset(dev_priv);
+ 		check_for_unclaimed_mmio(dev_priv);
+
+ 		(void)I915_READ(reg);
