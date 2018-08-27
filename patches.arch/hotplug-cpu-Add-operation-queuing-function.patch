@@ -1,0 +1,176 @@
+From 22566e66106baf7257db382fd1e025d732fd22f3 Mon Sep 17 00:00:00 2001
+From: Michael Bringmann <mwb@linux.vnet.ibm.com>
+Date: Sun, 29 Jul 2018 08:19:17 -0500
+Subject: [PATCH 2/5] hotplug/cpu: Add operation queuing function
+
+References: FATE#325308
+Patch-mainline: submitted https://patchwork.ozlabs.org/cover/950609/
+
+hotplug/cpu: This patch adds function dlpar_queue_action() which
+will queued up information about a CPU/Memory 'readd' operation
+according to resource type, action code, and DRC index.  Examples
+of such operations include 'readd' of CPU and Memory blocks
+identified as having changed their associativity during an LPAR
+migration event.
+
+At a subsequent point, the list of operations can be run/played
+in series from a worker function added to the pseries work queue.
+In the case of 'migration_store', the code has identified a set
+of post migration topology changes to be applied.  There may be
+a small number of CPU and memory changes to apply on small systems.
+On large SAP HANA systems though, there may changes to thousands
+and thousands of CPUs and memory blocks.  Applying these changes
+may take a significant amount of time -- much longer than the
+timeouts used by an associated HMC.  In order to avoid such
+timeout errors, the worker queue implementation allows the code
+to exit 'migration_store' with a good status, and then apply the
+changes to CPUs and memory blocks afterward.
+
+Signed-off-by: Michael Bringmann <mwb@linux.vnet.ibm.com>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/rtas.h           |  2 ++
+ arch/powerpc/platforms/pseries/dlpar.c    | 57 +++++++++++++++++++++++++++++++
+ arch/powerpc/platforms/pseries/mobility.c |  4 +++
+ arch/powerpc/platforms/pseries/pseries.h  |  2 ++
+ 4 files changed, 65 insertions(+)
+
+diff --git a/arch/powerpc/include/asm/rtas.h b/arch/powerpc/include/asm/rtas.h
+index ec9dd79398ee..4f451527a7c1 100644
+--- a/arch/powerpc/include/asm/rtas.h
++++ b/arch/powerpc/include/asm/rtas.h
+@@ -310,12 +310,14 @@ struct pseries_hp_errorlog {
+ 		struct { __be32 count, index; } ic;
+ 		char	drc_name[1];
+ 	} _drc_u;
++	struct list_head list;
+ };
+ 
+ #define PSERIES_HP_ELOG_RESOURCE_CPU	1
+ #define PSERIES_HP_ELOG_RESOURCE_MEM	2
+ #define PSERIES_HP_ELOG_RESOURCE_SLOT	3
+ #define PSERIES_HP_ELOG_RESOURCE_PHB	4
++#define PSERIES_HP_ELOG_RESOURCE_PMT	5
+ 
+ #define PSERIES_HP_ELOG_ACTION_ADD	1
+ #define PSERIES_HP_ELOG_ACTION_REMOVE	2
+diff --git a/arch/powerpc/platforms/pseries/dlpar.c b/arch/powerpc/platforms/pseries/dlpar.c
+index 5e658b0c437d..9343dbcd2607 100644
+--- a/arch/powerpc/platforms/pseries/dlpar.c
++++ b/arch/powerpc/platforms/pseries/dlpar.c
+@@ -25,6 +25,7 @@
+ #include <asm/prom.h>
+ #include <asm/machdep.h>
+ #include <linux/uaccess.h>
++#include <linux/delay.h>
+ #include <asm/rtas.h>
+ 
+ static struct workqueue_struct *pseries_hp_wq;
+@@ -345,6 +346,8 @@ int dlpar_release_drc(u32 drc_index)
+ 	return 0;
+ }
+ 
++static int dlpar_pmt(struct pseries_hp_errorlog *work);
++
+ static int handle_dlpar_errorlog(struct pseries_hp_errorlog *hp_elog)
+ {
+ 	int rc;
+@@ -373,6 +376,9 @@ static int handle_dlpar_errorlog(struct pseries_hp_errorlog *hp_elog)
+ 	case PSERIES_HP_ELOG_RESOURCE_CPU:
+ 		rc = dlpar_cpu(hp_elog);
+ 		break;
++	case PSERIES_HP_ELOG_RESOURCE_PMT:
++		rc = dlpar_pmt(hp_elog);
++		break;
+ 	default:
+ 		pr_warn_ratelimited("Invalid resource (%d) specified\n",
+ 				    hp_elog->resource);
+@@ -423,6 +429,57 @@ void queue_hotplug_event(struct pseries_hp_errorlog *hp_errlog,
+ 	}
+ }
+ 
++LIST_HEAD(dlpar_delayed_list);
++
++int dlpar_queue_action(int resource, int action, u32 drc_index)
++{
++	struct pseries_hp_errorlog *hp_errlog;
++
++	hp_errlog = kmalloc(sizeof(struct pseries_hp_errorlog), GFP_KERNEL);
++	if (!hp_errlog)
++		return -ENOMEM;
++
++	hp_errlog->resource = resource;
++	hp_errlog->action = action;
++	hp_errlog->id_type = PSERIES_HP_ELOG_ID_DRC_INDEX;
++	hp_errlog->_drc_u.drc_index = cpu_to_be32(drc_index);
++
++	list_add_tail(&hp_errlog->list, &dlpar_delayed_list);
++
++	return 0;
++}
++
++static int dlpar_pmt(struct pseries_hp_errorlog *work)
++{
++	struct list_head *pos, *q;
++
++	list_for_each_safe(pos, q, &dlpar_delayed_list) {
++		struct pseries_hp_errorlog *tmp;
++
++		tmp = list_entry(pos, struct pseries_hp_errorlog, list);
++		handle_dlpar_errorlog(tmp);
++
++		list_del(pos);
++		kfree(tmp);
++	}
++
++	return 0;
++}
++
++int dlpar_queued_actions_run(void)
++{
++	if (!list_empty(&dlpar_delayed_list)) {
++		struct pseries_hp_errorlog hp_errlog;
++
++		hp_errlog.resource = PSERIES_HP_ELOG_RESOURCE_PMT;
++		hp_errlog.action = 0;
++		hp_errlog.id_type = 0;
++
++		queue_hotplug_event(&hp_errlog, 0, 0);
++	}
++	return 0;
++}
++
+ static int dlpar_parse_resource(char **cmd, struct pseries_hp_errorlog *hp_elog)
+ {
+ 	char *arg;
+diff --git a/arch/powerpc/platforms/pseries/mobility.c b/arch/powerpc/platforms/pseries/mobility.c
+index ac98e83a5eb2..98379a2574da 100644
+--- a/arch/powerpc/platforms/pseries/mobility.c
++++ b/arch/powerpc/platforms/pseries/mobility.c
+@@ -374,6 +374,10 @@ static ssize_t migrate_store(struct class *class, struct class_attribute *attr,
+ 		return rc;
+ 
+ 	post_mobility_fixup();
++
++	/* Apply any necessary changes identified during fixup */
++	dlpar_queued_actions_run();
++
+ 	return count;
+ }
+ 
+diff --git a/arch/powerpc/platforms/pseries/pseries.h b/arch/powerpc/platforms/pseries/pseries.h
+index c02267557e7a..c21ed7a95b65 100644
+--- a/arch/powerpc/platforms/pseries/pseries.h
++++ b/arch/powerpc/platforms/pseries/pseries.h
+@@ -53,6 +53,8 @@ extern int dlpar_release_drc(u32 drc_index);
+ 
+ void queue_hotplug_event(struct pseries_hp_errorlog *hp_errlog,
+ 			 struct completion *hotplug_done, int *rc);
++int dlpar_queue_action(int resource, int action, u32 drc_index);
++int dlpar_queued_actions_run(void);
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ int dlpar_memory(struct pseries_hp_errorlog *hp_elog);
+ #else
+-- 
+2.13.7
+

@@ -1,0 +1,211 @@
+From: Quinn Tran <quinn.tran@cavium.com>
+Date: Thu, 2 Aug 2018 13:16:54 -0700
+Subject: [PATCH] scsi: qla2xxx: Fix race between switch cmd completion and
+ timeout
+References: bsc#1086327,FATE#324903
+Git-commit: f6145e86d21fccd59bbb87bc1e1eb076658fd79a
+Patch-mainline: v4.19-rc1
+
+Fix race condition between switch cmd completion and timeout timer. Timer
+has popped triggers command free. On IOCB completion, stale sp point was
+reused. Instead, an abort will be sent to FW to nudge the command out of FW
+where the normal completion will take place.
+
+RIP: 0010:qla2x00_chk_ms_status+0xf3/0x1b0 [qla2xxx]
+Call Trace:
+<IRQ>
+qla24xx_els_ct_entry.isra.15+0x1d4/0x2b0 [qla2xxx]
+ qla24xx_msix_rsp_q+0x39/0xf0 [qla2xxx]
+qla24xx_process_response_queue+0xbc/0x2b0 [qla2xxx]
+qla24xx_msix_rsp_q+0x8a/0xf0 [qla2xxx]
+__handle_irq_event_percpu+0xa0/0x1f0
+
+Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/qla2xxx/qla_def.h  |  1 +
+ drivers/scsi/qla2xxx/qla_gbl.h  |  2 +-
+ drivers/scsi/qla2xxx/qla_init.c | 75 ++++++++++++++++++++++++++++++-----------
+ 3 files changed, 58 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 0fdfe413c7eb..eecb4bc307b5 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -313,6 +313,7 @@ struct srb_cmd {
+ #define SRB_CRC_CTX_DMA_VALID		BIT_2	/* DIF: context DMA valid */
+ #define SRB_CRC_PROT_DMA_VALID		BIT_4	/* DIF: prot DMA valid */
+ #define SRB_CRC_CTX_DSD_VALID		BIT_5	/* DIF: dsd_list valid */
++#define SRB_WAKEUP_ON_COMP		BIT_6
+ 
+ /* To identify if a srb is of T10-CRC type. @sp => srb_t pointer */
+ #define IS_PROT_IO(sp)	(sp->flags & SRB_CRC_CTX_DSD_VALID)
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index f30a5e522e75..e436f2dad971 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -213,7 +213,7 @@ extern int qla24xx_post_upd_fcport_work(struct scsi_qla_host *, fc_port_t *);
+ void qla2x00_handle_login_done_event(struct scsi_qla_host *, fc_port_t *,
+ 	uint16_t *);
+ int qla24xx_post_gnl_work(struct scsi_qla_host *, fc_port_t *);
+-int qla24xx_async_abort_cmd(srb_t *);
++int qla24xx_async_abort_cmd(srb_t *, bool);
+ int qla24xx_post_relogin_work(struct scsi_qla_host *vha);
+ void qla2x00_wait_for_sess_deletion(scsi_qla_host_t *);
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index 0c5a04f9d016..b746cec1b4ed 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -50,16 +50,15 @@ qla2x00_sp_timeout(unsigned long __data)
+ {
+ 	srb_t *sp = (srb_t *)__data;
+ 	struct srb_iocb *iocb;
+-	scsi_qla_host_t *vha = sp->vha;
+ 	struct req_que *req;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&vha->hw->hardware_lock, flags);
+-	req = vha->hw->req_q_map[0];
++	spin_lock_irqsave(sp->qpair->qp_lock_ptr, flags);
++	req = sp->qpair->req;
+ 	req->outstanding_cmds[sp->handle] = NULL;
+ 	iocb = &sp->u.iocb_cmd;
++	spin_unlock_irqrestore(sp->qpair->qp_lock_ptr, flags);
+ 	iocb->timeout(sp);
+-	spin_unlock_irqrestore(&vha->hw->hardware_lock, flags);
+ }
+ 
+ void
+@@ -100,6 +99,8 @@ qla2x00_async_iocb_timeout(void *data)
+ 	srb_t *sp = data;
+ 	fc_port_t *fcport = sp->fcport;
+ 	struct srb_iocb *lio = &sp->u.iocb_cmd;
++	int rc, h;
++	unsigned long flags;
+ 
+ 	if (fcport) {
+ 		ql_dbg(ql_dbg_disc, fcport->vha, 0x2071,
+@@ -114,11 +115,26 @@ qla2x00_async_iocb_timeout(void *data)
+ 
+ 	switch (sp->type) {
+ 	case SRB_LOGIN_CMD:
+-		/* Retry as needed. */
+-		lio->u.logio.data[0] = MBS_COMMAND_ERROR;
+-		lio->u.logio.data[1] = lio->u.logio.flags & SRB_LOGIN_RETRIED ?
+-			QLA_LOGIO_LOGIN_RETRIED : 0;
+-		sp->done(sp, QLA_FUNCTION_TIMEOUT);
++		rc = qla24xx_async_abort_cmd(sp, false);
++		if (rc) {
++			/* Retry as needed. */
++			lio->u.logio.data[0] = MBS_COMMAND_ERROR;
++			lio->u.logio.data[1] =
++				lio->u.logio.flags & SRB_LOGIN_RETRIED ?
++				QLA_LOGIO_LOGIN_RETRIED : 0;
++			spin_lock_irqsave(sp->qpair->qp_lock_ptr, flags);
++			for (h = 1; h < sp->qpair->req->num_outstanding_cmds;
++			    h++) {
++				if (sp->qpair->req->outstanding_cmds[h] ==
++				    sp) {
++					sp->qpair->req->outstanding_cmds[h] =
++					    NULL;
++					break;
++				}
++			}
++			spin_unlock_irqrestore(sp->qpair->qp_lock_ptr, flags);
++			sp->done(sp, QLA_FUNCTION_TIMEOUT);
++		}
+ 		break;
+ 	case SRB_LOGOUT_CMD:
+ 	case SRB_CT_PTHRU_CMD:
+@@ -127,7 +143,21 @@ qla2x00_async_iocb_timeout(void *data)
+ 	case SRB_NACK_PRLI:
+ 	case SRB_NACK_LOGO:
+ 	case SRB_CTRL_VP:
+-		sp->done(sp, QLA_FUNCTION_TIMEOUT);
++		rc = qla24xx_async_abort_cmd(sp, false);
++		if (rc) {
++			spin_lock_irqsave(sp->qpair->qp_lock_ptr, flags);
++			for (h = 1; h < sp->qpair->req->num_outstanding_cmds;
++			    h++) {
++				if (sp->qpair->req->outstanding_cmds[h] ==
++				    sp) {
++					sp->qpair->req->outstanding_cmds[h] =
++					    NULL;
++					break;
++				}
++			}
++			spin_unlock_irqrestore(sp->qpair->qp_lock_ptr, flags);
++			sp->done(sp, QLA_FUNCTION_TIMEOUT);
++		}
+ 		break;
+ 	}
+ }
+@@ -1597,7 +1627,7 @@ qla24xx_abort_iocb_timeout(void *data)
+ 	struct srb_iocb *abt = &sp->u.iocb_cmd;
+ 
+ 	abt->u.abt.comp_status = CS_TIMEOUT;
+-	complete(&abt->u.abt.comp);
++	sp->done(sp, QLA_FUNCTION_TIMEOUT);
+ }
+ 
+ static void
+@@ -1606,12 +1636,16 @@ qla24xx_abort_sp_done(void *ptr, int res)
+ 	srb_t *sp = ptr;
+ 	struct srb_iocb *abt = &sp->u.iocb_cmd;
+ 
+-	if (del_timer(&sp->u.iocb_cmd.timer))
+-		complete(&abt->u.abt.comp);
++	if (del_timer(&sp->u.iocb_cmd.timer)) {
++		if (sp->flags & SRB_WAKEUP_ON_COMP)
++			complete(&abt->u.abt.comp);
++		else
++			sp->free(sp);
++	}
+ }
+ 
+ int
+-qla24xx_async_abort_cmd(srb_t *cmd_sp)
++qla24xx_async_abort_cmd(srb_t *cmd_sp, bool wait)
+ {
+ 	scsi_qla_host_t *vha = cmd_sp->vha;
+ 	fc_port_t *fcport = cmd_sp->fcport;
+@@ -1626,6 +1660,8 @@ qla24xx_async_abort_cmd(srb_t *cmd_sp)
+ 	abt_iocb = &sp->u.iocb_cmd;
+ 	sp->type = SRB_ABT_CMD;
+ 	sp->name = "abort";
++	if (wait)
++		sp->flags = SRB_WAKEUP_ON_COMP;
+ 
+ 	abt_iocb->timeout = qla24xx_abort_iocb_timeout;
+ 	init_completion(&abt_iocb->u.abt.comp);
+@@ -1649,10 +1685,11 @@ qla24xx_async_abort_cmd(srb_t *cmd_sp)
+ 	    "Abort command issued - hdl=%x, target_id=%x\n",
+ 	    cmd_sp->handle, fcport->tgt_id);
+ 
+-	wait_for_completion(&abt_iocb->u.abt.comp);
+-
+-	rval = abt_iocb->u.abt.comp_status == CS_COMPLETE ?
+-	    QLA_SUCCESS : QLA_FUNCTION_FAILED;
++	if (wait) {
++		wait_for_completion(&abt_iocb->u.abt.comp);
++		rval = abt_iocb->u.abt.comp_status == CS_COMPLETE ?
++			QLA_SUCCESS : QLA_FUNCTION_FAILED;
++	}
+ 
+ done_free_sp:
+ 	sp->free(sp);
+@@ -1688,7 +1725,7 @@ qla24xx_async_abort_command(srb_t *sp)
+ 		return qlafx00_fx_disc(vha, &vha->hw->mr.fcport,
+ 		    FXDISC_ABORT_IOCTL);
+ 
+-	return qla24xx_async_abort_cmd(sp);
++	return qla24xx_async_abort_cmd(sp, true);
+ }
+ 
+ static void
+-- 
+2.12.3
+
