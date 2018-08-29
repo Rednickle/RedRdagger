@@ -1,0 +1,476 @@
+From e7638488434415aa478e78435cac8f0365737638 Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Wed, 16 May 2018 11:46:08 -0700
+Subject: [PATCH] mm: introduce MEMORY_DEVICE_FS_DAX and CONFIG_DEV_PAGEMAP_OPS
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: e7638488434415aa478e78435cac8f0365737638
+Patch-mainline: v4.18-rc1
+References: bsc#1104888
+
+In preparation for fixing dax-dma-vs-unmap issues, filesystems need to
+be able to rely on the fact that they will get wakeups on dev_pagemap
+page-idle events. Introduce MEMORY_DEVICE_FS_DAX and
+generic_dax_page_free() as common indicator / infrastructure for dax
+filesytems to require. With this change there are no users of the
+MEMORY_DEVICE_HOST designation, so remove it.
+
+The HMM sub-system extended dev_pagemap to arrange a callback when a
+dev_pagemap managed page is freed. Since a dev_pagemap page is free /
+idle when its reference count is 1 it requires an additional branch to
+check the page-type at put_page() time. Given put_page() is a hot-path
+we do not want to incur that check if HMM is not in use, so a static
+branch is used to avoid that overhead when not necessary.
+
+Now, the FS_DAX implementation wants to reuse this mechanism for
+receiving dev_pagemap ->page_free() callbacks. Rework the HMM-specific
+static-key into a generic mechanism that either HMM or FS_DAX code paths
+can enable.
+
+For ARCH=um builds, and any other arch that lacks ZONE_DEVICE support,
+care must be taken to compile out the DEV_PAGEMAP_OPS infrastructure.
+However, we still need to support FS_DAX in the FS_DAX_LIMITED case
+implemented by the s390/dcssblk driver.
+
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Reported-by: kbuild test robot <lkp@intel.com>
+Reported-by: Thomas Meyer <thomas@m3y3r.de>
+Reported-by: Dave Jiang <dave.jiang@intel.com>
+Cc: "Jérôme Glisse" <jglisse@redhat.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ drivers/dax/super.c       |   14 +++++++--
+ drivers/nvdimm/pfn_devs.c |    2 -
+ drivers/nvdimm/pmem.c     |   25 ++++++++++++++++
+ fs/Kconfig                |    1 
+ include/linux/memremap.h  |   36 ++++++-----------------
+ include/linux/mm.h        |   71 ++++++++++++++++++++++++++++++++++------------
+ kernel/memremap.c         |   32 ++++++++++++++++++--
+ mm/Kconfig                |    5 +++
+ mm/hmm.c                  |   13 +-------
+ mm/swap.c                 |    3 +
+ 10 files changed, 137 insertions(+), 65 deletions(-)
+
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@ -85,6 +85,7 @@ EXPORT_SYMBOL_GPL(fs_dax_get_by_bdev);
+ bool __bdev_dax_supported(struct block_device *bdev, int blocksize)
+ {
+ 	struct dax_device *dax_dev;
++	bool dax_enabled = false;
+ 	pgoff_t pgoff;
+ 	int err, id;
+ 	void *kaddr;
+@@ -134,14 +135,21 @@ bool __bdev_dax_supported(struct block_d
+ 		 * on being able to do (page_address(pfn_to_page())).
+ 		 */
+ 		WARN_ON(IS_ENABLED(CONFIG_ARCH_HAS_PMEM_API));
++		dax_enabled = true;
+ 	} else if (pfn_t_devmap(pfn)) {
+-		/* pass */;
+-	} else {
++		struct dev_pagemap *pgmap;
++
++		pgmap = get_dev_pagemap(pfn_t_to_pfn(pfn), NULL);
++		if (pgmap && pgmap->type == MEMORY_DEVICE_FS_DAX)
++			dax_enabled = true;
++		put_dev_pagemap(pgmap);
++	}
++
++	if (!dax_enabled) {
+ 		pr_debug("%s: error: dax support not enabled\n",
+ 				bdevname(bdev, buf));
+ 		return false;
+ 	}
+-
+ 	return true;
+ }
+ EXPORT_SYMBOL_GPL(__bdev_dax_supported);
+--- a/drivers/nvdimm/pfn_devs.c
++++ b/drivers/nvdimm/pfn_devs.c
+@@ -550,8 +550,6 @@ static int __nvdimm_setup_pfn(struct nd_
+ 	res->start += start_pad;
+ 	res->end -= end_trunc;
+ 
+-	pgmap->type = MEMORY_DEVICE_HOST;
+-
+ 	if (nd_pfn->mode == PFN_MODE_RAM) {
+ 		if (offset < SZ_8K)
+ 			return -EINVAL;
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -275,6 +275,27 @@ static void pmem_release_disk(void *__pm
+ 	put_disk(pmem->disk);
+ }
+ 
++static void pmem_release_pgmap_ops(void *__pgmap)
++{
++	dev_pagemap_put_ops();
++}
++
++static void fsdax_pagefree(struct page *page, void *data)
++{
++	wake_up_var(&page->_refcount);
++}
++
++static int setup_pagemap_fsdax(struct device *dev, struct dev_pagemap *pgmap)
++{
++	dev_pagemap_get_ops();
++	if (devm_add_action_or_reset(dev, pmem_release_pgmap_ops, pgmap))
++		return -ENOMEM;
++	pgmap->type = MEMORY_DEVICE_FS_DAX;
++	pgmap->page_free = fsdax_pagefree;
++
++	return 0;
++}
++
+ static int pmem_attach_disk(struct device *dev,
+ 		struct nd_namespace_common *ndns)
+ {
+@@ -333,6 +354,8 @@ static int pmem_attach_disk(struct devic
+ 	pmem->pfn_flags = PFN_DEV;
+ 	pmem->pgmap.ref = &q->q_usage_counter;
+ 	if (is_nd_pfn(dev)) {
++		if (setup_pagemap_fsdax(dev, &pmem->pgmap))
++			return -ENOMEM;
+ 		addr = devm_memremap_pages(dev, &pmem->pgmap);
+ 		pfn_sb = nd_pfn->pfn_sb;
+ 		pmem->data_offset = le64_to_cpu(pfn_sb->dataoff);
+@@ -344,6 +367,8 @@ static int pmem_attach_disk(struct devic
+ 	} else if (pmem_should_map_pages(dev)) {
+ 		memcpy(&pmem->pgmap.res, &nsio->res, sizeof(pmem->pgmap.res));
+ 		pmem->pgmap.altmap_valid = false;
++		if (setup_pagemap_fsdax(dev, &pmem->pgmap))
++			return -ENOMEM;
+ 		addr = devm_memremap_pages(dev, &pmem->pgmap);
+ 		pmem->pfn_flags |= PFN_MAP;
+ 		memcpy(&bb_res, &pmem->pgmap.res, sizeof(bb_res));
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -38,6 +38,7 @@ config FS_DAX
+ 	bool "Direct Access (DAX) support"
+ 	depends on MMU
+ 	depends on !(ARM || MIPS || SPARC)
++	select DEV_PAGEMAP_OPS if (ZONE_DEVICE && !FS_DAX_LIMITED)
+ 	select FS_IOMAP
+ 	select DAX
+ 	help
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@ -1,6 +1,5 @@
+ #ifndef _LINUX_MEMREMAP_H_
+ #define _LINUX_MEMREMAP_H_
+-#include <linux/mm.h>
+ #include <linux/ioport.h>
+ #include <linux/percpu-refcount.h>
+ 
+@@ -29,13 +28,6 @@ struct vmem_altmap {
+  * Specialize ZONE_DEVICE memory into multiple types each having differents
+  * usage.
+  *
+- * MEMORY_DEVICE_HOST:
+- * Persistent device memory (pmem): struct page might be allocated in different
+- * memory and architecture might want to perform special actions. It is similar
+- * to regular memory, in that the CPU can access it transparently. However,
+- * it is likely to have different bandwidth and latency than regular memory.
+- * See Documentation/nvdimm/nvdimm.txt for more information.
+- *
+  * MEMORY_DEVICE_PRIVATE:
+  * Device memory that is not directly addressable by the CPU: CPU can neither
+  * read nor write private memory. In this case, we do still have struct pages
+@@ -52,11 +44,19 @@ struct vmem_altmap {
+  * driver can hotplug the device memory using ZONE_DEVICE and with that memory
+  * type. Any page of a process can be migrated to such memory. However no one
+  * should be allow to pin such memory so that it can always be evicted.
++ *
++ * MEMORY_DEVICE_FS_DAX:
++ * Host memory that has similar access semantics as System RAM i.e. DMA
++ * coherent and supports page pinning. In support of coordinating page
++ * pinning vs other operations MEMORY_DEVICE_FS_DAX arranges for a
++ * wakeup event whenever a page is unpinned and becomes idle. This
++ * wakeup is used to coordinate physical address space management (ex:
++ * fs truncate/hole punch) vs pinned pages (ex: device dma).
+  */
+ enum memory_type {
+-	MEMORY_DEVICE_HOST = 0,
+-	MEMORY_DEVICE_PRIVATE,
++	MEMORY_DEVICE_PRIVATE = 1,
+ 	MEMORY_DEVICE_PUBLIC,
++	MEMORY_DEVICE_FS_DAX,
+ };
+ 
+ /*
+@@ -128,8 +128,6 @@ struct dev_pagemap *get_dev_pagemap(unsi
+ 
+ unsigned long vmem_altmap_offset(struct vmem_altmap *altmap);
+ void vmem_altmap_free(struct vmem_altmap *altmap, unsigned long nr_pfns);
+-
+-static inline bool is_zone_device_page(const struct page *page);
+ #else
+ static inline void *devm_memremap_pages(struct device *dev,
+ 		struct dev_pagemap *pgmap)
+@@ -160,20 +158,6 @@ static inline void vmem_altmap_free(stru
+ }
+ #endif /* CONFIG_ZONE_DEVICE */
+ 
+-#if defined(CONFIG_DEVICE_PRIVATE) || defined(CONFIG_DEVICE_PUBLIC)
+-static inline bool is_device_private_page(const struct page *page)
+-{
+-	return is_zone_device_page(page) &&
+-		page->pgmap->type == MEMORY_DEVICE_PRIVATE;
+-}
+-
+-static inline bool is_device_public_page(const struct page *page)
+-{
+-	return is_zone_device_page(page) &&
+-		page->pgmap->type == MEMORY_DEVICE_PUBLIC;
+-}
+-#endif /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
+-
+ static inline void put_dev_pagemap(struct dev_pagemap *pgmap)
+ {
+ 	if (pgmap)
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -809,27 +809,65 @@ static inline bool is_zone_device_page(c
+ }
+ #endif
+ 
+-#if defined(CONFIG_DEVICE_PRIVATE) || defined(CONFIG_DEVICE_PUBLIC)
+-void put_zone_device_private_or_public_page(struct page *page);
+-DECLARE_STATIC_KEY_FALSE(device_private_key);
+-#define IS_HMM_ENABLED static_branch_unlikely(&device_private_key)
+-static inline bool is_device_private_page(const struct page *page);
+-static inline bool is_device_public_page(const struct page *page);
+-#else /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
+-static inline void put_zone_device_private_or_public_page(struct page *page)
++#ifdef CONFIG_DEV_PAGEMAP_OPS
++void dev_pagemap_get_ops(void);
++void dev_pagemap_put_ops(void);
++void __put_devmap_managed_page(struct page *page);
++DECLARE_STATIC_KEY_FALSE(devmap_managed_key);
++static inline bool put_devmap_managed_page(struct page *page)
+ {
++	if (!static_branch_unlikely(&devmap_managed_key))
++		return false;
++	if (!is_zone_device_page(page))
++		return false;
++	switch (page->pgmap->type) {
++	case MEMORY_DEVICE_PRIVATE:
++	case MEMORY_DEVICE_PUBLIC:
++	case MEMORY_DEVICE_FS_DAX:
++		__put_devmap_managed_page(page);
++		return true;
++	default:
++		break;
++	}
++	return false;
+ }
+-#define IS_HMM_ENABLED 0
++
+ static inline bool is_device_private_page(const struct page *page)
+ {
+-	return false;
++	return is_zone_device_page(page) &&
++		page->pgmap->type == MEMORY_DEVICE_PRIVATE;
+ }
++
+ static inline bool is_device_public_page(const struct page *page)
+ {
++	return is_zone_device_page(page) &&
++		page->pgmap->type == MEMORY_DEVICE_PUBLIC;
++}
++
++#else /* CONFIG_DEV_PAGEMAP_OPS */
++static inline void dev_pagemap_get_ops(void)
++{
++}
++
++static inline void dev_pagemap_put_ops(void)
++{
++}
++
++static inline bool put_devmap_managed_page(struct page *page)
++{
++	return false;
++}
++
++static inline bool is_device_private_page(const struct page *page)
++{
+ 	return false;
+ }
+-#endif /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
+ 
++static inline bool is_device_public_page(const struct page *page)
++{
++	return false;
++}
++#endif /* CONFIG_DEV_PAGEMAP_OPS */
+ 
+ static inline void get_page(struct page *page)
+ {
+@@ -847,16 +885,13 @@ static inline void put_page(struct page
+ 	page = compound_head(page);
+ 
+ 	/*
+-	 * For private device pages we need to catch refcount transition from
+-	 * 2 to 1, when refcount reach one it means the private device page is
+-	 * free and we need to inform the device driver through callback. See
++	 * For devmap managed pages we need to catch refcount transition from
++	 * 2 to 1, when refcount reach one it means the page is free and we
++	 * need to inform the device driver through callback. See
+ 	 * include/linux/memremap.h and HMM for details.
+ 	 */
+-	if (IS_HMM_ENABLED && unlikely(is_device_private_page(page) ||
+-	    unlikely(is_device_public_page(page)))) {
+-		put_zone_device_private_or_public_page(page);
++	if (put_devmap_managed_page(page))
+ 		return;
+-	}
+ 
+ 	if (put_page_testzero(page))
+ 		__put_page(page);
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@ -19,6 +19,7 @@
+ #include <linux/memory_hotplug.h>
+ #include <linux/swap.h>
+ #include <linux/swapops.h>
++#include <linux/wait_bit.h>
+ 
+ #ifndef ioremap_cache
+ /* temporary while we convert existing ioremap_cache users to memremap */
+@@ -466,10 +467,33 @@ struct dev_pagemap *get_dev_pagemap(unsi
+ 
+ 	return pgmap;
+ }
++EXPORT_SYMBOL_GPL(get_dev_pagemap);
+ #endif /* CONFIG_ZONE_DEVICE */
+ 
+-#if IS_ENABLED(CONFIG_DEVICE_PRIVATE) ||  IS_ENABLED(CONFIG_DEVICE_PUBLIC)
+-void put_zone_device_private_or_public_page(struct page *page)
++#ifdef CONFIG_DEV_PAGEMAP_OPS
++DEFINE_STATIC_KEY_FALSE(devmap_managed_key);
++EXPORT_SYMBOL_GPL(devmap_managed_key);
++static atomic_t devmap_enable;
++
++/*
++ * Toggle the static key for ->page_free() callbacks when dev_pagemap
++ * pages go idle.
++ */
++void dev_pagemap_get_ops(void)
++{
++	if (atomic_inc_return(&devmap_enable) == 1)
++		static_branch_enable(&devmap_managed_key);
++}
++EXPORT_SYMBOL_GPL(dev_pagemap_get_ops);
++
++void dev_pagemap_put_ops(void)
++{
++	if (atomic_dec_and_test(&devmap_enable))
++		static_branch_disable(&devmap_managed_key);
++}
++EXPORT_SYMBOL_GPL(dev_pagemap_put_ops);
++
++void __put_devmap_managed_page(struct page *page)
+ {
+ 	int count = page_ref_dec_return(page);
+ 
+@@ -489,5 +513,5 @@ void put_zone_device_private_or_public_p
+ 	} else if (!count)
+ 		__put_page(page);
+ }
+-EXPORT_SYMBOL(put_zone_device_private_or_public_page);
+-#endif /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
++EXPORT_SYMBOL_GPL(__put_devmap_managed_page);
++#endif /* CONFIG_DEV_PAGEMAP_OPS */
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -713,6 +713,9 @@ config ARCH_HAS_HMM
+ config MIGRATE_VMA_HELPER
+ 	bool
+ 
++config DEV_PAGEMAP_OPS
++	bool
++
+ config HMM
+ 	bool
+ 	select MIGRATE_VMA_HELPER
+@@ -733,6 +736,7 @@ config DEVICE_PRIVATE
+ 	bool "Unaddressable device memory (GPU memory, ...)"
+ 	depends on ARCH_HAS_HMM
+ 	select HMM
++	select DEV_PAGEMAP_OPS
+ 
+ 	help
+ 	  Allows creation of struct pages to represent unaddressable device
+@@ -743,6 +747,7 @@ config DEVICE_PUBLIC
+ 	bool "Addressable device memory (like GPU memory)"
+ 	depends on ARCH_HAS_HMM
+ 	select HMM
++	select DEV_PAGEMAP_OPS
+ 
+ 	help
+ 	  Allows creation of struct pages to represent addressable device
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@ -35,15 +35,6 @@
+ 
+ #define PA_SECTION_SIZE (1UL << PA_SECTION_SHIFT)
+ 
+-#if defined(CONFIG_DEVICE_PRIVATE) || defined(CONFIG_DEVICE_PUBLIC)
+-/*
+- * Device private memory see HMM (Documentation/vm/hmm.txt) or hmm.h
+- */
+-DEFINE_STATIC_KEY_FALSE(device_private_key);
+-EXPORT_SYMBOL(device_private_key);
+-#endif /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
+-
+-
+ #if IS_ENABLED(CONFIG_HMM_MIRROR)
+ static const struct mmu_notifier_ops hmm_mmu_notifier_ops;
+ 
+@@ -999,7 +990,7 @@ struct hmm_devmem *hmm_devmem_add(const
+ 	resource_size_t addr;
+ 	int ret;
+ 
+-	static_branch_enable(&device_private_key);
++	dev_pagemap_get_ops();
+ 
+ 	devmem = devres_alloc_node(&hmm_devmem_release, sizeof(*devmem),
+ 				   GFP_KERNEL, dev_to_node(device));
+@@ -1093,7 +1084,7 @@ struct hmm_devmem *hmm_devmem_add_resour
+ 	if (res->desc != IORES_DESC_DEVICE_PUBLIC_MEMORY)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	static_branch_enable(&device_private_key);
++	dev_pagemap_get_ops();
+ 
+ 	devmem = devres_alloc_node(&hmm_devmem_release, sizeof(*devmem),
+ 				   GFP_KERNEL, dev_to_node(device));
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -29,6 +29,7 @@
+ #include <linux/cpu.h>
+ #include <linux/notifier.h>
+ #include <linux/backing-dev.h>
++#include <linux/memremap.h>
+ #include <linux/memcontrol.h>
+ #include <linux/gfp.h>
+ #include <linux/uio.h>
+@@ -766,7 +767,7 @@ void release_pages(struct page **pages,
+ 						       flags);
+ 				locked_pgdat = NULL;
+ 			}
+-			put_zone_device_private_or_public_page(page);
++			put_devmap_managed_page(page);
+ 			continue;
+ 		}
+ 
