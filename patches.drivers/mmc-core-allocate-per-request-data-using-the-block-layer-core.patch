@@ -1,0 +1,546 @@
+From: Linus Walleij <linus.walleij@linaro.org>
+Date: Thu, 18 May 2017 11:29:32 +0200
+Subject: mmc: core: Allocate per-request data using the block layer core
+Git-commit: 304419d8a7e9204c5d19b704467b814df8c8f5b1
+Patch-mainline: v4.13-rc1
+References: FATE#324519
+
+The mmc_queue_req is a per-request state container the MMC core uses
+to carry bounce buffers, pointers to asynchronous requests and so on.
+Currently allocated as a static array of objects, then as a request
+comes in, a mmc_queue_req is assigned to it, and used during the
+lifetime of the request.
+
+This is backwards compared to how other block layer drivers work:
+they usally let the block core provide a per-request struct that get
+allocated right beind the struct request, and which can be obtained
+using the blk_mq_rq_to_pdu() helper. (The _mq_ infix in this function
+name is misleading: it is used by both the old and the MQ block
+layer.)
+
+The per-request struct gets allocated to the size stored in the queue
+variable .cmd_size initialized using the .init_rq_fn() and
+cleaned up using .exit_rq_fn().
+
+The block layer code makes the MMC core rely on this mechanism to
+allocate the per-request mmc_queue_req state container.
+
+Doing this make a lot of complicated queue handling go away. We only
+need to keep the .qnct that keeps count of how many request are
+currently being processed by the MMC layer. The MQ block layer will
+replace also this once we transition to it.
+
+Doing this refactoring is necessary to move the ioctl() operations
+into custom block layer requests tagged with REQ_OP_DRV_[IN|OUT]
+instead of the custom code using the BigMMCHostLock that we have
+today: those require that per-request data be obtainable easily from
+a request after creating a custom request with e.g.:
+
+struct request *rq = blk_get_request(q, REQ_OP_DRV_IN, __GFP_RECLAIM);
+struct mmc_queue_req *mq_rq = req_to_mq_rq(rq);
+
+And this is not possible with the current construction, as the request
+is not immediately assigned the per-request state container, but
+instead it gets assigned when the request finally enters the MMC
+queue, which is way too late for custom requests.
+
+Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+[Ulf: Folded in the fix to drop a call to blk_cleanup_queue()]
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Tested-by: Heiner Kallweit <hkallweit1@gmail.com>
+Acked-by: Nicolas Saenz Julienne <nsaenzjulienne@suse.com>
+---
+ drivers/mmc/core/block.c |   38 +-------
+ drivers/mmc/core/queue.c |  220 ++++++++++++-----------------------------------
+ drivers/mmc/core/queue.h |   22 ++--
+ include/linux/mmc/card.h |    2 
+ 4 files changed, 78 insertions(+), 204 deletions(-)
+
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@ -129,13 +129,6 @@ static inline int mmc_blk_part_switch(st
+ 				      struct mmc_blk_data *md);
+ static int get_card_status(struct mmc_card *card, u32 *status, int retries);
+ 
+-static void mmc_blk_requeue(struct request_queue *q, struct request *req)
+-{
+-	spin_lock_irq(q->queue_lock);
+-	blk_requeue_request(q, req);
+-	spin_unlock_irq(q->queue_lock);
+-}
+-
+ static struct mmc_blk_data *mmc_blk_get(struct gendisk *disk)
+ {
+ 	struct mmc_blk_data *md;
+@@ -1647,7 +1640,7 @@ static void mmc_blk_rw_cmd_abort(struct
+ 	if (mmc_card_removed(card))
+ 		req->rq_flags |= RQF_QUIET;
+ 	while (blk_end_request(req, BLK_STS_IOERR, blk_rq_cur_bytes(req)));
+-	mmc_queue_req_free(mq, mqrq);
++	mq->qcnt--;
+ }
+ 
+ /**
+@@ -1667,7 +1660,7 @@ static void mmc_blk_rw_try_restart(struc
+ 	if (mmc_card_removed(mq->card)) {
+ 		req->rq_flags |= RQF_QUIET;
+ 		blk_end_request_all(req, BLK_STS_IOERR);
+-		mmc_queue_req_free(mq, mqrq);
++		mq->qcnt--; /* FIXME: just set to 0? */
+ 		return;
+ 	}
+ 	/* Else proceed and try to restart the current async request */
+@@ -1690,12 +1683,8 @@ static void mmc_blk_issue_rw_rq(struct m
+ 	bool req_pending = true;
+ 
+ 	if (new_req) {
+-		mqrq_cur = mmc_queue_req_find(mq, new_req);
+-		if (!mqrq_cur) {
+-			WARN_ON(1);
+-			mmc_blk_requeue(mq->queue, new_req);
+-			new_req = NULL;
+-		}
++		mqrq_cur = req_to_mmc_queue_req(new_req);
++		mq->qcnt++;
+ 	}
+ 
+ 	if (!mq->qcnt)
+@@ -1769,12 +1758,12 @@ static void mmc_blk_issue_rw_rq(struct m
+ 				if (req_pending)
+ 					mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
+ 				else
+-					mmc_queue_req_free(mq, mq_rq);
++					mq->qcnt--;
+ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
+ 				return;
+ 			}
+ 			if (!req_pending) {
+-				mmc_queue_req_free(mq, mq_rq);
++				mq->qcnt--;
+ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
+ 				return;
+ 			}
+@@ -1819,7 +1808,7 @@ static void mmc_blk_issue_rw_rq(struct m
+ 			req_pending = blk_end_request(old_req, BLK_STS_IOERR,
+ 						      brq->data.blksz);
+ 			if (!req_pending) {
+-				mmc_queue_req_free(mq, mq_rq);
++				mq->qcnt--;
+ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
+ 				return;
+ 			}
+@@ -1849,7 +1838,7 @@ static void mmc_blk_issue_rw_rq(struct m
+ 		}
+ 	} while (req_pending);
+ 
+-	mmc_queue_req_free(mq, mq_rq);
++	mq->qcnt--;
+ }
+ 
+ void mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+@@ -2171,7 +2160,6 @@ static int mmc_blk_probe(struct mmc_card
+ {
+ 	struct mmc_blk_data *md, *part_md;
+ 	char cap_str[10];
+-	int ret;
+ 
+ 	/*
+ 	 * Check that the card supports the command class(es) we need.
+@@ -2181,15 +2169,9 @@ static int mmc_blk_probe(struct mmc_card
+ 
+ 	mmc_fixup_device(card, mmc_blk_fixups);
+ 
+-	ret = mmc_queue_alloc_shared_queue(card);
+-	if (ret)
+-		return ret;
+-
+ 	md = mmc_blk_alloc(card);
+-	if (IS_ERR(md)) {
+-		mmc_queue_free_shared_queue(card);
++	if (IS_ERR(md))
+ 		return PTR_ERR(md);
+-	}
+ 
+ 	string_get_size((u64)get_capacity(md->disk), 512, STRING_UNITS_2,
+ 			cap_str, sizeof(cap_str));
+@@ -2227,7 +2209,6 @@ static int mmc_blk_probe(struct mmc_card
+  out:
+ 	mmc_blk_remove_parts(card, md);
+ 	mmc_blk_remove_req(md);
+-	mmc_queue_free_shared_queue(card);
+ 	return 0;
+ }
+ 
+@@ -2245,7 +2226,6 @@ static void mmc_blk_remove(struct mmc_ca
+ 	pm_runtime_put_noidle(&card->dev);
+ 	mmc_blk_remove_req(md);
+ 	dev_set_drvdata(&card->dev, NULL);
+-	mmc_queue_free_shared_queue(card);
+ }
+ 
+ static int _mmc_blk_suspend(struct mmc_card *card)
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@ -40,35 +40,6 @@ static int mmc_prep_request(struct reque
+ 	return BLKPREP_OK;
+ }
+ 
+-struct mmc_queue_req *mmc_queue_req_find(struct mmc_queue *mq,
+-					 struct request *req)
+-{
+-	struct mmc_queue_req *mqrq;
+-	int i = ffz(mq->qslots);
+-
+-	if (i >= mq->qdepth)
+-		return NULL;
+-
+-	mqrq = &mq->mqrq[i];
+-	WARN_ON(mqrq->req || mq->qcnt >= mq->qdepth ||
+-		test_bit(mqrq->task_id, &mq->qslots));
+-	mqrq->req = req;
+-	mq->qcnt += 1;
+-	__set_bit(mqrq->task_id, &mq->qslots);
+-
+-	return mqrq;
+-}
+-
+-void mmc_queue_req_free(struct mmc_queue *mq,
+-			struct mmc_queue_req *mqrq)
+-{
+-	WARN_ON(!mqrq->req || mq->qcnt < 1 ||
+-		!test_bit(mqrq->task_id, &mq->qslots));
+-	mqrq->req = NULL;
+-	mq->qcnt -= 1;
+-	__clear_bit(mqrq->task_id, &mq->qslots);
+-}
+-
+ static int mmc_queue_thread(void *d)
+ {
+ 	struct mmc_queue *mq = d;
+@@ -149,11 +120,11 @@ static void mmc_request_fn(struct reques
+ 		wake_up_process(mq->thread);
+ }
+ 
+-static struct scatterlist *mmc_alloc_sg(int sg_len)
++static struct scatterlist *mmc_alloc_sg(int sg_len, gfp_t gfp)
+ {
+ 	struct scatterlist *sg;
+ 
+-	sg = kmalloc_array(sg_len, sizeof(*sg), GFP_KERNEL);
++	sg = kmalloc_array(sg_len, sizeof(*sg), gfp);
+ 	if (sg)
+ 		sg_init_table(sg, sg_len);
+ 
+@@ -179,80 +150,6 @@ static void mmc_queue_setup_discard(stru
+ 		queue_flag_set_unlocked(QUEUE_FLAG_SECERASE, q);
+ }
+ 
+-static void mmc_queue_req_free_bufs(struct mmc_queue_req *mqrq)
+-{
+-	kfree(mqrq->bounce_sg);
+-	mqrq->bounce_sg = NULL;
+-
+-	kfree(mqrq->sg);
+-	mqrq->sg = NULL;
+-
+-	kfree(mqrq->bounce_buf);
+-	mqrq->bounce_buf = NULL;
+-}
+-
+-static void mmc_queue_reqs_free_bufs(struct mmc_queue_req *mqrq, int qdepth)
+-{
+-	int i;
+-
+-	for (i = 0; i < qdepth; i++)
+-		mmc_queue_req_free_bufs(&mqrq[i]);
+-}
+-
+-static void mmc_queue_free_mqrqs(struct mmc_queue_req *mqrq, int qdepth)
+-{
+-	mmc_queue_reqs_free_bufs(mqrq, qdepth);
+-	kfree(mqrq);
+-}
+-
+-static struct mmc_queue_req *mmc_queue_alloc_mqrqs(int qdepth)
+-{
+-	struct mmc_queue_req *mqrq;
+-	int i;
+-
+-	mqrq = kcalloc(qdepth, sizeof(*mqrq), GFP_KERNEL);
+-	if (mqrq) {
+-		for (i = 0; i < qdepth; i++)
+-			mqrq[i].task_id = i;
+-	}
+-
+-	return mqrq;
+-}
+-
+-static int mmc_queue_alloc_bounce_bufs(struct mmc_queue_req *mqrq, int qdepth,
+-				       unsigned int bouncesz)
+-{
+-	int i;
+-
+-	for (i = 0; i < qdepth; i++) {
+-		mqrq[i].bounce_buf = kmalloc(bouncesz, GFP_KERNEL);
+-		if (!mqrq[i].bounce_buf)
+-			return -ENOMEM;
+-
+-		mqrq[i].sg = mmc_alloc_sg(1);
+-		if (!mqrq[i].sg)
+-			return -ENOMEM;
+-
+-		mqrq[i].bounce_sg = mmc_alloc_sg(bouncesz / 512);
+-		if (!mqrq[i].bounce_sg)
+-			return -ENOMEM;
+-	}
+-
+-	return 0;
+-}
+-
+-static bool mmc_queue_alloc_bounce(struct mmc_queue_req *mqrq, int qdepth,
+-				   unsigned int bouncesz)
+-{
+-	int ret;
+-
+-	ret = mmc_queue_alloc_bounce_bufs(mqrq, qdepth, bouncesz);
+-	if (ret)
+-		mmc_queue_reqs_free_bufs(mqrq, qdepth);
+-
+-	return !ret;
+-}
+-
+ static unsigned int mmc_queue_calc_bouncesz(struct mmc_host *host)
+ {
+ 	unsigned int bouncesz = MMC_QUEUE_BOUNCESZ;
+@@ -273,71 +170,61 @@ static unsigned int mmc_queue_calc_bounc
+ 	return bouncesz;
+ }
+ 
+-static int mmc_queue_alloc_sgs(struct mmc_queue_req *mqrq, int qdepth,
+-			       int max_segs)
++/**
++ * mmc_init_request() - initialize the MMC-specific per-request data
++ * @q: the request queue
++ * @req: the request
++ * @gfp: memory allocation policy
++ */
++static int mmc_init_request(struct request_queue *q, struct request *req,
++			    gfp_t gfp)
+ {
+-	int i;
++	struct mmc_queue_req *mq_rq = req_to_mmc_queue_req(req);
++	struct mmc_queue *mq = q->queuedata;
++	struct mmc_card *card = mq->card;
++	struct mmc_host *host = card->host;
++
++	mq_rq->req = req;
+ 
+-	for (i = 0; i < qdepth; i++) {
+-		mqrq[i].sg = mmc_alloc_sg(max_segs);
+-		if (!mqrq[i].sg)
++	if (card->bouncesz) {
++		mq_rq->bounce_buf = kmalloc(card->bouncesz, gfp);
++		if (!mq_rq->bounce_buf)
++			return -ENOMEM;
++		if (card->bouncesz > 512) {
++			mq_rq->sg = mmc_alloc_sg(1, gfp);
++			if (!mq_rq->sg)
++				return -ENOMEM;
++			mq_rq->bounce_sg = mmc_alloc_sg(card->bouncesz / 512,
++							gfp);
++			if (!mq_rq->bounce_sg)
++				return -ENOMEM;
++		}
++	} else {
++		mq_rq->bounce_buf = NULL;
++		mq_rq->bounce_sg = NULL;
++		mq_rq->sg = mmc_alloc_sg(host->max_segs, gfp);
++		if (!mq_rq->sg)
+ 			return -ENOMEM;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-void mmc_queue_free_shared_queue(struct mmc_card *card)
+-{
+-	if (card->mqrq) {
+-		mmc_queue_free_mqrqs(card->mqrq, card->qdepth);
+-		card->mqrq = NULL;
+-	}
+-}
+-
+-static int __mmc_queue_alloc_shared_queue(struct mmc_card *card, int qdepth)
++static void mmc_exit_request(struct request_queue *q, struct request *req)
+ {
+-	struct mmc_host *host = card->host;
+-	struct mmc_queue_req *mqrq;
+-	unsigned int bouncesz;
+-	int ret = 0;
+-
+-	if (card->mqrq)
+-		return -EINVAL;
+-
+-	mqrq = mmc_queue_alloc_mqrqs(qdepth);
+-	if (!mqrq)
+-		return -ENOMEM;
+-
+-	card->mqrq = mqrq;
+-	card->qdepth = qdepth;
+-
+-	bouncesz = mmc_queue_calc_bouncesz(host);
+-
+-	if (bouncesz && !mmc_queue_alloc_bounce(mqrq, qdepth, bouncesz)) {
+-		bouncesz = 0;
+-		pr_warn("%s: unable to allocate bounce buffers\n",
+-			mmc_card_name(card));
+-	}
++	struct mmc_queue_req *mq_rq = req_to_mmc_queue_req(req);
+ 
+-	card->bouncesz = bouncesz;
++	/* It is OK to kfree(NULL) so this will be smooth */
++	kfree(mq_rq->bounce_sg);
++	mq_rq->bounce_sg = NULL;
+ 
+-	if (!bouncesz) {
+-		ret = mmc_queue_alloc_sgs(mqrq, qdepth, host->max_segs);
+-		if (ret)
+-			goto out_err;
+-	}
++	kfree(mq_rq->bounce_buf);
++	mq_rq->bounce_buf = NULL;
+ 
+-	return ret;
++	kfree(mq_rq->sg);
++	mq_rq->sg = NULL;
+ 
+-out_err:
+-	mmc_queue_free_shared_queue(card);
+-	return ret;
+-}
+-
+-int mmc_queue_alloc_shared_queue(struct mmc_card *card)
+-{
+-	return __mmc_queue_alloc_shared_queue(card, 2);
++	mq_rq->req = NULL;
+ }
+ 
+ /**
+@@ -360,13 +247,21 @@ int mmc_init_queue(struct mmc_queue *mq,
+ 		limit = (u64)dma_max_pfn(mmc_dev(host)) << PAGE_SHIFT;
+ 
+ 	mq->card = card;
+-	mq->queue = blk_init_queue(mmc_request_fn, lock);
++	mq->queue = blk_alloc_queue(GFP_KERNEL);
+ 	if (!mq->queue)
+ 		return -ENOMEM;
+-
+-	mq->mqrq = card->mqrq;
+-	mq->qdepth = card->qdepth;
++	mq->queue->queue_lock = lock;
++	mq->queue->request_fn = mmc_request_fn;
++	mq->queue->init_rq_fn = mmc_init_request;
++	mq->queue->exit_rq_fn = mmc_exit_request;
++	mq->queue->cmd_size = sizeof(struct mmc_queue_req);
+ 	mq->queue->queuedata = mq;
++	mq->qcnt = 0;
++	ret = blk_init_allocated_queue(mq->queue);
++	if (ret) {
++		blk_cleanup_queue(mq->queue);
++		return ret;
++	}
+ 
+ 	blk_queue_prep_rq(mq->queue, mmc_prep_request);
+ 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, mq->queue);
+@@ -374,6 +269,7 @@ int mmc_init_queue(struct mmc_queue *mq,
+ 	if (mmc_can_erase(card))
+ 		mmc_queue_setup_discard(mq->queue, card);
+ 
++	card->bouncesz = mmc_queue_calc_bouncesz(host);
+ 	if (card->bouncesz) {
+ 		blk_queue_bounce_limit(mq->queue, BLK_BOUNCE_ANY);
+ 		blk_queue_max_hw_sectors(mq->queue, card->bouncesz / 512);
+@@ -400,7 +296,6 @@ int mmc_init_queue(struct mmc_queue *mq,
+ 	return 0;
+ 
+ cleanup_queue:
+-	mq->mqrq = NULL;
+ 	blk_cleanup_queue(mq->queue);
+ 	return ret;
+ }
+@@ -422,7 +317,6 @@ void mmc_cleanup_queue(struct mmc_queue
+ 	blk_start_queue(q);
+ 	spin_unlock_irqrestore(q->queue_lock, flags);
+ 
+-	mq->mqrq = NULL;
+ 	mq->card = NULL;
+ }
+ EXPORT_SYMBOL(mmc_cleanup_queue);
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@ -3,9 +3,15 @@
+ 
+ #include <linux/types.h>
+ #include <linux/blkdev.h>
++#include <linux/blk-mq.h>
+ #include <linux/mmc/core.h>
+ #include <linux/mmc/host.h>
+ 
++static inline struct mmc_queue_req *req_to_mmc_queue_req(struct request *rq)
++{
++	return blk_mq_rq_to_pdu(rq);
++}
++
+ static inline bool mmc_req_is_special(struct request *req)
+ {
+ 	return req &&
+@@ -34,7 +40,6 @@ struct mmc_queue_req {
+ 	struct scatterlist	*bounce_sg;
+ 	unsigned int		bounce_sg_len;
+ 	struct mmc_async_req	areq;
+-	int			task_id;
+ };
+ 
+ struct mmc_queue {
+@@ -45,14 +50,15 @@ struct mmc_queue {
+ 	bool			asleep;
+ 	struct mmc_blk_data	*blkdata;
+ 	struct request_queue	*queue;
+-	struct mmc_queue_req	*mqrq;
+-	int			qdepth;
++	/*
++	 * FIXME: this counter is not a very reliable way of keeping
++	 * track of how many requests that are ongoing. Switch to just
++	 * letting the block core keep track of requests and per-request
++	 * associated mmc_queue_req data.
++	 */
+ 	int			qcnt;
+-	unsigned long		qslots;
+ };
+ 
+-extern int mmc_queue_alloc_shared_queue(struct mmc_card *card);
+-extern void mmc_queue_free_shared_queue(struct mmc_card *card);
+ extern int mmc_init_queue(struct mmc_queue *, struct mmc_card *, spinlock_t *,
+ 			  const char *);
+ extern void mmc_cleanup_queue(struct mmc_queue *);
+@@ -66,8 +72,4 @@ extern void mmc_queue_bounce_post(struct
+ 
+ extern int mmc_access_rpmb(struct mmc_queue *);
+ 
+-extern struct mmc_queue_req *mmc_queue_req_find(struct mmc_queue *,
+-						struct request *);
+-extern void mmc_queue_req_free(struct mmc_queue *, struct mmc_queue_req *);
+-
+ #endif
+--- a/include/linux/mmc/card.h
++++ b/include/linux/mmc/card.h
+@@ -305,9 +305,7 @@ struct mmc_card {
+ 	struct mmc_part	part[MMC_NUM_PHY_PARTITION]; /* physical partitions */
+ 	unsigned int    nr_parts;
+ 
+-	struct mmc_queue_req	*mqrq;		/* Shared queue structure */
+ 	unsigned int		bouncesz;	/* Bounce buffer size */
+-	int			qdepth;		/* Shared queue depth */
+ };
+ 
+ static inline bool mmc_large_sector(struct mmc_card *card)
