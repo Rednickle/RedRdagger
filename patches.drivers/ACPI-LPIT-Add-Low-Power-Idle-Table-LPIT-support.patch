@@ -1,0 +1,398 @@
+From eeb2d80d502af28e5660ff4bbe00f90ceb82c2db Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Thu, 5 Oct 2017 16:24:03 -0700
+Subject: [PATCH] ACPI / LPIT: Add Low Power Idle Table (LPIT) support
+Git-commit: eeb2d80d502af28e5660ff4bbe00f90ceb82c2db
+Patch-mainline: v4.15-rc1
+References: FATE#326281
+
+Add functionality to read LPIT table, which provides:
+
+ - Sysfs interface to read residency counters via
+   /sys/devices/system/cpu/cpuidle/low_power_idle_cpu_residency_us
+   /sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us
+
+Here the count "low_power_idle_cpu_residency_us" shows the time spent
+by CPU package in low power state.  This is read via MSR interface,
+which points to MSR for PKG C10.
+
+Here the count "low_power_idle_system_residency_us" show the count the
+system was in low power state. This is read via MMIO interface. This
+is mapped to SLP_S0 residency on modern Intel systems. This residency
+is achieved only when CPU is in PKG C10 and all functional blocks are
+in low power state.
+
+It is possible that none of the above counters present or anyone of the
+counter present or all counters present.
+
+For example: On my Kabylake system both of the above counters present.
+After suspend to idle these counts updated and prints:
+
+ 6916179
+ 6998564
+
+This counter can be read by tools like turbostat to display. Or it can
+be used to debug, if modern systems are reaching desired low power state.
+
+ - Provides an interface to read residency counter memory address
+
+   This address can be used to get the base address of PMC memory
+   mapped IO.  This is utilized by intel_pmc_core driver to print
+   more debug information.
+
+In addition, to avoid code duplication to read iomem, removed the read of
+iomem from acpi_os_read_memory() in osl.c and made a common function
+acpi_os_read_iomem(). This new function is used for reading iomem in
+in both osl.c and acpi_lpit.c.
+
+Link: http://www.uefi.org/sites/default/files/resources/Intel_ACPI_Low_Power_S0_Idle.pdf
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ Documentation/acpi/lpit.txt |   25 ++++++
+ drivers/acpi/Kconfig        |    5 +
+ drivers/acpi/Makefile       |    1 
+ drivers/acpi/acpi_lpit.c    |  162 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/acpi/internal.h     |    6 +
+ drivers/acpi/osl.c          |   42 +++++++----
+ drivers/acpi/scan.c         |    1 
+ include/acpi/acpiosxf.h     |    2 
+ include/linux/acpi.h        |    9 ++
+ 9 files changed, 237 insertions(+), 16 deletions(-)
+ create mode 100644 Documentation/acpi/lpit.txt
+ create mode 100644 drivers/acpi/acpi_lpit.c
+
+--- /dev/null
++++ b/Documentation/acpi/lpit.txt
+@@ -0,0 +1,25 @@
++To enumerate platform Low Power Idle states, Intel platforms are using
++“Low Power Idle Table” (LPIT). More details about this table can be
++downloaded from:
++http://www.uefi.org/sites/default/files/resources/Intel_ACPI_Low_Power_S0_Idle.pdf
++
++Residencies for each low power state can be read via FFH
++(Function fixed hardware) or a memory mapped interface.
++
++On platforms supporting S0ix sleep states, there can be two types of
++residencies:
++- CPU PKG C10 (Read via FFH interface)
++- Platform Controller Hub (PCH) SLP_S0 (Read via memory mapped interface)
++
++The following attributes are added dynamically to the cpuidle
++sysfs attribute group:
++	/sys/devices/system/cpu/cpuidle/low_power_idle_cpu_residency_us
++	/sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us
++
++The "low_power_idle_cpu_residency_us" attribute shows time spent
++by the CPU package in PKG C10
++
++The "low_power_idle_system_residency_us" attribute shows SLP_S0
++residency, or system time spent with the SLP_S0# signal asserted.
++This is the lowest possible system power state, achieved only when CPU is in
++PKG C10 and all functional blocks in PCH are in a low power state.
+--- a/drivers/acpi/Kconfig
++++ b/drivers/acpi/Kconfig
+@@ -80,6 +80,11 @@ endif
+ config ACPI_SPCR_TABLE
+ 	bool
+ 
++config ACPI_LPIT
++	bool
++	depends on X86_64
++	default y
++
+ config ACPI_SLEEP
+ 	bool
+ 	depends on SUSPEND || HIBERNATION
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -55,6 +55,7 @@ acpi-$(CONFIG_DEBUG_FS)		+= debugfs.o
+ acpi-$(CONFIG_ACPI_NUMA)	+= numa.o
+ acpi-$(CONFIG_ACPI_PROCFS_POWER) += cm_sbs.o
+ acpi-y				+= acpi_lpat.o
++acpi-$(CONFIG_ACPI_LPIT)	+= acpi_lpit.o
+ acpi-$(CONFIG_ACPI_GENERIC_GSI) += irq.o
+ acpi-$(CONFIG_ACPI_WATCHDOG)	+= acpi_watchdog.o
+ 
+--- /dev/null
++++ b/drivers/acpi/acpi_lpit.c
+@@ -0,0 +1,162 @@
++
++/*
++ * acpi_lpit.c - LPIT table processing functions
++ *
++ * Copyright (C) 2017 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/cpu.h>
++#include <linux/acpi.h>
++#include <asm/msr.h>
++#include <asm/tsc.h>
++
++struct lpit_residency_info {
++	struct acpi_generic_address gaddr;
++	u64 frequency;
++	void __iomem *iomem_addr;
++};
++
++/* Storage for an memory mapped and FFH based entries */
++static struct lpit_residency_info residency_info_mem;
++static struct lpit_residency_info residency_info_ffh;
++
++static int lpit_read_residency_counter_us(u64 *counter, bool io_mem)
++{
++	int err;
++
++	if (io_mem) {
++		u64 count = 0;
++		int error;
++
++		error = acpi_os_read_iomem(residency_info_mem.iomem_addr, &count,
++					   residency_info_mem.gaddr.bit_width);
++		if (error)
++			return error;
++
++		*counter = div64_u64(count * 1000000ULL, residency_info_mem.frequency);
++		return 0;
++	}
++
++	err = rdmsrl_safe(residency_info_ffh.gaddr.address, counter);
++	if (!err) {
++		u64 mask = GENMASK_ULL(residency_info_ffh.gaddr.bit_offset +
++				       residency_info_ffh.gaddr. bit_width - 1,
++				       residency_info_ffh.gaddr.bit_offset);
++
++		*counter &= mask;
++		*counter >>= residency_info_ffh.gaddr.bit_offset;
++		*counter = div64_u64(*counter * 1000000ULL, residency_info_ffh.frequency);
++		return 0;
++	}
++
++	return -ENODATA;
++}
++
++static ssize_t low_power_idle_system_residency_us_show(struct device *dev,
++						       struct device_attribute *attr,
++						       char *buf)
++{
++	u64 counter;
++	int ret;
++
++	ret = lpit_read_residency_counter_us(&counter, true);
++	if (ret)
++		return ret;
++
++	return sprintf(buf, "%llu\n", counter);
++}
++static DEVICE_ATTR_RO(low_power_idle_system_residency_us);
++
++static ssize_t low_power_idle_cpu_residency_us_show(struct device *dev,
++						    struct device_attribute *attr,
++						    char *buf)
++{
++	u64 counter;
++	int ret;
++
++	ret = lpit_read_residency_counter_us(&counter, false);
++	if (ret)
++		return ret;
++
++	return sprintf(buf, "%llu\n", counter);
++}
++static DEVICE_ATTR_RO(low_power_idle_cpu_residency_us);
++
++int lpit_read_residency_count_address(u64 *address)
++{
++	if (!residency_info_mem.gaddr.address)
++		return -EINVAL;
++
++	*address = residency_info_mem.gaddr.address;
++
++	return 0;
++}
++
++static void lpit_update_residency(struct lpit_residency_info *info,
++				 struct acpi_lpit_native *lpit_native)
++{
++	info->frequency = lpit_native->counter_frequency ?
++				lpit_native->counter_frequency : tsc_khz * 1000;
++	if (!info->frequency)
++		info->frequency = 1;
++
++	info->gaddr = lpit_native->residency_counter;
++	if (info->gaddr.space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY) {
++		info->iomem_addr = ioremap_nocache(info->gaddr.address,
++						   info->gaddr.bit_width / 8);
++		if (!info->iomem_addr)
++			return;
++
++		/* Silently fail, if cpuidle attribute group is not present */
++		sysfs_add_file_to_group(&cpu_subsys.dev_root->kobj,
++					&dev_attr_low_power_idle_system_residency_us.attr,
++					"cpuidle");
++	} else if (info->gaddr.space_id == ACPI_ADR_SPACE_FIXED_HARDWARE) {
++		/* Silently fail, if cpuidle attribute group is not present */
++		sysfs_add_file_to_group(&cpu_subsys.dev_root->kobj,
++					&dev_attr_low_power_idle_cpu_residency_us.attr,
++					"cpuidle");
++	}
++}
++
++static void lpit_process(u64 begin, u64 end)
++{
++	while (begin + sizeof(struct acpi_lpit_native) < end) {
++		struct acpi_lpit_native *lpit_native = (struct acpi_lpit_native *)begin;
++
++		if (!lpit_native->header.type && !lpit_native->header.flags) {
++			if (lpit_native->residency_counter.space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY &&
++			    !residency_info_mem.gaddr.address) {
++				lpit_update_residency(&residency_info_mem, lpit_native);
++			} else if (lpit_native->residency_counter.space_id == ACPI_ADR_SPACE_FIXED_HARDWARE &&
++				   !residency_info_ffh.gaddr.address) {
++				lpit_update_residency(&residency_info_ffh, lpit_native);
++			}
++		}
++		begin += lpit_native->header.length;
++	}
++}
++
++void acpi_init_lpit(void)
++{
++	acpi_status status;
++	u64 lpit_begin;
++	struct acpi_table_lpit *lpit;
++
++	status = acpi_get_table(ACPI_SIG_LPIT, 0, (struct acpi_table_header **)&lpit);
++
++	if (ACPI_FAILURE(status))
++		return;
++
++	lpit_begin = (u64)lpit + sizeof(*lpit);
++	lpit_process(lpit_begin, lpit_begin + lpit->header.length);
++}
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -240,4 +240,10 @@ void acpi_watchdog_init(void);
+ static inline void acpi_watchdog_init(void) {}
+ #endif
+ 
++#ifdef CONFIG_ACPI_LPIT
++void acpi_init_lpit(void);
++#else
++static inline void acpi_init_lpit(void) { }
++#endif
++
+ #endif /* _ACPI_INTERNAL_H_ */
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -663,6 +663,29 @@ acpi_status acpi_os_write_port(acpi_io_a
+ 
+ EXPORT_SYMBOL(acpi_os_write_port);
+ 
++int acpi_os_read_iomem(void __iomem *virt_addr, u64 *value, u32 width)
++{
++
++	switch (width) {
++	case 8:
++		*(u8 *) value = readb(virt_addr);
++		break;
++	case 16:
++		*(u16 *) value = readw(virt_addr);
++		break;
++	case 32:
++		*(u32 *) value = readl(virt_addr);
++		break;
++	case 64:
++		*(u64 *) value = readq(virt_addr);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ acpi_status
+ acpi_os_read_memory(acpi_physical_address phys_addr, u64 *value, u32 width)
+ {
+@@ -670,6 +693,7 @@ acpi_os_read_memory(acpi_physical_addres
+ 	unsigned int size = width / 8;
+ 	bool unmap = false;
+ 	u64 dummy;
++	int error;
+ 
+ 	rcu_read_lock();
+ 	virt_addr = acpi_map_vaddr_lookup(phys_addr, size);
+@@ -684,22 +708,8 @@ acpi_os_read_memory(acpi_physical_addres
+ 	if (!value)
+ 		value = &dummy;
+ 
+-	switch (width) {
+-	case 8:
+-		*(u8 *) value = readb(virt_addr);
+-		break;
+-	case 16:
+-		*(u16 *) value = readw(virt_addr);
+-		break;
+-	case 32:
+-		*(u32 *) value = readl(virt_addr);
+-		break;
+-	case 64:
+-		*(u64 *) value = readq(virt_addr);
+-		break;
+-	default:
+-		BUG();
+-	}
++	error = acpi_os_read_iomem(virt_addr, value, width);
++	BUG_ON(error);
+ 
+ 	if (unmap)
+ 		iounmap(virt_addr);
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -2043,6 +2043,7 @@ int __init acpi_scan_init(void)
+ 	acpi_int340x_thermal_init();
+ 	acpi_amba_init();
+ 	acpi_watchdog_init();
++	acpi_init_lpit();
+ 
+ 	acpi_scan_add_handler(&generic_device_handler);
+ 
+--- a/include/acpi/acpiosxf.h
++++ b/include/acpi/acpiosxf.h
+@@ -287,6 +287,8 @@ acpi_status acpi_os_write_port(acpi_io_a
+ /*
+  * Platform and hardware-independent physical memory interfaces
+  */
++int acpi_os_read_iomem(void __iomem *virt_addr, u64 *value, u32 width);
++
+ #ifndef ACPI_USE_ALTERNATE_PROTOTYPE_acpi_os_read_memory
+ acpi_status
+ acpi_os_read_memory(acpi_physical_address address, u64 *value, u32 width);
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -1237,4 +1237,13 @@ int acpi_irq_get(acpi_handle handle, uns
+ }
+ #endif
+ 
++#ifdef CONFIG_ACPI_LPIT
++int lpit_read_residency_count_address(u64 *address);
++#else
++static inline int lpit_read_residency_count_address(u64 *address)
++{
++	return -EINVAL;
++}
++#endif
++
+ #endif	/*_LINUX_ACPI_H*/
