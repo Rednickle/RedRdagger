@@ -1,0 +1,143 @@
+From 60622d68227d6d71fdfba5fb39f7f3d44cdd8815 Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Thu, 3 May 2018 17:06:21 -0700
+Subject: [PATCH] x86/asm/memcpy_mcsafe: Return bytes remaining
+Git-commit: 60622d68227d6d71fdfba5fb39f7f3d44cdd8815
+Patch-mainline: v4.18-rc1
+References: bsc#1098782
+
+Machine check safe memory copies are currently deployed in the pmem
+driver whenever reading from persistent memory media, so that -EIO is
+returned rather than triggering a kernel panic. While this protects most
+pmem accesses, it is not complete in the filesystem-dax case. When
+filesystem-dax is enabled reads may bypass the block layer and the
+driver via dax_iomap_actor() and its usage of copy_to_iter().
+
+In preparation for creating a copy_to_iter() variant that can handle
+machine checks, teach memcpy_mcsafe() to return the number of bytes
+remaining rather than -EFAULT when an exception occurs.
+
+Co-developed-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tony Luck <tony.luck@intel.com>
+Cc: hch@lst.de
+Cc: linux-fsdevel@vger.kernel.org
+Cc: linux-nvdimm@lists.01.org
+Link: http://lkml.kernel.org/r/152539238119.31796.14318473522414462886.stgit@dwillia2-desk3.amr.corp.intel.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ arch/x86/include/asm/string_64.h |    8 +++++---
+ arch/x86/lib/memcpy_64.S         |   20 ++++++++++++++------
+ drivers/nvdimm/claim.c           |    3 ++-
+ drivers/nvdimm/pmem.c            |    6 +++---
+ include/linux/string.h           |    4 ++--
+ 5 files changed, 26 insertions(+), 15 deletions(-)
+
+--- a/arch/x86/include/asm/string_64.h
++++ b/arch/x86/include/asm/string_64.h
+@@ -80,7 +80,8 @@ int strcmp(const char *cs, const char *c
+ #endif
+ 
+ #define __HAVE_ARCH_MEMCPY_MCSAFE 1
+-__must_check int __memcpy_mcsafe(void *dst, const void *src, size_t cnt);
++__must_check unsigned long __memcpy_mcsafe(void *dst, const void *src,
++		size_t cnt);
+ DECLARE_STATIC_KEY_FALSE(mcsafe_key);
+ 
+ /**
+@@ -95,9 +96,10 @@ DECLARE_STATIC_KEY_FALSE(mcsafe_key);
+  * actually do machine check recovery. Everyone else can just
+  * use memcpy().
+  *
+- * Return 0 for success, -EFAULT for fail
++ * Return 0 for success, or number of bytes not copied if there was an
++ * exception.
+  */
+-static __always_inline __must_check int
++static __always_inline __must_check unsigned long
+ memcpy_mcsafe(void *dst, const void *src, size_t cnt)
+ {
+ #ifdef CONFIG_X86_MCE
+--- a/arch/x86/lib/memcpy_64.S
++++ b/arch/x86/lib/memcpy_64.S
+@@ -252,14 +252,22 @@ ENDPROC(__memcpy_mcsafe)
+ EXPORT_SYMBOL_GPL(__memcpy_mcsafe)
+ 
+ 	.section .fixup, "ax"
+-	/* Return -EFAULT for any failure */
+-.L_memcpy_mcsafe_fail:
+-	mov	$-EFAULT, %rax
++	/*
++	 * Return number of bytes not copied for any failure. Note that
++	 * there is no "tail" handling since the source buffer is 8-byte
++	 * aligned and poison is cacheline aligned.
++	 */
++.E_read_words:
++	shll	$3, %ecx
++.E_leading_bytes:
++	addl	%edx, %ecx
++.E_trailing_bytes:
++	mov	%ecx, %eax
+ 	ret
+ 
+ 	.previous
+ 
+-	_ASM_EXTABLE_FAULT(.L_read_leading_bytes, .L_memcpy_mcsafe_fail)
+-	_ASM_EXTABLE_FAULT(.L_read_words, .L_memcpy_mcsafe_fail)
+-	_ASM_EXTABLE_FAULT(.L_read_trailing_bytes, .L_memcpy_mcsafe_fail)
++	_ASM_EXTABLE_FAULT(.L_read_leading_bytes, .E_leading_bytes)
++	_ASM_EXTABLE_FAULT(.L_read_words, .E_read_words)
++	_ASM_EXTABLE_FAULT(.L_read_trailing_bytes, .E_trailing_bytes)
+ #endif
+--- a/drivers/nvdimm/claim.c
++++ b/drivers/nvdimm/claim.c
+@@ -277,7 +277,8 @@ static int nsio_rw_bytes(struct nd_names
+ 	if (rw == READ) {
+ 		if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align)))
+ 			return -EIO;
+-		return memcpy_mcsafe(buf, nsio->addr + offset, size);
++		if (memcpy_mcsafe(buf, nsio->addr + offset, size) != 0)
++			return -EIO;
+ 	}
+ 
+ 	if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -91,12 +91,12 @@ static void write_pmem(void *pmem_addr,
+ static blk_status_t read_pmem(struct page *page, unsigned int off,
+ 		void *pmem_addr, unsigned int len)
+ {
+-	int rc;
++	unsigned long rem;
+ 	void *mem = kmap_atomic(page);
+ 
+-	rc = memcpy_mcsafe(mem + off, pmem_addr, len);
++	rem = memcpy_mcsafe(mem + off, pmem_addr, len);
+ 	kunmap_atomic(mem);
+-	if (rc)
++	if (rem)
+ 		return BLK_STS_IOERR;
+ 	return BLK_STS_OK;
+ }
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@ -115,8 +115,8 @@ extern int memcmp(const void *,const voi
+ extern void * memchr(const void *,int,__kernel_size_t);
+ #endif
+ #ifndef __HAVE_ARCH_MEMCPY_MCSAFE
+-static inline __must_check int memcpy_mcsafe(void *dst, const void *src,
+-		size_t cnt)
++static inline __must_check unsigned long memcpy_mcsafe(void *dst,
++		const void *src, size_t cnt)
+ {
+ 	memcpy(dst, src, cnt);
+ 	return 0;
