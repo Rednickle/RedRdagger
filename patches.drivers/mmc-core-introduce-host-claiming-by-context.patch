@@ -1,0 +1,251 @@
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Fri, 22 Sep 2017 15:36:51 +0300
+Subject: mmc: core: Introduce host claiming by context
+Git-commit: 6c0cedd1ef9527ef13e66875746570e76a3188a7
+Patch-mainline: v4.15-rc1
+References: FATE#324519
+
+Currently the host can be claimed by a task.  Change this so that the host
+can be claimed by a context that may or may not be a task.  This provides
+for the host to be claimed by a block driver queue to support blk-mq, while
+maintaining compatibility with the existing use of mmc_claim_host().
+
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Acked-by: Nicolas Saenz Julienne <nsaenzjulienne@suse.com>
+---
+ drivers/mmc/core/block.c    |    4 +--
+ drivers/mmc/core/core.c     |   48 +++++++++++++++++++++++++++++++++++++-------
+ drivers/mmc/core/core.h     |    9 ++++----
+ drivers/mmc/core/mmc.c      |    4 +--
+ drivers/mmc/core/sd.c       |    4 +--
+ drivers/mmc/core/sdio_irq.c |    3 +-
+ include/linux/mmc/host.h    |    7 +++++-
+ 7 files changed, 60 insertions(+), 19 deletions(-)
+
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@ -1949,7 +1949,7 @@ void mmc_blk_issue_rq(struct mmc_queue *
+ 
+ 	if (req && !mq->qcnt)
+ 		/* claim host only for the first request */
+-		mmc_get_card(card);
++		mmc_get_card(card, NULL);
+ 
+ 	ret = mmc_blk_part_switch(card, md->part_type);
+ 	if (ret) {
+@@ -2012,7 +2012,7 @@ void mmc_blk_issue_rq(struct mmc_queue *
+ 
+ out:
+ 	if (!mq->qcnt)
+-		mmc_put_card(card);
++		mmc_put_card(card, NULL);
+ }
+ 
+ static inline int mmc_blk_readonly(struct mmc_card *card)
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -900,9 +900,36 @@ unsigned int mmc_align_data_size(struct
+ }
+ EXPORT_SYMBOL(mmc_align_data_size);
+ 
++/*
++ * Allow claiming an already claimed host if the context is the same or there is
++ * no context but the task is the same.
++ */
++static inline bool mmc_ctx_matches(struct mmc_host *host, struct mmc_ctx *ctx,
++				   struct task_struct *task)
++{
++	return host->claimer == ctx ||
++	       (!ctx && task && host->claimer->task == task);
++}
++
++static inline void mmc_ctx_set_claimer(struct mmc_host *host,
++				       struct mmc_ctx *ctx,
++				       struct task_struct *task)
++{
++	if (!host->claimer) {
++		if (ctx)
++			host->claimer = ctx;
++		else
++			host->claimer = &host->default_ctx;
++	}
++	if (task)
++		host->claimer->task = task;
++}
++
+ /**
+  *	__mmc_claim_host - exclusively claim a host
+  *	@host: mmc host to claim
++ *	@ctx: context that claims the host or NULL in which case the default
++ *	context will be used
+  *	@abort: whether or not the operation should be aborted
+  *
+  *	Claim a host for a set of operations.  If @abort is non null and
+@@ -910,8 +937,10 @@ EXPORT_SYMBOL(mmc_align_data_size);
+  *	that non-zero value without acquiring the lock.  Returns zero
+  *	with the lock held otherwise.
+  */
+-int __mmc_claim_host(struct mmc_host *host, atomic_t *abort)
++int __mmc_claim_host(struct mmc_host *host, struct mmc_ctx *ctx,
++		     atomic_t *abort)
+ {
++	struct task_struct *task = ctx ? NULL : current;
+ 	DECLARE_WAITQUEUE(wait, current);
+ 	unsigned long flags;
+ 	int stop;
+@@ -924,7 +953,7 @@ int __mmc_claim_host(struct mmc_host *ho
+ 	while (1) {
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+ 		stop = abort ? atomic_read(abort) : 0;
+-		if (stop || !host->claimed || host->claimer == current)
++		if (stop || !host->claimed || mmc_ctx_matches(host, ctx, task))
+ 			break;
+ 		spin_unlock_irqrestore(&host->lock, flags);
+ 		schedule();
+@@ -933,7 +962,7 @@ int __mmc_claim_host(struct mmc_host *ho
+ 	set_current_state(TASK_RUNNING);
+ 	if (!stop) {
+ 		host->claimed = 1;
+-		host->claimer = current;
++		mmc_ctx_set_claimer(host, ctx, task);
+ 		host->claim_cnt += 1;
+ 		if (host->claim_cnt == 1)
+ 			pm = true;
+@@ -968,6 +997,7 @@ void mmc_release_host(struct mmc_host *h
+ 		spin_unlock_irqrestore(&host->lock, flags);
+ 	} else {
+ 		host->claimed = 0;
++		host->claimer->task = NULL;
+ 		host->claimer = NULL;
+ 		spin_unlock_irqrestore(&host->lock, flags);
+ 		wake_up(&host->wq);
+@@ -981,10 +1011,10 @@ EXPORT_SYMBOL(mmc_release_host);
+  * This is a helper function, which fetches a runtime pm reference for the
+  * card device and also claims the host.
+  */
+-void mmc_get_card(struct mmc_card *card)
++void mmc_get_card(struct mmc_card *card, struct mmc_ctx *ctx)
+ {
+ 	pm_runtime_get_sync(&card->dev);
+-	mmc_claim_host(card->host);
++	__mmc_claim_host(card->host, ctx, NULL);
+ }
+ EXPORT_SYMBOL(mmc_get_card);
+ 
+@@ -992,9 +1022,13 @@ EXPORT_SYMBOL(mmc_get_card);
+  * This is a helper function, which releases the host and drops the runtime
+  * pm reference for the card device.
+  */
+-void mmc_put_card(struct mmc_card *card)
++void mmc_put_card(struct mmc_card *card, struct mmc_ctx *ctx)
+ {
+-	mmc_release_host(card->host);
++	struct mmc_host *host = card->host;
++
++	WARN_ON(ctx && host->claimer != ctx);
++
++	mmc_release_host(host);
+ 	pm_runtime_mark_last_busy(&card->dev);
+ 	pm_runtime_put_autosuspend(&card->dev);
+ }
+--- a/drivers/mmc/core/core.h
++++ b/drivers/mmc/core/core.h
+@@ -122,10 +122,11 @@ int mmc_set_blocklen(struct mmc_card *ca
+ int mmc_set_blockcount(struct mmc_card *card, unsigned int blockcount,
+ 			bool is_rel_write);
+ 
+-int __mmc_claim_host(struct mmc_host *host, atomic_t *abort);
++int __mmc_claim_host(struct mmc_host *host, struct mmc_ctx *ctx,
++		     atomic_t *abort);
+ void mmc_release_host(struct mmc_host *host);
+-void mmc_get_card(struct mmc_card *card);
+-void mmc_put_card(struct mmc_card *card);
++void mmc_get_card(struct mmc_card *card, struct mmc_ctx *ctx);
++void mmc_put_card(struct mmc_card *card, struct mmc_ctx *ctx);
+ 
+ /**
+  *	mmc_claim_host - exclusively claim a host
+@@ -135,7 +136,7 @@ void mmc_put_card(struct mmc_card *card)
+  */
+ static inline void mmc_claim_host(struct mmc_host *host)
+ {
+-	__mmc_claim_host(host, NULL);
++	__mmc_claim_host(host, NULL, NULL);
+ }
+ 
+ #endif
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -1917,14 +1917,14 @@ static void mmc_detect(struct mmc_host *
+ {
+ 	int err;
+ 
+-	mmc_get_card(host->card);
++	mmc_get_card(host->card, NULL);
+ 
+ 	/*
+ 	 * Just check if our card has been removed.
+ 	 */
+ 	err = _mmc_detect_card_removed(host);
+ 
+-	mmc_put_card(host->card);
++	mmc_put_card(host->card, NULL);
+ 
+ 	if (err) {
+ 		mmc_remove(host);
+--- a/drivers/mmc/core/sd.c
++++ b/drivers/mmc/core/sd.c
+@@ -1070,14 +1070,14 @@ static void mmc_sd_detect(struct mmc_hos
+ {
+ 	int err;
+ 
+-	mmc_get_card(host->card);
++	mmc_get_card(host->card, NULL);
+ 
+ 	/*
+ 	 * Just check if our card has been removed.
+ 	 */
+ 	err = _mmc_detect_card_removed(host);
+ 
+-	mmc_put_card(host->card);
++	mmc_put_card(host->card, NULL);
+ 
+ 	if (err) {
+ 		mmc_sd_remove(host);
+--- a/drivers/mmc/core/sdio_irq.c
++++ b/drivers/mmc/core/sdio_irq.c
+@@ -137,7 +137,8 @@ static int sdio_irq_thread(void *_host)
+ 		 * holding of the host lock does not cover too much work
+ 		 * that doesn't require that lock to be held.
+ 		 */
+-		ret = __mmc_claim_host(host, &host->sdio_irq_thread_abort);
++		ret = __mmc_claim_host(host, NULL,
++				       &host->sdio_irq_thread_abort);
+ 		if (ret)
+ 			break;
+ 		ret = process_sdio_pending_irqs(host);
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -253,6 +253,10 @@ struct mmc_supply {
+ 	struct regulator *vqmmc;	/* Optional Vccq supply */
+ };
+ 
++struct mmc_ctx {
++	struct task_struct *task;
++};
++
+ struct mmc_host {
+ 	struct device		*parent;
+ 	struct device		class_dev;
+@@ -389,8 +393,9 @@ struct mmc_host {
+ 	struct mmc_card		*card;		/* device attached to this host */
+ 
+ 	wait_queue_head_t	wq;
+-	struct task_struct	*claimer;	/* task that has host claimed */
++	struct mmc_ctx		*claimer;	/* context that has host claimed */
+ 	int			claim_cnt;	/* "claim" nesting count */
++	struct mmc_ctx		default_ctx;	/* default context */
+ 
+ 	struct delayed_work	detect;
+ 	int			detect_change;	/* card detect flag */
