@@ -1,0 +1,229 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Fri, 4 Aug 2017 22:02:19 -0700
+Subject: bpf: devmap fix mutex in rcu critical section
+Patch-mainline: v4.14-rc1
+Git-commit: 4cc7b9544b9a904add353406ed1bacbf56f75c52
+References: bsc#1109837
+
+Originally we used a mutex to protect concurrent devmap update
+and delete operations from racing with netdev unregister notifier
+callbacks.
+
+The notifier hook is needed because we increment the netdev ref
+count when a dev is added to the devmap. This ensures the netdev
+reference is valid in the datapath. However, we don't want to block
+unregister events, hence the initial mutex and notifier handler.
+
+The concern was in the notifier hook we search the map for dev
+entries that hold a refcnt on the net device being torn down. But,
+in order to do this we require two steps,
+
+  (i) dereference the netdev:  dev = rcu_dereference(map[i])
+ (ii) test ifindex:   dev->ifindex == removing_ifindex
+
+and then finally we can swap in the NULL dev in the map via an
+xchg operation,
+
+  xchg(map[i], NULL)
+
+The danger here is a concurrent update could run a different
+xchg op concurrently leading us to replace the new dev with a
+NULL dev incorrectly.
+
+      CPU 1                        CPU 2
+
+   notifier hook                   bpf devmap update
+
+   dev = rcu_dereference(map[i])
+                                   dev = rcu_dereference(map[i])
+                                   xchg(map[i]), new_dev);
+                                   rcu_call(dev,...)
+   xchg(map[i], NULL)
+
+The above flow would create the incorrect state with the dev
+reference in the update path being lost. To resolve this the
+original code used a mutex around the above block. However,
+updates, deletes, and lookups occur inside rcu critical sections
+so we can't use a mutex in this context safely.
+
+Fortunately, by writing slightly better code we can avoid the
+mutex altogether. If CPU 1 in the above example uses a cmpxchg
+and _only_ replaces the dev reference in the map when it is in
+fact the expected dev the race is removed completely. The two
+cases being illustrated here, first the race condition,
+
+      CPU 1                          CPU 2
+
+   notifier hook                     bpf devmap update
+
+   dev = rcu_dereference(map[i])
+                                     dev = rcu_dereference(map[i])
+                                     xchg(map[i]), new_dev);
+                                     rcu_call(dev,...)
+   odev = cmpxchg(map[i], dev, NULL)
+
+Now we can test the cmpxchg return value, detect odev != dev and
+abort. Or in the good case,
+
+      CPU 1                          CPU 2
+
+   notifier hook                     bpf devmap update
+   dev = rcu_dereference(map[i])
+   odev = cmpxchg(map[i], dev, NULL)
+                                     [...]
+
+Now 'odev == dev' and we can do proper cleanup.
+
+And viola the original race we tried to solve with a mutex is
+corrected and the trace noted by Sasha below is resolved due
+to removal of the mutex.
+
+Note: When walking the devmap and removing dev references as needed
+we depend on the core to fail any calls to dev_get_by_index() using
+the ifindex of the device being removed. This way we do not race with
+the user while searching the devmap.
+
+Additionally, the mutex was also protecting list add/del/read on
+the list of maps in-use. This patch converts this to an RCU list
+and spinlock implementation. This protects the list from concurrent
+alloc/free operations. The notifier hook walks this list so it uses
+RCU read semantics.
+
+BUG: sleeping function called from invalid context at kernel/locking/mutex.c:747
+in_atomic(): 1, irqs_disabled(): 0, pid: 16315, name: syz-executor1
+1 lock held by syz-executor1/16315:
+ #0:  (rcu_read_lock){......}, at: [<ffffffff8c363bc2>] map_delete_elem kernel/bpf/syscall.c:577 [inline]
+ #0:  (rcu_read_lock){......}, at: [<ffffffff8c363bc2>] SYSC_bpf kernel/bpf/syscall.c:1427 [inline]
+ #0:  (rcu_read_lock){......}, at: [<ffffffff8c363bc2>] SyS_bpf+0x1d32/0x4ba0 kernel/bpf/syscall.c:1388
+
+Fixes: 2ddf71e23cc2 ("net: add notifier hooks for devmap bpf map")
+Reported-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ kernel/bpf/devmap.c |   48 +++++++++++++++++++++++++-----------------------
+ 1 file changed, 25 insertions(+), 23 deletions(-)
+
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -40,11 +40,12 @@
+  * contain a reference to the net device and remove them. This is a two step
+  * process (a) dereference the bpf_dtab_netdev object in netdev_map and (b)
+  * check to see if the ifindex is the same as the net_device being removed.
+- * Unfortunately, the xchg() operations do not protect against this. To avoid
+- * potentially removing incorrect objects the dev_map_list_mutex protects
+- * conflicting netdev unregister and BPF syscall operations. Updates and
+- * deletes from a BPF program (done in rcu critical section) are blocked
+- * because of this mutex.
++ * When removing the dev a cmpxchg() is used to ensure the correct dev is
++ * removed, in the case of a concurrent update or delete operation it is
++ * possible that the initially referenced dev is no longer in the map. As the
++ * notifier hook walks the map we know that new dev references can not be
++ * added by the user because core infrastructure ensures dev_get_by_index()
++ * calls will fail at this point.
+  */
+ #include <linux/bpf.h>
+ #include <linux/jhash.h>
+@@ -68,7 +69,7 @@ struct bpf_dtab {
+ 	struct list_head list;
+ };
+ 
+-static DEFINE_MUTEX(dev_map_list_mutex);
++static DEFINE_SPINLOCK(dev_map_lock);
+ static LIST_HEAD(dev_map_list);
+ 
+ static struct bpf_map *dev_map_alloc(union bpf_attr *attr)
+@@ -128,9 +129,9 @@ static struct bpf_map *dev_map_alloc(uni
+ 	if (!dtab->netdev_map)
+ 		goto free_dtab;
+ 
+-	mutex_lock(&dev_map_list_mutex);
+-	list_add_tail(&dtab->list, &dev_map_list);
+-	mutex_unlock(&dev_map_list_mutex);
++	spin_lock(&dev_map_lock);
++	list_add_tail_rcu(&dtab->list, &dev_map_list);
++	spin_unlock(&dev_map_lock);
+ 	return &dtab->map;
+ 
+ free_dtab:
+@@ -169,7 +170,6 @@ static void dev_map_free(struct bpf_map
+ 	 * at this point we we can still race with netdev notifier, hence the
+ 	 * lock.
+ 	 */
+-	mutex_lock(&dev_map_list_mutex);
+ 	for (i = 0; i < dtab->map.max_entries; i++) {
+ 		struct bpf_dtab_netdev *dev;
+ 
+@@ -184,8 +184,9 @@ static void dev_map_free(struct bpf_map
+ 	/* At this point bpf program is detached and all pending operations
+ 	 * _must_ be complete
+ 	 */
+-	list_del(&dtab->list);
+-	mutex_unlock(&dev_map_list_mutex);
++	spin_lock(&dev_map_lock);
++	list_del_rcu(&dtab->list);
++	spin_unlock(&dev_map_lock);
+ 	free_percpu(dtab->flush_needed);
+ 	bpf_map_area_free(dtab->netdev_map);
+ 	kfree(dtab);
+@@ -322,11 +323,9 @@ static int dev_map_delete_elem(struct bp
+ 	 * the driver tear down ensures all soft irqs are complete before
+ 	 * removing the net device in the case of dev_put equals zero.
+ 	 */
+-	mutex_lock(&dev_map_list_mutex);
+ 	old_dev = xchg(&dtab->netdev_map[k], NULL);
+ 	if (old_dev)
+ 		call_rcu(&old_dev->rcu, __dev_map_entry_free);
+-	mutex_unlock(&dev_map_list_mutex);
+ 	return 0;
+ }
+ 
+@@ -369,11 +368,9 @@ static int dev_map_update_elem(struct bp
+ 	 * Remembering the driver side flush operation will happen before the
+ 	 * net device is removed.
+ 	 */
+-	mutex_lock(&dev_map_list_mutex);
+ 	old_dev = xchg(&dtab->netdev_map[i], dev);
+ 	if (old_dev)
+ 		call_rcu(&old_dev->rcu, __dev_map_entry_free);
+-	mutex_unlock(&dev_map_list_mutex);
+ 
+ 	return 0;
+ }
+@@ -396,22 +393,27 @@ static int dev_map_notification(struct n
+ 
+ 	switch (event) {
+ 	case NETDEV_UNREGISTER:
+-		mutex_lock(&dev_map_list_mutex);
+-		list_for_each_entry(dtab, &dev_map_list, list) {
++		/* This rcu_read_lock/unlock pair is needed because
++		 * dev_map_list is an RCU list AND to ensure a delete
++		 * operation does not free a netdev_map entry while we
++		 * are comparing it against the netdev being unregistered.
++		 */
++		rcu_read_lock();
++		list_for_each_entry_rcu(dtab, &dev_map_list, list) {
+ 			for (i = 0; i < dtab->map.max_entries; i++) {
+-				struct bpf_dtab_netdev *dev;
++				struct bpf_dtab_netdev *dev, *odev;
+ 
+-				dev = dtab->netdev_map[i];
++				dev = READ_ONCE(dtab->netdev_map[i]);
+ 				if (!dev ||
+ 				    dev->dev->ifindex != netdev->ifindex)
+ 					continue;
+-				dev = xchg(&dtab->netdev_map[i], NULL);
+-				if (dev)
++				odev = cmpxchg(&dtab->netdev_map[i], dev, NULL);
++				if (dev == odev)
+ 					call_rcu(&dev->rcu,
+ 						 __dev_map_entry_free);
+ 			}
+ 		}
+-		mutex_unlock(&dev_map_list_mutex);
++		rcu_read_unlock();
+ 		break;
+ 	default:
+ 		break;
