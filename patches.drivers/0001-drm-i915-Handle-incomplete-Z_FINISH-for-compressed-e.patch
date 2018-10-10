@@ -1,0 +1,211 @@
+From 4c9613ce556fdeb671e779668b627ea3a2b61728 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 3 Oct 2018 09:24:22 +0100
+Subject: drm/i915: Handle incomplete Z_FINISH for compressed error states
+Git-commit: 4c9613ce556fdeb671e779668b627ea3a2b61728
+Patch-mainline: v4.19-rc6
+References: bsc#1100132
+
+The final call to zlib_deflate(Z_FINISH) may require more output
+space to be allocated and so needs to re-invoked. Failure to do so in
+the current code leads to incomplete zlib streams (albeit intact due to
+the use of Z_SYNC_FLUSH) resulting in the occasional short object
+capture.
+
+v2: Check against overrunning our pre-allocated page array
+v3: Drop Z_SYNC_FLUSH entirely
+
+Backporting notes:
+
+  * updated i915_gpu_error.c for context changes
+  * |struct drm_i915_error_object| is in i915_drv.h
+
+Testcase: igt/i915-error-capture.js
+Fixes: 0a97015d45ee ("drm/i915: Compress GPU objects in error state")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: <stable@vger.kernel.org> # v4.10+
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20181003082422.23214-1-chris@chris-wilson.co.uk
+(cherry picked from commit 83bc0f5b432f60394466deef16fc753e27371d0b)
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+---
+ drivers/gpu/drm/i915/i915_drv.h       |    1
+ drivers/gpu/drm/i915/i915_gpu_error.c |   88 ++++++++++++++++++++++++----------
+ 2 files changed, 64 insertions(+), 25 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -562,6 +562,7 @@ struct i915_gpu_state {
+ 		struct drm_i915_error_object {
+ 			u64 gtt_offset;
+ 			u64 gtt_size;
++			int num_pages;
+ 			int page_count;
+ 			int unused;
+ 			u32 *pages[0];
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -221,6 +221,20 @@ static bool compress_init(struct compres
+ 	return true;
+ }
+
++static void *compress_next_page(struct drm_i915_error_object *dst)
++{
++	unsigned long page;
++
++	if (dst->page_count >= dst->num_pages)
++		return ERR_PTR(-ENOSPC);
++
++	page = __get_free_page(GFP_ATOMIC | __GFP_NOWARN);
++	if (!page)
++		return ERR_PTR(-ENOMEM);
++
++	return dst->pages[dst->page_count++] = (void *)page;
++}
++
+ static int compress_page(struct compress *c,
+ 			 void *src,
+ 			 struct drm_i915_error_object *dst)
+@@ -234,19 +248,14 @@ static int compress_page(struct compress
+
+ 	do {
+ 		if (zstream->avail_out == 0) {
+-			unsigned long page;
+-
+-			page = __get_free_page(GFP_ATOMIC | __GFP_NOWARN);
+-			if (!page)
+-				return -ENOMEM;
++			zstream->next_out = compress_next_page(dst);
++			if (IS_ERR(zstream->next_out))
++				return PTR_ERR(zstream->next_out);
+
+-			dst->pages[dst->page_count++] = (void *)page;
+-
+-			zstream->next_out = (void *)page;
+ 			zstream->avail_out = PAGE_SIZE;
+ 		}
+
+-		if (zlib_deflate(zstream, Z_SYNC_FLUSH) != Z_OK)
++		if (zlib_deflate(zstream, Z_NO_FLUSH) != Z_OK)
+ 			return -EIO;
+ 	} while (zstream->avail_in);
+
+@@ -257,19 +266,42 @@ static int compress_page(struct compress
+ 	return 0;
+ }
+
+-static void compress_fini(struct compress *c,
++static int compress_flush(struct compress *c,
+ 			  struct drm_i915_error_object *dst)
+ {
+ 	struct z_stream_s *zstream = &c->zstream;
+
+-	if (dst) {
+-		zlib_deflate(zstream, Z_FINISH);
+-		dst->unused = zstream->avail_out;
+-	}
++	do {
++		switch (zlib_deflate(zstream, Z_FINISH)) {
++		case Z_OK: /* more space requested */
++			zstream->next_out = compress_next_page(dst);
++			if (IS_ERR(zstream->next_out))
++				return PTR_ERR(zstream->next_out);
++
++			zstream->avail_out = PAGE_SIZE;
++			break;
++
++		case Z_STREAM_END:
++			goto end;
++
++		default: /* any error */
++			return -EIO;
++		}
++	} while (1);
++
++end:
++	memset(zstream->next_out, 0, zstream->avail_out);
++	dst->unused = zstream->avail_out;
++	return 0;
++}
++
++static void compress_fini(struct compress *c,
++			  struct drm_i915_error_object *dst)
++{
++	struct z_stream_s *zstream = &c->zstream;
+
+ 	zlib_deflateEnd(zstream);
+ 	kfree(zstream->workspace);
+-
+ 	if (c->tmp)
+ 		free_page((unsigned long)c->tmp);
+ }
+@@ -308,6 +340,12 @@ static int compress_page(struct compress
+ 	return 0;
+ }
+
++static int compress_flush(struct compress *c,
++			  struct drm_i915_error_object *dst)
++{
++	return 0;
++}
++
+ static void compress_fini(struct compress *c,
+ 			  struct drm_i915_error_object *dst)
+ {
+@@ -912,6 +950,7 @@ i915_error_object_create(struct drm_i915
+ 	unsigned long num_pages;
+ 	struct sgt_iter iter;
+ 	dma_addr_t dma;
++	int ret;
+
+ 	if (!vma)
+ 		return NULL;
+@@ -925,6 +964,7 @@ i915_error_object_create(struct drm_i915
+
+ 	dst->gtt_offset = vma->node.start;
+ 	dst->gtt_size = vma->node.size;
++	dst->num_pages = num_pages;
+ 	dst->page_count = 0;
+ 	dst->unused = 0;
+
+@@ -933,9 +973,9 @@ i915_error_object_create(struct drm_i915
+ 		return NULL;
+ 	}
+
++	ret = -EINVAL;
+ 	for_each_sgt_dma(dma, iter, vma->pages) {
+ 		void __iomem *s;
+-		int ret;
+
+ 		ggtt->base.insert_page(&ggtt->base, dma, slot,
+ 				       I915_CACHE_NONE, 0);
+@@ -943,19 +983,17 @@ i915_error_object_create(struct drm_i915
+ 		s = io_mapping_map_atomic_wc(&ggtt->iomap, slot);
+ 		ret = compress_page(&compress, (void  __force *)s, dst);
+ 		io_mapping_unmap_atomic(s);
+-
+ 		if (ret)
+-			goto unwind;
++			break;
+ 	}
+-	goto out;
+
+-unwind:
+-	while (dst->page_count--)
+-		free_page((unsigned long)dst->pages[dst->page_count]);
+-	kfree(dst);
+-	dst = NULL;
++	if (ret || compress_flush(&compress, dst)) {
++		while (dst->page_count--)
++			free_page((unsigned long)dst->pages[dst->page_count]);
++		kfree(dst);
++		dst = NULL;
++	}
+
+-out:
+ 	compress_fini(&compress, dst);
+ 	ggtt->base.clear_range(&ggtt->base, slot, PAGE_SIZE);
+ 	return dst;
