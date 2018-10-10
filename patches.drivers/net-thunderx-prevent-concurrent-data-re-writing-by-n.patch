@@ -1,0 +1,168 @@
+From: Vadim Lomovtsev <Vadim.Lomovtsev@cavium.com>
+Date: Fri, 8 Jun 2018 02:27:59 -0700
+Subject: net: thunderx: prevent concurrent data re-writing by
+ nicvf_set_rx_mode
+Patch-mainline: v4.18-rc1
+Git-commit: 469998c861faaa9f228701557fe8454f75a12e5c
+References: bsc#1110096
+
+For each network interface linux network stack issue ndo_set_rx_mode call
+in order to configure MAC address filters (e.g. for multicast filtering).
+Currently ThunderX NICVF driver has only one ordered workqueue to process
+such requests for all VFs.
+
+And because of that it is possible that subsequent call to
+ndo_set_rx_mode would corrupt data which is currently in use
+by nicvf_set_rx_mode_task. Which in turn could cause following issue:
+[...]
+[   48.978341] Unable to handle kernel paging request at virtual address 1fffff0000000000
+[   48.986275] Mem abort info:
+[   48.989058]   Exception class = DABT (current EL), IL = 32 bits
+[   48.994965]   SET = 0, FnV = 0
+[   48.998020]   EA = 0, S1PTW = 0
+[   49.001152] Data abort info:
+[   49.004022]   ISV = 0, ISS = 0x00000004
+[   49.007869]   CM = 0, WnR = 0
+[   49.010826] [1fffff0000000000] address between user and kernel address ranges
+[   49.017963] Internal error: Oops: 96000004 [#1] SMP
+[...]
+[   49.072138] task: ffff800fdd675400 task.stack: ffff000026440000
+[   49.078051] PC is at prefetch_freepointer.isra.37+0x28/0x3c
+[   49.083613] LR is at kmem_cache_alloc_trace+0xc8/0x1fc
+[...]
+[   49.272684] [<ffff0000082738f0>] prefetch_freepointer.isra.37+0x28/0x3c
+[   49.279286] [<ffff000008276bc8>] kmem_cache_alloc_trace+0xc8/0x1fc
+[   49.285455] [<ffff0000082c0c0c>] alloc_fdtable+0x78/0x134
+[   49.290841] [<ffff0000082c15c0>] dup_fd+0x254/0x2f4
+[   49.295709] [<ffff0000080d1954>] copy_process.isra.38.part.39+0x64c/0x1168
+[   49.302572] [<ffff0000080d264c>] _do_fork+0xfc/0x3b0
+[   49.307524] [<ffff0000080d29e8>] SyS_clone+0x44/0x50
+[...]
+
+This patch is to prevent such concurrent data write with spinlock.
+
+Reported-by: Dean Nelson <dnelson@redhat.com>
+Signed-off-by: Vadim Lomovtsev <Vadim.Lomovtsev@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/cavium/thunder/nic.h        |    2 
+ drivers/net/ethernet/cavium/thunder/nicvf_main.c |   50 ++++++++++++++++-------
+ 2 files changed, 38 insertions(+), 14 deletions(-)
+
+--- a/drivers/net/ethernet/cavium/thunder/nic.h
++++ b/drivers/net/ethernet/cavium/thunder/nic.h
+@@ -325,6 +325,8 @@ struct nicvf {
+ 	struct tasklet_struct	qs_err_task;
+ 	struct work_struct	reset_task;
+ 	struct nicvf_work       rx_mode_work;
++	/* spinlock to protect workqueue arguments from concurrent access */
++	spinlock_t              rx_mode_wq_lock;
+ 
+ 	/* PTP timestamp */
+ 	struct cavium_ptp	*ptp_clock;
+--- a/drivers/net/ethernet/cavium/thunder/nicvf_main.c
++++ b/drivers/net/ethernet/cavium/thunder/nicvf_main.c
+@@ -1925,17 +1925,12 @@ static int nicvf_ioctl(struct net_device
+ 	}
+ }
+ 
+-static void nicvf_set_rx_mode_task(struct work_struct *work_arg)
++static void __nicvf_set_rx_mode_task(u8 mode, struct xcast_addr_list *mc_addrs,
++				     struct nicvf *nic)
+ {
+-	struct nicvf_work *vf_work = container_of(work_arg, struct nicvf_work,
+-						  work.work);
+-	struct nicvf *nic = container_of(vf_work, struct nicvf, rx_mode_work);
+ 	union nic_mbx mbx = {};
+ 	int idx;
+ 
+-	if (!vf_work)
+-		return;
+-
+ 	/* From the inside of VM code flow we have only 128 bits memory
+ 	 * available to send message to host's PF, so send all mc addrs
+ 	 * one by one, starting from flush command in case if kernel
+@@ -1946,7 +1941,7 @@ static void nicvf_set_rx_mode_task(struc
+ 	mbx.xcast.msg = NIC_MBOX_MSG_RESET_XCAST;
+ 	nicvf_send_msg_to_pf(nic, &mbx);
+ 
+-	if (vf_work->mode & BGX_XCAST_MCAST_FILTER) {
++	if (mode & BGX_XCAST_MCAST_FILTER) {
+ 		/* once enabling filtering, we need to signal to PF to add
+ 		 * its' own LMAC to the filter to accept packets for it.
+ 		 */
+@@ -1956,23 +1951,46 @@ static void nicvf_set_rx_mode_task(struc
+ 	}
+ 
+ 	/* check if we have any specific MACs to be added to PF DMAC filter */
+-	if (vf_work->mc) {
++	if (mc_addrs) {
+ 		/* now go through kernel list of MACs and add them one by one */
+-		for (idx = 0; idx < vf_work->mc->count; idx++) {
++		for (idx = 0; idx < mc_addrs->count; idx++) {
+ 			mbx.xcast.msg = NIC_MBOX_MSG_ADD_MCAST;
+-			mbx.xcast.data.mac = vf_work->mc->mc[idx];
++			mbx.xcast.data.mac = mc_addrs->mc[idx];
+ 			nicvf_send_msg_to_pf(nic, &mbx);
+ 		}
+-		kfree(vf_work->mc);
++		kfree(mc_addrs);
+ 	}
+ 
+ 	/* and finally set rx mode for PF accordingly */
+ 	mbx.xcast.msg = NIC_MBOX_MSG_SET_XCAST;
+-	mbx.xcast.data.mode = vf_work->mode;
++	mbx.xcast.data.mode = mode;
+ 
+ 	nicvf_send_msg_to_pf(nic, &mbx);
+ }
+ 
++static void nicvf_set_rx_mode_task(struct work_struct *work_arg)
++{
++	struct nicvf_work *vf_work = container_of(work_arg, struct nicvf_work,
++						  work.work);
++	struct nicvf *nic = container_of(vf_work, struct nicvf, rx_mode_work);
++	u8 mode;
++	struct xcast_addr_list *mc;
++
++	if (!vf_work)
++		return;
++
++	/* Save message data locally to prevent them from
++	 * being overwritten by next ndo_set_rx_mode call().
++	 */
++	spin_lock(&nic->rx_mode_wq_lock);
++	mode = vf_work->mode;
++	mc = vf_work->mc;
++	vf_work->mc = NULL;
++	spin_unlock(&nic->rx_mode_wq_lock);
++
++	__nicvf_set_rx_mode_task(mode, mc, nic);
++}
++
+ static void nicvf_set_rx_mode(struct net_device *netdev)
+ {
+ 	struct nicvf *nic = netdev_priv(netdev);
+@@ -2006,9 +2024,12 @@ static void nicvf_set_rx_mode(struct net
+ 			}
+ 		}
+ 	}
++	spin_lock(&nic->rx_mode_wq_lock);
++	kfree(nic->rx_mode_work.mc);
+ 	nic->rx_mode_work.mc = mc_list;
+ 	nic->rx_mode_work.mode = mode;
+-	queue_delayed_work(nicvf_rx_mode_wq, &nic->rx_mode_work.work, 2 * HZ);
++	queue_delayed_work(nicvf_rx_mode_wq, &nic->rx_mode_work.work, 0);
++	spin_unlock(&nic->rx_mode_wq_lock);
+ }
+ 
+ static const struct net_device_ops nicvf_netdev_ops = {
+@@ -2165,6 +2186,7 @@ static int nicvf_probe(struct pci_dev *p
+ 	INIT_WORK(&nic->reset_task, nicvf_reset_task);
+ 
+ 	INIT_DELAYED_WORK(&nic->rx_mode_work.work, nicvf_set_rx_mode_task);
++	spin_lock_init(&nic->rx_mode_wq_lock);
+ 
+ 	err = register_netdev(netdev);
+ 	if (err) {
