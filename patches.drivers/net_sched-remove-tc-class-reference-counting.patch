@@ -1,0 +1,1120 @@
+From: WANG Cong <xiyou.wangcong@gmail.com>
+Date: Thu, 24 Aug 2017 16:51:29 -0700
+Subject: net_sched: remove tc class reference counting
+Patch-mainline: v4.14-rc1
+Git-commit: 143976ce992fcf3bfc0f4d15d5726bb492dcf262
+References: bsc#1109837
+
+For TC classes, their ->get() and ->put() are always paired, and the
+reference counting is completely useless, because:
+
+1) For class modification and dumping paths, we already hold RTNL lock,
+   so all of these ->get(),->change(),->put() are atomic.
+
+2) For filter bindiing/unbinding, we use other reference counter than
+   this one, and they should have RTNL lock too.
+
+3) For ->qlen_notify(), it is special because it is called on ->enqueue()
+   path, but we already hold qdisc tree lock there, and we hold this
+   tree lock when graft or delete the class too, so it should not be gone
+   or changed until we release the tree lock.
+
+Therefore, this patch removes ->get() and ->put(), but:
+
+1) Adds a new ->find() to find the pointer to a class by classid, no
+   refcnt.
+
+2) Move the original class destroy upon the last refcnt into ->delete(),
+   right after releasing tree lock. This is fine because the class is
+   already removed from hash when holding the lock.
+
+For those who also use ->put() as ->unbind(), just rename them to reflect
+this change.
+
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+Acked-by: Jiri Pirko <jiri@mellanox.com>
+Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/sch_generic.h |    3 +--
+ net/sched/cls_api.c       |   17 ++++++-----------
+ net/sched/sch_api.c       |   21 ++++++++-------------
+ net/sched/sch_atm.c       |   30 ++++++++++++++++--------------
+ net/sched/sch_cbq.c       |   41 ++++-------------------------------------
+ net/sched/sch_drr.c       |   30 +++++-------------------------
+ net/sched/sch_dsmark.c    |   17 ++++++++---------
+ net/sched/sch_fq_codel.c  |    9 ++++-----
+ net/sched/sch_hfsc.c      |   32 +++++---------------------------
+ net/sched/sch_htb.c       |   33 +++++++--------------------------
+ net/sched/sch_ingress.c   |   20 +++++++++-----------
+ net/sched/sch_mq.c        |    9 ++-------
+ net/sched/sch_mqprio.c    |    9 ++-------
+ net/sched/sch_multiq.c    |   11 +++++------
+ net/sched/sch_netem.c     |    9 ++-------
+ net/sched/sch_prio.c      |   11 +++++------
+ net/sched/sch_qfq.c       |   30 +++++-------------------------
+ net/sched/sch_red.c       |    9 ++-------
+ net/sched/sch_sfb.c       |    9 ++++-----
+ net/sched/sch_sfq.c       |    9 ++++-----
+ net/sched/sch_tbf.c       |    9 ++-------
+ 21 files changed, 106 insertions(+), 262 deletions(-)
+
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -154,8 +154,7 @@ struct Qdisc_class_ops {
+ 	void			(*qlen_notify)(struct Qdisc *, unsigned long);
+ 
+ 	/* Class manipulation routines */
+-	unsigned long		(*get)(struct Qdisc *, u32 classid);
+-	void			(*put)(struct Qdisc *, unsigned long);
++	unsigned long		(*find)(struct Qdisc *, u32 classid);
+ 	int			(*change)(struct Qdisc *, u32, u32,
+ 					struct nlattr **, unsigned long *);
+ 	int			(*delete)(struct Qdisc *, unsigned long);
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -594,7 +594,7 @@ replay:
+ 
+ 	/* Do we search for filter, attached to class? */
+ 	if (TC_H_MIN(parent)) {
+-		cl = cops->get(q, parent);
++		cl = cops->find(q, parent);
+ 		if (cl == 0)
+ 			return -ENOENT;
+ 	}
+@@ -724,8 +724,6 @@ replay:
+ errout:
+ 	if (chain)
+ 		tcf_chain_put(chain);
+-	if (cl)
+-		cops->put(q, cl);
+ 	if (err == -EAGAIN)
+ 		/* Replay the request. */
+ 		goto replay;
+@@ -830,17 +828,17 @@ static int tc_dump_tfilter(struct sk_buf
+ 		goto out;
+ 	cops = q->ops->cl_ops;
+ 	if (!cops)
+-		goto errout;
++		goto out;
+ 	if (!cops->tcf_block)
+-		goto errout;
++		goto out;
+ 	if (TC_H_MIN(tcm->tcm_parent)) {
+-		cl = cops->get(q, tcm->tcm_parent);
++		cl = cops->find(q, tcm->tcm_parent);
+ 		if (cl == 0)
+-			goto errout;
++			goto out;
+ 	}
+ 	block = cops->tcf_block(q, cl);
+ 	if (!block)
+-		goto errout;
++		goto out;
+ 
+ 	index_start = cb->args[0];
+ 	index = 0;
+@@ -855,9 +853,6 @@ static int tc_dump_tfilter(struct sk_buf
+ 
+ 	cb->args[0] = index;
+ 
+-errout:
+-	if (cl)
+-		cops->put(q, cl);
+ out:
+ 	return skb->len;
+ }
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -153,7 +153,7 @@ int register_qdisc(struct Qdisc_ops *qop
+ 	if (qops->cl_ops) {
+ 		const struct Qdisc_class_ops *cops = qops->cl_ops;
+ 
+-		if (!(cops->get && cops->put && cops->walk && cops->leaf))
++		if (!(cops->find && cops->walk && cops->leaf))
+ 			goto out_einval;
+ 
+ 		if (cops->tcf_block && !(cops->bind_tcf && cops->unbind_tcf))
+@@ -320,12 +320,11 @@ static struct Qdisc *qdisc_leaf(struct Q
+ 
+ 	if (cops == NULL)
+ 		return NULL;
+-	cl = cops->get(p, classid);
++	cl = cops->find(p, classid);
+ 
+ 	if (cl == 0)
+ 		return NULL;
+ 	leaf = cops->leaf(p, cl);
+-	cops->put(p, cl);
+ 	return leaf;
+ }
+ 
+@@ -756,9 +755,8 @@ void qdisc_tree_reduce_backlog(struct Qd
+ 		}
+ 		cops = sch->ops->cl_ops;
+ 		if (notify && cops->qlen_notify) {
+-			cl = cops->get(sch, parentid);
++			cl = cops->find(sch, parentid);
+ 			cops->qlen_notify(sch, cl);
+-			cops->put(sch, cl);
+ 		}
+ 		sch->q.qlen -= n;
+ 		sch->qstats.backlog -= len;
+@@ -955,11 +953,11 @@ skip:
+ 
+ 		err = -EOPNOTSUPP;
+ 		if (cops && cops->graft) {
+-			unsigned long cl = cops->get(parent, classid);
+-			if (cl) {
++			unsigned long cl = cops->find(parent, classid);
++
++			if (cl)
+ 				err = cops->graft(parent, cl, new, &old);
+-				cops->put(parent, cl);
+-			} else
++			else
+ 				err = -ENOENT;
+ 		}
+ 		if (!err)
+@@ -1739,7 +1737,7 @@ static int tc_ctl_tclass(struct sk_buff
+ 		clid = TC_H_MAKE(qid, clid);
+ 
+ 	if (clid)
+-		cl = cops->get(q, clid);
++		cl = cops->find(q, clid);
+ 
+ 	if (cl == 0) {
+ 		err = -ENOENT;
+@@ -1773,9 +1771,6 @@ static int tc_ctl_tclass(struct sk_buff
+ 		tclass_notify(net, skb, n, q, new_cl, RTM_NEWTCLASS);
+ 
+ out:
+-	if (cl)
+-		cops->put(q, cl);
+-
+ 	return err;
+ }
+ 
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -108,23 +108,29 @@ static struct Qdisc *atm_tc_leaf(struct
+ 	return flow ? flow->q : NULL;
+ }
+ 
+-static unsigned long atm_tc_get(struct Qdisc *sch, u32 classid)
++static unsigned long atm_tc_find(struct Qdisc *sch, u32 classid)
+ {
+ 	struct atm_qdisc_data *p __maybe_unused = qdisc_priv(sch);
+ 	struct atm_flow_data *flow;
+ 
+-	pr_debug("atm_tc_get(sch %p,[qdisc %p],classid %x)\n", sch, p, classid);
++	pr_debug("%s(sch %p,[qdisc %p],classid %x)\n", __func__, sch, p, classid);
+ 	flow = lookup_flow(sch, classid);
+-	if (flow)
+-		flow->ref++;
+-	pr_debug("atm_tc_get: flow %p\n", flow);
++	pr_debug("%s: flow %p\n", __func__, flow);
+ 	return (unsigned long)flow;
+ }
+ 
+ static unsigned long atm_tc_bind_filter(struct Qdisc *sch,
+ 					unsigned long parent, u32 classid)
+ {
+-	return atm_tc_get(sch, classid);
++	struct atm_qdisc_data *p __maybe_unused = qdisc_priv(sch);
++	struct atm_flow_data *flow;
++
++	pr_debug("%s(sch %p,[qdisc %p],classid %x)\n", __func__, sch, p, classid);
++	flow = lookup_flow(sch, classid);
++	if (flow)
++		flow->ref++;
++	pr_debug("%s: flow %p\n", __func__, flow);
++	return (unsigned long)flow;
+ }
+ 
+ /*
+@@ -234,7 +240,7 @@ static int atm_tc_change(struct Qdisc *s
+ 		excess = NULL;
+ 	else {
+ 		excess = (struct atm_flow_data *)
+-			atm_tc_get(sch, nla_get_u32(tb[TCA_ATM_EXCESS]));
++			atm_tc_find(sch, nla_get_u32(tb[TCA_ATM_EXCESS]));
+ 		if (!excess)
+ 			return -ENOENT;
+ 	}
+@@ -262,10 +268,9 @@ static int atm_tc_change(struct Qdisc *s
+ 
+ 		for (i = 1; i < 0x8000; i++) {
+ 			classid = TC_H_MAKE(sch->handle, 0x8000 | i);
+-			cl = atm_tc_get(sch, classid);
++			cl = atm_tc_find(sch, classid);
+ 			if (!cl)
+ 				break;
+-			atm_tc_put(sch, cl);
+ 		}
+ 	}
+ 	pr_debug("atm_tc_change: new id %x\n", classid);
+@@ -305,8 +310,6 @@ static int atm_tc_change(struct Qdisc *s
+ 	*arg = (unsigned long)flow;
+ 	return 0;
+ err_out:
+-	if (excess)
+-		atm_tc_put(sch, (unsigned long)excess);
+ 	sockfd_put(sock);
+ 	return error;
+ }
+@@ -377,7 +380,7 @@ static int atm_tc_enqueue(struct sk_buff
+ 	result = TC_ACT_OK;	/* be nice to gcc */
+ 	flow = NULL;
+ 	if (TC_H_MAJ(skb->priority) != sch->handle ||
+-	    !(flow = (struct atm_flow_data *)atm_tc_get(sch, skb->priority))) {
++	    !(flow = (struct atm_flow_data *)atm_tc_find(sch, skb->priority))) {
+ 		struct tcf_proto *fl;
+ 
+ 		list_for_each_entry(flow, &p->flows, list) {
+@@ -655,8 +658,7 @@ static int atm_tc_dump(struct Qdisc *sch
+ static const struct Qdisc_class_ops atm_class_ops = {
+ 	.graft		= atm_tc_graft,
+ 	.leaf		= atm_tc_leaf,
+-	.get		= atm_tc_get,
+-	.put		= atm_tc_put,
++	.find		= atm_tc_find,
+ 	.change		= atm_tc_change,
+ 	.delete		= atm_tc_delete,
+ 	.walk		= atm_tc_walk,
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -129,7 +129,6 @@ struct cbq_class {
+ 	struct tcf_proto __rcu	*filter_list;
+ 	struct tcf_block	*block;
+ 
+-	int			refcnt;
+ 	int			filters;
+ 
+ 	struct cbq_class	*defaults[TC_PRIO_MAX + 1];
+@@ -1162,7 +1161,6 @@ static int cbq_init(struct Qdisc *sch, s
+ 	if (err < 0)
+ 		goto put_rtab;
+ 
+-	q->link.refcnt = 1;
+ 	q->link.sibling = &q->link;
+ 	q->link.common.classid = sch->handle;
+ 	q->link.qdisc = sch;
+@@ -1392,16 +1390,11 @@ static void cbq_qlen_notify(struct Qdisc
+ 	cbq_deactivate_class(cl);
+ }
+ 
+-static unsigned long cbq_get(struct Qdisc *sch, u32 classid)
++static unsigned long cbq_find(struct Qdisc *sch, u32 classid)
+ {
+ 	struct cbq_sched_data *q = qdisc_priv(sch);
+-	struct cbq_class *cl = cbq_class_lookup(q, classid);
+ 
+-	if (cl) {
+-		cl->refcnt++;
+-		return (unsigned long)cl;
+-	}
+-	return 0;
++	return (unsigned long)cbq_class_lookup(q, classid);
+ }
+ 
+ static void cbq_destroy_class(struct Qdisc *sch, struct cbq_class *cl)
+@@ -1447,25 +1440,6 @@ static void cbq_destroy(struct Qdisc *sc
+ 	qdisc_class_hash_destroy(&q->clhash);
+ }
+ 
+-static void cbq_put(struct Qdisc *sch, unsigned long arg)
+-{
+-	struct cbq_class *cl = (struct cbq_class *)arg;
+-
+-	if (--cl->refcnt == 0) {
+-#ifdef CONFIG_NET_CLS_ACT
+-		spinlock_t *root_lock = qdisc_root_sleeping_lock(sch);
+-		struct cbq_sched_data *q = qdisc_priv(sch);
+-
+-		spin_lock_bh(root_lock);
+-		if (q->rx_class == cl)
+-			q->rx_class = NULL;
+-		spin_unlock_bh(root_lock);
+-#endif
+-
+-		cbq_destroy_class(sch, cl);
+-	}
+-}
+-
+ static int
+ cbq_change_class(struct Qdisc *sch, u32 classid, u32 parentid, struct nlattr **tca,
+ 		 unsigned long *arg)
+@@ -1612,7 +1586,6 @@ cbq_change_class(struct Qdisc *sch, u32
+ 
+ 	cl->R_tab = rtab;
+ 	rtab = NULL;
+-	cl->refcnt = 1;
+ 	cl->q = qdisc_create_dflt(sch->dev_queue, &pfifo_qdisc_ops, classid);
+ 	if (!cl->q)
+ 		cl->q = &noop_qdisc;
+@@ -1693,12 +1666,7 @@ static int cbq_delete(struct Qdisc *sch,
+ 	cbq_rmprio(q, cl);
+ 	sch_tree_unlock(sch);
+ 
+-	BUG_ON(--cl->refcnt == 0);
+-	/*
+-	 * This shouldn't happen: we "hold" one cops->get() when called
+-	 * from tc_ctl_tclass; the destroy method is done from cops->put().
+-	 */
+-
++	cbq_destroy_class(sch, cl);
+ 	return 0;
+ }
+ 
+@@ -1764,8 +1732,7 @@ static const struct Qdisc_class_ops cbq_
+ 	.graft		=	cbq_graft,
+ 	.leaf		=	cbq_leaf,
+ 	.qlen_notify	=	cbq_qlen_notify,
+-	.get		=	cbq_get,
+-	.put		=	cbq_put,
++	.find		=	cbq_find,
+ 	.change		=	cbq_change_class,
+ 	.delete		=	cbq_delete,
+ 	.walk		=	cbq_walk,
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -20,7 +20,6 @@
+ 
+ struct drr_class {
+ 	struct Qdisc_class_common	common;
+-	unsigned int			refcnt;
+ 	unsigned int			filter_cnt;
+ 
+ 	struct gnet_stats_basic_packed		bstats;
+@@ -111,7 +110,6 @@ static int drr_change_class(struct Qdisc
+ 	if (cl == NULL)
+ 		return -ENOBUFS;
+ 
+-	cl->refcnt	   = 1;
+ 	cl->common.classid = classid;
+ 	cl->quantum	   = quantum;
+ 	cl->qdisc	   = qdisc_create_dflt(sch->dev_queue,
+@@ -163,32 +161,15 @@ static int drr_delete_class(struct Qdisc
+ 	drr_purge_queue(cl);
+ 	qdisc_class_hash_remove(&q->clhash, &cl->common);
+ 
+-	BUG_ON(--cl->refcnt == 0);
+-	/*
+-	 * This shouldn't happen: we "hold" one cops->get() when called
+-	 * from tc_ctl_tclass; the destroy method is done from cops->put().
+-	 */
+-
+ 	sch_tree_unlock(sch);
+-	return 0;
+-}
+-
+-static unsigned long drr_get_class(struct Qdisc *sch, u32 classid)
+-{
+-	struct drr_class *cl = drr_find_class(sch, classid);
+ 
+-	if (cl != NULL)
+-		cl->refcnt++;
+-
+-	return (unsigned long)cl;
++	drr_destroy_class(sch, cl);
++	return 0;
+ }
+ 
+-static void drr_put_class(struct Qdisc *sch, unsigned long arg)
++static unsigned long drr_search_class(struct Qdisc *sch, u32 classid)
+ {
+-	struct drr_class *cl = (struct drr_class *)arg;
+-
+-	if (--cl->refcnt == 0)
+-		drr_destroy_class(sch, cl);
++	return (unsigned long)drr_find_class(sch, classid);
+ }
+ 
+ static struct tcf_block *drr_tcf_block(struct Qdisc *sch, unsigned long cl)
+@@ -478,8 +459,7 @@ static void drr_destroy_qdisc(struct Qdi
+ static const struct Qdisc_class_ops drr_class_ops = {
+ 	.change		= drr_change_class,
+ 	.delete		= drr_delete_class,
+-	.get		= drr_get_class,
+-	.put		= drr_put_class,
++	.find		= drr_search_class,
+ 	.tcf_block	= drr_tcf_block,
+ 	.bind_tcf	= drr_bind_tcf,
+ 	.unbind_tcf	= drr_unbind_tcf,
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@ -85,21 +85,21 @@ static struct Qdisc *dsmark_leaf(struct
+ 	return p->q;
+ }
+ 
+-static unsigned long dsmark_get(struct Qdisc *sch, u32 classid)
++static unsigned long dsmark_find(struct Qdisc *sch, u32 classid)
+ {
+-	pr_debug("%s(sch %p,[qdisc %p],classid %x)\n",
+-		 __func__, sch, qdisc_priv(sch), classid);
+-
+ 	return TC_H_MIN(classid) + 1;
+ }
+ 
+ static unsigned long dsmark_bind_filter(struct Qdisc *sch,
+ 					unsigned long parent, u32 classid)
+ {
+-	return dsmark_get(sch, classid);
++	pr_debug("%s(sch %p,[qdisc %p],classid %x)\n",
++		 __func__, sch, qdisc_priv(sch), classid);
++
++	return dsmark_find(sch, classid);
+ }
+ 
+-static void dsmark_put(struct Qdisc *sch, unsigned long cl)
++static void dsmark_unbind_filter(struct Qdisc *sch, unsigned long cl)
+ {
+ }
+ 
+@@ -469,14 +469,13 @@ nla_put_failure:
+ static const struct Qdisc_class_ops dsmark_class_ops = {
+ 	.graft		=	dsmark_graft,
+ 	.leaf		=	dsmark_leaf,
+-	.get		=	dsmark_get,
+-	.put		=	dsmark_put,
++	.find		=	dsmark_find,
+ 	.change		=	dsmark_change,
+ 	.delete		=	dsmark_delete,
+ 	.walk		=	dsmark_walk,
+ 	.tcf_block	=	dsmark_tcf_block,
+ 	.bind_tcf	=	dsmark_bind_filter,
+-	.unbind_tcf	=	dsmark_put,
++	.unbind_tcf	=	dsmark_unbind_filter,
+ 	.dump		=	dsmark_dump_class,
+ };
+ 
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -577,7 +577,7 @@ static struct Qdisc *fq_codel_leaf(struc
+ 	return NULL;
+ }
+ 
+-static unsigned long fq_codel_get(struct Qdisc *sch, u32 classid)
++static unsigned long fq_codel_find(struct Qdisc *sch, u32 classid)
+ {
+ 	return 0;
+ }
+@@ -590,7 +590,7 @@ static unsigned long fq_codel_bind(struc
+ 	return 0;
+ }
+ 
+-static void fq_codel_put(struct Qdisc *q, unsigned long cl)
++static void fq_codel_unbind(struct Qdisc *q, unsigned long cl)
+ {
+ }
+ 
+@@ -681,11 +681,10 @@ static void fq_codel_walk(struct Qdisc *
+ 
+ static const struct Qdisc_class_ops fq_codel_class_ops = {
+ 	.leaf		=	fq_codel_leaf,
+-	.get		=	fq_codel_get,
+-	.put		=	fq_codel_put,
++	.find		=	fq_codel_find,
+ 	.tcf_block	=	fq_codel_tcf_block,
+ 	.bind_tcf	=	fq_codel_bind,
+-	.unbind_tcf	=	fq_codel_put,
++	.unbind_tcf	=	fq_codel_unbind,
+ 	.dump		=	fq_codel_dump_class,
+ 	.dump_stats	=	fq_codel_dump_class_stats,
+ 	.walk		=	fq_codel_walk,
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -110,7 +110,6 @@ enum hfsc_class_flags {
+ 
+ struct hfsc_class {
+ 	struct Qdisc_class_common cl_common;
+-	unsigned int	refcnt;		/* usage count */
+ 
+ 	struct gnet_stats_basic_packed bstats;
+ 	struct gnet_stats_queue qstats;
+@@ -1045,7 +1044,6 @@ hfsc_change_class(struct Qdisc *sch, u32
+ 		hfsc_change_usc(cl, usc, 0);
+ 
+ 	cl->cl_common.classid = classid;
+-	cl->refcnt    = 1;
+ 	cl->sched     = q;
+ 	cl->cl_parent = parent;
+ 	cl->qdisc = qdisc_create_dflt(sch->dev_queue,
+@@ -1101,13 +1099,9 @@ hfsc_delete_class(struct Qdisc *sch, uns
+ 	hfsc_purge_queue(sch, cl);
+ 	qdisc_class_hash_remove(&q->clhash, &cl->cl_common);
+ 
+-	BUG_ON(--cl->refcnt == 0);
+-	/*
+-	 * This shouldn't happen: we "hold" one cops->get() when called
+-	 * from tc_ctl_tclass; the destroy method is done from cops->put().
+-	 */
+-
+ 	sch_tree_unlock(sch);
++
++	hfsc_destroy_class(sch, cl);
+ 	return 0;
+ }
+ 
+@@ -1208,23 +1202,9 @@ hfsc_qlen_notify(struct Qdisc *sch, unsi
+ }
+ 
+ static unsigned long
+-hfsc_get_class(struct Qdisc *sch, u32 classid)
+-{
+-	struct hfsc_class *cl = hfsc_find_class(classid, sch);
+-
+-	if (cl != NULL)
+-		cl->refcnt++;
+-
+-	return (unsigned long)cl;
+-}
+-
+-static void
+-hfsc_put_class(struct Qdisc *sch, unsigned long arg)
++hfsc_search_class(struct Qdisc *sch, u32 classid)
+ {
+-	struct hfsc_class *cl = (struct hfsc_class *)arg;
+-
+-	if (--cl->refcnt == 0)
+-		hfsc_destroy_class(sch, cl);
++	return (unsigned long)hfsc_find_class(classid, sch);
+ }
+ 
+ static unsigned long
+@@ -1415,7 +1395,6 @@ hfsc_init_qdisc(struct Qdisc *sch, struc
+ 		return err;
+ 
+ 	q->root.cl_common.classid = sch->handle;
+-	q->root.refcnt  = 1;
+ 	q->root.sched   = q;
+ 	q->root.qdisc = qdisc_create_dflt(sch->dev_queue, &pfifo_qdisc_ops,
+ 					  sch->handle);
+@@ -1657,8 +1636,7 @@ static const struct Qdisc_class_ops hfsc
+ 	.graft		= hfsc_graft_class,
+ 	.leaf		= hfsc_class_leaf,
+ 	.qlen_notify	= hfsc_qlen_notify,
+-	.get		= hfsc_get_class,
+-	.put		= hfsc_put_class,
++	.find		= hfsc_search_class,
+ 	.bind_tcf	= hfsc_bind_tcf,
+ 	.unbind_tcf	= hfsc_unbind_tcf,
+ 	.tcf_block	= hfsc_tcf_block,
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -107,7 +107,6 @@ struct htb_class {
+ 	struct tcf_proto __rcu	*filter_list;	/* class attached filters */
+ 	struct tcf_block	*block;
+ 	int			filter_cnt;
+-	int			refcnt;		/* usage count of this class */
+ 
+ 	int			level;		/* our level (see above) */
+ 	unsigned int		children;
+@@ -193,6 +192,10 @@ static inline struct htb_class *htb_find
+ 	return container_of(clc, struct htb_class, common);
+ }
+ 
++static unsigned long htb_search(struct Qdisc *sch, u32 handle)
++{
++	return (unsigned long)htb_find(handle, sch);
++}
+ /**
+  * htb_classify - classify a packet into class
+  *
+@@ -1190,14 +1193,6 @@ static void htb_qlen_notify(struct Qdisc
+ 	htb_deactivate(qdisc_priv(sch), cl);
+ }
+ 
+-static unsigned long htb_get(struct Qdisc *sch, u32 classid)
+-{
+-	struct htb_class *cl = htb_find(classid, sch);
+-	if (cl)
+-		cl->refcnt++;
+-	return (unsigned long)cl;
+-}
+-
+ static inline int htb_parent_last_child(struct htb_class *cl)
+ {
+ 	if (!cl->parent)
+@@ -1317,22 +1312,10 @@ static int htb_delete(struct Qdisc *sch,
+ 	if (last_child)
+ 		htb_parent_to_leaf(q, cl, new_q);
+ 
+-	BUG_ON(--cl->refcnt == 0);
+-	/*
+-	 * This shouldn't happen: we "hold" one cops->get() when called
+-	 * from tc_ctl_tclass; the destroy method is done from cops->put().
+-	 */
+-
+ 	sch_tree_unlock(sch);
+-	return 0;
+-}
+ 
+-static void htb_put(struct Qdisc *sch, unsigned long arg)
+-{
+-	struct htb_class *cl = (struct htb_class *)arg;
+-
+-	if (--cl->refcnt == 0)
+-		htb_destroy_class(sch, cl);
++	htb_destroy_class(sch, cl);
++	return 0;
+ }
+ 
+ static int htb_change_class(struct Qdisc *sch, u32 classid,
+@@ -1423,7 +1406,6 @@ static int htb_change_class(struct Qdisc
+ 			}
+ 		}
+ 
+-		cl->refcnt = 1;
+ 		cl->children = 0;
+ 		INIT_LIST_HEAD(&cl->un.leaf.drop_list);
+ 		RB_CLEAR_NODE(&cl->pq_node);
+@@ -1599,8 +1581,7 @@ static const struct Qdisc_class_ops htb_
+ 	.graft		=	htb_graft,
+ 	.leaf		=	htb_leaf,
+ 	.qlen_notify	=	htb_qlen_notify,
+-	.get		=	htb_get,
+-	.put		=	htb_put,
++	.find		=	htb_search,
+ 	.change		=	htb_change_class,
+ 	.delete		=	htb_delete,
+ 	.walk		=	htb_walk,
+--- a/net/sched/sch_ingress.c
++++ b/net/sched/sch_ingress.c
+@@ -27,7 +27,7 @@ static struct Qdisc *ingress_leaf(struct
+ 	return NULL;
+ }
+ 
+-static unsigned long ingress_get(struct Qdisc *sch, u32 classid)
++static unsigned long ingress_find(struct Qdisc *sch, u32 classid)
+ {
+ 	return TC_H_MIN(classid) + 1;
+ }
+@@ -35,10 +35,10 @@ static unsigned long ingress_get(struct
+ static unsigned long ingress_bind_filter(struct Qdisc *sch,
+ 					 unsigned long parent, u32 classid)
+ {
+-	return ingress_get(sch, classid);
++	return ingress_find(sch, classid);
+ }
+ 
+-static void ingress_put(struct Qdisc *sch, unsigned long cl)
++static void ingress_unbind_filter(struct Qdisc *sch, unsigned long cl)
+ {
+ }
+ 
+@@ -94,12 +94,11 @@ nla_put_failure:
+ 
+ static const struct Qdisc_class_ops ingress_class_ops = {
+ 	.leaf		=	ingress_leaf,
+-	.get		=	ingress_get,
+-	.put		=	ingress_put,
++	.find		=	ingress_find,
+ 	.walk		=	ingress_walk,
+ 	.tcf_block	=	ingress_tcf_block,
+ 	.bind_tcf	=	ingress_bind_filter,
+-	.unbind_tcf	=	ingress_put,
++	.unbind_tcf	=	ingress_unbind_filter,
+ };
+ 
+ static struct Qdisc_ops ingress_qdisc_ops __read_mostly = {
+@@ -117,7 +116,7 @@ struct clsact_sched_data {
+ 	struct tcf_block *egress_block;
+ };
+ 
+-static unsigned long clsact_get(struct Qdisc *sch, u32 classid)
++static unsigned long clsact_find(struct Qdisc *sch, u32 classid)
+ {
+ 	switch (TC_H_MIN(classid)) {
+ 	case TC_H_MIN(TC_H_MIN_INGRESS):
+@@ -131,7 +130,7 @@ static unsigned long clsact_get(struct Q
+ static unsigned long clsact_bind_filter(struct Qdisc *sch,
+ 					unsigned long parent, u32 classid)
+ {
+-	return clsact_get(sch, classid);
++	return clsact_find(sch, classid);
+ }
+ 
+ static struct tcf_block *clsact_tcf_block(struct Qdisc *sch, unsigned long cl)
+@@ -183,12 +182,11 @@ static void clsact_destroy(struct Qdisc
+ 
+ static const struct Qdisc_class_ops clsact_class_ops = {
+ 	.leaf		=	ingress_leaf,
+-	.get		=	clsact_get,
+-	.put		=	ingress_put,
++	.find		=	clsact_find,
+ 	.walk		=	ingress_walk,
+ 	.tcf_block	=	clsact_tcf_block,
+ 	.bind_tcf	=	clsact_bind_filter,
+-	.unbind_tcf	=	ingress_put,
++	.unbind_tcf	=	ingress_unbind_filter,
+ };
+ 
+ static struct Qdisc_ops clsact_qdisc_ops __read_mostly = {
+--- a/net/sched/sch_mq.c
++++ b/net/sched/sch_mq.c
+@@ -165,7 +165,7 @@ static struct Qdisc *mq_leaf(struct Qdis
+ 	return dev_queue->qdisc_sleeping;
+ }
+ 
+-static unsigned long mq_get(struct Qdisc *sch, u32 classid)
++static unsigned long mq_find(struct Qdisc *sch, u32 classid)
+ {
+ 	unsigned int ntx = TC_H_MIN(classid);
+ 
+@@ -174,10 +174,6 @@ static unsigned long mq_get(struct Qdisc
+ 	return ntx;
+ }
+ 
+-static void mq_put(struct Qdisc *sch, unsigned long cl)
+-{
+-}
+-
+ static int mq_dump_class(struct Qdisc *sch, unsigned long cl,
+ 			 struct sk_buff *skb, struct tcmsg *tcm)
+ {
+@@ -223,8 +219,7 @@ static const struct Qdisc_class_ops mq_c
+ 	.select_queue	= mq_select_queue,
+ 	.graft		= mq_graft,
+ 	.leaf		= mq_leaf,
+-	.get		= mq_get,
+-	.put		= mq_put,
++	.find		= mq_find,
+ 	.walk		= mq_walk,
+ 	.dump		= mq_dump_class,
+ 	.dump_stats	= mq_dump_class_stats,
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@ -277,7 +277,7 @@ static struct Qdisc *mqprio_leaf(struct
+ 	return dev_queue->qdisc_sleeping;
+ }
+ 
+-static unsigned long mqprio_get(struct Qdisc *sch, u32 classid)
++static unsigned long mqprio_find(struct Qdisc *sch, u32 classid)
+ {
+ 	struct net_device *dev = qdisc_dev(sch);
+ 	unsigned int ntx = TC_H_MIN(classid);
+@@ -287,10 +287,6 @@ static unsigned long mqprio_get(struct Q
+ 	return ntx;
+ }
+ 
+-static void mqprio_put(struct Qdisc *sch, unsigned long cl)
+-{
+-}
+-
+ static int mqprio_dump_class(struct Qdisc *sch, unsigned long cl,
+ 			 struct sk_buff *skb, struct tcmsg *tcm)
+ {
+@@ -403,8 +399,7 @@ static void mqprio_walk(struct Qdisc *sc
+ static const struct Qdisc_class_ops mqprio_class_ops = {
+ 	.graft		= mqprio_graft,
+ 	.leaf		= mqprio_leaf,
+-	.get		= mqprio_get,
+-	.put		= mqprio_put,
++	.find		= mqprio_find,
+ 	.walk		= mqprio_walk,
+ 	.dump		= mqprio_dump_class,
+ 	.dump_stats	= mqprio_dump_class_stats,
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -301,7 +301,7 @@ multiq_leaf(struct Qdisc *sch, unsigned
+ 	return q->queues[band];
+ }
+ 
+-static unsigned long multiq_get(struct Qdisc *sch, u32 classid)
++static unsigned long multiq_find(struct Qdisc *sch, u32 classid)
+ {
+ 	struct multiq_sched_data *q = qdisc_priv(sch);
+ 	unsigned long band = TC_H_MIN(classid);
+@@ -314,11 +314,11 @@ static unsigned long multiq_get(struct Q
+ static unsigned long multiq_bind(struct Qdisc *sch, unsigned long parent,
+ 				 u32 classid)
+ {
+-	return multiq_get(sch, classid);
++	return multiq_find(sch, classid);
+ }
+ 
+ 
+-static void multiq_put(struct Qdisc *q, unsigned long cl)
++static void multiq_unbind(struct Qdisc *q, unsigned long cl)
+ {
+ }
+ 
+@@ -380,12 +380,11 @@ static struct tcf_block *multiq_tcf_bloc
+ static const struct Qdisc_class_ops multiq_class_ops = {
+ 	.graft		=	multiq_graft,
+ 	.leaf		=	multiq_leaf,
+-	.get		=	multiq_get,
+-	.put		=	multiq_put,
++	.find		=	multiq_find,
+ 	.walk		=	multiq_walk,
+ 	.tcf_block	=	multiq_tcf_block,
+ 	.bind_tcf	=	multiq_bind,
+-	.unbind_tcf	=	multiq_put,
++	.unbind_tcf	=	multiq_unbind,
+ 	.dump		=	multiq_dump_class,
+ 	.dump_stats	=	multiq_dump_class_stats,
+ };
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -1096,15 +1096,11 @@ static struct Qdisc *netem_leaf(struct Q
+ 	return q->qdisc;
+ }
+ 
+-static unsigned long netem_get(struct Qdisc *sch, u32 classid)
++static unsigned long netem_find(struct Qdisc *sch, u32 classid)
+ {
+ 	return 1;
+ }
+ 
+-static void netem_put(struct Qdisc *sch, unsigned long arg)
+-{
+-}
+-
+ static void netem_walk(struct Qdisc *sch, struct qdisc_walker *walker)
+ {
+ 	if (!walker->stop) {
+@@ -1120,8 +1116,7 @@ static void netem_walk(struct Qdisc *sch
+ static const struct Qdisc_class_ops netem_class_ops = {
+ 	.graft		=	netem_graft,
+ 	.leaf		=	netem_leaf,
+-	.get		=	netem_get,
+-	.put		=	netem_put,
++	.find		=	netem_find,
+ 	.walk		=	netem_walk,
+ 	.dump		=	netem_dump_class,
+ };
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -260,7 +260,7 @@ prio_leaf(struct Qdisc *sch, unsigned lo
+ 	return q->queues[band];
+ }
+ 
+-static unsigned long prio_get(struct Qdisc *sch, u32 classid)
++static unsigned long prio_find(struct Qdisc *sch, u32 classid)
+ {
+ 	struct prio_sched_data *q = qdisc_priv(sch);
+ 	unsigned long band = TC_H_MIN(classid);
+@@ -272,11 +272,11 @@ static unsigned long prio_get(struct Qdi
+ 
+ static unsigned long prio_bind(struct Qdisc *sch, unsigned long parent, u32 classid)
+ {
+-	return prio_get(sch, classid);
++	return prio_find(sch, classid);
+ }
+ 
+ 
+-static void prio_put(struct Qdisc *q, unsigned long cl)
++static void prio_unbind(struct Qdisc *q, unsigned long cl)
+ {
+ }
+ 
+@@ -338,12 +338,11 @@ static struct tcf_block *prio_tcf_block(
+ static const struct Qdisc_class_ops prio_class_ops = {
+ 	.graft		=	prio_graft,
+ 	.leaf		=	prio_leaf,
+-	.get		=	prio_get,
+-	.put		=	prio_put,
++	.find		=	prio_find,
+ 	.walk		=	prio_walk,
+ 	.tcf_block	=	prio_tcf_block,
+ 	.bind_tcf	=	prio_bind,
+-	.unbind_tcf	=	prio_put,
++	.unbind_tcf	=	prio_unbind,
+ 	.dump		=	prio_dump_class,
+ 	.dump_stats	=	prio_dump_class_stats,
+ };
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -132,7 +132,6 @@ struct qfq_aggregate;
+ struct qfq_class {
+ 	struct Qdisc_class_common common;
+ 
+-	unsigned int refcnt;
+ 	unsigned int filter_cnt;
+ 
+ 	struct gnet_stats_basic_packed bstats;
+@@ -477,7 +476,6 @@ static int qfq_change_class(struct Qdisc
+ 	if (cl == NULL)
+ 		return -ENOBUFS;
+ 
+-	cl->refcnt = 1;
+ 	cl->common.classid = classid;
+ 	cl->deficit = lmax;
+ 
+@@ -555,32 +553,15 @@ static int qfq_delete_class(struct Qdisc
+ 	qfq_purge_queue(cl);
+ 	qdisc_class_hash_remove(&q->clhash, &cl->common);
+ 
+-	BUG_ON(--cl->refcnt == 0);
+-	/*
+-	 * This shouldn't happen: we "hold" one cops->get() when called
+-	 * from tc_ctl_tclass; the destroy method is done from cops->put().
+-	 */
+-
+ 	sch_tree_unlock(sch);
+-	return 0;
+-}
+-
+-static unsigned long qfq_get_class(struct Qdisc *sch, u32 classid)
+-{
+-	struct qfq_class *cl = qfq_find_class(sch, classid);
+-
+-	if (cl != NULL)
+-		cl->refcnt++;
+ 
+-	return (unsigned long)cl;
++	qfq_destroy_class(sch, cl);
++	return 0;
+ }
+ 
+-static void qfq_put_class(struct Qdisc *sch, unsigned long arg)
++static unsigned long qfq_search_class(struct Qdisc *sch, u32 classid)
+ {
+-	struct qfq_class *cl = (struct qfq_class *)arg;
+-
+-	if (--cl->refcnt == 0)
+-		qfq_destroy_class(sch, cl);
++	return (unsigned long)qfq_find_class(sch, classid);
+ }
+ 
+ static struct tcf_block *qfq_tcf_block(struct Qdisc *sch, unsigned long cl)
+@@ -1510,8 +1491,7 @@ static void qfq_destroy_qdisc(struct Qdi
+ static const struct Qdisc_class_ops qfq_class_ops = {
+ 	.change		= qfq_change_class,
+ 	.delete		= qfq_delete_class,
+-	.get		= qfq_get_class,
+-	.put		= qfq_put_class,
++	.find		= qfq_search_class,
+ 	.tcf_block	= qfq_tcf_block,
+ 	.bind_tcf	= qfq_bind_tcf,
+ 	.unbind_tcf	= qfq_unbind_tcf,
+--- a/net/sched/sch_red.c
++++ b/net/sched/sch_red.c
+@@ -311,15 +311,11 @@ static struct Qdisc *red_leaf(struct Qdi
+ 	return q->qdisc;
+ }
+ 
+-static unsigned long red_get(struct Qdisc *sch, u32 classid)
++static unsigned long red_find(struct Qdisc *sch, u32 classid)
+ {
+ 	return 1;
+ }
+ 
+-static void red_put(struct Qdisc *sch, unsigned long arg)
+-{
+-}
+-
+ static void red_walk(struct Qdisc *sch, struct qdisc_walker *walker)
+ {
+ 	if (!walker->stop) {
+@@ -335,8 +331,7 @@ static void red_walk(struct Qdisc *sch,
+ static const struct Qdisc_class_ops red_class_ops = {
+ 	.graft		=	red_graft,
+ 	.leaf		=	red_leaf,
+-	.get		=	red_get,
+-	.put		=	red_put,
++	.find		=	red_find,
+ 	.walk		=	red_walk,
+ 	.dump		=	red_dump_class,
+ };
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -632,12 +632,12 @@ static struct Qdisc *sfb_leaf(struct Qdi
+ 	return q->qdisc;
+ }
+ 
+-static unsigned long sfb_get(struct Qdisc *sch, u32 classid)
++static unsigned long sfb_find(struct Qdisc *sch, u32 classid)
+ {
+ 	return 1;
+ }
+ 
+-static void sfb_put(struct Qdisc *sch, unsigned long arg)
++static void sfb_unbind(struct Qdisc *sch, unsigned long arg)
+ {
+ }
+ 
+@@ -683,14 +683,13 @@ static unsigned long sfb_bind(struct Qdi
+ static const struct Qdisc_class_ops sfb_class_ops = {
+ 	.graft		=	sfb_graft,
+ 	.leaf		=	sfb_leaf,
+-	.get		=	sfb_get,
+-	.put		=	sfb_put,
++	.find		=	sfb_find,
+ 	.change		=	sfb_change_class,
+ 	.delete		=	sfb_delete,
+ 	.walk		=	sfb_walk,
+ 	.tcf_block	=	sfb_tcf_block,
+ 	.bind_tcf	=	sfb_bind,
+-	.unbind_tcf	=	sfb_put,
++	.unbind_tcf	=	sfb_unbind,
+ 	.dump		=	sfb_dump_class,
+ };
+ 
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -808,7 +808,7 @@ static struct Qdisc *sfq_leaf(struct Qdi
+ 	return NULL;
+ }
+ 
+-static unsigned long sfq_get(struct Qdisc *sch, u32 classid)
++static unsigned long sfq_find(struct Qdisc *sch, u32 classid)
+ {
+ 	return 0;
+ }
+@@ -821,7 +821,7 @@ static unsigned long sfq_bind(struct Qdi
+ 	return 0;
+ }
+ 
+-static void sfq_put(struct Qdisc *q, unsigned long cl)
++static void sfq_unbind(struct Qdisc *q, unsigned long cl)
+ {
+ }
+ 
+@@ -885,11 +885,10 @@ static void sfq_walk(struct Qdisc *sch,
+ 
+ static const struct Qdisc_class_ops sfq_class_ops = {
+ 	.leaf		=	sfq_leaf,
+-	.get		=	sfq_get,
+-	.put		=	sfq_put,
++	.find		=	sfq_find,
+ 	.tcf_block	=	sfq_tcf_block,
+ 	.bind_tcf	=	sfq_bind,
+-	.unbind_tcf	=	sfq_put,
++	.unbind_tcf	=	sfq_unbind,
+ 	.dump		=	sfq_dump_class,
+ 	.dump_stats	=	sfq_dump_class_stats,
+ 	.walk		=	sfq_walk,
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@ -511,15 +511,11 @@ static struct Qdisc *tbf_leaf(struct Qdi
+ 	return q->qdisc;
+ }
+ 
+-static unsigned long tbf_get(struct Qdisc *sch, u32 classid)
++static unsigned long tbf_find(struct Qdisc *sch, u32 classid)
+ {
+ 	return 1;
+ }
+ 
+-static void tbf_put(struct Qdisc *sch, unsigned long arg)
+-{
+-}
+-
+ static void tbf_walk(struct Qdisc *sch, struct qdisc_walker *walker)
+ {
+ 	if (!walker->stop) {
+@@ -535,8 +531,7 @@ static void tbf_walk(struct Qdisc *sch,
+ static const struct Qdisc_class_ops tbf_class_ops = {
+ 	.graft		=	tbf_graft,
+ 	.leaf		=	tbf_leaf,
+-	.get		=	tbf_get,
+-	.put		=	tbf_put,
++	.find		=	tbf_find,
+ 	.walk		=	tbf_walk,
+ 	.dump		=	tbf_dump_class,
+ };
