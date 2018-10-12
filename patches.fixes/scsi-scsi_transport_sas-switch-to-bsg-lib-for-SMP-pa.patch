@@ -1,0 +1,1084 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Fri, 25 Aug 2017 17:37:41 +0200
+Subject: [PATCH] scsi: scsi_transport_sas: switch to bsg-lib for SMP
+Git-commit: 651a013649943710a900551ec6e03d2084e1a65a
+Patch-mainline: v4.14-rc1
+References: bsc#1104967,FATE#325924
+ passthrough
+
+Simplify the SMP passthrough code by switching it to the generic bsg-lib
+helpers that abstract away the details of the request code, and gets
+drivers out of seeing struct scsi_request.
+
+For the libsas host SMP code there is a small behavior difference in
+that we now always clear the residual len for successful commands,
+similar to the three other SMP handler implementations.  Given that
+there is no partial command handling in the host SMP handler this should
+not matter in practice.
+
+[mkp: typos and checkpatch fixes]
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/message/fusion/mptsas.c          |  79 +++++------
+ drivers/scsi/libsas/Kconfig              |   1 +
+ drivers/scsi/libsas/sas_expander.c       |  70 +++++-----
+ drivers/scsi/libsas/sas_host_smp.c       | 106 ++++++--------
+ drivers/scsi/libsas/sas_internal.h       |  12 +-
+ drivers/scsi/mpt3sas/mpt3sas_transport.c | 230 ++++++++++++-------------------
+ drivers/scsi/scsi_transport_sas.c        | 118 ++++------------
+ include/scsi/libsas.h                    |   3 -
+ include/scsi/scsi_transport_sas.h        |   4 +-
+ 9 files changed, 243 insertions(+), 380 deletions(-)
+
+diff --git a/drivers/message/fusion/mptsas.c b/drivers/message/fusion/mptsas.c
+index 42ee70c23d9f..345f6035599e 100644
+--- a/drivers/message/fusion/mptsas.c
++++ b/drivers/message/fusion/mptsas.c
+@@ -2210,33 +2210,26 @@ mptsas_get_bay_identifier(struct sas_rphy *rphy)
+ 	return rc;
+ }
+ 
+-static int mptsas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+-			      struct request *req)
++static void mptsas_smp_handler(struct bsg_job *job, struct Scsi_Host *shost,
++		struct sas_rphy *rphy)
+ {
+ 	MPT_ADAPTER *ioc = ((MPT_SCSI_HOST *) shost->hostdata)->ioc;
+ 	MPT_FRAME_HDR *mf;
+ 	SmpPassthroughRequest_t *smpreq;
+-	struct request *rsp = req->next_rq;
+-	int ret;
+ 	int flagsLength;
+ 	unsigned long timeleft;
+ 	char *psge;
+-	dma_addr_t dma_addr_in = 0;
+-	dma_addr_t dma_addr_out = 0;
+ 	u64 sas_address = 0;
+-
+-	if (!rsp) {
+-		printk(MYIOC_s_ERR_FMT "%s: the smp response space is missing\n",
+-		    ioc->name, __func__);
+-		return -EINVAL;
+-	}
++	unsigned int reslen = 0;
++	int ret = -EINVAL;
+ 
+ 	/* do we need to support multiple segments? */
+-	if (bio_multiple_segments(req->bio) ||
+-	    bio_multiple_segments(rsp->bio)) {
++	if (job->request_payload.sg_cnt > 1 ||
++	    job->reply_payload.sg_cnt > 1) {
+ 		printk(MYIOC_s_ERR_FMT "%s: multiple segments req %u, rsp %u\n",
+-		    ioc->name, __func__, blk_rq_bytes(req), blk_rq_bytes(rsp));
+-		return -EINVAL;
++		    ioc->name, __func__, job->request_payload.payload_len,
++		    job->reply_payload.payload_len);
++		goto out;
+ 	}
+ 
+ 	ret = mutex_lock_interruptible(&ioc->sas_mgmt.mutex);
+@@ -2252,7 +2245,8 @@ static int mptsas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 	smpreq = (SmpPassthroughRequest_t *)mf;
+ 	memset(smpreq, 0, sizeof(*smpreq));
+ 
+-	smpreq->RequestDataLength = cpu_to_le16(blk_rq_bytes(req) - 4);
++	smpreq->RequestDataLength =
++		cpu_to_le16(job->request_payload.payload_len - 4);
+ 	smpreq->Function = MPI_FUNCTION_SMP_PASSTHROUGH;
+ 
+ 	if (rphy)
+@@ -2278,13 +2272,14 @@ static int mptsas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 		       MPI_SGE_FLAGS_END_OF_BUFFER |
+ 		       MPI_SGE_FLAGS_DIRECTION)
+ 		       << MPI_SGE_FLAGS_SHIFT;
+-	flagsLength |= (blk_rq_bytes(req) - 4);
+ 
+-	dma_addr_out = pci_map_single(ioc->pcidev, bio_data(req->bio),
+-				      blk_rq_bytes(req), PCI_DMA_BIDIRECTIONAL);
+-	if (pci_dma_mapping_error(ioc->pcidev, dma_addr_out))
++	if (!dma_map_sg(&ioc->pcidev->dev, job->request_payload.sg_list,
++			1, PCI_DMA_BIDIRECTIONAL))
+ 		goto put_mf;
+-	ioc->add_sge(psge, flagsLength, dma_addr_out);
++
++	flagsLength |= (sg_dma_len(job->request_payload.sg_list) - 4);
++	ioc->add_sge(psge, flagsLength,
++			sg_dma_address(job->request_payload.sg_list));
+ 	psge += ioc->SGE_size;
+ 
+ 	/* response */
+@@ -2294,12 +2289,13 @@ static int mptsas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 		MPI_SGE_FLAGS_END_OF_BUFFER;
+ 
+ 	flagsLength = flagsLength << MPI_SGE_FLAGS_SHIFT;
+-	flagsLength |= blk_rq_bytes(rsp) + 4;
+-	dma_addr_in =  pci_map_single(ioc->pcidev, bio_data(rsp->bio),
+-				      blk_rq_bytes(rsp), PCI_DMA_BIDIRECTIONAL);
+-	if (pci_dma_mapping_error(ioc->pcidev, dma_addr_in))
+-		goto unmap;
+-	ioc->add_sge(psge, flagsLength, dma_addr_in);
++
++	if (!dma_map_sg(&ioc->pcidev->dev, job->reply_payload.sg_list,
++			1, PCI_DMA_BIDIRECTIONAL))
++		goto unmap_out;
++	flagsLength |= sg_dma_len(job->reply_payload.sg_list) + 4;
++	ioc->add_sge(psge, flagsLength,
++			sg_dma_address(job->reply_payload.sg_list));
+ 
+ 	INITIALIZE_MGMT_STATUS(ioc->sas_mgmt.status)
+ 	mpt_put_msg_frame(mptsasMgmtCtx, ioc, mf);
+@@ -2310,10 +2306,10 @@ static int mptsas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 		mpt_free_msg_frame(ioc, mf);
+ 		mf = NULL;
+ 		if (ioc->sas_mgmt.status & MPT_MGMT_STATUS_DID_IOCRESET)
+-			goto unmap;
++			goto unmap_in;
+ 		if (!timeleft)
+ 			mpt_Soft_Hard_ResetHandler(ioc, CAN_SLEEP);
+-		goto unmap;
++		goto unmap_in;
+ 	}
+ 	mf = NULL;
+ 
+@@ -2321,23 +2317,22 @@ static int mptsas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 		SmpPassthroughReply_t *smprep;
+ 
+ 		smprep = (SmpPassthroughReply_t *)ioc->sas_mgmt.reply;
+-		memcpy(scsi_req(req)->sense, smprep, sizeof(*smprep));
+-		scsi_req(req)->sense_len = sizeof(*smprep);
+-		scsi_req(req)->resid_len = 0;
+-		scsi_req(rsp)->resid_len -= smprep->ResponseDataLength;
++		memcpy(job->reply, smprep, sizeof(*smprep));
++		job->reply_len = sizeof(*smprep);
++		reslen = smprep->ResponseDataLength;
+ 	} else {
+ 		printk(MYIOC_s_ERR_FMT
+ 		    "%s: smp passthru reply failed to be returned\n",
+ 		    ioc->name, __func__);
+ 		ret = -ENXIO;
+ 	}
+-unmap:
+-	if (dma_addr_out)
+-		pci_unmap_single(ioc->pcidev, dma_addr_out, blk_rq_bytes(req),
+-				 PCI_DMA_BIDIRECTIONAL);
+-	if (dma_addr_in)
+-		pci_unmap_single(ioc->pcidev, dma_addr_in, blk_rq_bytes(rsp),
+-				 PCI_DMA_BIDIRECTIONAL);
++
++unmap_in:
++	dma_unmap_sg(&ioc->pcidev->dev, job->reply_payload.sg_list, 1,
++			PCI_DMA_BIDIRECTIONAL);
++unmap_out:
++	dma_unmap_sg(&ioc->pcidev->dev, job->request_payload.sg_list, 1,
++			PCI_DMA_BIDIRECTIONAL);
+ put_mf:
+ 	if (mf)
+ 		mpt_free_msg_frame(ioc, mf);
+@@ -2345,7 +2340,7 @@ static int mptsas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 	CLEAR_MGMT_STATUS(ioc->sas_mgmt.status)
+ 	mutex_unlock(&ioc->sas_mgmt.mutex);
+ out:
+-	return ret;
++	bsg_job_done(job, ret, reslen);
+ }
+ 
+ static struct sas_function_template mptsas_transport_functions = {
+diff --git a/drivers/scsi/libsas/Kconfig b/drivers/scsi/libsas/Kconfig
+index 9dafe64e7c7a..13739bfacc67 100644
+--- a/drivers/scsi/libsas/Kconfig
++++ b/drivers/scsi/libsas/Kconfig
+@@ -26,6 +26,7 @@ config SCSI_SAS_LIBSAS
+ 	tristate "SAS Domain Transport Attributes"
+ 	depends on SCSI
+ 	select SCSI_SAS_ATTRS
++	select BLK_DEV_BSGLIB
+ 	help
+ 	  This provides transport specific helpers for SAS drivers which
+ 	  use the domain device construct (like the aic94xxx).
+diff --git a/drivers/scsi/libsas/sas_expander.c b/drivers/scsi/libsas/sas_expander.c
+index 570b2cb2da43..6b4fd2375178 100644
+--- a/drivers/scsi/libsas/sas_expander.c
++++ b/drivers/scsi/libsas/sas_expander.c
+@@ -64,8 +64,8 @@ static void smp_task_done(struct sas_task *task)
+ /* Give it some long enough timeout. In seconds. */
+ #define SMP_TIMEOUT 10
+ 
+-static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
+-			    void *resp, int resp_size)
++static int smp_execute_task_sg(struct domain_device *dev,
++		struct scatterlist *req, struct scatterlist *resp)
+ {
+ 	int res, retry;
+ 	struct sas_task *task = NULL;
+@@ -86,8 +86,8 @@ static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
+ 		}
+ 		task->dev = dev;
+ 		task->task_proto = dev->tproto;
+-		sg_init_one(&task->smp_task.smp_req, req, req_size);
+-		sg_init_one(&task->smp_task.smp_resp, resp, resp_size);
++		task->smp_task.smp_req = *req;
++		task->smp_task.smp_resp = *resp;
+ 
+ 		task->task_done = smp_task_done;
+ 
+@@ -151,6 +151,17 @@ static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
+ 	return res;
+ }
+ 
++static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
++			    void *resp, int resp_size)
++{
++	struct scatterlist req_sg;
++	struct scatterlist resp_sg;
++
++	sg_init_one(&req_sg, req, req_size);
++	sg_init_one(&resp_sg, resp, resp_size);
++	return smp_execute_task_sg(dev, &req_sg, &resp_sg);
++}
++
+ /* ---------- Allocations ---------- */
+ 
+ static inline void *alloc_smp_req(int size)
+@@ -2130,57 +2141,50 @@ int sas_ex_revalidate_domain(struct domain_device *port_dev)
+ 	return res;
+ }
+ 
+-int sas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+-		    struct request *req)
++void sas_smp_handler(struct bsg_job *job, struct Scsi_Host *shost,
++		struct sas_rphy *rphy)
+ {
+ 	struct domain_device *dev;
+-	int ret, type;
+-	struct request *rsp = req->next_rq;
+-
+-	if (!rsp) {
+-		printk("%s: space for a smp response is missing\n",
+-		       __func__);
+-		return -EINVAL;
+-	}
++	unsigned int reslen = 0;
++	int ret = -EINVAL;
+ 
+ 	/* no rphy means no smp target support (ie aic94xx host) */
+ 	if (!rphy)
+-		return sas_smp_host_handler(shost, req, rsp);
+-
+-	type = rphy->identify.device_type;
++		return sas_smp_host_handler(job, shost);
+ 
+-	if (type != SAS_EDGE_EXPANDER_DEVICE &&
+-	    type != SAS_FANOUT_EXPANDER_DEVICE) {
++	switch (rphy->identify.device_type) {
++	case SAS_EDGE_EXPANDER_DEVICE:
++	case SAS_FANOUT_EXPANDER_DEVICE:
++		break;
++	default:
+ 		printk("%s: can we send a smp request to a device?\n",
+ 		       __func__);
+-		return -EINVAL;
++		goto out;
+ 	}
+ 
+ 	dev = sas_find_dev_by_rphy(rphy);
+ 	if (!dev) {
+ 		printk("%s: fail to find a domain_device?\n", __func__);
+-		return -EINVAL;
++		goto out;
+ 	}
+ 
+ 	/* do we need to support multiple segments? */
+-	if (bio_multiple_segments(req->bio) ||
+-	    bio_multiple_segments(rsp->bio)) {
++	if (job->request_payload.sg_cnt > 1 ||
++	    job->reply_payload.sg_cnt > 1) {
+ 		printk("%s: multiple segments req %u, rsp %u\n",
+-		       __func__, blk_rq_bytes(req), blk_rq_bytes(rsp));
+-		return -EINVAL;
++		       __func__, job->request_payload.payload_len,
++		       job->reply_payload.payload_len);
++		goto out;
+ 	}
+ 
+-	ret = smp_execute_task(dev, bio_data(req->bio), blk_rq_bytes(req),
+-			       bio_data(rsp->bio), blk_rq_bytes(rsp));
++	ret = smp_execute_task_sg(dev, job->request_payload.sg_list,
++			job->reply_payload.sg_list);
+ 	if (ret > 0) {
+ 		/* positive number is the untransferred residual */
+-		scsi_req(rsp)->resid_len = ret;
+-		scsi_req(req)->resid_len = 0;
++		reslen = ret;
+ 		ret = 0;
+-	} else if (ret == 0) {
+-		scsi_req(rsp)->resid_len = 0;
+-		scsi_req(req)->resid_len = 0;
+ 	}
+ 
+-	return ret;
++out:
++	bsg_job_done(job, ret, reslen);
+ }
+diff --git a/drivers/scsi/libsas/sas_host_smp.c b/drivers/scsi/libsas/sas_host_smp.c
+index 45cbbc44f4d7..9ead93df3a6e 100644
+--- a/drivers/scsi/libsas/sas_host_smp.c
++++ b/drivers/scsi/libsas/sas_host_smp.c
+@@ -225,47 +225,36 @@ static void sas_phy_control(struct sas_ha_struct *sas_ha, u8 phy_id,
+ 		resp_data[2] = SMP_RESP_FUNC_ACC;
+ }
+ 
+-int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+-			 struct request *rsp)
++void sas_smp_host_handler(struct bsg_job *job, struct Scsi_Host *shost)
+ {
+-	u8 *req_data = NULL, *resp_data = NULL, *buf;
+ 	struct sas_ha_struct *sas_ha = SHOST_TO_SAS_HA(shost);
++	u8 *req_data, *resp_data;
++	unsigned int reslen = 0;
+ 	int error = -EINVAL;
+ 
+ 	/* eight is the minimum size for request and response frames */
+-	if (blk_rq_bytes(req) < 8 || blk_rq_bytes(rsp) < 8)
++	if (job->request_payload.payload_len < 8 ||
++	    job->reply_payload.payload_len < 8)
+ 		goto out;
+ 
+-	if (bio_offset(req->bio) + blk_rq_bytes(req) > PAGE_SIZE ||
+-	    bio_offset(rsp->bio) + blk_rq_bytes(rsp) > PAGE_SIZE) {
+-		shost_printk(KERN_ERR, shost,
+-			"SMP request/response frame crosses page boundary");
++	error = -ENOMEM;
++	req_data = kzalloc(job->request_payload.payload_len, GFP_KERNEL);
++	if (!req_data)
+ 		goto out;
+-	}
+-
+-	req_data = kzalloc(blk_rq_bytes(req), GFP_KERNEL);
++	sg_copy_to_buffer(job->request_payload.sg_list,
++			  job->request_payload.sg_cnt, req_data,
++			  job->request_payload.payload_len);
+ 
+ 	/* make sure frame can always be built ... we copy
+ 	 * back only the requested length */
+-	resp_data = kzalloc(max(blk_rq_bytes(rsp), 128U), GFP_KERNEL);
+-
+-	if (!req_data || !resp_data) {
+-		error = -ENOMEM;
+-		goto out;
+-	}
+-
+-	local_irq_disable();
+-	buf = kmap_atomic(bio_page(req->bio));
+-	memcpy(req_data, buf, blk_rq_bytes(req));
+-	kunmap_atomic(buf - bio_offset(req->bio));
+-	local_irq_enable();
++	resp_data = kzalloc(max(job->reply_payload.payload_len, 128U),
++			GFP_KERNEL);
++	if (!resp_data)
++		goto out_free_req;
+ 
++	error = -EINVAL;
+ 	if (req_data[0] != SMP_REQUEST)
+-		goto out;
+-
+-	/* always succeeds ... even if we can't process the request
+-	 * the result is in the response frame */
+-	error = 0;
++		goto out_free_resp;
+ 
+ 	/* set up default don't know response */
+ 	resp_data[0] = SMP_RESPONSE;
+@@ -274,20 +263,18 @@ int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+ 
+ 	switch (req_data[1]) {
+ 	case SMP_REPORT_GENERAL:
+-		scsi_req(req)->resid_len -= 8;
+-		scsi_req(rsp)->resid_len -= 32;
+ 		resp_data[2] = SMP_RESP_FUNC_ACC;
+ 		resp_data[9] = sas_ha->num_phys;
++		reslen = 32;
+ 		break;
+ 
+ 	case SMP_REPORT_MANUF_INFO:
+-		scsi_req(req)->resid_len -= 8;
+-		scsi_req(rsp)->resid_len -= 64;
+ 		resp_data[2] = SMP_RESP_FUNC_ACC;
+ 		memcpy(resp_data + 12, shost->hostt->name,
+ 		       SAS_EXPANDER_VENDOR_ID_LEN);
+ 		memcpy(resp_data + 20, "libsas virt phy",
+ 		       SAS_EXPANDER_PRODUCT_ID_LEN);
++		reslen = 64;
+ 		break;
+ 
+ 	case SMP_READ_GPIO_REG:
+@@ -295,14 +282,10 @@ int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+ 		break;
+ 
+ 	case SMP_DISCOVER:
+-		scsi_req(req)->resid_len -= 16;
+-		if ((int)scsi_req(req)->resid_len < 0) {
+-			scsi_req(req)->resid_len = 0;
+-			error = -EINVAL;
+-			goto out;
+-		}
+-		scsi_req(rsp)->resid_len -= 56;
++		if (job->request_payload.payload_len < 16)
++			goto out_free_resp;
+ 		sas_host_smp_discover(sas_ha, resp_data, req_data[9]);
++		reslen = 56;
+ 		break;
+ 
+ 	case SMP_REPORT_PHY_ERR_LOG:
+@@ -311,14 +294,10 @@ int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+ 		break;
+ 
+ 	case SMP_REPORT_PHY_SATA:
+-		scsi_req(req)->resid_len -= 16;
+-		if ((int)scsi_req(req)->resid_len < 0) {
+-			scsi_req(req)->resid_len = 0;
+-			error = -EINVAL;
+-			goto out;
+-		}
+-		scsi_req(rsp)->resid_len -= 60;
++		if (job->request_payload.payload_len < 16)
++			goto out_free_resp;
+ 		sas_report_phy_sata(sas_ha, resp_data, req_data[9]);
++		reslen = 60;
+ 		break;
+ 
+ 	case SMP_REPORT_ROUTE_INFO:
+@@ -330,16 +309,15 @@ int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+ 		const int base_frame_size = 11;
+ 		int to_write = req_data[4];
+ 
+-		if (blk_rq_bytes(req) < base_frame_size + to_write * 4 ||
+-		    scsi_req(req)->resid_len < base_frame_size + to_write * 4) {
++		if (job->request_payload.payload_len <
++				base_frame_size + to_write * 4) {
+ 			resp_data[2] = SMP_RESP_INV_FRM_LEN;
+ 			break;
+ 		}
+ 
+ 		to_write = sas_host_smp_write_gpio(sas_ha, resp_data, req_data[2],
+ 						   req_data[3], to_write, &req_data[8]);
+-		scsi_req(req)->resid_len -= base_frame_size + to_write * 4;
+-		scsi_req(rsp)->resid_len -= 8;
++		reslen = 8;
+ 		break;
+ 	}
+ 
+@@ -348,16 +326,12 @@ int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+ 		break;
+ 
+ 	case SMP_PHY_CONTROL:
+-		scsi_req(req)->resid_len -= 44;
+-		if ((int)scsi_req(req)->resid_len < 0) {
+-			scsi_req(req)->resid_len = 0;
+-			error = -EINVAL;
+-			goto out;
+-		}
+-		scsi_req(rsp)->resid_len -= 8;
++		if (job->request_payload.payload_len < 44)
++			goto out_free_resp;
+ 		sas_phy_control(sas_ha, req_data[9], req_data[10],
+ 				req_data[32] >> 4, req_data[33] >> 4,
+ 				resp_data);
++		reslen = 8;
+ 		break;
+ 
+ 	case SMP_PHY_TEST_FUNCTION:
+@@ -369,15 +343,15 @@ int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+ 		break;
+ 	}
+ 
+-	local_irq_disable();
+-	buf = kmap_atomic(bio_page(rsp->bio));
+-	memcpy(buf, resp_data, blk_rq_bytes(rsp));
+-	flush_kernel_dcache_page(bio_page(rsp->bio));
+-	kunmap_atomic(buf - bio_offset(rsp->bio));
+-	local_irq_enable();
++	sg_copy_from_buffer(job->reply_payload.sg_list,
++			    job->reply_payload.sg_cnt, resp_data,
++			    job->reply_payload.payload_len);
+ 
+- out:
+-	kfree(req_data);
++	error = 0;
++out_free_resp:
+ 	kfree(resp_data);
+-	return error;
++out_free_req:
++	kfree(req_data);
++out:
++	bsg_job_done(job, error, reslen);
+ }
+diff --git a/drivers/scsi/libsas/sas_internal.h b/drivers/scsi/libsas/sas_internal.h
+index a216c957b639..c07e08136491 100644
+--- a/drivers/scsi/libsas/sas_internal.h
++++ b/drivers/scsi/libsas/sas_internal.h
+@@ -81,6 +81,8 @@ int sas_queue_work(struct sas_ha_struct *ha, struct sas_work *sw);
+ int sas_notify_lldd_dev_found(struct domain_device *);
+ void sas_notify_lldd_dev_gone(struct domain_device *);
+ 
++void sas_smp_handler(struct bsg_job *job, struct Scsi_Host *shost,
++		struct sas_rphy *rphy);
+ int sas_smp_phy_control(struct domain_device *dev, int phy_id,
+ 			enum phy_func phy_func, struct sas_phy_linkrates *);
+ int sas_smp_get_phy_events(struct sas_phy *phy);
+@@ -98,16 +100,14 @@ void sas_hae_reset(struct work_struct *work);
+ void sas_free_device(struct kref *kref);
+ 
+ #ifdef CONFIG_SCSI_SAS_HOST_SMP
+-extern int sas_smp_host_handler(struct Scsi_Host *shost, struct request *req,
+-				struct request *rsp);
++extern void sas_smp_host_handler(struct bsg_job *job, struct Scsi_Host *shost);
+ #else
+-static inline int sas_smp_host_handler(struct Scsi_Host *shost,
+-				       struct request *req,
+-				       struct request *rsp)
++static inline void sas_smp_host_handler(struct bsg_job *job,
++		struct Scsi_Host *shost)
+ {
+ 	shost_printk(KERN_ERR, shost,
+ 		"Cannot send SMP to a sas host (not enabled in CONFIG)\n");
+-	return -EINVAL;
++	bsg_job_done(job, -EINVAL, 0);
+ }
+ #endif
+ 
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_transport.c b/drivers/scsi/mpt3sas/mpt3sas_transport.c
+index e7a7a704a315..d3940c5d079d 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_transport.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_transport.c
+@@ -1870,6 +1870,38 @@ _transport_phy_speed(struct sas_phy *phy, struct sas_phy_linkrates *rates)
+ 	return rc;
+ }
+ 
++static int
++_transport_map_smp_buffer(struct device *dev, struct bsg_buffer *buf,
++		dma_addr_t *dma_addr, size_t *dma_len, void **p)
++{
++	/* Check if the request is split across multiple segments */
++	if (buf->sg_cnt > 1) {
++		*p = dma_alloc_coherent(dev, buf->payload_len, dma_addr,
++				GFP_KERNEL);
++		if (!*p)
++			return -ENOMEM;
++		*dma_len = buf->payload_len;
++	} else {
++		if (!dma_map_sg(dev, buf->sg_list, 1, DMA_BIDIRECTIONAL))
++			return -ENOMEM;
++		*dma_addr = sg_dma_address(buf->sg_list);
++		*dma_len = sg_dma_len(buf->sg_list);
++		*p = NULL;
++	}
++
++	return 0;
++}
++
++static void
++_transport_unmap_smp_buffer(struct device *dev, struct bsg_buffer *buf,
++		dma_addr_t dma_addr, void *p)
++{
++	if (p)
++		dma_free_coherent(dev, buf->payload_len, p, dma_addr);
++	else
++		dma_unmap_sg(dev, buf->sg_list, 1, DMA_BIDIRECTIONAL);
++}
++
+ /**
+  * _transport_smp_handler - transport portal for smp passthru
+  * @shost: shost object
+@@ -1880,9 +1912,9 @@ _transport_phy_speed(struct sas_phy *phy, struct sas_phy_linkrates *rates)
+  * Example:
+  *           smp_rep_general /sys/class/bsg/expander-5:0
+  */
+-static int
+-_transport_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+-	struct request *req)
++static void
++_transport_smp_handler(struct bsg_job *job, struct Scsi_Host *shost,
++		struct sas_rphy *rphy)
+ {
+ 	struct MPT3SAS_ADAPTER *ioc = shost_priv(shost);
+ 	Mpi2SmpPassthroughRequest_t *mpi_request;
+@@ -1891,33 +1923,25 @@ _transport_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 	u16 smid;
+ 	u32 ioc_state;
+ 	void *psge;
+-	u8 issue_reset = 0;
+-	dma_addr_t dma_addr_in = 0;
+-	dma_addr_t dma_addr_out = 0;
+-	dma_addr_t pci_dma_in = 0;
+-	dma_addr_t pci_dma_out = 0;
+-	void *pci_addr_in = NULL;
+-	void *pci_addr_out = NULL;
++	dma_addr_t dma_addr_in;
++	dma_addr_t dma_addr_out;
++	void *addr_in = NULL;
++	void *addr_out = NULL;
++	size_t dma_len_in;
++	size_t dma_len_out;
+ 	u16 wait_state_count;
+-	struct request *rsp = req->next_rq;
+-	struct bio_vec bvec;
+-	struct bvec_iter iter;
+-
+-	if (!rsp) {
+-		pr_err(MPT3SAS_FMT "%s: the smp response space is missing\n",
+-			ioc->name, __func__);
+-		return -EINVAL;
+-	}
++	unsigned int reslen = 0;
+ 
+ 	if (ioc->shost_recovery || ioc->pci_error_recovery) {
+ 		pr_info(MPT3SAS_FMT "%s: host reset in progress!\n",
+ 		    __func__, ioc->name);
+-		return -EFAULT;
++		rc = -EFAULT;
++		goto out;
+ 	}
+ 
+ 	rc = mutex_lock_interruptible(&ioc->transport_cmds.mutex);
+ 	if (rc)
+-		return rc;
++		goto out;
+ 
+ 	if (ioc->transport_cmds.status != MPT3_CMD_NOT_USED) {
+ 		pr_err(MPT3SAS_FMT "%s: transport_cmds in use\n", ioc->name,
+@@ -1927,58 +1951,20 @@ _transport_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 	}
+ 	ioc->transport_cmds.status = MPT3_CMD_PENDING;
+ 
+-	/* Check if the request is split across multiple segments */
+-	if (bio_multiple_segments(req->bio)) {
+-		u32 offset = 0;
+-
+-		/* Allocate memory and copy the request */
+-		pci_addr_out = pci_alloc_consistent(ioc->pdev,
+-		    blk_rq_bytes(req), &pci_dma_out);
+-		if (!pci_addr_out) {
+-			pr_info(MPT3SAS_FMT "%s(): PCI Addr out = NULL\n",
+-			    ioc->name, __func__);
+-			rc = -ENOMEM;
+-			goto out;
+-		}
+-
+-		bio_for_each_segment(bvec, req->bio, iter) {
+-			memcpy(pci_addr_out + offset,
+-			    page_address(bvec.bv_page) + bvec.bv_offset,
+-			    bvec.bv_len);
+-			offset += bvec.bv_len;
+-		}
+-	} else {
+-		dma_addr_out = pci_map_single(ioc->pdev, bio_data(req->bio),
+-		    blk_rq_bytes(req), PCI_DMA_BIDIRECTIONAL);
+-		if (pci_dma_mapping_error(ioc->pdev, dma_addr_out)) {
+-			pr_info(MPT3SAS_FMT "%s(): DMA Addr out = NULL\n",
+-			    ioc->name, __func__);
+-			rc = -ENOMEM;
+-			goto free_pci;
+-		}
++	rc = _transport_map_smp_buffer(&ioc->pdev->dev, &job->request_payload,
++			&dma_addr_out, &dma_len_out, &addr_out);
++	if (rc)
++		goto out;
++	if (addr_out) {
++		sg_copy_to_buffer(job->request_payload.sg_list,
++				job->request_payload.sg_cnt, addr_out,
++				job->request_payload.payload_len);
+ 	}
+ 
+-	/* Check if the response needs to be populated across
+-	 * multiple segments */
+-	if (bio_multiple_segments(rsp->bio)) {
+-		pci_addr_in = pci_alloc_consistent(ioc->pdev, blk_rq_bytes(rsp),
+-		    &pci_dma_in);
+-		if (!pci_addr_in) {
+-			pr_info(MPT3SAS_FMT "%s(): PCI Addr in = NULL\n",
+-			    ioc->name, __func__);
+-			rc = -ENOMEM;
+-			goto unmap;
+-		}
+-	} else {
+-		dma_addr_in =  pci_map_single(ioc->pdev, bio_data(rsp->bio),
+-		    blk_rq_bytes(rsp), PCI_DMA_BIDIRECTIONAL);
+-		if (pci_dma_mapping_error(ioc->pdev, dma_addr_in)) {
+-			pr_info(MPT3SAS_FMT "%s(): DMA Addr in = NULL\n",
+-			    ioc->name, __func__);
+-			rc = -ENOMEM;
+-			goto unmap;
+-		}
+-	}
++	rc = _transport_map_smp_buffer(&ioc->pdev->dev, &job->reply_payload,
++			&dma_addr_in, &dma_len_in, &addr_in);
++	if (rc)
++		goto unmap_out;
+ 
+ 	wait_state_count = 0;
+ 	ioc_state = mpt3sas_base_get_iocstate(ioc, 1);
+@@ -1988,7 +1974,7 @@ _transport_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 			    "%s: failed due to ioc not operational\n",
+ 			    ioc->name, __func__);
+ 			rc = -EFAULT;
+-			goto unmap;
++			goto unmap_in;
+ 		}
+ 		ssleep(1);
+ 		ioc_state = mpt3sas_base_get_iocstate(ioc, 1);
+@@ -2005,7 +1991,7 @@ _transport_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 		pr_err(MPT3SAS_FMT "%s: failed obtaining a smid\n",
+ 		    ioc->name, __func__);
+ 		rc = -EAGAIN;
+-		goto unmap;
++		goto unmap_in;
+ 	}
+ 
+ 	rc = 0;
+@@ -2018,15 +2004,11 @@ _transport_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 	mpi_request->SASAddress = (rphy) ?
+ 	    cpu_to_le64(rphy->identify.sas_address) :
+ 	    cpu_to_le64(ioc->sas_hba.sas_address);
+-	mpi_request->RequestDataLength = cpu_to_le16(blk_rq_bytes(req) - 4);
++	mpi_request->RequestDataLength = cpu_to_le16(dma_len_out - 4);
+ 	psge = &mpi_request->SGL;
+ 
+-	if (bio_multiple_segments(req->bio))
+-		ioc->build_sg(ioc, psge, pci_dma_out, (blk_rq_bytes(req) - 4),
+-		    pci_dma_in, (blk_rq_bytes(rsp) + 4));
+-	else
+-		ioc->build_sg(ioc, psge, dma_addr_out, (blk_rq_bytes(req) - 4),
+-		    dma_addr_in, (blk_rq_bytes(rsp) + 4));
++	ioc->build_sg(ioc, psge, dma_addr_out, dma_len_out - 4, dma_addr_in,
++			dma_len_in - 4);
+ 
+ 	dtransportprintk(ioc, pr_info(MPT3SAS_FMT
+ 		"%s - sending smp request\n", ioc->name, __func__));
+@@ -2040,83 +2022,51 @@ _transport_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+ 		    __func__, ioc->name);
+ 		_debug_dump_mf(mpi_request,
+ 		    sizeof(Mpi2SmpPassthroughRequest_t)/4);
+-		if (!(ioc->transport_cmds.status & MPT3_CMD_RESET))
+-			issue_reset = 1;
+-		goto issue_host_reset;
++		if (!(ioc->transport_cmds.status & MPT3_CMD_RESET)) {
++			mpt3sas_base_hard_reset_handler(ioc, FORCE_BIG_HAMMER);
++			rc = -ETIMEDOUT;
++			goto unmap_in;
++		}
+ 	}
+ 
+ 	dtransportprintk(ioc, pr_info(MPT3SAS_FMT
+ 		"%s - complete\n", ioc->name, __func__));
+ 
+-	if (ioc->transport_cmds.status & MPT3_CMD_REPLY_VALID) {
+-
+-		mpi_reply = ioc->transport_cmds.reply;
+-
+-		dtransportprintk(ioc, pr_info(MPT3SAS_FMT
+-		    "%s - reply data transfer size(%d)\n",
+-		    ioc->name, __func__,
+-		    le16_to_cpu(mpi_reply->ResponseDataLength)));
+-
+-		memcpy(scsi_req(req)->sense, mpi_reply, sizeof(*mpi_reply));
+-		scsi_req(req)->sense_len = sizeof(*mpi_reply);
+-		scsi_req(req)->resid_len = 0;
+-		scsi_req(rsp)->resid_len -=
+-		    le16_to_cpu(mpi_reply->ResponseDataLength);
+-
+-		/* check if the resp needs to be copied from the allocated
+-		 * pci mem */
+-		if (bio_multiple_segments(rsp->bio)) {
+-			u32 offset = 0;
+-			u32 bytes_to_copy =
+-			    le16_to_cpu(mpi_reply->ResponseDataLength);
+-			bio_for_each_segment(bvec, rsp->bio, iter) {
+-				if (bytes_to_copy <= bvec.bv_len) {
+-					memcpy(page_address(bvec.bv_page) +
+-					    bvec.bv_offset, pci_addr_in +
+-					    offset, bytes_to_copy);
+-					break;
+-				} else {
+-					memcpy(page_address(bvec.bv_page) +
+-					    bvec.bv_offset, pci_addr_in +
+-					    offset, bvec.bv_len);
+-					bytes_to_copy -= bvec.bv_len;
+-				}
+-				offset += bvec.bv_len;
+-			}
+-		}
+-	} else {
++	if (!(ioc->transport_cmds.status & MPT3_CMD_REPLY_VALID)) {
+ 		dtransportprintk(ioc, pr_info(MPT3SAS_FMT
+ 		    "%s - no reply\n", ioc->name, __func__));
+ 		rc = -ENXIO;
++		goto unmap_in;
+ 	}
+ 
+- issue_host_reset:
+-	if (issue_reset) {
+-		mpt3sas_base_hard_reset_handler(ioc, FORCE_BIG_HAMMER);
+-		rc = -ETIMEDOUT;
+-	}
++	mpi_reply = ioc->transport_cmds.reply;
+ 
+- unmap:
+-	if (dma_addr_out)
+-		pci_unmap_single(ioc->pdev, dma_addr_out, blk_rq_bytes(req),
+-		    PCI_DMA_BIDIRECTIONAL);
+-	if (dma_addr_in)
+-		pci_unmap_single(ioc->pdev, dma_addr_in, blk_rq_bytes(rsp),
+-		    PCI_DMA_BIDIRECTIONAL);
++	dtransportprintk(ioc,
++		pr_info(MPT3SAS_FMT "%s - reply data transfer size(%d)\n",
++			ioc->name, __func__,
++			le16_to_cpu(mpi_reply->ResponseDataLength)));
+ 
+- free_pci:
+-	if (pci_addr_out)
+-		pci_free_consistent(ioc->pdev, blk_rq_bytes(req), pci_addr_out,
+-		    pci_dma_out);
++	memcpy(job->reply, mpi_reply, sizeof(*mpi_reply));
++	job->reply_len = sizeof(*mpi_reply);
++	reslen = le16_to_cpu(mpi_reply->ResponseDataLength);
+ 
+-	if (pci_addr_in)
+-		pci_free_consistent(ioc->pdev, blk_rq_bytes(rsp), pci_addr_in,
+-		    pci_dma_in);
++	if (addr_in) {
++		sg_copy_to_buffer(job->reply_payload.sg_list,
++				job->reply_payload.sg_cnt, addr_in,
++				job->reply_payload.payload_len);
++	}
+ 
++	rc = 0;
++ unmap_in:
++	_transport_unmap_smp_buffer(&ioc->pdev->dev, &job->reply_payload,
++			dma_addr_in, addr_in);
++ unmap_out:
++	_transport_unmap_smp_buffer(&ioc->pdev->dev, &job->request_payload,
++			dma_addr_out, addr_out);
+  out:
+ 	ioc->transport_cmds.status = MPT3_CMD_NOT_USED;
+ 	mutex_unlock(&ioc->transport_cmds.mutex);
+-	return rc;
++	bsg_job_done(job, rc, reslen);
+ }
+ 
+ struct sas_function_template mpt3sas_transport_functions = {
+diff --git a/drivers/scsi/scsi_transport_sas.c b/drivers/scsi/scsi_transport_sas.c
+index e2e948f1ce28..319dff970237 100644
+--- a/drivers/scsi/scsi_transport_sas.c
++++ b/drivers/scsi/scsi_transport_sas.c
+@@ -169,39 +169,22 @@ static struct sas_end_device *sas_sdev_to_rdev(struct scsi_device *sdev)
+ 	return rdev;
+ }
+ 
+-static void sas_smp_request(struct request_queue *q, struct Scsi_Host *shost,
+-			    struct sas_rphy *rphy)
++static int sas_smp_dispatch(struct bsg_job *job)
+ {
+-	struct request *req;
+-	blk_status_t ret;
+-	int (*handler)(struct Scsi_Host *, struct sas_rphy *, struct request *);
++	struct Scsi_Host *shost = dev_to_shost(job->dev);
++	struct sas_rphy *rphy = NULL;
+ 
+-	while ((req = blk_fetch_request(q)) != NULL) {
+-		spin_unlock_irq(q->queue_lock);
++	if (!scsi_is_host_device(job->dev))
++		rphy = dev_to_rphy(job->dev);
+ 
+-		scsi_req(req)->resid_len = blk_rq_bytes(req);
+-		if (req->next_rq)
+-			scsi_req(req->next_rq)->resid_len =
+-				blk_rq_bytes(req->next_rq);
+-		handler = to_sas_internal(shost->transportt)->f->smp_handler;
+-		ret = handler(shost, rphy, req);
+-		scsi_req(req)->result = ret;
+-
+-		blk_end_request_all(req, 0);
+-
+-		spin_lock_irq(q->queue_lock);
++	if (!job->req->next_rq) {
++		dev_warn(job->dev, "space for a smp response is missing\n");
++		bsg_job_done(job, -EINVAL, 0);
++		return 0;
+ 	}
+-}
+ 
+-static void sas_host_smp_request(struct request_queue *q)
+-{
+-	sas_smp_request(q, (struct Scsi_Host *)q->queuedata, NULL);
+-}
+-
+-static void sas_non_host_smp_request(struct request_queue *q)
+-{
+-	struct sas_rphy *rphy = q->queuedata;
+-	sas_smp_request(q, rphy_to_shost(rphy), rphy);
++	to_sas_internal(shost->transportt)->f->smp_handler(job, shost, rphy);
++	return 0;
+ }
+ 
+ static void sas_host_release(struct device *dev)
+@@ -217,81 +200,36 @@ static void sas_host_release(struct device *dev)
+ static int sas_bsg_initialize(struct Scsi_Host *shost, struct sas_rphy *rphy)
+ {
+ 	struct request_queue *q;
+-	int error;
+-	struct device *dev;
+-	char namebuf[20];
+-	const char *name;
+-	void (*release)(struct device *);
+ 
+ 	if (!to_sas_internal(shost->transportt)->f->smp_handler) {
+ 		printk("%s can't handle SMP requests\n", shost->hostt->name);
+ 		return 0;
+ 	}
+ 
+-	q = blk_alloc_queue(GFP_KERNEL);
+-	if (!q)
+-		return -ENOMEM;
+-	q->initialize_rq_fn = scsi_initialize_rq;
+-	q->cmd_size = sizeof(struct scsi_request);
+-
+ 	if (rphy) {
+-		q->request_fn = sas_non_host_smp_request;
+-		dev = &rphy->dev;
+-		name = dev_name(dev);
+-		release = NULL;
++		q = bsg_setup_queue(&rphy->dev, dev_name(&rphy->dev),
++				sas_smp_dispatch, 0, NULL);
++		if (IS_ERR(q))
++			return PTR_ERR(q);
++		rphy->q = q;
+ 	} else {
+-		q->request_fn = sas_host_smp_request;
+-		dev = &shost->shost_gendev;
+-		snprintf(namebuf, sizeof(namebuf),
+-			 "sas_host%d", shost->host_no);
+-		name = namebuf;
+-		release = sas_host_release;
++		char name[20];
++
++		snprintf(name, sizeof(name), "sas_host%d", shost->host_no);
++		q = bsg_setup_queue(&shost->shost_gendev, name,
++				sas_smp_dispatch, 0, sas_host_release);
++		if (IS_ERR(q))
++			return PTR_ERR(q);
++		to_sas_host_attrs(shost)->q = q;
+ 	}
+-	error = blk_init_allocated_queue(q);
+-	if (error)
+-		goto out_cleanup_queue;
+ 
+ 	/*
+ 	 * by default assume old behaviour and bounce for any highmem page
+ 	 */
+ 	blk_queue_bounce_limit(q, BLK_BOUNCE_HIGH);
+-
+-	error = bsg_register_queue(q, dev, name, release);
+-	if (error)
+-		goto out_cleanup_queue;
+-
+-	if (rphy)
+-		rphy->q = q;
+-	else
+-		to_sas_host_attrs(shost)->q = q;
+-
+-	if (rphy)
+-		q->queuedata = rphy;
+-	else
+-		q->queuedata = shost;
+-
+ 	queue_flag_set_unlocked(QUEUE_FLAG_BIDI, q);
+ 	queue_flag_set_unlocked(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
+ 	return 0;
+-
+-out_cleanup_queue:
+-	blk_cleanup_queue(q);
+-	return error;
+-}
+-
+-static void sas_bsg_remove(struct Scsi_Host *shost, struct sas_rphy *rphy)
+-{
+-	struct request_queue *q;
+-
+-	if (rphy)
+-		q = rphy->q;
+-	else
+-		q = to_sas_host_attrs(shost)->q;
+-
+-	if (!q)
+-		return;
+-
+-	bsg_unregister_queue(q);
+ }
+ 
+ /*
+@@ -321,9 +259,10 @@ static int sas_host_remove(struct transport_container *tc, struct device *dev,
+ 			   struct device *cdev)
+ {
+ 	struct Scsi_Host *shost = dev_to_shost(dev);
++	struct request_queue *q = to_sas_host_attrs(shost)->q;
+ 
+-	sas_bsg_remove(shost, NULL);
+-
++	if (q)
++		bsg_unregister_queue(q);
+ 	return 0;
+ }
+ 
+@@ -1713,7 +1652,8 @@ sas_rphy_remove(struct sas_rphy *rphy)
+ 	}
+ 
+ 	sas_rphy_unlink(rphy);
+-	sas_bsg_remove(NULL, rphy);
++	if (rphy->q)
++		bsg_unregister_queue(rphy->q);
+ 	transport_remove_device(dev);
+ 	device_del(dev);
+ }
+diff --git a/include/scsi/libsas.h b/include/scsi/libsas.h
+index e7c012ce5ecd..6c0dc6155ee7 100644
+--- a/include/scsi/libsas.h
++++ b/include/scsi/libsas.h
+@@ -721,9 +721,6 @@ extern int sas_slave_alloc(struct scsi_device *);
+ extern int sas_ioctl(struct scsi_device *sdev, int cmd, void __user *arg);
+ extern int sas_drain_work(struct sas_ha_struct *ha);
+ 
+-extern int sas_smp_handler(struct Scsi_Host *shost, struct sas_rphy *rphy,
+-			   struct request *req);
+-
+ extern void sas_ssp_task_response(struct device *dev, struct sas_task *task,
+ 				  struct ssp_response_iu *iu);
+ struct sas_phy *sas_get_local_phy(struct domain_device *dev);
+diff --git a/include/scsi/scsi_transport_sas.h b/include/scsi/scsi_transport_sas.h
+index 73d870918939..a23304b7fb2e 100644
+--- a/include/scsi/scsi_transport_sas.h
++++ b/include/scsi/scsi_transport_sas.h
+@@ -5,6 +5,7 @@
+ #include <linux/types.h>
+ #include <linux/mutex.h>
+ #include <scsi/sas.h>
++#include <linux/bsg-lib.h>
+ 
+ struct scsi_transport_template;
+ struct sas_rphy;
+@@ -176,7 +177,8 @@ struct sas_function_template {
+ 	int (*phy_setup)(struct sas_phy *);
+ 	void (*phy_release)(struct sas_phy *);
+ 	int (*set_phy_speed)(struct sas_phy *, struct sas_phy_linkrates *);
+-	int (*smp_handler)(struct Scsi_Host *, struct sas_rphy *, struct request *);
++	void (*smp_handler)(struct bsg_job *, struct Scsi_Host *,
++			struct sas_rphy *);
+ };
+ 
+ 
+-- 
+2.16.4
+
