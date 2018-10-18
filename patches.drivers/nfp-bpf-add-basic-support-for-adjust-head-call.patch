@@ -1,0 +1,328 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Thu, 14 Dec 2017 21:29:18 -0800
+Subject: nfp: bpf: add basic support for adjust head call
+Patch-mainline: v4.16-rc1
+Git-commit: 0d49eaf4db2ad18489ff1cfceba17006c1d17b7e
+References: bsc#1109837
+
+Support bpf_xdp_adjust_head().  We need to check whether the
+packet offset after adjustment is within datapath's limits.
+We also check if the frame is at least ETH_HLEN long (similar
+to the kernel implementation).
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/fw.h       |   54 ++++++++++++++++
+ drivers/net/ethernet/netronome/nfp/bpf/jit.c      |   73 ++++++++++++++++++++++
+ drivers/net/ethernet/netronome/nfp/bpf/main.c     |   38 +++++++++++
+ drivers/net/ethernet/netronome/nfp/bpf/main.h     |   11 +++
+ drivers/net/ethernet/netronome/nfp/bpf/verifier.c |   12 +++
+ drivers/net/ethernet/netronome/nfp/nfp_asm.h      |    2 
+ 6 files changed, 190 insertions(+)
+ create mode 100644 drivers/net/ethernet/netronome/nfp/bpf/fw.h
+
+--- /dev/null
++++ b/drivers/net/ethernet/netronome/nfp/bpf/fw.h
+@@ -0,0 +1,54 @@
++/*
++ * Copyright (C) 2017 Netronome Systems, Inc.
++ *
++ * This software is dual licensed under the GNU General License Version 2,
++ * June 1991 as shown in the file COPYING in the top-level directory of this
++ * source tree or the BSD 2-Clause License provided below.  You have the
++ * option to license this software under the complete terms of either license.
++ *
++ * The BSD 2-Clause License:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      1. Redistributions of source code must retain the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer.
++ *
++ *      2. Redistributions in binary form must reproduce the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer in the documentation and/or other materials
++ *         provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef NFP_BPF_FW_H
++#define NFP_BPF_FW_H 1
++
++#include <linux/bitops.h>
++#include <linux/types.h>
++
++enum bpf_cap_tlv_type {
++	NFP_BPF_CAP_TYPE_ADJUST_HEAD	= 2,
++};
++
++struct nfp_bpf_cap_tlv_adjust_head {
++	__le32 flags;
++	__le32 off_min;
++	__le32 off_max;
++	__le32 guaranteed_sub;
++	__le32 guaranteed_add;
++};
++
++#define NFP_BPF_ADJUST_HEAD_NO_META	BIT(0)
++
++#endif
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -33,6 +33,7 @@
+ 
+ #define pr_fmt(fmt)	"NFP net bpf: " fmt
+ 
++#include <linux/bug.h>
+ #include <linux/kernel.h>
+ #include <linux/bpf.h>
+ #include <linux/filter.h>
+@@ -87,6 +88,18 @@ static unsigned int nfp_prog_current_off
+ 	return nfp_prog->start_off + nfp_prog->prog_len;
+ }
+ 
++static bool
++nfp_prog_confirm_current_offset(struct nfp_prog *nfp_prog, unsigned int off)
++{
++	/* If there is a recorded error we may have dropped instructions;
++	 * that doesn't have to be due to translator bug, and the translation
++	 * will fail anyway, so just return OK.
++	 */
++	if (nfp_prog->error)
++		return true;
++	return !WARN_ON_ONCE(nfp_prog_current_offset(nfp_prog) != off);
++}
++
+ static unsigned int
+ nfp_prog_offset_to_index(struct nfp_prog *nfp_prog, unsigned int offset)
+ {
+@@ -1196,6 +1209,64 @@ static void wrp_end32(struct nfp_prog *n
+ 		      SHF_SC_R_ROT, 16);
+ }
+ 
++static int adjust_head(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	swreg tmp = imm_a(nfp_prog), tmp_len = imm_b(nfp_prog);
++	struct nfp_bpf_cap_adjust_head *adjust_head;
++	u32 ret_einval, end;
++
++	adjust_head = &nfp_prog->bpf->adjust_head;
++
++	ret_einval = nfp_prog_current_offset(nfp_prog) + 14;
++	end = ret_einval + 2;
++
++	/* We need to use a temp because offset is just a part of the pkt ptr */
++	emit_alu(nfp_prog, tmp,
++		 reg_a(2 * 2), ALU_OP_ADD_2B, pptr_reg(nfp_prog));
++
++	/* Validate result will fit within FW datapath constraints */
++	emit_alu(nfp_prog, reg_none(),
++		 tmp, ALU_OP_SUB, reg_imm(adjust_head->off_min));
++	emit_br(nfp_prog, BR_BLO, ret_einval, 0);
++	emit_alu(nfp_prog, reg_none(),
++		 reg_imm(adjust_head->off_max), ALU_OP_SUB, tmp);
++	emit_br(nfp_prog, BR_BLO, ret_einval, 0);
++
++	/* Validate the length is at least ETH_HLEN */
++	emit_alu(nfp_prog, tmp_len,
++		 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++	emit_alu(nfp_prog, reg_none(),
++		 tmp_len, ALU_OP_SUB, reg_imm(ETH_HLEN));
++	emit_br(nfp_prog, BR_BMI, ret_einval, 0);
++
++	/* Load the ret code */
++	wrp_immed(nfp_prog, reg_both(0), 0);
++	wrp_immed(nfp_prog, reg_both(1), 0);
++
++	/* Modify the packet metadata */
++	emit_ld_field(nfp_prog, pptr_reg(nfp_prog), 0x3, tmp, SHF_SC_NONE, 0);
++
++	/* Skip over the -EINVAL ret code (defer 2) */
++	emit_br_def(nfp_prog, end, 2);
++
++	emit_alu(nfp_prog, plen_reg(nfp_prog),
++		 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++	emit_alu(nfp_prog, pv_len(nfp_prog),
++		 pv_len(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++
++	/* return -EINVAL target */
++	if (!nfp_prog_confirm_current_offset(nfp_prog, ret_einval))
++		return -EINVAL;
++
++	wrp_immed(nfp_prog, reg_both(0), -22);
++	wrp_immed(nfp_prog, reg_both(1), ~0);
++
++	if (!nfp_prog_confirm_current_offset(nfp_prog, end))
++		return -EINVAL;
++
++	return 0;
++}
++
+ /* --- Callbacks --- */
+ static int mov_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+@@ -1933,6 +2004,8 @@ static int jne_reg(struct nfp_prog *nfp_
+ static int call(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+ 	switch (meta->insn.imm) {
++	case BPF_FUNC_xdp_adjust_head:
++		return adjust_head(nfp_prog, meta);
+ 	default:
+ 		WARN_ONCE(1, "verifier allowed unsupported function\n");
+ 		return -EOPNOTSUPP;
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -39,6 +39,7 @@
+ #include "../nfp_main.h"
+ #include "../nfp_net.h"
+ #include "../nfp_port.h"
++#include "fw.h"
+ #include "main.h"
+ 
+ static bool nfp_net_ebpf_capable(struct nfp_net *nn)
+@@ -166,6 +167,36 @@ static bool nfp_bpf_tc_busy(struct nfp_a
+ 	return nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF;
+ }
+ 
++static int
++nfp_bpf_parse_cap_adjust_head(struct nfp_app_bpf *bpf, void __iomem *value,
++			      u32 length)
++{
++	struct nfp_bpf_cap_tlv_adjust_head __iomem *cap = value;
++	struct nfp_cpp *cpp = bpf->app->pf->cpp;
++
++	if (length < sizeof(*cap)) {
++		nfp_err(cpp, "truncated adjust_head TLV: %d\n", length);
++		return -EINVAL;
++	}
++
++	bpf->adjust_head.flags = readl(&cap->flags);
++	bpf->adjust_head.off_min = readl(&cap->off_min);
++	bpf->adjust_head.off_max = readl(&cap->off_max);
++
++	if (bpf->adjust_head.off_min > bpf->adjust_head.off_max) {
++		nfp_err(cpp, "invalid adjust_head TLV: min > max\n");
++		return -EINVAL;
++	}
++	if (!FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_min) ||
++	    !FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_max)) {
++		nfp_warn(cpp, "disabling adjust_head - driver expects min/max to fit in as immediates\n");
++		memset(&bpf->adjust_head, 0, sizeof(bpf->adjust_head));
++		return 0;
++	}
++
++	return 0;
++}
++
+ static int nfp_bpf_parse_capabilities(struct nfp_app *app)
+ {
+ 	struct nfp_cpp *cpp = app->pf->cpp;
+@@ -179,16 +210,23 @@ static int nfp_bpf_parse_capabilities(st
+ 
+ 	start = mem;
+ 	while (mem - start + 8 < nfp_cpp_area_size(area)) {
++		u8 __iomem *value;
+ 		u32 type, length;
+ 
+ 		type = readl(mem);
+ 		length = readl(mem + 4);
++		value = mem + 8;
+ 
+ 		mem += 8 + length;
+ 		if (mem - start > nfp_cpp_area_size(area))
+ 			goto err_release_free;
+ 
+ 		switch (type) {
++		case NFP_BPF_CAP_TYPE_ADJUST_HEAD:
++			if (nfp_bpf_parse_cap_adjust_head(app->priv, value,
++							  length))
++				goto err_release_free;
++			break;
+ 		default:
+ 			nfp_dbg(cpp, "unknown BPF capability: %d\n", type);
+ 			break;
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -81,9 +81,20 @@ enum pkt_vec {
+ /**
+  * struct nfp_app_bpf - bpf app priv structure
+  * @app:		backpointer to the app
++ *
++ * @adjust_head:	adjust head capability
++ * @flags:		extra flags for adjust head
++ * @off_min:		minimal packet offset within buffer required
++ * @off_max:		maximum packet offset within buffer required
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
++
++	struct nfp_bpf_cap_adjust_head {
++		u32 flags;
++		int off_min;
++		int off_max;
++	} adjust_head;
+ };
+ 
+ struct nfp_prog;
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -38,6 +38,7 @@
+ #include <linux/kernel.h>
+ #include <linux/pkt_cls.h>
+ 
++#include "fw.h"
+ #include "main.h"
+ 
+ struct nfp_insn_meta *
+@@ -71,9 +72,20 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_p
+ static int
+ nfp_bpf_check_call(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
++	struct nfp_app_bpf *bpf = nfp_prog->bpf;
+ 	u32 func_id = meta->insn.imm;
+ 
+ 	switch (func_id) {
++	case BPF_FUNC_xdp_adjust_head:
++		if (!bpf->adjust_head.off_max) {
++			pr_warn("adjust_head not supported by FW\n");
++			return -EOPNOTSUPP;
++		}
++		if (!(bpf->adjust_head.flags & NFP_BPF_ADJUST_HEAD_NO_META)) {
++			pr_warn("adjust_head: FW requires shifting metadata, not supported by the driver\n");
++			return -EOPNOTSUPP;
++		}
++		break;
+ 	default:
+ 		pr_warn("unsupported function id: %d\n", func_id);
+ 		return -EOPNOTSUPP;
+--- a/drivers/net/ethernet/netronome/nfp/nfp_asm.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_asm.h
+@@ -77,6 +77,7 @@
+ enum br_mask {
+ 	BR_BEQ = 0x00,
+ 	BR_BNE = 0x01,
++	BR_BMI = 0x02,
+ 	BR_BHS = 0x04,
+ 	BR_BLO = 0x05,
+ 	BR_BGE = 0x08,
+@@ -175,6 +176,7 @@ enum alu_op {
+ 	ALU_OP_NONE	= 0x00,
+ 	ALU_OP_ADD	= 0x01,
+ 	ALU_OP_NOT	= 0x04,
++	ALU_OP_ADD_2B	= 0x05,
+ 	ALU_OP_AND	= 0x08,
+ 	ALU_OP_SUB_C	= 0x0d,
+ 	ALU_OP_ADD_C	= 0x11,
