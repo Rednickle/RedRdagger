@@ -1,0 +1,818 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Tue, 13 Mar 2018 17:28:41 +0100
+Subject: [PATCH] bsg: split handling of SCSI CDBs vs transport requeues
+Git-commit: 17cb960f29c29ee07bf6848ada3265f4be55972e
+Patch-mainline: v4.17-rc1
+References: bsc#1104967,FATE#325924
+
+The current BSG design tries to shoe-horn the transport-specific
+passthrough commands into the overall framework for SCSI passthrough
+requests.  This has a couple problems:
+
+ - each passthrough queue has to set the QUEUE_FLAG_SCSI_PASSTHROUGH flag
+   despite not dealing with SCSI commands at all.  Because of that these
+   queues could also incorrectly accept SCSI commands from in-kernel
+   users or through the legacy SCSI_IOCTL_SEND_COMMAND ioctl.
+ - the real SCSI bsg queues also incorrectly accept bsg requests of the
+   BSG_SUB_PROTOCOL_SCSI_TRANSPORT type
+ - the bsg transport code is almost unredable because it tries to reuse
+   different SCSI concepts for its own purpose.
+
+This patch instead adds a new bsg_ops structure to handle the two cases
+differently, and thus solves all of the above problems.  Another side
+effect is that the bsg-lib queues also don't need to embedd a
+struct scsi_request anymore.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ block/bsg-lib.c                   | 158 +++++++++++++++--------
+ block/bsg.c                       | 262 +++++++++++++++++---------------------
+ drivers/scsi/scsi_lib.c           |   4 +-
+ drivers/scsi/scsi_sysfs.c         |   3 +-
+ drivers/scsi/scsi_transport_sas.c |   1 -
+ include/linux/bsg-lib.h           |   4 +-
+ include/linux/bsg.h               |  35 +++--
+ 7 files changed, 250 insertions(+), 217 deletions(-)
+
+diff --git a/block/bsg-lib.c b/block/bsg-lib.c
+index f2c2d54a61b4..fc2e5ff2c4b9 100644
+--- a/block/bsg-lib.c
++++ b/block/bsg-lib.c
+@@ -27,6 +27,94 @@
+ #include <linux/bsg-lib.h>
+ #include <linux/export.h>
+ #include <scsi/scsi_cmnd.h>
++#include <scsi/sg.h>
++
++#define uptr64(val) ((void __user *)(uintptr_t)(val))
++
++static int bsg_transport_check_proto(struct sg_io_v4 *hdr)
++{
++	if (hdr->protocol != BSG_PROTOCOL_SCSI  ||
++	    hdr->subprotocol != BSG_SUB_PROTOCOL_SCSI_TRANSPORT)
++		return -EINVAL;
++	if (!capable(CAP_SYS_RAWIO))
++		return -EPERM;
++	return 0;
++}
++
++static int bsg_transport_fill_hdr(struct request *rq, struct sg_io_v4 *hdr,
++		fmode_t mode)
++{
++	struct bsg_job *job = blk_mq_rq_to_pdu(rq);
++
++	job->request_len = hdr->request_len;
++	job->request = memdup_user(uptr64(hdr->request), hdr->request_len);
++	if (IS_ERR(job->request))
++		return PTR_ERR(job->request);
++	return 0;
++}
++
++static int bsg_transport_complete_rq(struct request *rq, struct sg_io_v4 *hdr)
++{
++	struct bsg_job *job = blk_mq_rq_to_pdu(rq);
++	int ret = 0;
++
++	/*
++	 * The assignments below don't make much sense, but are kept for
++	 * bug by bug backwards compatibility:
++	 */
++	hdr->device_status = job->result & 0xff;
++	hdr->transport_status = host_byte(job->result);
++	hdr->driver_status = driver_byte(job->result);
++	hdr->info = 0;
++	if (hdr->device_status || hdr->transport_status || hdr->driver_status)
++		hdr->info |= SG_INFO_CHECK;
++	hdr->response_len = 0;
++
++	if (job->result < 0) {
++		/* we're only returning the result field in the reply */
++		job->reply_len = sizeof(u32);
++		ret = job->result;
++	}
++
++	if (job->reply_len && hdr->response) {
++		int len = min(hdr->max_response_len, job->reply_len);
++
++		if (copy_to_user(uptr64(hdr->response), job->reply, len))
++			ret = -EFAULT;
++		else
++			hdr->response_len = len;
++	}
++
++	/* we assume all request payload was transferred, residual == 0 */
++	hdr->dout_resid = 0;
++
++	if (rq->next_rq) {
++		unsigned int rsp_len = job->reply_payload.payload_len;
++
++		if (WARN_ON(job->reply_payload_rcv_len > rsp_len))
++			hdr->din_resid = 0;
++		else
++			hdr->din_resid = rsp_len - job->reply_payload_rcv_len;
++	} else {
++		hdr->din_resid = 0;
++	}
++
++	return ret;
++}
++
++static void bsg_transport_free_rq(struct request *rq)
++{
++	struct bsg_job *job = blk_mq_rq_to_pdu(rq);
++
++	kfree(job->request);
++}
++
++static const struct bsg_ops bsg_transport_ops = {
++	.check_proto		= bsg_transport_check_proto,
++	.fill_hdr		= bsg_transport_fill_hdr,
++	.complete_rq		= bsg_transport_complete_rq,
++	.free_rq		= bsg_transport_free_rq,
++};
+ 
+ /**
+  * bsg_teardown_job - routine to teardown a bsg job
+@@ -68,27 +156,9 @@ EXPORT_SYMBOL_GPL(bsg_job_get);
+ void bsg_job_done(struct bsg_job *job, int result,
+ 		  unsigned int reply_payload_rcv_len)
+ {
+-	struct request *req = blk_mq_rq_from_pdu(job);
+-	struct request *rsp = req->next_rq;
+-	int err;
+-
+-	err = job->sreq.result = result;
+-	if (err < 0)
+-		/* we're only returning the result field in the reply */
+-		job->sreq.sense_len = sizeof(u32);
+-	else
+-		job->sreq.sense_len = job->reply_len;
+-	/* we assume all request payload was transferred, residual == 0 */
+-	job->sreq.resid_len = 0;
+-
+-	if (rsp) {
+-		WARN_ON(reply_payload_rcv_len > scsi_req(rsp)->resid_len);
+-
+-		/* set reply (bidi) residual */
+-		scsi_req(rsp)->resid_len -=
+-			min(reply_payload_rcv_len, scsi_req(rsp)->resid_len);
+-	}
+-	blk_complete_request(req);
++	job->result = result;
++	job->reply_payload_rcv_len = reply_payload_rcv_len;
++	blk_complete_request(blk_mq_rq_from_pdu(job));
+ }
+ EXPORT_SYMBOL_GPL(bsg_job_done);
+ 
+@@ -113,7 +183,6 @@ static int bsg_map_buffer(struct bsg_buffer *buf, struct request *req)
+ 	if (!buf->sg_list)
+ 		return -ENOMEM;
+ 	sg_init_table(buf->sg_list, req->nr_phys_segments);
+-	scsi_req(req)->resid_len = blk_rq_bytes(req);
+ 	buf->sg_cnt = blk_rq_map_sg(req->q, req, buf->sg_list);
+ 	buf->payload_len = blk_rq_bytes(req);
+ 	return 0;
+@@ -124,16 +193,13 @@ static int bsg_map_buffer(struct bsg_buffer *buf, struct request *req)
+  * @dev: device that is being sent the bsg request
+  * @req: BSG request that needs a job structure
+  */
+-static int bsg_prepare_job(struct device *dev, struct request *req)
++static bool bsg_prepare_job(struct device *dev, struct request *req)
+ {
+ 	struct request *rsp = req->next_rq;
+-	struct scsi_request *rq = scsi_req(req);
+ 	struct bsg_job *job = blk_mq_rq_to_pdu(req);
+ 	int ret;
+ 
+ 	job->timeout = req->timeout;
+-	job->request = rq->cmd;
+-	job->request_len = rq->cmd_len;
+ 
+ 	if (req->bio) {
+ 		ret = bsg_map_buffer(&job->request_payload, req);
+@@ -149,12 +215,13 @@ static int bsg_prepare_job(struct device *dev, struct request *req)
+ 	/* take a reference for the request */
+ 	get_device(job->dev);
+ 	kref_init(&job->kref);
+-	return 0;
++	return true;
+ 
+ failjob_rls_rqst_payload:
+ 	kfree(job->request_payload.sg_list);
+ failjob_rls_job:
+-	return -ENOMEM;
++	job->result = -ENOMEM;
++	return false;
+ }
+ 
+ /**
+@@ -183,9 +250,7 @@ static void bsg_request_fn(struct request_queue *q)
+ 			break;
+ 		spin_unlock_irq(q->queue_lock);
+ 
+-		ret = bsg_prepare_job(dev, req);
+-		if (ret) {
+-			scsi_req(req)->result = ret;
++		if (!bsg_prepare_job(dev, req)) {
+ 			blk_end_request_all(req, BLK_STS_OK);
+ 			spin_lock_irq(q->queue_lock);
+ 			continue;
+@@ -202,46 +267,34 @@ static void bsg_request_fn(struct request_queue *q)
+ 	spin_lock_irq(q->queue_lock);
+ }
+ 
++/* called right after the request is allocated for the request_queue */
+ static int bsg_init_rq(struct request_queue *q, struct request *req, gfp_t gfp)
+ {
+ 	struct bsg_job *job = blk_mq_rq_to_pdu(req);
+-	struct scsi_request *sreq = &job->sreq;
+-
+-	/* called right after the request is allocated for the request_queue */
+ 
+-	sreq->sense = kzalloc(SCSI_SENSE_BUFFERSIZE, gfp);
+-	if (!sreq->sense)
++	job->reply = kzalloc(SCSI_SENSE_BUFFERSIZE, gfp);
++	if (!job->reply)
+ 		return -ENOMEM;
+-
+ 	return 0;
+ }
+ 
++/* called right before the request is given to the request_queue user */
+ static void bsg_initialize_rq(struct request *req)
+ {
+ 	struct bsg_job *job = blk_mq_rq_to_pdu(req);
+-	struct scsi_request *sreq = &job->sreq;
+-	void *sense = sreq->sense;
+-
+-	/* called right before the request is given to the request_queue user */
++	void *reply = job->reply;
+ 
+ 	memset(job, 0, sizeof(*job));
+-
+-	scsi_req_init(sreq);
+-
+-	sreq->sense = sense;
+-	sreq->sense_len = SCSI_SENSE_BUFFERSIZE;
+-
+-	job->reply = sense;
+-	job->reply_len = sreq->sense_len;
++	job->reply = reply;
++	job->reply_len = SCSI_SENSE_BUFFERSIZE;
+ 	job->dd_data = job + 1;
+ }
+ 
+ static void bsg_exit_rq(struct request_queue *q, struct request *req)
+ {
+ 	struct bsg_job *job = blk_mq_rq_to_pdu(req);
+-	struct scsi_request *sreq = &job->sreq;
+ 
+-	kfree(sreq->sense);
++	kfree(job->reply);
+ }
+ 
+ /**
+@@ -275,11 +328,10 @@ struct request_queue *bsg_setup_queue(struct device *dev, const char *name,
+ 	q->queuedata = dev;
+ 	q->bsg_job_fn = job_fn;
+ 	blk_queue_flag_set(QUEUE_FLAG_BIDI, q);
+-	blk_queue_flag_set(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
+ 	blk_queue_softirq_done(q, bsg_softirq_done);
+ 	blk_queue_rq_timeout(q, BLK_DEFAULT_SG_TIMEOUT);
+ 
+-	ret = bsg_register_queue(q, dev, name, release);
++	ret = bsg_register_queue(q, dev, name, &bsg_transport_ops, release);
+ 	if (ret) {
+ 		printk(KERN_ERR "%s: bsg interface failed to "
+ 		       "initialize - register queue\n", dev->kobj.name);
+diff --git a/block/bsg.c b/block/bsg.c
+index 06dc96e1f670..defa06c11858 100644
+--- a/block/bsg.c
++++ b/block/bsg.c
+@@ -130,114 +130,120 @@ static inline struct hlist_head *bsg_dev_idx_hash(int index)
+ 	return &bsg_device_list[index & (BSG_LIST_ARRAY_SIZE - 1)];
+ }
+ 
+-static int blk_fill_sgv4_hdr_rq(struct request_queue *q, struct request *rq,
+-				struct sg_io_v4 *hdr, struct bsg_device *bd,
+-				fmode_t mode)
++#define uptr64(val) ((void __user *)(uintptr_t)(val))
++
++static int bsg_scsi_check_proto(struct sg_io_v4 *hdr)
++{
++	if (hdr->protocol != BSG_PROTOCOL_SCSI  ||
++	    hdr->subprotocol != BSG_SUB_PROTOCOL_SCSI_CMD)
++		return -EINVAL;
++	return 0;
++}
++
++static int bsg_scsi_fill_hdr(struct request *rq, struct sg_io_v4 *hdr,
++		fmode_t mode)
+ {
+-	struct scsi_request *req = scsi_req(rq);
++	struct scsi_request *sreq = scsi_req(rq);
+ 
+-	if (hdr->request_len > BLK_MAX_CDB) {
+-		req->cmd = kzalloc(hdr->request_len, GFP_KERNEL);
+-		if (!req->cmd)
++	sreq->cmd_len = hdr->request_len;
++	if (sreq->cmd_len > BLK_MAX_CDB) {
++		sreq->cmd = kzalloc(sreq->cmd_len, GFP_KERNEL);
++		if (!sreq->cmd)
+ 			return -ENOMEM;
+ 	}
+ 
+-	if (copy_from_user(req->cmd, (void __user *)(unsigned long)hdr->request,
+-			   hdr->request_len))
++	if (copy_from_user(sreq->cmd, uptr64(hdr->request), sreq->cmd_len))
+ 		return -EFAULT;
+-
+-	if (hdr->subprotocol == BSG_SUB_PROTOCOL_SCSI_CMD) {
+-		if (blk_verify_command(req->cmd, mode))
+-			return -EPERM;
+-	} else if (!capable(CAP_SYS_RAWIO))
++	if (blk_verify_command(sreq->cmd, mode))
+ 		return -EPERM;
+-
+-	/*
+-	 * fill in request structure
+-	 */
+-	req->cmd_len = hdr->request_len;
+-
+-	rq->timeout = msecs_to_jiffies(hdr->timeout);
+-	if (!rq->timeout)
+-		rq->timeout = q->sg_timeout;
+-	if (!rq->timeout)
+-		rq->timeout = BLK_DEFAULT_SG_TIMEOUT;
+-	if (rq->timeout < BLK_MIN_SG_TIMEOUT)
+-		rq->timeout = BLK_MIN_SG_TIMEOUT;
+-
+ 	return 0;
+ }
+ 
+-/*
+- * Check if sg_io_v4 from user is allowed and valid
+- */
+-static int
+-bsg_validate_sgv4_hdr(struct sg_io_v4 *hdr, int *op)
++static int bsg_scsi_complete_rq(struct request *rq, struct sg_io_v4 *hdr)
+ {
++	struct scsi_request *sreq = scsi_req(rq);
+ 	int ret = 0;
+ 
+-	if (hdr->guard != 'Q')
+-		return -EINVAL;
++	/*
++	 * fill in all the output members
++	 */
++	hdr->device_status = sreq->result & 0xff;
++	hdr->transport_status = host_byte(sreq->result);
++	hdr->driver_status = driver_byte(sreq->result);
++	hdr->info = 0;
++	if (hdr->device_status || hdr->transport_status || hdr->driver_status)
++		hdr->info |= SG_INFO_CHECK;
++	hdr->response_len = 0;
+ 
+-	switch (hdr->protocol) {
+-	case BSG_PROTOCOL_SCSI:
+-		switch (hdr->subprotocol) {
+-		case BSG_SUB_PROTOCOL_SCSI_CMD:
+-		case BSG_SUB_PROTOCOL_SCSI_TRANSPORT:
+-			break;
+-		default:
+-			ret = -EINVAL;
+-		}
+-		break;
+-	default:
+-		ret = -EINVAL;
++	if (sreq->sense_len && hdr->response) {
++		int len = min_t(unsigned int, hdr->max_response_len,
++					sreq->sense_len);
++
++		if (copy_to_user(uptr64(hdr->response), sreq->sense, len))
++			ret = -EFAULT;
++		else
++			hdr->response_len = len;
++	}
++
++	if (rq->next_rq) {
++		hdr->dout_resid = sreq->resid_len;
++		hdr->din_resid = scsi_req(rq->next_rq)->resid_len;
++	} else if (rq_data_dir(rq) == READ) {
++		hdr->din_resid = sreq->resid_len;
++	} else {
++		hdr->dout_resid = sreq->resid_len;
+ 	}
+ 
+-	*op = hdr->dout_xfer_len ? REQ_OP_SCSI_OUT : REQ_OP_SCSI_IN;
+ 	return ret;
+ }
+ 
+-/*
+- * map sg_io_v4 to a request.
+- */
++static void bsg_scsi_free_rq(struct request *rq)
++{
++	scsi_req_free_cmd(scsi_req(rq));
++}
++
++static const struct bsg_ops bsg_scsi_ops = {
++	.check_proto		= bsg_scsi_check_proto,
++	.fill_hdr		= bsg_scsi_fill_hdr,
++	.complete_rq		= bsg_scsi_complete_rq,
++	.free_rq		= bsg_scsi_free_rq,
++};
++
+ static struct request *
+-bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t mode)
++bsg_map_hdr(struct request_queue *q, struct sg_io_v4 *hdr, fmode_t mode)
+ {
+-	struct request_queue *q = bd->queue;
+ 	struct request *rq, *next_rq = NULL;
+ 	int ret;
+-	unsigned int op, dxfer_len;
+-	void __user *dxferp = NULL;
+-	struct bsg_class_device *bcd = &q->bsg_dev;
+ 
+-	/* if the LLD has been removed then the bsg_unregister_queue will
+-	 * eventually be called and the class_dev was freed, so we can no
+-	 * longer use this request_queue. Return no such address.
+-	 */
+-	if (!bcd->class_dev)
++	if (!q->bsg_dev.class_dev)
+ 		return ERR_PTR(-ENXIO);
+ 
+-	bsg_dbg(bd, "map hdr %llx/%u %llx/%u\n",
+-		(unsigned long long) hdr->dout_xferp,
+-		hdr->dout_xfer_len, (unsigned long long) hdr->din_xferp,
+-		hdr->din_xfer_len);
++	if (hdr->guard != 'Q')
++		return ERR_PTR(-EINVAL);
+ 
+-	ret = bsg_validate_sgv4_hdr(hdr, &op);
++	ret = q->bsg_dev.ops->check_proto(hdr);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+-	/*
+-	 * map scatter-gather elements separately and string them to request
+-	 */
+-	rq = blk_get_request(q, op, GFP_KERNEL);
++	rq = blk_get_request(q, hdr->dout_xfer_len ?
++			REQ_OP_SCSI_OUT : REQ_OP_SCSI_IN,
++			GFP_KERNEL);
+ 	if (IS_ERR(rq))
+ 		return rq;
+ 
+-	ret = blk_fill_sgv4_hdr_rq(q, rq, hdr, bd, mode);
++	ret = q->bsg_dev.ops->fill_hdr(rq, hdr, mode);
+ 	if (ret)
+ 		goto out;
+ 
+-	if (op == REQ_OP_SCSI_OUT && hdr->din_xfer_len) {
++	rq->timeout = msecs_to_jiffies(hdr->timeout);
++	if (!rq->timeout)
++		rq->timeout = q->sg_timeout;
++	if (!rq->timeout)
++		rq->timeout = BLK_DEFAULT_SG_TIMEOUT;
++	if (rq->timeout < BLK_MIN_SG_TIMEOUT)
++		rq->timeout = BLK_MIN_SG_TIMEOUT;
++
++	if (hdr->dout_xfer_len && hdr->din_xfer_len) {
+ 		if (!test_bit(QUEUE_FLAG_BIDI, &q->queue_flags)) {
+ 			ret = -EOPNOTSUPP;
+ 			goto out;
+@@ -246,42 +252,39 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t mode)
+ 		next_rq = blk_get_request(q, REQ_OP_SCSI_IN, GFP_KERNEL);
+ 		if (IS_ERR(next_rq)) {
+ 			ret = PTR_ERR(next_rq);
+-			next_rq = NULL;
+ 			goto out;
+ 		}
+-		rq->next_rq = next_rq;
+ 
+-		dxferp = (void __user *)(unsigned long)hdr->din_xferp;
+-		ret =  blk_rq_map_user(q, next_rq, NULL, dxferp,
++		rq->next_rq = next_rq;
++		ret = blk_rq_map_user(q, next_rq, NULL, uptr64(hdr->din_xferp),
+ 				       hdr->din_xfer_len, GFP_KERNEL);
+ 		if (ret)
+-			goto out;
++			goto out_free_nextrq;
+ 	}
+ 
+ 	if (hdr->dout_xfer_len) {
+-		dxfer_len = hdr->dout_xfer_len;
+-		dxferp = (void __user *)(unsigned long)hdr->dout_xferp;
++		ret = blk_rq_map_user(q, rq, NULL, uptr64(hdr->dout_xferp),
++				hdr->dout_xfer_len, GFP_KERNEL);
+ 	} else if (hdr->din_xfer_len) {
+-		dxfer_len = hdr->din_xfer_len;
+-		dxferp = (void __user *)(unsigned long)hdr->din_xferp;
+-	} else
+-		dxfer_len = 0;
+-
+-	if (dxfer_len) {
+-		ret = blk_rq_map_user(q, rq, NULL, dxferp, dxfer_len,
+-				      GFP_KERNEL);
+-		if (ret)
+-			goto out;
++		ret = blk_rq_map_user(q, rq, NULL, uptr64(hdr->din_xferp),
++				hdr->din_xfer_len, GFP_KERNEL);
++	} else {
++		ret = blk_rq_map_user(q, rq, NULL, NULL, 0, GFP_KERNEL);
+ 	}
+ 
++	if (ret)
++		goto out_unmap_nextrq;
+ 	return rq;
++
++out_unmap_nextrq:
++	if (rq->next_rq)
++		blk_rq_unmap_user(rq->next_rq->bio);
++out_free_nextrq:
++	if (rq->next_rq)
++		blk_put_request(rq->next_rq);
+ out:
+-	scsi_req_free_cmd(scsi_req(rq));
++	q->bsg_dev.ops->free_rq(rq);
+ 	blk_put_request(rq);
+-	if (next_rq) {
+-		blk_rq_unmap_user(next_rq->bio);
+-		blk_put_request(next_rq);
+-	}
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -383,56 +386,18 @@ static struct bsg_command *bsg_get_done_cmd(struct bsg_device *bd)
+ static int blk_complete_sgv4_hdr_rq(struct request *rq, struct sg_io_v4 *hdr,
+ 				    struct bio *bio, struct bio *bidi_bio)
+ {
+-	struct scsi_request *req = scsi_req(rq);
+-	int ret = 0;
+-
+-	pr_debug("rq %p bio %p 0x%x\n", rq, bio, req->result);
+-	/*
+-	 * fill in all the output members
+-	 */
+-	hdr->device_status = req->result & 0xff;
+-	hdr->transport_status = host_byte(req->result);
+-	hdr->driver_status = driver_byte(req->result);
+-	hdr->info = 0;
+-	if (hdr->device_status || hdr->transport_status || hdr->driver_status)
+-		hdr->info |= SG_INFO_CHECK;
+-	hdr->response_len = 0;
+-
+-	if (req->sense_len && hdr->response) {
+-		int len = min_t(unsigned int, hdr->max_response_len,
+-					req->sense_len);
++	int ret;
+ 
+-		ret = copy_to_user((void __user *)(unsigned long)hdr->response,
+-				   req->sense, len);
+-		if (!ret)
+-			hdr->response_len = len;
+-		else
+-			ret = -EFAULT;
+-	}
++	ret = rq->q->bsg_dev.ops->complete_rq(rq, hdr);
+ 
+ 	if (rq->next_rq) {
+-		hdr->dout_resid = req->resid_len;
+-		hdr->din_resid = scsi_req(rq->next_rq)->resid_len;
+ 		blk_rq_unmap_user(bidi_bio);
+ 		blk_put_request(rq->next_rq);
+-	} else if (rq_data_dir(rq) == READ)
+-		hdr->din_resid = req->resid_len;
+-	else
+-		hdr->dout_resid = req->resid_len;
+-
+-	/*
+-	 * If the request generated a negative error number, return it
+-	 * (providing we aren't already returning an error); if it's
+-	 * just a protocol response (i.e. non negative), that gets
+-	 * processed above.
+-	 */
+-	if (!ret && req->result < 0)
+-		ret = req->result;
++	}
+ 
+ 	blk_rq_unmap_user(bio);
+-	scsi_req_free_cmd(req);
++	rq->q->bsg_dev.ops->free_rq(rq);
+ 	blk_put_request(rq);
+-
+ 	return ret;
+ }
+ 
+@@ -614,7 +579,7 @@ static int __bsg_write(struct bsg_device *bd, const char __user *buf,
+ 		/*
+ 		 * get a request, fill in the blanks, and add to request queue
+ 		 */
+-		rq = bsg_map_hdr(bd, &bc->hdr, mode);
++		rq = bsg_map_hdr(bd->queue, &bc->hdr, mode);
+ 		if (IS_ERR(rq)) {
+ 			ret = PTR_ERR(rq);
+ 			rq = NULL;
+@@ -742,11 +707,6 @@ static struct bsg_device *bsg_add_device(struct inode *inode,
+ 	struct bsg_device *bd;
+ 	unsigned char buf[32];
+ 
+-	if (!blk_queue_scsi_passthrough(rq)) {
+-		WARN_ONCE(true, "Attempt to register a non-SCSI queue\n");
+-		return ERR_PTR(-EINVAL);
+-	}
+-
+ 	if (!blk_get_queue(rq))
+ 		return ERR_PTR(-ENXIO);
+ 
+@@ -907,7 +867,7 @@ static long bsg_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 		if (copy_from_user(&hdr, uarg, sizeof(hdr)))
+ 			return -EFAULT;
+ 
+-		rq = bsg_map_hdr(bd, &hdr, file->f_mode);
++		rq = bsg_map_hdr(bd->queue, &hdr, file->f_mode);
+ 		if (IS_ERR(rq))
+ 			return PTR_ERR(rq);
+ 
+@@ -959,7 +919,8 @@ void bsg_unregister_queue(struct request_queue *q)
+ EXPORT_SYMBOL_GPL(bsg_unregister_queue);
+ 
+ int bsg_register_queue(struct request_queue *q, struct device *parent,
+-		       const char *name, void (*release)(struct device *))
++		const char *name, const struct bsg_ops *ops,
++		void (*release)(struct device *))
+ {
+ 	struct bsg_class_device *bcd;
+ 	dev_t dev;
+@@ -996,6 +957,7 @@ int bsg_register_queue(struct request_queue *q, struct device *parent,
+ 	bcd->queue = q;
+ 	bcd->parent = get_device(parent);
+ 	bcd->release = release;
++	bcd->ops = ops;
+ 	kref_init(&bcd->ref);
+ 	dev = MKDEV(bsg_major, bcd->minor);
+ 	class_dev = device_create(bsg_class, parent, dev, NULL, "%s", devname);
+@@ -1023,7 +985,17 @@ int bsg_register_queue(struct request_queue *q, struct device *parent,
+ 	mutex_unlock(&bsg_mutex);
+ 	return ret;
+ }
+-EXPORT_SYMBOL_GPL(bsg_register_queue);
++
++int bsg_scsi_register_queue(struct request_queue *q, struct device *parent)
++{
++	if (!blk_queue_scsi_passthrough(q)) {
++		WARN_ONCE(true, "Attempt to register a non-SCSI queue\n");
++		return -EINVAL;
++	}
++
++	return bsg_register_queue(q, parent, NULL, &bsg_scsi_ops, NULL);
++}
++EXPORT_SYMBOL_GPL(bsg_scsi_register_queue);
+ 
+ static struct cdev bsg_cdev;
+ 
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 538152f3528e..37c1d63e847e 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -2140,8 +2140,6 @@ void __scsi_init_queue(struct Scsi_Host *shost, struct request_queue *q)
+ {
+ 	struct device *dev = shost->dma_dev;
+ 
+-	blk_queue_flag_set(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
+-
+ 	/*
+ 	 * this limit is imposed by hardware restrictions
+ 	 */
+@@ -2239,6 +2237,7 @@ struct request_queue *scsi_old_alloc_queue(struct scsi_device *sdev)
+ 	}
+ 
+ 	__scsi_init_queue(shost, q);
++	blk_queue_flag_set(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
+ 	blk_queue_prep_rq(q, scsi_prep_fn);
+ 	blk_queue_unprep_rq(q, scsi_unprep_fn);
+ 	blk_queue_softirq_done(q, scsi_softirq_done);
+@@ -2270,6 +2269,7 @@ struct request_queue *scsi_mq_alloc_queue(struct scsi_device *sdev)
+ 
+ 	sdev->request_queue->queuedata = sdev;
+ 	__scsi_init_queue(sdev->host, sdev->request_queue);
++	blk_queue_flag_set(QUEUE_FLAG_SCSI_PASSTHROUGH, sdev->request_queue);
+ 	return sdev->request_queue;
+ }
+ 
+diff --git a/drivers/scsi/scsi_sysfs.c b/drivers/scsi/scsi_sysfs.c
+index 91b90f672d23..7142c8be1099 100644
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -1292,8 +1292,7 @@ int scsi_sysfs_add_sdev(struct scsi_device *sdev)
+ 	transport_add_device(&sdev->sdev_gendev);
+ 	sdev->is_visible = 1;
+ 
+-	error = bsg_register_queue(rq, &sdev->sdev_gendev, NULL, NULL);
+-
++	error = bsg_scsi_register_queue(rq, &sdev->sdev_gendev);
+ 	if (error)
+ 		/* we're treating error on bsg register as non-fatal,
+ 		 * so pretend nothing went wrong */
+diff --git a/drivers/scsi/scsi_transport_sas.c b/drivers/scsi/scsi_transport_sas.c
+index 7c0987616684..08acbabfae07 100644
+--- a/drivers/scsi/scsi_transport_sas.c
++++ b/drivers/scsi/scsi_transport_sas.c
+@@ -228,7 +228,6 @@ static int sas_bsg_initialize(struct Scsi_Host *shost, struct sas_rphy *rphy)
+ 	 */
+ 	blk_queue_bounce_limit(q, BLK_BOUNCE_HIGH);
+ 	blk_queue_flag_set(QUEUE_FLAG_BIDI, q);
+-	blk_queue_flag_set(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/bsg-lib.h b/include/linux/bsg-lib.h
+index 08762d297cbd..28a7ccc55c89 100644
+--- a/include/linux/bsg-lib.h
++++ b/include/linux/bsg-lib.h
+@@ -38,7 +38,6 @@ struct bsg_buffer {
+ };
+ 
+ struct bsg_job {
+-	struct scsi_request sreq;
+ 	struct device *dev;
+ 
+ 	struct kref kref;
+@@ -64,6 +63,9 @@ struct bsg_job {
+ 	struct bsg_buffer request_payload;
+ 	struct bsg_buffer reply_payload;
+ 
++	int result;
++	unsigned int reply_payload_rcv_len;
++
+ 	void *dd_data;		/* Used for driver-specific storage */
+ };
+ 
+diff --git a/include/linux/bsg.h b/include/linux/bsg.h
+index 2a202e41a3af..0c7dd9ceb139 100644
+--- a/include/linux/bsg.h
++++ b/include/linux/bsg.h
+@@ -1,33 +1,42 @@
+-#ifndef BSG_H
+-#define BSG_H
++#ifndef _LINUX_BSG_H
++#define _LINUX_BSG_H
+ 
+ #include <uapi/linux/bsg.h>
+ 
++struct request;
++
++#ifdef CONFIG_BLK_DEV_BSG
++struct bsg_ops {
++	int	(*check_proto)(struct sg_io_v4 *hdr);
++	int	(*fill_hdr)(struct request *rq, struct sg_io_v4 *hdr,
++				fmode_t mode);
++	int	(*complete_rq)(struct request *rq, struct sg_io_v4 *hdr);
++	void	(*free_rq)(struct request *rq);
++};
+ 
+-#if defined(CONFIG_BLK_DEV_BSG)
+ struct bsg_class_device {
+ 	struct device *class_dev;
+ 	struct device *parent;
+ 	int minor;
+ 	struct request_queue *queue;
+ 	struct kref ref;
++	const struct bsg_ops *ops;
+ 	void (*release)(struct device *);
+ };
+ 
+-extern int bsg_register_queue(struct request_queue *q,
+-			      struct device *parent, const char *name,
+-			      void (*release)(struct device *));
+-extern void bsg_unregister_queue(struct request_queue *);
++int bsg_register_queue(struct request_queue *q, struct device *parent,
++		const char *name, const struct bsg_ops *ops,
++		void (*release)(struct device *));
++int bsg_scsi_register_queue(struct request_queue *q, struct device *parent);
++void bsg_unregister_queue(struct request_queue *q);
+ #else
+-static inline int bsg_register_queue(struct request_queue *q,
+-				     struct device *parent, const char *name,
+-				     void (*release)(struct device *))
++static inline int bsg_scsi_register_queue(struct request_queue *q,
++		struct device *parent)
+ {
+ 	return 0;
+ }
+ static inline void bsg_unregister_queue(struct request_queue *q)
+ {
+ }
+-#endif
+-
+-#endif
++#endif /* CONFIG_BLK_DEV_BSG */
++#endif /* _LINUX_BSG_H */
+-- 
+2.16.4
+
