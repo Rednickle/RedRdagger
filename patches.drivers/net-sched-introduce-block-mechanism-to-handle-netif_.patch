@@ -1,0 +1,189 @@
+From: Jiri Pirko <jiri@mellanox.com>
+Date: Wed, 17 Jan 2018 11:46:48 +0100
+Subject: net: sched: introduce block mechanism to handle netif_keep_dst calls
+Patch-mainline: v4.16-rc1
+Git-commit: f36fe1c498c8959812415c57b683abaa4527dec5
+References: bsc#1109837
+
+Couple of classifiers call netif_keep_dst directly on q->dev. That is
+not possible to do directly for shared blocke where multiple qdiscs are
+owning the block. So introduce a infrastructure to keep track of the
+block owners in list and use this list to implement block variant of
+netif_keep_dst.
+
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Acked-by: David Ahern <dsahern@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/pkt_cls.h     |    1 
+ include/net/sch_generic.h |    2 +
+ net/sched/cls_api.c       |   69 ++++++++++++++++++++++++++++++++++++++++++++++
+ net/sched/cls_bpf.c       |    4 +-
+ net/sched/cls_flow.c      |    2 -
+ net/sched/cls_route.c     |    2 -
+ 6 files changed, 76 insertions(+), 4 deletions(-)
+
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -39,6 +39,7 @@ struct tcf_block_cb;
+ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
+ 				bool create);
+ void tcf_chain_put(struct tcf_chain *chain);
++void tcf_block_netif_keep_dst(struct tcf_block *block);
+ int tcf_block_get(struct tcf_block **p_block,
+ 		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q,
+ 		  struct netlink_ext_ack *extack);
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -288,6 +288,8 @@ struct tcf_block {
+ 	struct net *net;
+ 	struct Qdisc *q;
+ 	struct list_head cb_list;
++	struct list_head owner_list;
++	bool keep_dst;
+ };
+ 
+ static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -376,6 +376,7 @@ static struct tcf_block *tcf_block_creat
+ 	}
+ 	INIT_LIST_HEAD(&block->chain_list);
+ 	INIT_LIST_HEAD(&block->cb_list);
++	INIT_LIST_HEAD(&block->owner_list);
+ 
+ 	/* Create chain 0 by default, it has to be always present. */
+ 	chain = tcf_chain_create(block, 0);
+@@ -407,6 +408,65 @@ static struct tcf_chain *tcf_block_chain
+ 	return list_first_entry(&block->chain_list, struct tcf_chain, list);
+ }
+ 
++struct tcf_block_owner_item {
++	struct list_head list;
++	struct Qdisc *q;
++	enum tcf_block_binder_type binder_type;
++};
++
++static void
++tcf_block_owner_netif_keep_dst(struct tcf_block *block,
++			       struct Qdisc *q,
++			       enum tcf_block_binder_type binder_type)
++{
++	if (block->keep_dst &&
++	    binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS &&
++	    binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_EGRESS)
++		netif_keep_dst(qdisc_dev(q));
++}
++
++void tcf_block_netif_keep_dst(struct tcf_block *block)
++{
++	struct tcf_block_owner_item *item;
++
++	block->keep_dst = true;
++	list_for_each_entry(item, &block->owner_list, list)
++		tcf_block_owner_netif_keep_dst(block, item->q,
++					       item->binder_type);
++}
++EXPORT_SYMBOL(tcf_block_netif_keep_dst);
++
++static int tcf_block_owner_add(struct tcf_block *block,
++			       struct Qdisc *q,
++			       enum tcf_block_binder_type binder_type)
++{
++	struct tcf_block_owner_item *item;
++
++	item = kmalloc(sizeof(*item), GFP_KERNEL);
++	if (!item)
++		return -ENOMEM;
++	item->q = q;
++	item->binder_type = binder_type;
++	list_add(&item->list, &block->owner_list);
++	return 0;
++}
++
++static void tcf_block_owner_del(struct tcf_block *block,
++				struct Qdisc *q,
++				enum tcf_block_binder_type binder_type)
++{
++	struct tcf_block_owner_item *item;
++
++	list_for_each_entry(item, &block->owner_list, list) {
++		if (item->q == q && item->binder_type == binder_type) {
++			list_del(&item->list);
++			kfree(item);
++			return;
++		}
++	}
++	WARN_ON(1);
++}
++
+ int tcf_block_get_ext(struct tcf_block **p_block, struct Qdisc *q,
+ 		      struct tcf_block_ext_info *ei,
+ 		      struct netlink_ext_ack *extack)
+@@ -436,6 +496,12 @@ int tcf_block_get_ext(struct tcf_block *
+ 		}
+ 	}
+ 
++	err = tcf_block_owner_add(block, q, ei->binder_type);
++	if (err)
++		goto err_block_owner_add;
++
++	tcf_block_owner_netif_keep_dst(block, q, ei->binder_type);
++
+ 	err = tcf_chain_head_change_cb_add(tcf_block_chain_zero(block),
+ 					   ei, extack);
+ 	if (err)
+@@ -445,6 +511,8 @@ int tcf_block_get_ext(struct tcf_block *
+ 	return 0;
+ 
+ err_chain_head_change_cb_add:
++	tcf_block_owner_del(block, q, ei->binder_type);
++err_block_owner_add:
+ 	if (created) {
+ 		if (tcf_block_shared(block))
+ 			tcf_block_remove(block, net);
+@@ -490,6 +558,7 @@ void tcf_block_put_ext(struct tcf_block
+ 	if (!block)
+ 		return;
+ 	tcf_chain_head_change_cb_del(tcf_block_chain_zero(block), ei);
++	tcf_block_owner_del(block, q, ei->binder_type);
+ 
+ 	if (--block->refcnt == 0) {
+ 		if (tcf_block_shared(block))
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -399,8 +399,8 @@ static int cls_bpf_prog_from_efd(struct
+ 	prog->bpf_name = name;
+ 	prog->filter = fp;
+ 
+-	if (fp->dst_needed && !(tp->q->flags & TCQ_F_INGRESS))
+-		netif_keep_dst(qdisc_dev(tp->q));
++	if (fp->dst_needed)
++		tcf_block_netif_keep_dst(tp->chain->block);
+ 
+ 	return 0;
+ }
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -527,7 +527,7 @@ static int flow_change(struct net *net,
+ 	setup_deferrable_timer(&fnew->perturb_timer, flow_perturbation,
+ 			       (unsigned long)fnew);
+ 
+-	netif_keep_dst(qdisc_dev(tp->q));
++	tcf_block_netif_keep_dst(tp->chain->block);
+ 
+ 	if (tb[TCA_FLOW_KEYS]) {
+ 		fnew->keymask = keymask;
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -527,7 +527,7 @@ static int route4_change(struct net *net
+ 		if (f->handle < f1->handle)
+ 			break;
+ 
+-	netif_keep_dst(qdisc_dev(tp->q));
++	tcf_block_netif_keep_dst(tp->chain->block);
+ 	rcu_assign_pointer(f->next, f1);
+ 	rcu_assign_pointer(*fp, f);
+ 
