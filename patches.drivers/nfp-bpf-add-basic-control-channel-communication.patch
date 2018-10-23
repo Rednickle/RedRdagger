@@ -1,0 +1,456 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Thu, 11 Jan 2018 20:29:11 -0800
+Subject: nfp: bpf: add basic control channel communication
+Patch-mainline: v4.16-rc1
+Git-commit: d48ae231c5e13d98e3664443c6342c2011f5df2b
+References: bsc#1109837
+
+For map support we will need to send and receive control messages.
+Add basic support for sending a message to FW, and waiting for a
+reply.
+
+Control messages are tagged with a 16 bit ID.  Add a simple ID
+allocator and make sure we don't allow too many messages in flight,
+to avoid request <> reply mismatches.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/Makefile         |    1 
+ drivers/net/ethernet/netronome/nfp/bpf/cmsg.c       |  238 ++++++++++++++++++++
+ drivers/net/ethernet/netronome/nfp/bpf/fw.h         |   22 +
+ drivers/net/ethernet/netronome/nfp/bpf/main.c       |    5 
+ drivers/net/ethernet/netronome/nfp/bpf/main.h       |   23 +
+ drivers/net/ethernet/netronome/nfp/nfp_app.h        |    9 
+ drivers/net/ethernet/netronome/nfp/nfp_net.h        |   12 +
+ drivers/net/ethernet/netronome/nfp/nfp_net_common.c |    7 
+ 8 files changed, 317 insertions(+)
+ create mode 100644 drivers/net/ethernet/netronome/nfp/bpf/cmsg.c
+
+--- a/drivers/net/ethernet/netronome/nfp/Makefile
++++ b/drivers/net/ethernet/netronome/nfp/Makefile
+@@ -43,6 +43,7 @@ endif
+ 
+ ifeq ($(CONFIG_BPF_SYSCALL),y)
+ nfp-objs += \
++	    bpf/cmsg.o \
+ 	    bpf/main.o \
+ 	    bpf/offload.o \
+ 	    bpf/verifier.o \
+--- /dev/null
++++ b/drivers/net/ethernet/netronome/nfp/bpf/cmsg.c
+@@ -0,0 +1,238 @@
++/*
++ * Copyright (C) 2017 Netronome Systems, Inc.
++ *
++ * This software is dual licensed under the GNU General License Version 2,
++ * June 1991 as shown in the file COPYING in the top-level directory of this
++ * source tree or the BSD 2-Clause License provided below.  You have the
++ * option to license this software under the complete terms of either license.
++ *
++ * The BSD 2-Clause License:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      1. Redistributions of source code must retain the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer.
++ *
++ *      2. Redistributions in binary form must reproduce the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer in the documentation and/or other materials
++ *         provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/bitops.h>
++#include <linux/bug.h>
++#include <linux/jiffies.h>
++#include <linux/skbuff.h>
++#include <linux/wait.h>
++
++#include "../nfp_app.h"
++#include "../nfp_net.h"
++#include "fw.h"
++#include "main.h"
++
++#define cmsg_warn(bpf, msg...)	nn_dp_warn(&(bpf)->app->ctrl->dp, msg)
++
++#define NFP_BPF_TAG_ALLOC_SPAN	(U16_MAX / 4)
++
++static bool nfp_bpf_all_tags_busy(struct nfp_app_bpf *bpf)
++{
++	u16 used_tags;
++
++	used_tags = bpf->tag_alloc_next - bpf->tag_alloc_last;
++
++	return used_tags > NFP_BPF_TAG_ALLOC_SPAN;
++}
++
++static int nfp_bpf_alloc_tag(struct nfp_app_bpf *bpf)
++{
++	/* All FW communication for BPF is request-reply.  To make sure we
++	 * don't reuse the message ID too early after timeout - limit the
++	 * number of requests in flight.
++	 */
++	if (nfp_bpf_all_tags_busy(bpf)) {
++		cmsg_warn(bpf, "all FW request contexts busy!\n");
++		return -EAGAIN;
++	}
++
++	WARN_ON(__test_and_set_bit(bpf->tag_alloc_next, bpf->tag_allocator));
++	return bpf->tag_alloc_next++;
++}
++
++static void nfp_bpf_free_tag(struct nfp_app_bpf *bpf, u16 tag)
++{
++	WARN_ON(!__test_and_clear_bit(tag, bpf->tag_allocator));
++
++	while (!test_bit(bpf->tag_alloc_last, bpf->tag_allocator) &&
++	       bpf->tag_alloc_last != bpf->tag_alloc_next)
++		bpf->tag_alloc_last++;
++}
++
++static unsigned int nfp_bpf_cmsg_get_tag(struct sk_buff *skb)
++{
++	struct cmsg_hdr *hdr;
++
++	hdr = (struct cmsg_hdr *)skb->data;
++
++	return be16_to_cpu(hdr->tag);
++}
++
++static struct sk_buff *__nfp_bpf_reply(struct nfp_app_bpf *bpf, u16 tag)
++{
++	unsigned int msg_tag;
++	struct sk_buff *skb;
++
++	skb_queue_walk(&bpf->cmsg_replies, skb) {
++		msg_tag = nfp_bpf_cmsg_get_tag(skb);
++		if (msg_tag == tag) {
++			nfp_bpf_free_tag(bpf, tag);
++			__skb_unlink(skb, &bpf->cmsg_replies);
++			return skb;
++		}
++	}
++
++	return NULL;
++}
++
++static struct sk_buff *nfp_bpf_reply(struct nfp_app_bpf *bpf, u16 tag)
++{
++	struct sk_buff *skb;
++
++	nfp_ctrl_lock(bpf->app->ctrl);
++	skb = __nfp_bpf_reply(bpf, tag);
++	nfp_ctrl_unlock(bpf->app->ctrl);
++
++	return skb;
++}
++
++static struct sk_buff *nfp_bpf_reply_drop_tag(struct nfp_app_bpf *bpf, u16 tag)
++{
++	struct sk_buff *skb;
++
++	nfp_ctrl_lock(bpf->app->ctrl);
++	skb = __nfp_bpf_reply(bpf, tag);
++	if (!skb)
++		nfp_bpf_free_tag(bpf, tag);
++	nfp_ctrl_unlock(bpf->app->ctrl);
++
++	return skb;
++}
++
++static struct sk_buff *
++nfp_bpf_cmsg_wait_reply(struct nfp_app_bpf *bpf, enum nfp_bpf_cmsg_type type,
++			int tag)
++{
++	struct sk_buff *skb;
++	int err;
++
++	err = wait_event_interruptible_timeout(bpf->cmsg_wq,
++					       skb = nfp_bpf_reply(bpf, tag),
++					       msecs_to_jiffies(5000));
++	/* We didn't get a response - try last time and atomically drop
++	 * the tag even if no response is matched.
++	 */
++	if (!skb)
++		skb = nfp_bpf_reply_drop_tag(bpf, tag);
++	if (err < 0) {
++		cmsg_warn(bpf, "%s waiting for response to 0x%02x: %d\n",
++			  err == ERESTARTSYS ? "interrupted" : "error",
++			  type, err);
++		return ERR_PTR(err);
++	}
++	if (!skb) {
++		cmsg_warn(bpf, "timeout waiting for response to 0x%02x\n",
++			  type);
++		return ERR_PTR(-ETIMEDOUT);
++	}
++
++	return skb;
++}
++
++struct sk_buff *
++nfp_bpf_cmsg_communicate(struct nfp_app_bpf *bpf, struct sk_buff *skb,
++			 enum nfp_bpf_cmsg_type type, unsigned int reply_size)
++{
++	struct cmsg_hdr *hdr;
++	int tag;
++
++	nfp_ctrl_lock(bpf->app->ctrl);
++	tag = nfp_bpf_alloc_tag(bpf);
++	if (tag < 0) {
++		nfp_ctrl_unlock(bpf->app->ctrl);
++		dev_kfree_skb_any(skb);
++		return ERR_PTR(tag);
++	}
++
++	hdr = (void *)skb->data;
++	hdr->ver = CMSG_MAP_ABI_VERSION;
++	hdr->type = type;
++	hdr->tag = cpu_to_be16(tag);
++
++	__nfp_app_ctrl_tx(bpf->app, skb);
++
++	nfp_ctrl_unlock(bpf->app->ctrl);
++
++	skb = nfp_bpf_cmsg_wait_reply(bpf, type, tag);
++	if (IS_ERR(skb))
++		return skb;
++
++	hdr = (struct cmsg_hdr *)skb->data;
++	/* 0 reply_size means caller will do the validation */
++	if (reply_size && skb->len != reply_size) {
++		cmsg_warn(bpf, "cmsg drop - wrong size %d != %d!\n",
++			  skb->len, reply_size);
++		goto err_free;
++	}
++	if (hdr->type != __CMSG_REPLY(type)) {
++		cmsg_warn(bpf, "cmsg drop - wrong type 0x%02x != 0x%02lx!\n",
++			  hdr->type, __CMSG_REPLY(type));
++		goto err_free;
++	}
++
++	return skb;
++err_free:
++	dev_kfree_skb_any(skb);
++	return ERR_PTR(-EIO);
++}
++
++void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb)
++{
++	struct nfp_app_bpf *bpf = app->priv;
++	unsigned int tag;
++
++	if (unlikely(skb->len < sizeof(struct cmsg_reply_map_simple))) {
++		cmsg_warn(bpf, "cmsg drop - too short %d!\n", skb->len);
++		goto err_free;
++	}
++
++	nfp_ctrl_lock(bpf->app->ctrl);
++
++	tag = nfp_bpf_cmsg_get_tag(skb);
++	if (unlikely(!test_bit(tag, bpf->tag_allocator))) {
++		cmsg_warn(bpf, "cmsg drop - no one is waiting for tag %u!\n",
++			  tag);
++		goto err_unlock;
++	}
++
++	__skb_queue_tail(&bpf->cmsg_replies, skb);
++	wake_up_interruptible_all(&bpf->cmsg_wq);
++
++	nfp_ctrl_unlock(bpf->app->ctrl);
++
++	return;
++err_unlock:
++	nfp_ctrl_unlock(bpf->app->ctrl);
++err_free:
++	dev_kfree_skb_any(skb);
++}
+--- a/drivers/net/ethernet/netronome/nfp/bpf/fw.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/fw.h
+@@ -51,4 +51,26 @@ struct nfp_bpf_cap_tlv_adjust_head {
+ 
+ #define NFP_BPF_ADJUST_HEAD_NO_META	BIT(0)
+ 
++/*
++ * Types defined for map related control messages
++ */
++#define CMSG_MAP_ABI_VERSION		1
++
++enum nfp_bpf_cmsg_type {
++	__CMSG_TYPE_MAP_MAX,
++};
++
++#define CMSG_TYPE_MAP_REPLY_BIT		7
++#define __CMSG_REPLY(req)		(BIT(CMSG_TYPE_MAP_REPLY_BIT) | (req))
++
++struct cmsg_hdr {
++	u8 type;
++	u8 ver;
++	__be16 tag;
++};
++
++struct cmsg_reply_map_simple {
++	struct cmsg_hdr hdr;
++	__be32 rc;
++};
+ #endif
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -313,6 +313,8 @@ static int nfp_bpf_init(struct nfp_app *
+ 	bpf->app = app;
+ 	app->priv = bpf;
+ 
++	skb_queue_head_init(&bpf->cmsg_replies);
++	init_waitqueue_head(&bpf->cmsg_wq);
+ 	INIT_LIST_HEAD(&bpf->map_list);
+ 
+ 	err = nfp_bpf_parse_capabilities(app);
+@@ -330,6 +332,7 @@ static void nfp_bpf_clean(struct nfp_app
+ {
+ 	struct nfp_app_bpf *bpf = app->priv;
+ 
++	WARN_ON(!skb_queue_empty(&bpf->cmsg_replies));
+ 	WARN_ON(!list_empty(&bpf->map_list));
+ 	kfree(bpf);
+ }
+@@ -348,6 +351,8 @@ const struct nfp_app_type app_bpf = {
+ 	.vnic_alloc	= nfp_bpf_vnic_alloc,
+ 	.vnic_free	= nfp_bpf_vnic_free,
+ 
++	.ctrl_msg_rx	= nfp_bpf_ctrl_msg_rx,
++
+ 	.setup_tc	= nfp_bpf_setup_tc,
+ 	.tc_busy	= nfp_bpf_tc_busy,
+ 	.bpf		= nfp_ndo_bpf,
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -37,10 +37,14 @@
+ #include <linux/bitfield.h>
+ #include <linux/bpf.h>
+ #include <linux/bpf_verifier.h>
++#include <linux/kernel.h>
+ #include <linux/list.h>
++#include <linux/skbuff.h>
+ #include <linux/types.h>
++#include <linux/wait.h>
+ 
+ #include "../nfp_asm.h"
++#include "fw.h"
+ 
+ /* For relocation logic use up-most byte of branch instruction as scratch
+  * area.  Remember to clear this before sending instructions to HW!
+@@ -93,6 +97,13 @@ enum pkt_vec {
+  * struct nfp_app_bpf - bpf app priv structure
+  * @app:		backpointer to the app
+  *
++ * @tag_allocator:	bitmap of control message tags in use
++ * @tag_alloc_next:	next tag bit to allocate
++ * @tag_alloc_last:	next tag bit to be freed
++ *
++ * @cmsg_replies:	received cmsg replies waiting to be consumed
++ * @cmsg_wq:		work queue for waiting for cmsg replies
++ *
+  * @map_list:		list of offloaded maps
+  *
+  * @adjust_head:	adjust head capability
+@@ -105,6 +116,13 @@ enum pkt_vec {
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+ 
++	DECLARE_BITMAP(tag_allocator, U16_MAX + 1);
++	u16 tag_alloc_next;
++	u16 tag_alloc_last;
++
++	struct sk_buff_head cmsg_replies;
++	struct wait_queue_head cmsg_wq;
++
+ 	struct list_head map_list;
+ 
+ 	struct nfp_bpf_cap_adjust_head {
+@@ -284,4 +302,9 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_p
+ 		  unsigned int insn_idx, unsigned int n_insns);
+ 
+ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
++
++struct sk_buff *
++nfp_bpf_cmsg_communicate(struct nfp_app_bpf *bpf, struct sk_buff *skb,
++			 enum nfp_bpf_cmsg_type type, unsigned int reply_size);
++void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb);
+ #endif
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+@@ -165,6 +165,7 @@ struct nfp_app {
+ 	void *priv;
+ };
+ 
++bool __nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
+ bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb);
+ 
+ static inline int nfp_app_init(struct nfp_app *app)
+@@ -326,6 +327,14 @@ static inline int nfp_app_xdp_offload(st
+ 	return app->type->xdp_offload(app, nn, prog);
+ }
+ 
++static inline bool __nfp_app_ctrl_tx(struct nfp_app *app, struct sk_buff *skb)
++{
++	trace_devlink_hwmsg(priv_to_devlink(app->pf), false, 0,
++			    skb->data, skb->len);
++
++	return __nfp_ctrl_tx(app->ctrl, skb);
++}
++
+ static inline bool nfp_app_ctrl_tx(struct nfp_app *app, struct sk_buff *skb)
+ {
+ 	trace_devlink_hwmsg(priv_to_devlink(app->pf), false, 0,
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -839,6 +839,18 @@ static inline const char *nfp_net_name(s
+ 	return nn->dp.netdev ? nn->dp.netdev->name : "ctrl";
+ }
+ 
++static inline void nfp_ctrl_lock(struct nfp_net *nn)
++	__acquires(&nn->r_vecs[0].lock)
++{
++	spin_lock_bh(&nn->r_vecs[0].lock);
++}
++
++static inline void nfp_ctrl_unlock(struct nfp_net *nn)
++	__releases(&nn->r_vecs[0].lock)
++{
++	spin_unlock_bh(&nn->r_vecs[0].lock);
++}
++
+ /* Globals */
+ extern const char nfp_driver_version[];
+ 
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -1920,6 +1920,13 @@ err_free:
+ 	return false;
+ }
+ 
++bool __nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb)
++{
++	struct nfp_net_r_vector *r_vec = &nn->r_vecs[0];
++
++	return nfp_ctrl_tx_one(nn, r_vec, skb, false);
++}
++
+ bool nfp_ctrl_tx(struct nfp_net *nn, struct sk_buff *skb)
+ {
+ 	struct nfp_net_r_vector *r_vec = &nn->r_vecs[0];
