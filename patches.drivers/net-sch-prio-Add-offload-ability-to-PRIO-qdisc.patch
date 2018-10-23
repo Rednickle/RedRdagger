@@ -1,0 +1,169 @@
+From: Nogah Frankel <nogahf@mellanox.com>
+Date: Sun, 14 Jan 2018 12:33:15 +0100
+Subject: net: sch: prio: Add offload ability to PRIO qdisc
+Patch-mainline: v4.16-rc1
+Git-commit: 7fdb61b44c0c95d00f6c856d9fb61a9f647bc85f
+References: bsc#1109837
+
+Add the ability to offload PRIO qdisc by using ndo_setup_tc.
+There are three commands for PRIO offloading:
+* TC_PRIO_REPLACE: handles set and tune
+* TC_PRIO_DESTROY: handles qdisc destroy
+* TC_PRIO_STATS: updates the qdiscs counters (given as reference)
+
+Like RED qdisc, the indication of whether PRIO is being offloaded is being
+set and updated as part of the dump function. It is so because the driver
+could decide to offload or not based on the qdisc parent, which could
+change without notifying the qdisc.
+
+Signed-off-by: Nogah Frankel <nogahf@mellanox.com>
+Reviewed-by: Yuval Mintz <yuvalm@mellanox.com>
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/netdevice.h |    1 
+ include/net/pkt_cls.h     |   25 +++++++++++++++++++
+ net/sched/sch_prio.c      |   59 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 85 insertions(+)
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -780,6 +780,7 @@ enum tc_setup_type {
+ 	TC_SETUP_BLOCK,
+ 	TC_SETUP_QDISC_CBS,
+ 	TC_SETUP_QDISC_RED,
++	TC_SETUP_QDISC_PRIO,
+ };
+ 
+ /* These structures hold the attributes of bpf state that are being passed
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -761,4 +761,29 @@ struct tc_red_qopt_offload {
+ 	};
+ };
+ 
++enum tc_prio_command {
++	TC_PRIO_REPLACE,
++	TC_PRIO_DESTROY,
++	TC_PRIO_STATS,
++};
++
++struct tc_prio_qopt_offload_params {
++	int bands;
++	u8 priomap[TC_PRIO_MAX + 1];
++	/* In case that a prio qdisc is offloaded and now is changed to a
++	 * non-offloadedable config, it needs to update the backlog & qlen
++	 * values to negate the HW backlog & qlen values (and only them).
++	 */
++	struct gnet_stats_queue *qstats;
++};
++
++struct tc_prio_qopt_offload {
++	enum tc_prio_command command;
++	u32 handle;
++	u32 parent;
++	union {
++		struct tc_prio_qopt_offload_params replace_params;
++		struct tc_qopt_offload_stats stats;
++	};
++};
+ #endif
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -142,6 +142,31 @@ prio_reset(struct Qdisc *sch)
+ 	sch->q.qlen = 0;
+ }
+ 
++static int prio_offload(struct Qdisc *sch, bool enable)
++{
++	struct prio_sched_data *q = qdisc_priv(sch);
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_prio_qopt_offload opt = {
++		.handle = sch->handle,
++		.parent = sch->parent,
++	};
++
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return -EOPNOTSUPP;
++
++	if (enable) {
++		opt.command = TC_PRIO_REPLACE;
++		opt.replace_params.bands = q->bands;
++		memcpy(&opt.replace_params.priomap, q->prio2band,
++		       TC_PRIO_MAX + 1);
++		opt.replace_params.qstats = &sch->qstats;
++	} else {
++		opt.command = TC_PRIO_DESTROY;
++	}
++
++	return dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_PRIO, &opt);
++}
++
+ static void
+ prio_destroy(struct Qdisc *sch)
+ {
+@@ -149,6 +174,7 @@ prio_destroy(struct Qdisc *sch)
+ 	struct prio_sched_data *q = qdisc_priv(sch);
+ 
+ 	tcf_block_put(q->block);
++	prio_offload(sch, false);
+ 	for (prio = 0; prio < q->bands; prio++)
+ 		qdisc_destroy(q->queues[prio]);
+ }
+@@ -204,6 +230,7 @@ static int prio_tune(struct Qdisc *sch,
+ 	}
+ 
+ 	sch_tree_unlock(sch);
++	prio_offload(sch, true);
+ 	return 0;
+ }
+ 
+@@ -223,15 +250,47 @@ static int prio_init(struct Qdisc *sch,
+ 	return prio_tune(sch, opt, extack);
+ }
+ 
++static int prio_dump_offload(struct Qdisc *sch)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_prio_qopt_offload hw_stats = {
++		.handle = sch->handle,
++		.parent = sch->parent,
++		.command = TC_PRIO_STATS,
++		.stats.bstats = &sch->bstats,
++		.stats.qstats = &sch->qstats,
++	};
++	int err;
++
++	sch->flags &= ~TCQ_F_OFFLOADED;
++	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
++		return 0;
++
++	err = dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_PRIO,
++					    &hw_stats);
++	if (err == -EOPNOTSUPP)
++		return 0;
++
++	if (!err)
++		sch->flags |= TCQ_F_OFFLOADED;
++
++	return err;
++}
++
+ static int prio_dump(struct Qdisc *sch, struct sk_buff *skb)
+ {
+ 	struct prio_sched_data *q = qdisc_priv(sch);
+ 	unsigned char *b = skb_tail_pointer(skb);
+ 	struct tc_prio_qopt opt;
++	int err;
+ 
+ 	opt.bands = q->bands;
+ 	memcpy(&opt.priomap, q->prio2band, TC_PRIO_MAX + 1);
+ 
++	err = prio_dump_offload(sch);
++	if (err)
++		goto nla_put_failure;
++
+ 	if (nla_put(skb, TCA_OPTIONS, sizeof(opt), &opt))
+ 		goto nla_put_failure;
+ 
