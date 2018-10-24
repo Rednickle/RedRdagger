@@ -1,0 +1,148 @@
+From: Lawrence Brakmo <brakmo@fb.com>
+Date: Fri, 20 Oct 2017 11:05:41 -0700
+Subject: bpf: Add BPF_SOCKET_OPS_BASE_RTT support to tcp_nv
+Patch-mainline: v4.15-rc1
+Git-commit: 85cce215781685bbc94b6af2bd1aa40b71965a70
+References: bsc#1109837
+
+TCP_NV will try to get the base RTT from a socket_ops BPF program if one
+is loaded. NV will then use the base RTT to bound its min RTT (its
+notion of the base RTT). It uses the base RTT as an upper bound and 80%
+of the base RTT as its lower bound.
+
+In other words, NV will consider filtered RTTs larger than base RTT as a
+sign of congestion. As a result, there is no minRTT inflation when there
+is a lot of congestion. For example, in a DC where the RTTs are less
+than 40us when there is no congestion, a base RTT value of 80us improves
+the performance of NV. The difference between the uncongested RTT and
+the base RTT provided represents how much queueing we are willing to
+have (in practice it can be higher).
+
+NV has been tunned to reduce congestion when there are many flows at the
+cost of one flow not achieving full bandwith utilization. When a
+reasonable base RTT is provided, one NV flow can now fully utilize the
+full bandwidth. In addition, the performance is also improved when there
+are many flows.
+
+In the following examples the NV results are using a kernel with this
+patch set (i.e. both NV results are using the new nv_loss_dec_factor).
+
+With one host sending to another host and only one flow the
+goodputs are:
+  Cubic: 9.3 Gbps, NV: 5.5 Gbps, NV (baseRTT=80us): 9.2 Gbps
+
+With 2 hosts sending to one host (1 flow per host, the goodput per flow
+is:
+  Cubic: 4.6 Gbps, NV: 4.5 Gbps, NV (baseRTT=80us)L 4.6 Gbps
+
+But the RTTs seen by a ping process in the sender is:
+  Cubic: 3.3ms  NV: 97us,  NV (baseRTT=80us): 146us
+
+With a lot of flows things look even better for NV with baseRTT. Here we
+have 3 hosts sending to one host. Each sending host has 6 flows: 1
+stream, 4x1MB RPC, 1x10KB RPC. Cubic, NV and NV with baseRTT all fully
+utilize the full available bandwidth. However, the distribution of
+bandwidth among the flows is very different. For the 10KB RPC flow:
+  Cubic: 27Mbps, NV: 111Mbps, NV (baseRTT=80us): 222Mbps
+
+The 99% latencies for the 10KB flows are:
+  Cubic: 26ms,  NV: 1ms,  NV (baseRTT=80us): 500us
+
+The RTT seen by a ping process at the senders:
+  Cubic: 3.2ms  NV: 720us,  NV (baseRTT=80us): 330us
+
+Signed-off-by: Lawrence Brakmo <brakmo@fb.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ net/ipv4/tcp_nv.c |   40 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 38 insertions(+), 2 deletions(-)
+
+--- a/net/ipv4/tcp_nv.c
++++ b/net/ipv4/tcp_nv.c
+@@ -39,7 +39,7 @@
+  * nv_cong_dec_mult	Decrease cwnd by X% (30%) of congestion when detected
+  * nv_ssthresh_factor	On congestion set ssthresh to this * <desired cwnd> / 8
+  * nv_rtt_factor	RTT averaging factor
+- * nv_loss_dec_factor	Decrease cwnd by this (50%) when losses occur
++ * nv_loss_dec_factor	Decrease cwnd to this (80%) when losses occur
+  * nv_dec_eval_min_calls	Wait this many RTT measurements before dec cwnd
+  * nv_inc_eval_min_calls	Wait this many RTT measurements before inc cwnd
+  * nv_ssthresh_eval_min_calls	Wait this many RTT measurements before stopping
+@@ -61,7 +61,7 @@ static int nv_min_cwnd __read_mostly = 2
+ static int nv_cong_dec_mult __read_mostly = 30 * 128 / 100; /* = 30% */
+ static int nv_ssthresh_factor __read_mostly = 8; /* = 1 */
+ static int nv_rtt_factor __read_mostly = 128; /* = 1/2*old + 1/2*new */
+-static int nv_loss_dec_factor __read_mostly = 512; /* => 50% */
++static int nv_loss_dec_factor __read_mostly = 819; /* => 80% */
+ static int nv_cwnd_growth_rate_neg __read_mostly = 8;
+ static int nv_cwnd_growth_rate_pos __read_mostly; /* 0 => fixed like Reno */
+ static int nv_dec_eval_min_calls __read_mostly = 60;
+@@ -102,6 +102,11 @@ struct tcpnv {
+ 	u32 nv_last_rtt;	/* last rtt */
+ 	u32 nv_min_rtt;		/* active min rtt. Used to determine slope */
+ 	u32 nv_min_rtt_new;	/* min rtt for future use */
++	u32 nv_base_rtt;        /* If non-zero it represents the threshold for
++				 * congestion */
++	u32 nv_lower_bound_rtt; /* Used in conjunction with nv_base_rtt. It is
++				 * set to 80% of nv_base_rtt. It helps reduce
++				 * unfairness between flows */
+ 	u32 nv_rtt_max_rate;	/* max rate seen during current RTT */
+ 	u32 nv_rtt_start_seq;	/* current RTT ends when packet arrives
+ 				 * acking beyond nv_rtt_start_seq */
+@@ -134,9 +139,24 @@ static inline void tcpnv_reset(struct tc
+ static void tcpnv_init(struct sock *sk)
+ {
+ 	struct tcpnv *ca = inet_csk_ca(sk);
++	int base_rtt;
+ 
+ 	tcpnv_reset(ca, sk);
+ 
++	/* See if base_rtt is available from socket_ops bpf program.
++	 * It is meant to be used in environments, such as communication
++	 * within a datacenter, where we have reasonable estimates of
++	 * RTTs
++	 */
++	base_rtt = tcp_call_bpf(sk, BPF_SOCK_OPS_BASE_RTT);
++	if (base_rtt > 0) {
++		ca->nv_base_rtt = base_rtt;
++		ca->nv_lower_bound_rtt = (base_rtt * 205) >> 8; /* 80% */
++	} else {
++		ca->nv_base_rtt = 0;
++		ca->nv_lower_bound_rtt = 0;
++	}
++
+ 	ca->nv_allow_cwnd_growth = 1;
+ 	ca->nv_min_rtt_reset_jiffies = jiffies + 2 * HZ;
+ 	ca->nv_min_rtt = NV_INIT_RTT;
+@@ -146,6 +166,19 @@ static void tcpnv_init(struct sock *sk)
+ 	ca->cwnd_growth_factor = 0;
+ }
+ 
++/* If provided, apply upper (base_rtt) and lower (lower_bound_rtt)
++ * bounds to RTT.
++ */
++inline u32 nv_get_bounded_rtt(struct tcpnv *ca, u32 val)
++{
++	if (ca->nv_lower_bound_rtt > 0 && val < ca->nv_lower_bound_rtt)
++		return ca->nv_lower_bound_rtt;
++	else if (ca->nv_base_rtt > 0 && val > ca->nv_base_rtt)
++		return ca->nv_base_rtt;
++	else
++		return val;
++}
++
+ static void tcpnv_cong_avoid(struct sock *sk, u32 ack, u32 acked)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+@@ -276,6 +309,9 @@ static void tcpnv_acked(struct sock *sk,
+ 	if (ca->nv_eval_call_cnt < 255)
+ 		ca->nv_eval_call_cnt++;
+ 
++	/* Apply bounds to rtt. Only used to update min_rtt */
++	avg_rtt = nv_get_bounded_rtt(ca, avg_rtt);
++
+ 	/* update min rtt if necessary */
+ 	if (avg_rtt < ca->nv_min_rtt)
+ 		ca->nv_min_rtt = avg_rtt;
