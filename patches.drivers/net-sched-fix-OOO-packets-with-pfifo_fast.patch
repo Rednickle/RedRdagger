@@ -1,0 +1,91 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Sat, 24 Mar 2018 22:25:06 -0700
+Subject: net: sched, fix OOO packets with pfifo_fast
+Patch-mainline: v4.16
+Git-commit: eb82a994479245a79647d302f9b4eb8e7c9d7ca6
+References: bsc#1109837
+
+After the qdisc lock was dropped in pfifo_fast we allow multiple
+enqueue threads and dequeue threads to run in parallel. On the
+enqueue side the skb bit ooo_okay is used to ensure all related
+skbs are enqueued in-order. On the dequeue side though there is
+no similar logic. What we observe is with fewer queues than CPUs
+it is possible to re-order packets when two instances of
+__qdisc_run() are running in parallel. Each thread will dequeue
+a skb and then whichever thread calls the ndo op first will
+be sent on the wire. This doesn't typically happen because
+qdisc_run() is usually triggered by the same core that did the
+enqueue. However, drivers will trigger __netif_schedule()
+when queues are transitioning from stopped to awake using the
+netif_tx_wake_* APIs. When this happens netif_schedule() calls
+qdisc_run() on the same CPU that did the netif_tx_wake_* which
+is usually done in the interrupt completion context. This CPU
+is selected with the irq affinity which is unrelated to the
+enqueue operations.
+
+To resolve this we add a RUNNING bit to the qdisc to ensure
+only a single dequeue per qdisc is running. Enqueue and dequeue
+operations can still run in parallel and also on multi queue
+NICs we can still have a dequeue in-flight per qdisc, which
+is typically per CPU.
+
+Fixes: c5ad119fb6c0 ("net: sched: pfifo_fast use skb_array")
+Reported-by: Jakob Unterwurzacher <jakob.unterwurzacher@theobroma-systems.com>
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/sch_generic.h |    1 +
+ net/sched/sch_generic.c   |   17 +++++++++++++----
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -29,6 +29,7 @@ struct qdisc_rate_table {
+ enum qdisc_state_t {
+ 	__QDISC_STATE_SCHED,
+ 	__QDISC_STATE_DEACTIVATED,
++	__QDISC_STATE_RUNNING,
+ };
+ 
+ struct qdisc_size_table {
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -356,24 +356,33 @@ bool sch_direct_xmit(struct sk_buff *skb
+  */
+ static inline bool qdisc_restart(struct Qdisc *q, int *packets)
+ {
++	bool more, validate, nolock = q->flags & TCQ_F_NOLOCK;
+ 	spinlock_t *root_lock = NULL;
+ 	struct netdev_queue *txq;
+ 	struct net_device *dev;
+ 	struct sk_buff *skb;
+-	bool validate;
+ 
+ 	/* Dequeue packet */
++	if (nolock && test_and_set_bit(__QDISC_STATE_RUNNING, &q->state))
++		return false;
++
+ 	skb = dequeue_skb(q, &validate, packets);
+-	if (unlikely(!skb))
++	if (unlikely(!skb)) {
++		if (nolock)
++			clear_bit(__QDISC_STATE_RUNNING, &q->state);
+ 		return false;
++	}
+ 
+-	if (!(q->flags & TCQ_F_NOLOCK))
++	if (!nolock)
+ 		root_lock = qdisc_lock(q);
+ 
+ 	dev = qdisc_dev(q);
+ 	txq = skb_get_tx_queue(dev, skb);
+ 
+-	return sch_direct_xmit(skb, q, dev, txq, root_lock, validate);
++	more = sch_direct_xmit(skb, q, dev, txq, root_lock, validate);
++	if (nolock)
++		clear_bit(__QDISC_STATE_RUNNING, &q->state);
++	return more;
+ }
+ 
+ void __qdisc_run(struct Qdisc *q)
