@@ -1,0 +1,260 @@
+From: Yonghong Song <yhs@fb.com>
+Date: Mon, 11 Dec 2017 11:39:03 -0800
+Subject: bpf/tracing: add a bpf test for new ioctl query interface
+Patch-mainline: v4.16-rc1
+Git-commit: d279f1f8c64711ca986c3121c8ec811b892932f0
+References: bsc#1109837
+
+Added a subtest in test_progs. The tracepoint is
+sched/sched_switch. Multiple bpf programs are attached to
+this tracepoint and the query interface is exercised.
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ tools/include/uapi/linux/perf_event.h         |   22 ++++
+ tools/testing/selftests/bpf/Makefile          |    2 
+ tools/testing/selftests/bpf/test_progs.c      |  133 ++++++++++++++++++++++++++
+ tools/testing/selftests/bpf/test_tracepoint.c |   26 +++++
+ 4 files changed, 182 insertions(+), 1 deletion(-)
+ create mode 100644 tools/testing/selftests/bpf/test_tracepoint.c
+
+--- a/tools/include/uapi/linux/perf_event.h
++++ b/tools/include/uapi/linux/perf_event.h
+@@ -393,6 +393,27 @@ struct perf_event_attr {
+ 	__u16	__reserved_2;	/* align to __u64 */
+ };
+ 
++/*
++ * Structure used by below PERF_EVENT_IOC_QUERY_BPF command
++ * to query bpf programs attached to the same perf tracepoint
++ * as the given perf event.
++ */
++struct perf_event_query_bpf {
++	/*
++	 * The below ids array length
++	 */
++	__u32	ids_len;
++	/*
++	 * Set by the kernel to indicate the number of
++	 * available programs
++	 */
++	__u32	prog_cnt;
++	/*
++	 * User provided buffer to store program ids
++	 */
++	__u32	ids[0];
++};
++
+ #define perf_flags(attr)	(*(&(attr)->read_format + 1))
+ 
+ /*
+@@ -408,6 +429,7 @@ struct perf_event_attr {
+ #define PERF_EVENT_IOC_ID		_IOR('$', 7, __u64 *)
+ #define PERF_EVENT_IOC_SET_BPF		_IOW('$', 8, __u32)
+ #define PERF_EVENT_IOC_PAUSE_OUTPUT	_IOW('$', 9, __u32)
++#define PERF_EVENT_IOC_QUERY_BPF	_IOWR('$', 10, struct perf_event_query_bpf *)
+ 
+ enum perf_event_ioc_flags {
+ 	PERF_IOC_FLAG_GROUP		= 1U << 0,
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -18,7 +18,7 @@ TEST_GEN_PROGS = test_verifier test_tag
+ 
+ TEST_GEN_FILES = test_pkt_access.o test_xdp.o test_l4lb.o test_tcp_estats.o test_obj_id.o \
+ 	test_pkt_md_access.o test_xdp_redirect.o test_xdp_meta.o sockmap_parse_prog.o     \
+-	sockmap_verdict_prog.o dev_cgroup.o sample_ret0.o
++	sockmap_verdict_prog.o dev_cgroup.o sample_ret0.o test_tracepoint.o
+ 
+ TEST_PROGS := test_kmod.sh test_xdp_redirect.sh test_xdp_meta.sh \
+ 	test_offload.py
+--- a/tools/testing/selftests/bpf/test_progs.c
++++ b/tools/testing/selftests/bpf/test_progs.c
+@@ -21,8 +21,10 @@ typedef __u16 __sum16;
+ #include <linux/ipv6.h>
+ #include <linux/tcp.h>
+ #include <linux/filter.h>
++#include <linux/perf_event.h>
+ #include <linux/unistd.h>
+ 
++#include <sys/ioctl.h>
+ #include <sys/wait.h>
+ #include <sys/resource.h>
+ #include <sys/types.h>
+@@ -617,6 +619,136 @@ static void test_obj_name(void)
+ 	}
+ }
+ 
++static void test_tp_attach_query(void)
++{
++	const int num_progs = 3;
++	int i, j, bytes, efd, err, prog_fd[num_progs], pmu_fd[num_progs];
++	__u32 duration = 0, info_len, saved_prog_ids[num_progs];
++	const char *file = "./test_tracepoint.o";
++	struct perf_event_query_bpf *query;
++	struct perf_event_attr attr = {};
++	struct bpf_object *obj[num_progs];
++	struct bpf_prog_info prog_info;
++	char buf[256];
++
++	snprintf(buf, sizeof(buf),
++		 "/sys/kernel/debug/tracing/events/sched/sched_switch/id");
++	efd = open(buf, O_RDONLY, 0);
++	if (CHECK(efd < 0, "open", "err %d errno %d\n", efd, errno))
++		return;
++	bytes = read(efd, buf, sizeof(buf));
++	close(efd);
++	if (CHECK(bytes <= 0 || bytes >= sizeof(buf),
++		  "read", "bytes %d errno %d\n", bytes, errno))
++		return;
++
++	attr.config = strtol(buf, NULL, 0);
++	attr.type = PERF_TYPE_TRACEPOINT;
++	attr.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_CALLCHAIN;
++	attr.sample_period = 1;
++	attr.wakeup_events = 1;
++
++	query = malloc(sizeof(*query) + sizeof(__u32) * num_progs);
++	for (i = 0; i < num_progs; i++) {
++		err = bpf_prog_load(file, BPF_PROG_TYPE_TRACEPOINT, &obj[i],
++				    &prog_fd[i]);
++		if (CHECK(err, "prog_load", "err %d errno %d\n", err, errno))
++			goto cleanup1;
++
++		bzero(&prog_info, sizeof(prog_info));
++		prog_info.jited_prog_len = 0;
++		prog_info.xlated_prog_len = 0;
++		prog_info.nr_map_ids = 0;
++		info_len = sizeof(prog_info);
++		err = bpf_obj_get_info_by_fd(prog_fd[i], &prog_info, &info_len);
++		if (CHECK(err, "bpf_obj_get_info_by_fd", "err %d errno %d\n",
++			  err, errno))
++			goto cleanup1;
++		saved_prog_ids[i] = prog_info.id;
++
++		pmu_fd[i] = syscall(__NR_perf_event_open, &attr, -1 /* pid */,
++				    0 /* cpu 0 */, -1 /* group id */,
++				    0 /* flags */);
++		if (CHECK(pmu_fd[i] < 0, "perf_event_open", "err %d errno %d\n",
++			  pmu_fd[i], errno))
++			goto cleanup2;
++		err = ioctl(pmu_fd[i], PERF_EVENT_IOC_ENABLE, 0);
++		if (CHECK(err, "perf_event_ioc_enable", "err %d errno %d\n",
++			  err, errno))
++			goto cleanup3;
++
++		if (i == 0) {
++			/* check NULL prog array query */
++			query->ids_len = num_progs;
++			err = ioctl(pmu_fd[i], PERF_EVENT_IOC_QUERY_BPF, query);
++			if (CHECK(err || query->prog_cnt != 0,
++				  "perf_event_ioc_query_bpf",
++				  "err %d errno %d query->prog_cnt %u\n",
++				  err, errno, query->prog_cnt))
++				goto cleanup3;
++		}
++
++		err = ioctl(pmu_fd[i], PERF_EVENT_IOC_SET_BPF, prog_fd[i]);
++		if (CHECK(err, "perf_event_ioc_set_bpf", "err %d errno %d\n",
++			  err, errno))
++			goto cleanup3;
++
++		if (i == 1) {
++			/* try to get # of programs only */
++			query->ids_len = 0;
++			err = ioctl(pmu_fd[i], PERF_EVENT_IOC_QUERY_BPF, query);
++			if (CHECK(err || query->prog_cnt != 2,
++				  "perf_event_ioc_query_bpf",
++				  "err %d errno %d query->prog_cnt %u\n",
++				  err, errno, query->prog_cnt))
++				goto cleanup3;
++
++			/* try a few negative tests */
++			/* invalid query pointer */
++			err = ioctl(pmu_fd[i], PERF_EVENT_IOC_QUERY_BPF,
++				    (struct perf_event_query_bpf *)0x1);
++			if (CHECK(!err || errno != EFAULT,
++				  "perf_event_ioc_query_bpf",
++				  "err %d errno %d\n", err, errno))
++				goto cleanup3;
++
++			/* no enough space */
++			query->ids_len = 1;
++			err = ioctl(pmu_fd[i], PERF_EVENT_IOC_QUERY_BPF, query);
++			if (CHECK(!err || errno != ENOSPC || query->prog_cnt != 2,
++				  "perf_event_ioc_query_bpf",
++				  "err %d errno %d query->prog_cnt %u\n",
++				  err, errno, query->prog_cnt))
++				goto cleanup3;
++		}
++
++		query->ids_len = num_progs;
++		err = ioctl(pmu_fd[i], PERF_EVENT_IOC_QUERY_BPF, query);
++		if (CHECK(err || query->prog_cnt != (i + 1),
++			  "perf_event_ioc_query_bpf",
++			  "err %d errno %d query->prog_cnt %u\n",
++			  err, errno, query->prog_cnt))
++			goto cleanup3;
++		for (j = 0; j < i + 1; j++)
++			if (CHECK(saved_prog_ids[j] != query->ids[j],
++				  "perf_event_ioc_query_bpf",
++				  "#%d saved_prog_id %x query prog_id %x\n",
++				  j, saved_prog_ids[j], query->ids[j]))
++				goto cleanup3;
++	}
++
++	i = num_progs - 1;
++	for (; i >= 0; i--) {
++ cleanup3:
++		ioctl(pmu_fd[i], PERF_EVENT_IOC_DISABLE);
++ cleanup2:
++		close(pmu_fd[i]);
++ cleanup1:
++		bpf_object__close(obj[i]);
++	}
++	free(query);
++}
++
+ int main(void)
+ {
+ 	struct rlimit rinf = { RLIM_INFINITY, RLIM_INFINITY };
+@@ -630,6 +762,7 @@ int main(void)
+ 	test_bpf_obj_id();
+ 	test_pkt_md_access();
+ 	test_obj_name();
++	test_tp_attach_query();
+ 
+ 	printf("Summary: %d PASSED, %d FAILED\n", pass_cnt, error_cnt);
+ 	return error_cnt ? EXIT_FAILURE : EXIT_SUCCESS;
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_tracepoint.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2017 Facebook
++
++#include <linux/bpf.h>
++#include "bpf_helpers.h"
++
++/* taken from /sys/kernel/debug/tracing/events/sched/sched_switch/format */
++struct sched_switch_args {
++	unsigned long long pad;
++	char prev_comm[16];
++	int prev_pid;
++	int prev_prio;
++	long long prev_state;
++	char next_comm[16];
++	int next_pid;
++	int next_prio;
++};
++
++SEC("tracepoint/sched/sched_switch")
++int oncpu(struct sched_switch_args *ctx)
++{
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";
++__u32 _version SEC("version") = 1; /* ignored by tracepoints, required by libbpf.a */
