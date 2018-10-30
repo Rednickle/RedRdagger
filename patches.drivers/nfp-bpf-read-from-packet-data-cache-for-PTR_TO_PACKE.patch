@@ -1,0 +1,157 @@
+From: Jiong Wang <jiong.wang@netronome.com>
+Date: Wed, 28 Mar 2018 17:48:25 -0700
+Subject: nfp: bpf: read from packet data cache for PTR_TO_PACKET
+Patch-mainline: v4.17-rc1
+Git-commit: be75923786aa28774bf2b5ef8184590a52429103
+References: bsc#1109837
+
+This patch assumes there is a packet data cache, and would try to read
+packet data from the cache instead of from memory.
+
+This patch only implements the optimisation "backend", it doesn't build
+the packet data cache, so this optimisation is not enabled.
+
+This patch has only enabled aligned packet data read, i.e. when the read
+offset to the start of cache is REG_WIDTH aligned.
+
+Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/jit.c  |   80 +++++++++++++++++++++++++-
+ drivers/net/ethernet/netronome/nfp/bpf/main.h |    9 ++
+ drivers/net/ethernet/netronome/nfp/nfp_asm.h  |    1 
+ 3 files changed, 88 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -1840,6 +1840,74 @@ mem_ldx_emem(struct nfp_prog *nfp_prog,
+ 					 tmp_reg, meta->insn.dst_reg * 2, size);
+ }
+ 
++static void
++mem_ldx_data_init_pktcache(struct nfp_prog *nfp_prog,
++			   struct nfp_insn_meta *meta)
++{
++	s16 range_start = meta->pkt_cache.range_start;
++	s16 range_end = meta->pkt_cache.range_end;
++	swreg src_base, off;
++	u8 xfer_num, len;
++	bool indir;
++
++	off = re_load_imm_any(nfp_prog, range_start, imm_b(nfp_prog));
++	src_base = reg_a(meta->insn.src_reg * 2);
++	len = range_end - range_start;
++	xfer_num = round_up(len, REG_WIDTH) / REG_WIDTH;
++
++	indir = len > 8 * REG_WIDTH;
++	/* Setup PREV_ALU for indirect mode. */
++	if (indir)
++		wrp_immed(nfp_prog, reg_none(),
++			  CMD_OVE_LEN | FIELD_PREP(CMD_OV_LEN, xfer_num - 1));
++
++	/* Cache memory into transfer-in registers. */
++	emit_cmd_any(nfp_prog, CMD_TGT_READ32_SWAP, CMD_MODE_32b, 0, src_base,
++		     off, xfer_num - 1, true, indir);
++}
++
++static int
++mem_ldx_data_from_pktcache_aligned(struct nfp_prog *nfp_prog,
++				   struct nfp_insn_meta *meta,
++				   unsigned int size)
++{
++	swreg dst_lo, dst_hi, src_lo;
++	u8 dst_gpr, idx;
++
++	idx = (meta->insn.off - meta->pkt_cache.range_start) / REG_WIDTH;
++	dst_gpr = meta->insn.dst_reg * 2;
++	dst_hi = reg_both(dst_gpr + 1);
++	dst_lo = reg_both(dst_gpr);
++	src_lo = reg_xfer(idx);
++
++	if (size < REG_WIDTH) {
++		wrp_reg_subpart(nfp_prog, dst_lo, src_lo, size, 0);
++		wrp_immed(nfp_prog, dst_hi, 0);
++	} else if (size == REG_WIDTH) {
++		wrp_mov(nfp_prog, dst_lo, src_lo);
++		wrp_immed(nfp_prog, dst_hi, 0);
++	} else {
++		swreg src_hi = reg_xfer(idx + 1);
++
++		wrp_mov(nfp_prog, dst_lo, src_lo);
++		wrp_mov(nfp_prog, dst_hi, src_hi);
++	}
++
++	return 0;
++}
++
++static int
++mem_ldx_data_from_pktcache(struct nfp_prog *nfp_prog,
++			   struct nfp_insn_meta *meta, unsigned int size)
++{
++	u8 off = meta->insn.off - meta->pkt_cache.range_start;
++
++	if (WARN_ON_ONCE(!IS_ALIGNED(off, REG_WIDTH)))
++		return -EOPNOTSUPP;
++
++	return mem_ldx_data_from_pktcache_aligned(nfp_prog, meta, size);
++}
++
+ static int
+ mem_ldx(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 	unsigned int size)
+@@ -1854,8 +1922,16 @@ mem_ldx(struct nfp_prog *nfp_prog, struc
+ 			return mem_ldx_skb(nfp_prog, meta, size);
+ 	}
+ 
+-	if (meta->ptr.type == PTR_TO_PACKET)
+-		return mem_ldx_data(nfp_prog, meta, size);
++	if (meta->ptr.type == PTR_TO_PACKET) {
++		if (meta->pkt_cache.range_end) {
++			if (meta->pkt_cache.do_init)
++				mem_ldx_data_init_pktcache(nfp_prog, meta);
++
++			return mem_ldx_data_from_pktcache(nfp_prog, meta, size);
++		} else {
++			return mem_ldx_data(nfp_prog, meta, size);
++		}
++	}
+ 
+ 	if (meta->ptr.type == PTR_TO_STACK)
+ 		return mem_ldx_stack(nfp_prog, meta, size,
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -199,6 +199,10 @@ typedef int (*instr_cb_t)(struct nfp_pro
+  * @ldst_gather_len: memcpy length gathered from load/store sequence
+  * @paired_st: the paired store insn at the head of the sequence
+  * @ptr_not_const: pointer is not always constant
++ * @pkt_cache: packet data cache information
++ * @pkt_cache.range_start: start offset for associated packet data cache
++ * @pkt_cache.range_end: end offset for associated packet data cache
++ * @pkt_cache.do_init: this read needs to initialize packet data cache
+  * @jmp_dst: destination info for jump instructions
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+@@ -219,6 +223,11 @@ struct nfp_insn_meta {
+ 			struct bpf_insn *paired_st;
+ 			s16 ldst_gather_len;
+ 			bool ptr_not_const;
++			struct {
++				s16 range_start;
++				s16 range_end;
++				bool do_init;
++			} pkt_cache;
+ 		};
+ 		struct nfp_insn_meta *jmp_dst;
+ 		struct {
+--- a/drivers/net/ethernet/netronome/nfp/nfp_asm.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_asm.h
+@@ -39,6 +39,7 @@
+ #include <linux/types.h>
+ 
+ #define REG_NONE	0
++#define REG_WIDTH	4
+ 
+ #define RE_REG_NO_DST	0x020
+ #define RE_REG_IMM	0x020
