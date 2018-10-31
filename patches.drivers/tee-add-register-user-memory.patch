@@ -1,0 +1,515 @@
+From: Jens Wiklander <jens.wiklander@linaro.org>
+Date: Wed, 29 Nov 2017 14:48:26 +0200
+Subject: tee: add register user memory
+Git-commit: 033ddf12bcf5326b93bd604f50a7474a434a35f9
+Patch-mainline: v4.16-rc1
+References: fate#325372
+
+Added new ioctl to allow users register own buffers as a shared memory.
+
+Signed-off-by: Volodymyr Babchuk <vlad.babchuk@gmail.com>
+[jw: moved tee_shm_is_registered() declaration]
+[jw: added space after __tee_shm_alloc() implementation]
+Signed-off-by: Jens Wiklander <jens.wiklander@linaro.org>
+Signed-off-by: Matthias Brugger <mbrugger@suse.com>
+---
+ drivers/tee/tee_core.c   |  41 +++++++-
+ drivers/tee/tee_shm.c    | 206 ++++++++++++++++++++++++++++++++++-----
+ include/linux/tee_drv.h  |  47 ++++++++-
+ include/uapi/linux/tee.h |  30 ++++++
+ 4 files changed, 294 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/tee/tee_core.c b/drivers/tee/tee_core.c
+index 58a5009eacc3..295910f5cdd0 100644
+--- a/drivers/tee/tee_core.c
++++ b/drivers/tee/tee_core.c
+@@ -114,8 +114,6 @@ static int tee_ioctl_shm_alloc(struct tee_context *ctx,
+ 	if (data.flags)
+ 		return -EINVAL;
+ 
+-	data.id = -1;
+-
+ 	shm = tee_shm_alloc(ctx, data.size, TEE_SHM_MAPPED | TEE_SHM_DMA_BUF);
+ 	if (IS_ERR(shm))
+ 		return PTR_ERR(shm);
+@@ -138,6 +136,43 @@ static int tee_ioctl_shm_alloc(struct tee_context *ctx,
+ 	return ret;
+ }
+ 
++static int
++tee_ioctl_shm_register(struct tee_context *ctx,
++		       struct tee_ioctl_shm_register_data __user *udata)
++{
++	long ret;
++	struct tee_ioctl_shm_register_data data;
++	struct tee_shm *shm;
++
++	if (copy_from_user(&data, udata, sizeof(data)))
++		return -EFAULT;
++
++	/* Currently no input flags are supported */
++	if (data.flags)
++		return -EINVAL;
++
++	shm = tee_shm_register(ctx, data.addr, data.length,
++			       TEE_SHM_DMA_BUF | TEE_SHM_USER_MAPPED);
++	if (IS_ERR(shm))
++		return PTR_ERR(shm);
++
++	data.id = shm->id;
++	data.flags = shm->flags;
++	data.length = shm->size;
++
++	if (copy_to_user(udata, &data, sizeof(data)))
++		ret = -EFAULT;
++	else
++		ret = tee_shm_get_fd(shm);
++	/*
++	 * When user space closes the file descriptor the shared memory
++	 * should be freed or if tee_shm_get_fd() failed then it will
++	 * be freed immediately.
++	 */
++	tee_shm_put(shm);
++	return ret;
++}
++
+ static int params_from_user(struct tee_context *ctx, struct tee_param *params,
+ 			    size_t num_params,
+ 			    struct tee_ioctl_param __user *uparams)
+@@ -586,6 +621,8 @@ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		return tee_ioctl_version(ctx, uarg);
+ 	case TEE_IOC_SHM_ALLOC:
+ 		return tee_ioctl_shm_alloc(ctx, uarg);
++	case TEE_IOC_SHM_REGISTER:
++		return tee_ioctl_shm_register(ctx, uarg);
+ 	case TEE_IOC_OPEN_SESSION:
+ 		return tee_ioctl_open_session(ctx, uarg);
+ 	case TEE_IOC_INVOKE:
+diff --git a/drivers/tee/tee_shm.c b/drivers/tee/tee_shm.c
+index fdda89e917f7..11d11a46d86e 100644
+--- a/drivers/tee/tee_shm.c
++++ b/drivers/tee/tee_shm.c
+@@ -23,7 +23,6 @@
+ static void tee_shm_release(struct tee_shm *shm)
+ {
+ 	struct tee_device *teedev = shm->teedev;
+-	struct tee_shm_pool_mgr *poolm;
+ 
+ 	mutex_lock(&teedev->mutex);
+ 	idr_remove(&teedev->idr, shm->id);
+@@ -31,12 +30,29 @@ static void tee_shm_release(struct tee_shm *shm)
+ 		list_del(&shm->link);
+ 	mutex_unlock(&teedev->mutex);
+ 
+-	if (shm->flags & TEE_SHM_DMA_BUF)
+-		poolm = teedev->pool->dma_buf_mgr;
+-	else
+-		poolm = teedev->pool->private_mgr;
++	if (shm->flags & TEE_SHM_POOL) {
++		struct tee_shm_pool_mgr *poolm;
++
++		if (shm->flags & TEE_SHM_DMA_BUF)
++			poolm = teedev->pool->dma_buf_mgr;
++		else
++			poolm = teedev->pool->private_mgr;
++
++		poolm->ops->free(poolm, shm);
++	} else if (shm->flags & TEE_SHM_REGISTER) {
++		size_t n;
++		int rc = teedev->desc->ops->shm_unregister(shm->ctx, shm);
++
++		if (rc)
++			dev_err(teedev->dev.parent,
++				"unregister shm %p failed: %d", shm, rc);
++
++		for (n = 0; n < shm->num_pages; n++)
++			put_page(shm->pages[n]);
++
++		kfree(shm->pages);
++	}
+ 
+-	poolm->ops->free(poolm, shm);
+ 	kfree(shm);
+ 
+ 	tee_device_put(teedev);
+@@ -76,6 +92,10 @@ static int tee_shm_op_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
+ 	struct tee_shm *shm = dmabuf->priv;
+ 	size_t size = vma->vm_end - vma->vm_start;
+ 
++	/* Refuse sharing shared memory provided by application */
++	if (shm->flags & TEE_SHM_REGISTER)
++		return -EINVAL;
++
+ 	return remap_pfn_range(vma, vma->vm_start, shm->paddr >> PAGE_SHIFT,
+ 			       size, vma->vm_page_prot);
+ }
+@@ -89,26 +109,20 @@ static const struct dma_buf_ops tee_shm_dma_buf_ops = {
+ 	.mmap = tee_shm_op_mmap,
+ };
+ 
+-/**
+- * tee_shm_alloc() - Allocate shared memory
+- * @ctx:	Context that allocates the shared memory
+- * @size:	Requested size of shared memory
+- * @flags:	Flags setting properties for the requested shared memory.
+- *
+- * Memory allocated as global shared memory is automatically freed when the
+- * TEE file pointer is closed. The @flags field uses the bits defined by
+- * TEE_SHM_* in <linux/tee_drv.h>. TEE_SHM_MAPPED must currently always be
+- * set. If TEE_SHM_DMA_BUF global shared memory will be allocated and
+- * associated with a dma-buf handle, else driver private memory.
+- */
+-struct tee_shm *tee_shm_alloc(struct tee_context *ctx, size_t size, u32 flags)
++struct tee_shm *__tee_shm_alloc(struct tee_context *ctx,
++				struct tee_device *teedev,
++				size_t size, u32 flags)
+ {
+-	struct tee_device *teedev = ctx->teedev;
+ 	struct tee_shm_pool_mgr *poolm = NULL;
+ 	struct tee_shm *shm;
+ 	void *ret;
+ 	int rc;
+ 
++	if (ctx && ctx->teedev != teedev) {
++		dev_err(teedev->dev.parent, "ctx and teedev mismatch\n");
++		return ERR_PTR(-EINVAL);
++	}
++
+ 	if (!(flags & TEE_SHM_MAPPED)) {
+ 		dev_err(teedev->dev.parent,
+ 			"only mapped allocations supported\n");
+@@ -135,7 +149,7 @@ struct tee_shm *tee_shm_alloc(struct tee_context *ctx, size_t size, u32 flags)
+ 		goto err_dev_put;
+ 	}
+ 
+-	shm->flags = flags;
++	shm->flags = flags | TEE_SHM_POOL;
+ 	shm->teedev = teedev;
+ 	shm->ctx = ctx;
+ 	if (flags & TEE_SHM_DMA_BUF)
+@@ -171,9 +185,12 @@ struct tee_shm *tee_shm_alloc(struct tee_context *ctx, size_t size, u32 flags)
+ 			goto err_rem;
+ 		}
+ 	}
+-	mutex_lock(&teedev->mutex);
+-	list_add_tail(&shm->link, &ctx->list_shm);
+-	mutex_unlock(&teedev->mutex);
++
++	if (ctx) {
++		mutex_lock(&teedev->mutex);
++		list_add_tail(&shm->link, &ctx->list_shm);
++		mutex_unlock(&teedev->mutex);
++	}
+ 
+ 	return shm;
+ err_rem:
+@@ -188,8 +205,140 @@ struct tee_shm *tee_shm_alloc(struct tee_context *ctx, size_t size, u32 flags)
+ 	tee_device_put(teedev);
+ 	return ret;
+ }
++
++/**
++ * tee_shm_alloc() - Allocate shared memory
++ * @ctx:	Context that allocates the shared memory
++ * @size:	Requested size of shared memory
++ * @flags:	Flags setting properties for the requested shared memory.
++ *
++ * Memory allocated as global shared memory is automatically freed when the
++ * TEE file pointer is closed. The @flags field uses the bits defined by
++ * TEE_SHM_* in <linux/tee_drv.h>. TEE_SHM_MAPPED must currently always be
++ * set. If TEE_SHM_DMA_BUF global shared memory will be allocated and
++ * associated with a dma-buf handle, else driver private memory.
++ */
++struct tee_shm *tee_shm_alloc(struct tee_context *ctx, size_t size, u32 flags)
++{
++	return __tee_shm_alloc(ctx, ctx->teedev, size, flags);
++}
+ EXPORT_SYMBOL_GPL(tee_shm_alloc);
+ 
++struct tee_shm *tee_shm_priv_alloc(struct tee_device *teedev, size_t size)
++{
++	return __tee_shm_alloc(NULL, teedev, size, TEE_SHM_MAPPED);
++}
++EXPORT_SYMBOL_GPL(tee_shm_priv_alloc);
++
++struct tee_shm *tee_shm_register(struct tee_context *ctx, unsigned long addr,
++				 size_t length, u32 flags)
++{
++	struct tee_device *teedev = ctx->teedev;
++	const u32 req_flags = TEE_SHM_DMA_BUF | TEE_SHM_USER_MAPPED;
++	struct tee_shm *shm;
++	void *ret;
++	int rc;
++	int num_pages;
++	unsigned long start;
++
++	if (flags != req_flags)
++		return ERR_PTR(-ENOTSUPP);
++
++	if (!tee_device_get(teedev))
++		return ERR_PTR(-EINVAL);
++
++	if (!teedev->desc->ops->shm_register ||
++	    !teedev->desc->ops->shm_unregister) {
++		tee_device_put(teedev);
++		return ERR_PTR(-ENOTSUPP);
++	}
++
++	shm = kzalloc(sizeof(*shm), GFP_KERNEL);
++	if (!shm) {
++		ret = ERR_PTR(-ENOMEM);
++		goto err;
++	}
++
++	shm->flags = flags | TEE_SHM_REGISTER;
++	shm->teedev = teedev;
++	shm->ctx = ctx;
++	shm->id = -1;
++	start = rounddown(addr, PAGE_SIZE);
++	shm->offset = addr - start;
++	shm->size = length;
++	num_pages = (roundup(addr + length, PAGE_SIZE) - start) / PAGE_SIZE;
++	shm->pages = kcalloc(num_pages, sizeof(*shm->pages), GFP_KERNEL);
++	if (!shm->pages) {
++		ret = ERR_PTR(-ENOMEM);
++		goto err;
++	}
++
++	rc = get_user_pages_fast(start, num_pages, 1, shm->pages);
++	if (rc > 0)
++		shm->num_pages = rc;
++	if (rc != num_pages) {
++		if (rc > 0)
++			rc = -ENOMEM;
++		ret = ERR_PTR(rc);
++		goto err;
++	}
++
++	mutex_lock(&teedev->mutex);
++	shm->id = idr_alloc(&teedev->idr, shm, 1, 0, GFP_KERNEL);
++	mutex_unlock(&teedev->mutex);
++
++	if (shm->id < 0) {
++		ret = ERR_PTR(shm->id);
++		goto err;
++	}
++
++	rc = teedev->desc->ops->shm_register(ctx, shm, shm->pages,
++					     shm->num_pages);
++	if (rc) {
++		ret = ERR_PTR(rc);
++		goto err;
++	}
++
++	if (flags & TEE_SHM_DMA_BUF) {
++		DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
++
++		exp_info.ops = &tee_shm_dma_buf_ops;
++		exp_info.size = shm->size;
++		exp_info.flags = O_RDWR;
++		exp_info.priv = shm;
++
++		shm->dmabuf = dma_buf_export(&exp_info);
++		if (IS_ERR(shm->dmabuf)) {
++			ret = ERR_CAST(shm->dmabuf);
++			teedev->desc->ops->shm_unregister(ctx, shm);
++			goto err;
++		}
++	}
++
++	mutex_lock(&teedev->mutex);
++	list_add_tail(&shm->link, &ctx->list_shm);
++	mutex_unlock(&teedev->mutex);
++
++	return shm;
++err:
++	if (shm) {
++		size_t n;
++
++		if (shm->id >= 0) {
++			mutex_lock(&teedev->mutex);
++			idr_remove(&teedev->idr, shm->id);
++			mutex_unlock(&teedev->mutex);
++		}
++		for (n = 0; n < shm->num_pages; n++)
++			put_page(shm->pages[n]);
++		kfree(shm->pages);
++	}
++	kfree(shm);
++	tee_device_put(teedev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tee_shm_register);
++
+ /**
+  * tee_shm_get_fd() - Increase reference count and return file descriptor
+  * @shm:	Shared memory handle
+@@ -197,10 +346,9 @@ EXPORT_SYMBOL_GPL(tee_shm_alloc);
+  */
+ int tee_shm_get_fd(struct tee_shm *shm)
+ {
+-	u32 req_flags = TEE_SHM_MAPPED | TEE_SHM_DMA_BUF;
+ 	int fd;
+ 
+-	if ((shm->flags & req_flags) != req_flags)
++	if (!(shm->flags & TEE_SHM_DMA_BUF))
+ 		return -EINVAL;
+ 
+ 	fd = dma_buf_fd(shm->dmabuf, O_CLOEXEC);
+@@ -238,6 +386,8 @@ EXPORT_SYMBOL_GPL(tee_shm_free);
+  */
+ int tee_shm_va2pa(struct tee_shm *shm, void *va, phys_addr_t *pa)
+ {
++	if (!(shm->flags & TEE_SHM_MAPPED))
++		return -EINVAL;
+ 	/* Check that we're in the range of the shm */
+ 	if ((char *)va < (char *)shm->kaddr)
+ 		return -EINVAL;
+@@ -258,6 +408,8 @@ EXPORT_SYMBOL_GPL(tee_shm_va2pa);
+  */
+ int tee_shm_pa2va(struct tee_shm *shm, phys_addr_t pa, void **va)
+ {
++	if (!(shm->flags & TEE_SHM_MAPPED))
++		return -EINVAL;
+ 	/* Check that we're in the range of the shm */
+ 	if (pa < shm->paddr)
+ 		return -EINVAL;
+@@ -284,6 +436,8 @@ EXPORT_SYMBOL_GPL(tee_shm_pa2va);
+  */
+ void *tee_shm_get_va(struct tee_shm *shm, size_t offs)
+ {
++	if (!(shm->flags & TEE_SHM_MAPPED))
++		return ERR_PTR(-EINVAL);
+ 	if (offs >= shm->size)
+ 		return ERR_PTR(-EINVAL);
+ 	return (char *)shm->kaddr + offs;
+diff --git a/include/linux/tee_drv.h b/include/linux/tee_drv.h
+index e9be4a45ff3e..7c8495607b99 100644
+--- a/include/linux/tee_drv.h
++++ b/include/linux/tee_drv.h
+@@ -25,8 +25,12 @@
+  * specific TEE driver.
+  */
+ 
+-#define TEE_SHM_MAPPED		0x1	/* Memory mapped by the kernel */
+-#define TEE_SHM_DMA_BUF		0x2	/* Memory with dma-buf handle */
++#define TEE_SHM_MAPPED		BIT(0)	/* Memory mapped by the kernel */
++#define TEE_SHM_DMA_BUF		BIT(1)	/* Memory with dma-buf handle */
++#define TEE_SHM_EXT_DMA_BUF	BIT(2)	/* Memory with dma-buf handle */
++#define TEE_SHM_REGISTER	BIT(3)  /* Memory registered in secure world */
++#define TEE_SHM_USER_MAPPED	BIT(4)  /* Memory mapped in user space */
++#define TEE_SHM_POOL		BIT(5)  /* Memory allocated from pool */
+ 
+ struct device;
+ struct tee_device;
+@@ -76,6 +80,8 @@ struct tee_param {
+  * @cancel_req:		request cancel of an ongoing invoke or open
+  * @supp_revc:		called for supplicant to get a command
+  * @supp_send:		called for supplicant to send a response
++ * @shm_register:	register shared memory buffer in TEE
++ * @shm_unregister:	unregister shared memory buffer in TEE
+  */
+ struct tee_driver_ops {
+ 	void (*get_version)(struct tee_device *teedev,
+@@ -94,6 +100,9 @@ struct tee_driver_ops {
+ 			 struct tee_param *param);
+ 	int (*supp_send)(struct tee_context *ctx, u32 ret, u32 num_params,
+ 			 struct tee_param *param);
++	int (*shm_register)(struct tee_context *ctx, struct tee_shm *shm,
++			    struct page **pages, size_t num_pages);
++	int (*shm_unregister)(struct tee_context *ctx, struct tee_shm *shm);
+ };
+ 
+ /**
+@@ -301,6 +310,40 @@ void *tee_get_drvdata(struct tee_device *teedev);
+  */
+ struct tee_shm *tee_shm_alloc(struct tee_context *ctx, size_t size, u32 flags);
+ 
++/**
++ * tee_shm_priv_alloc() - Allocate shared memory privately
++ * @dev:	Device that allocates the shared memory
++ * @size:	Requested size of shared memory
++ *
++ * Allocates shared memory buffer that is not associated with any client
++ * context. Such buffers are owned by TEE driver and used for internal calls.
++ *
++ * @returns a pointer to 'struct tee_shm'
++ */
++struct tee_shm *tee_shm_priv_alloc(struct tee_device *teedev, size_t size);
++
++/**
++ * tee_shm_register() - Register shared memory buffer
++ * @ctx:	Context that registers the shared memory
++ * @addr:	Address is userspace of the shared buffer
++ * @length:	Length of the shared buffer
++ * @flags:	Flags setting properties for the requested shared memory.
++ *
++ * @returns a pointer to 'struct tee_shm'
++ */
++struct tee_shm *tee_shm_register(struct tee_context *ctx, unsigned long addr,
++				 size_t length, u32 flags);
++
++/**
++ * tee_shm_is_registered() - Check if shared memory object in registered in TEE
++ * @shm:	Shared memory handle
++ * @returns true if object is registered in TEE
++ */
++static inline bool tee_shm_is_registered(struct tee_shm *shm)
++{
++	return shm && (shm->flags & TEE_SHM_REGISTER);
++}
++
+ /**
+  * tee_shm_free() - Free shared memory
+  * @shm:	Handle to shared memory to free
+diff --git a/include/uapi/linux/tee.h b/include/uapi/linux/tee.h
+index 688782e90140..d41a07afe3fc 100644
+--- a/include/uapi/linux/tee.h
++++ b/include/uapi/linux/tee.h
+@@ -50,6 +50,7 @@
+ 
+ #define TEE_GEN_CAP_GP		(1 << 0)/* GlobalPlatform compliant TEE */
+ #define TEE_GEN_CAP_PRIVILEGED	(1 << 1)/* Privileged device (for supplicant) */
++#define TEE_GEN_CAP_REG_MEM	(1 << 2)/* Supports registering shared memory */
+ 
+ /*
+  * TEE Implementation ID
+@@ -332,6 +333,35 @@ struct tee_iocl_supp_send_arg {
+ #define TEE_IOC_SUPPL_SEND	_IOR(TEE_IOC_MAGIC, TEE_IOC_BASE + 7, \
+ 				     struct tee_ioctl_buf_data)
+ 
++/**
++ * struct tee_ioctl_shm_register_data - Shared memory register argument
++ * @addr:      [in] Start address of shared memory to register
++ * @length:    [in/out] Length of shared memory to register
++ * @flags:     [in/out] Flags to/from registration.
++ * @id:                [out] Identifier of the shared memory
++ *
++ * The flags field should currently be zero as input. Updated by the call
++ * with actual flags as defined by TEE_IOCTL_SHM_* above.
++ * This structure is used as argument for TEE_IOC_SHM_REGISTER below.
++ */
++struct tee_ioctl_shm_register_data {
++	__u64 addr;
++	__u64 length;
++	__u32 flags;
++	__s32 id;
++};
++
++/**
++ * TEE_IOC_SHM_REGISTER - Register shared memory argument
++ *
++ * Registers shared memory between the user space process and secure OS.
++ *
++ * Returns a file descriptor on success or < 0 on failure
++ *
++ * The shared memory is unregisterred when the descriptor is closed.
++ */
++#define TEE_IOC_SHM_REGISTER   _IOWR(TEE_IOC_MAGIC, TEE_IOC_BASE + 9, \
++				     struct tee_ioctl_shm_register_data)
+ /*
+  * Five syscalls are used when communicating with the TEE driver.
+  * open(): opens the device associated with the driver
+-- 
+2.19.1
+
