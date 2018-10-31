@@ -1,0 +1,186 @@
+From 9b9b13a6d1537ddc4caccd6f1c41b78edbc08437 Mon Sep 17 00:00:00 2001
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date: Fri, 12 Jan 2018 13:37:16 +1100
+Subject: [PATCH] KVM: PPC: Book3S HV: Keep XIVE escalation interrupt masked
+ unless ceded
+
+References: bsc#1061840
+Patch-mainline: v4.16-rc1
+Git-commit: 9b9b13a6d1537ddc4caccd6f1c41b78edbc08437
+
+This works on top of the single escalation support. When in single
+escalation, with this change, we will keep the escalation interrupt
+disabled unless the VCPU is in H_CEDE (idle). In any other case, we
+know the VCPU will be rescheduled and thus there is no need to take
+escalation interrupts in the host whenever a guest interrupt fires.
+
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/kvm_host.h     |  3 ++
+ arch/powerpc/kernel/asm-offsets.c       |  3 ++
+ arch/powerpc/kvm/book3s_hv_rmhandlers.S | 62 ++++++++++++++++++++++++++++++++-
+ arch/powerpc/kvm/book3s_xive.c          | 30 ++++++++++++++++
+ 4 files changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 0c44fa67608d..fef8133becc8 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -740,7 +740,10 @@ struct kvm_vcpu_arch {
+ 	struct kvmppc_xive_vcpu *xive_vcpu; /* XIVE virtual CPU data */
+ 	__be32 xive_cam_word;    /* Cooked W2 in proper endian with valid bit */
+ 	u8 xive_pushed;		 /* Is the VP pushed on the physical CPU ? */
++	u8 xive_esc_on;		 /* Is the escalation irq enabled ? */
+ 	union xive_tma_w01 xive_saved_state; /* W0..1 of XIVE thread state */
++	u64 xive_esc_raddr;	 /* Escalation interrupt ESB real addr */
++	u64 xive_esc_vaddr;	 /* Escalation interrupt ESB virt addr */
+ #endif
+ 
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 825089cf3e23..1672dffd94e2 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -734,6 +734,9 @@ int main(void)
+ 	DEFINE(VCPU_XIVE_CAM_WORD, offsetof(struct kvm_vcpu,
+ 					    arch.xive_cam_word));
+ 	DEFINE(VCPU_XIVE_PUSHED, offsetof(struct kvm_vcpu, arch.xive_pushed));
++	DEFINE(VCPU_XIVE_ESC_ON, offsetof(struct kvm_vcpu, arch.xive_esc_on));
++	DEFINE(VCPU_XIVE_ESC_RADDR, offsetof(struct kvm_vcpu, arch.xive_esc_raddr));
++	DEFINE(VCPU_XIVE_ESC_VADDR, offsetof(struct kvm_vcpu, arch.xive_esc_vaddr));
+ #endif
+ 
+ #ifdef CONFIG_KVM_EXIT_TIMING
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index a7f429bc6de0..a7a20b85d8eb 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -1045,6 +1045,41 @@ ALT_FTR_SECTION_END_IFCLR(CPU_FTR_ARCH_300)
+ 	 */
+ 	li	r0,0
+ 	stb	r0, VCPU_IRQ_PENDING(r4)
++
++	/*
++	 * In single escalation mode, if the escalation interrupt is
++	 * on, we mask it.
++	 */
++	lbz	r0, VCPU_XIVE_ESC_ON(r4)
++	cmpwi	r0,0
++	beq	1f
++	ld	r10, VCPU_XIVE_ESC_RADDR(r4)
++	li	r9, XIVE_ESB_SET_PQ_01
++	ldcix	r0, r10, r9
++	sync
++
++	/* We have a possible subtle race here: The escalation interrupt might
++	 * have fired and be on its way to the host queue while we mask it,
++	 * and if we unmask it early enough (re-cede right away), there is
++	 * a theorical possibility that it fires again, thus landing in the
++	 * target queue more than once which is a big no-no.
++	 *
++	 * Fortunately, solving this is rather easy. If the above load setting
++	 * PQ to 01 returns a previous value where P is set, then we know the
++	 * escalation interrupt is somewhere on its way to the host. In that
++	 * case we simply don't clear the xive_esc_on flag below. It will be
++	 * eventually cleared by the handler for the escalation interrupt.
++	 *
++	 * Then, when doing a cede, we check that flag again before re-enabling
++	 * the escalation interrupt, and if set, we abort the cede.
++	 */
++	andi.	r0, r0, XIVE_ESB_VAL_P
++	bne-	1f
++
++	/* Now P is 0, we can clear the flag */
++	li	r0, 0
++	stb	r0, VCPU_XIVE_ESC_ON(r4)
++1:
+ no_xive:
+ #endif /* CONFIG_KVM_XICS */
+ 
+@@ -2756,7 +2791,32 @@ kvm_cede_prodded:
+ 	/* we've ceded but we want to give control to the host */
+ kvm_cede_exit:
+ 	ld	r9, HSTATE_KVM_VCPU(r13)
+-	b	guest_exit_cont
++#ifdef CONFIG_KVM_XICS
++	/* Abort if we still have a pending escalation */
++	lbz	r5, VCPU_XIVE_ESC_ON(r9)
++	cmpwi	r5, 0
++	beq	1f
++	li	r0, 0
++	stb	r0, VCPU_CEDED(r9)
++1:	/* Enable XIVE escalation */
++	li	r5, XIVE_ESB_SET_PQ_00
++	mfmsr	r0
++	andi.	r0, r0, MSR_DR		/* in real mode? */
++	beq	1f
++	ld	r10, VCPU_XIVE_ESC_VADDR(r9)
++	cmpdi	r10, 0
++	beq	3f
++	ldx	r0, r10, r5
++	b	2f
++1:	ld	r10, VCPU_XIVE_ESC_RADDR(r9)
++	cmpdi	r10, 0
++	beq	3f
++	ldcix	r0, r10, r5
++2:	sync
++	li	r0, 1
++	stb	r0, VCPU_XIVE_ESC_ON(r9)
++#endif /* CONFIG_KVM_XICS */
++3:	b	guest_exit_cont
+ 
+ 	/* Try to handle a machine check in real mode */
+ machine_check_realmode:
+diff --git a/arch/powerpc/kvm/book3s_xive.c b/arch/powerpc/kvm/book3s_xive.c
+index eef9ccafdc09..7a047bc88f11 100644
+--- a/arch/powerpc/kvm/book3s_xive.c
++++ b/arch/powerpc/kvm/book3s_xive.c
+@@ -89,6 +89,17 @@ static irqreturn_t xive_esc_irq(int irq, void *data)
+ 	if (vcpu->arch.ceded)
+ 		kvmppc_fast_vcpu_kick(vcpu);
+ 
++	/* Since we have the no-EOI flag, the interrupt is effectively
++	 * disabled now. Clearing xive_esc_on means we won't bother
++	 * doing so on the next entry.
++	 *
++	 * This also allows the entry code to know that if a PQ combination
++	 * of 10 is observed while xive_esc_on is true, it means the queue
++	 * contains an unprocessed escalation interrupt. We don't make use of
++	 * that knowledge today but might (see comment in book3s_hv_rmhandler.S)
++	 */
++	vcpu->arch.xive_esc_on = false;
++
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -134,6 +145,25 @@ static int xive_attach_escalation(struct kvm_vcpu *vcpu, u8 prio)
+ 		goto error;
+ 	}
+ 	xc->esc_virq_names[prio] = name;
++
++	/* In single escalation mode, we grab the ESB MMIO of the
++	 * interrupt and mask it. Also populate the VCPU v/raddr
++	 * of the ESB page for use by asm entry/exit code. Finally
++	 * set the XIVE_IRQ_NO_EOI flag which will prevent the
++	 * core code from performing an EOI on the escalation
++	 * interrupt, thus leaving it effectively masked after
++	 * it fires once.
++	 */
++	if (xc->xive->single_escalation) {
++		struct irq_data *d = irq_get_irq_data(xc->esc_virq[prio]);
++		struct xive_irq_data *xd = irq_data_get_irq_handler_data(d);
++
++		xive_vm_esb_load(xd, XIVE_ESB_SET_PQ_01);
++		vcpu->arch.xive_esc_raddr = xd->eoi_page;
++		vcpu->arch.xive_esc_vaddr = (__force u64)xd->eoi_mmio;
++		xd->flags |= XIVE_IRQ_NO_EOI;
++	}
++
+ 	return 0;
+ error:
+ 	irq_dispose_mapping(xc->esc_virq[prio]);
+-- 
+2.13.7
+
