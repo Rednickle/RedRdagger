@@ -1,0 +1,145 @@
+From: Dmitry Safonov <dima@arista.com>
+Date: Thu, 1 Nov 2018 00:24:48 +0000
+Subject: tty: Don't block on IO when ldisc change is pending
+Patch-mainline: Submitted on 2018/11/1
+References: bnc#1105428
+
+There might be situations where tty_ldisc_lock() has blocked, but there
+is already IO on tty and it prevents line discipline changes.
+It might theoretically turn into dead-lock.
+
+Basically, provide more priority to pending tty_ldisc_lock() than to
+servicing reads/writes over tty.
+
+User-visible issue was reported by Mikulas where on pa-risc with
+Debian 5 reboot took either 80 seconds, 3 minutes or 3:25 after proper
+locking in tty_reopen().
+
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Jiri Slaby <jslaby@suse.com>
+Reported-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Dmitry Safonov <dima@arista.com>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ drivers/tty/n_hdlc.c    |    4 ++--
+ drivers/tty/n_r3964.c   |    2 +-
+ drivers/tty/n_tty.c     |    8 ++++----
+ drivers/tty/tty_ldisc.c |    7 +++++++
+ include/linux/tty.h     |    7 +++++++
+ 5 files changed, 21 insertions(+), 7 deletions(-)
+
+--- a/drivers/tty/n_hdlc.c
++++ b/drivers/tty/n_hdlc.c
+@@ -613,7 +613,7 @@ static ssize_t n_hdlc_tty_read(struct tt
+ 		}
+ 			
+ 		/* no data */
+-		if (file->f_flags & O_NONBLOCK) {
++		if (tty_io_nonblock(tty, file)) {
+ 			ret = -EAGAIN;
+ 			break;
+ 		}
+@@ -680,7 +680,7 @@ static ssize_t n_hdlc_tty_write(struct t
+ 		if (tbuf)
+ 			break;
+ 
+-		if (file->f_flags & O_NONBLOCK) {
++		if (tty_io_nonblock(tty, file)) {
+ 			error = -EAGAIN;
+ 			break;
+ 		}
+--- a/drivers/tty/n_r3964.c
++++ b/drivers/tty/n_r3964.c
+@@ -1080,7 +1080,7 @@ static ssize_t r3964_read(struct tty_str
+ 		pMsg = remove_msg(pInfo, pClient);
+ 		if (pMsg == NULL) {
+ 			/* no messages available. */
+-			if (file->f_flags & O_NONBLOCK) {
++			if (tty_io_nonblock(tty, file)) {
+ 				ret = -EAGAIN;
+ 				goto unlock;
+ 			}
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@ -1691,7 +1691,7 @@ n_tty_receive_buf_common(struct tty_stru
+ 
+ 	down_read(&tty->termios_rwsem);
+ 
+-	while (1) {
++	do {
+ 		/*
+ 		 * When PARMRK is set, each input char may take up to 3 chars
+ 		 * in the read buf; reduce the buffer space avail by 3x
+@@ -1733,7 +1733,7 @@ n_tty_receive_buf_common(struct tty_stru
+ 			fp += n;
+ 		count -= n;
+ 		rcvd += n;
+-	}
++	} while (!test_bit(TTY_LDISC_CHANGING, &tty->flags));
+ 
+ 	tty->receive_room = room;
+ 
+@@ -2199,7 +2199,7 @@ static ssize_t n_tty_read(struct tty_str
+ 					break;
+ 				if (!timeout)
+ 					break;
+-				if (file->f_flags & O_NONBLOCK) {
++				if (tty_io_nonblock(tty, file)) {
+ 					retval = -EAGAIN;
+ 					break;
+ 				}
+@@ -2353,7 +2353,7 @@ static ssize_t n_tty_write(struct tty_st
+ 		}
+ 		if (!nr)
+ 			break;
+-		if (file->f_flags & O_NONBLOCK) {
++		if (tty_io_nonblock(tty, file)) {
+ 			retval = -EAGAIN;
+ 			break;
+ 		}
+--- a/drivers/tty/tty_ldisc.c
++++ b/drivers/tty/tty_ldisc.c
+@@ -339,6 +339,11 @@ int tty_ldisc_lock(struct tty_struct *tt
+ {
+ 	int ret;
+ 
++	/* Kindly asking blocked readers to release the read side */
++	set_bit(TTY_LDISC_CHANGING, &tty->flags);
++	wake_up_interruptible_all(&tty->read_wait);
++	wake_up_interruptible_all(&tty->write_wait);
++
+ 	ret = __tty_ldisc_lock(tty, timeout);
+ 	if (!ret)
+ 		return -EBUSY;
+@@ -349,6 +354,8 @@ int tty_ldisc_lock(struct tty_struct *tt
+ void tty_ldisc_unlock(struct tty_struct *tty)
+ {
+ 	clear_bit(TTY_LDISC_HALTED, &tty->flags);
++	/* Can be cleared here - ldisc_unlock will wake up writers firstly */
++	clear_bit(TTY_LDISC_CHANGING, &tty->flags);
+ 	__tty_ldisc_unlock(tty);
+ }
+ 
+--- a/include/linux/tty.h
++++ b/include/linux/tty.h
+@@ -363,6 +363,7 @@ struct tty_file_private {
+ #define TTY_NO_WRITE_SPLIT 	17	/* Preserve write boundaries to driver */
+ #define TTY_HUPPED 		18	/* Post driver->hangup() */
+ #define TTY_HUPPING		19	/* Hangup in progress */
++#define TTY_LDISC_CHANGING	20	/* Change pending - non-block IO */
+ #define TTY_LDISC_HALTED	22	/* Line discipline is halted */
+ 
+ /* Values for tty->flow_change */
+@@ -380,6 +381,12 @@ static inline void tty_set_flow_change(s
+ 	smp_mb();
+ }
+ 
++static inline bool tty_io_nonblock(struct tty_struct *tty, struct file *file)
++{
++	return file->f_flags & O_NONBLOCK ||
++		test_bit(TTY_LDISC_CHANGING, &tty->flags);
++}
++
+ static inline bool tty_io_error(struct tty_struct *tty)
+ {
+ 	return test_bit(TTY_IO_ERROR, &tty->flags);
