@@ -1,0 +1,158 @@
+From 7aa15842c15f8a32000372ad2b3195029fde6fd4 Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Fri, 20 Apr 2018 19:53:22 +1000
+Subject: [PATCH] KVM: PPC: Book3S HV: Set RWMR on POWER8 so PURR/SPURR count
+ correctly
+
+References: bsc#1061840
+Patch-mainline: v4.18-rc1
+Git-commit: 7aa15842c15f8a32000372ad2b3195029fde6fd4
+
+Although Linux doesn't use PURR and SPURR ((Scaled) Processor
+Utilization of Resources Register), other OSes depend on them.
+On POWER8 they count at a rate depending on whether the VCPU is
+idle or running, the activity of the VCPU, and the value in the
+RWMR (Region-Weighting Mode Register).  Hardware expects the
+hypervisor to update the RWMR when a core is dispatched to reflect
+the number of online VCPUs in the vcore.
+
+This adds code to maintain a count in the vcore struct indicating
+how many VCPUs are online.  In kvmppc_run_core we use that count
+to set the RWMR register on POWER8.  If the core is split because
+of a static or dynamic micro-threading mode, we use the value for
+8 threads.  The RWMR value is not relevant when the host is
+executing because Linux does not use the PURR or SPURR register,
+so we don't bother saving and restoring the host value.
+
+For the sake of old userspace which does not set the KVM_REG_PPC_ONLINE
+register, we set online to 1 if it was 0 at the time of a KVM_RUN
+ioctl.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/kvm_book3s.h |  1 +
+ arch/powerpc/include/asm/reg.h        |  1 +
+ arch/powerpc/kvm/book3s_hv.c          | 61 ++++++++++++++++++++++++++++++++++-
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index e7377b73cfec..c1f3a870c48a 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -104,6 +104,7 @@ struct kvmppc_vcore {
+ 	ulong vtb;		/* virtual timebase */
+ 	ulong conferring_threads;
+ 	unsigned int halt_poll_ns;
++	atomic_t online_count;
+ };
+ 
+ struct kvmppc_vcpu_book3s {
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index cb0f272ce123..44b2be4a65d1 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -365,6 +365,7 @@
+ #define SPRN_PSSCR	0x357	/* Processor Stop Status and Control Register (ISA 3.0) */
+ #define SPRN_PSSCR_PR	0x337	/* PSSCR ISA 3.0, privileged mode access */
+ #define SPRN_PMCR	0x374	/* Power Management Control Register */
++#define SPRN_RWMR	0x375	/* Region-Weighting Mode Register */
+ 
+ /* HFSCR and FSCR bit numbers are the same */
+ #define FSCR_SCV_LG	12	/* Enable System Call Vectored */
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 04bd71796098..f61dd9efa6fb 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -123,6 +123,32 @@ static bool no_mixing_hpt_and_radix;
+ static void kvmppc_end_cede(struct kvm_vcpu *vcpu);
+ static int kvmppc_hv_setup_htab_rma(struct kvm_vcpu *vcpu);
+ 
++/*
++ * RWMR values for POWER8.  These control the rate at which PURR
++ * and SPURR count and should be set according to the number of
++ * online threads in the vcore being run.
++ */
++#define RWMR_RPA_P8_1THREAD	0x164520C62609AECA
++#define RWMR_RPA_P8_2THREAD	0x7FFF2908450D8DA9
++#define RWMR_RPA_P8_3THREAD	0x164520C62609AECA
++#define RWMR_RPA_P8_4THREAD	0x199A421245058DA9
++#define RWMR_RPA_P8_5THREAD	0x164520C62609AECA
++#define RWMR_RPA_P8_6THREAD	0x164520C62609AECA
++#define RWMR_RPA_P8_7THREAD	0x164520C62609AECA
++#define RWMR_RPA_P8_8THREAD	0x164520C62609AECA
++
++static unsigned long p8_rwmr_values[MAX_SMT_THREADS + 1] = {
++	RWMR_RPA_P8_1THREAD,
++	RWMR_RPA_P8_1THREAD,
++	RWMR_RPA_P8_2THREAD,
++	RWMR_RPA_P8_3THREAD,
++	RWMR_RPA_P8_4THREAD,
++	RWMR_RPA_P8_5THREAD,
++	RWMR_RPA_P8_6THREAD,
++	RWMR_RPA_P8_7THREAD,
++	RWMR_RPA_P8_8THREAD,
++};
++
+ static inline struct kvm_vcpu *next_runnable_thread(struct kvmppc_vcore *vc,
+ 		int *ip)
+ {
+@@ -1761,7 +1787,12 @@ static int kvmppc_set_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+ 			vcpu->arch.vcore->tb_offset;
+ 		break;
+ 	case KVM_REG_PPC_ONLINE:
+-		vcpu->arch.online = set_reg_val(id, *val);
++		i = set_reg_val(id, *val);
++		if (i && !vcpu->arch.online)
++			atomic_inc(&vcpu->arch.vcore->online_count);
++		else if (!i && vcpu->arch.online)
++			atomic_dec(&vcpu->arch.vcore->online_count);
++		vcpu->arch.online = i;
+ 		break;
+ 	default:
+ 		r = -EINVAL;
+@@ -2856,6 +2887,25 @@ static noinline void kvmppc_run_core(struct kvmppc_vcore *vc)
+ 		}
+ 	}
+ 
++	/*
++	 * On POWER8, set RWMR register.
++	 * Since it only affects PURR and SPURR, it doesn't affect
++	 * the host, so we don't save/restore the host value.
++	 */
++	if (is_power8) {
++		unsigned long rwmr_val = RWMR_RPA_P8_8THREAD;
++		int n_online = atomic_read(&vc->online_count);
++
++		/*
++		 * Use the 8-thread value if we're doing split-core
++		 * or if the vcore's online count looks bogus.
++		 */
++		if (split == 1 && threads_per_subcore == MAX_SMT_THREADS &&
++		    n_online >= 1 && n_online <= MAX_SMT_THREADS)
++			rwmr_val = p8_rwmr_values[n_online];
++		mtspr(SPRN_RWMR, rwmr_val);
++	}
++
+ 	/* Start all the threads */
+ 	active = 0;
+ 	for (sub = 0; sub < core_info.n_subcores; ++sub) {
+@@ -3358,6 +3408,15 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 	}
+ #endif
+ 
++	/*
++	 * Force online to 1 for the sake of old userspace which doesn't
++	 * set it.
++	 */
++	if (!vcpu->arch.online) {
++		atomic_inc(&vcpu->arch.vcore->online_count);
++		vcpu->arch.online = 1;
++	}
++
+ 	kvmppc_core_prepare_to_enter(vcpu);
+ 
+ 	/* No need to go into the guest when all we'll do is come back out */
+-- 
+2.13.7
+
