@@ -1,0 +1,310 @@
+From: Ido Schimmel <idosch@mellanox.com>
+Date: Thu, 3 Aug 2017 13:28:14 +0200
+Subject: net: fib_rules: Implement notification logic in core
+Patch-mainline: v4.14-rc1
+Git-commit: 1b2a4440858857f2f93bb2ec5bb3a60f4fcc25be
+References: bsc#1112374
+
+Unlike the routing tables, the FIB rules share a common core, so instead
+of replicating the same logic for each address family we can simply dump
+the rules and send notifications from the core itself.
+
+To protect the integrity of the dump, a rules-specific sequence counter
+is added for each address family and incremented whenever a rule is
+added or deleted (under RTNL).
+
+Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/fib_rules.h |    9 ++++++
+ include/net/ip_fib.h    |   24 +++++++++---------
+ net/core/fib_rules.c    |   63 ++++++++++++++++++++++++++++++++++++++++++++++++
+ net/ipv4/fib_notifier.c |    9 +++++-
+ net/ipv4/fib_rules.c    |   45 +++++++---------------------------
+ 5 files changed, 101 insertions(+), 49 deletions(-)
+
+--- a/include/net/fib_rules.h
++++ b/include/net/fib_rules.h
+@@ -7,6 +7,7 @@
+ #include <linux/fib_rules.h>
+ #include <net/flow.h>
+ #include <net/rtnetlink.h>
++#include <net/fib_notifier.h>
+ 
+ struct fib_kuid_range {
+ 	kuid_t start;
+@@ -56,6 +57,7 @@ struct fib_rules_ops {
+ 	int			addr_size;
+ 	int			unresolved_rules;
+ 	int			nr_goto_rules;
++	unsigned int		fib_rules_seq;
+ 
+ 	int			(*action)(struct fib_rule *,
+ 					  struct flowi *, int,
+@@ -88,6 +90,11 @@ struct fib_rules_ops {
+ 	struct rcu_head		rcu;
+ };
+ 
++struct fib_rule_notifier_info {
++	struct fib_notifier_info info; /* must be first */
++	struct fib_rule *rule;
++};
++
+ #define FRA_GENERIC_POLICY \
+ 	[FRA_IIFNAME]	= { .type = NLA_STRING, .len = IFNAMSIZ - 1 }, \
+ 	[FRA_OIFNAME]	= { .type = NLA_STRING, .len = IFNAMSIZ - 1 }, \
+@@ -142,6 +149,8 @@ int fib_rules_lookup(struct fib_rules_op
+ int fib_default_rule_add(struct fib_rules_ops *, u32 pref, u32 table,
+ 			 u32 flags);
+ bool fib_rule_matchall(const struct fib_rule *rule);
++int fib_rules_dump(struct net *net, struct notifier_block *nb, int family);
++unsigned int fib_rules_seq_read(struct net *net, int family);
+ 
+ int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		   struct netlink_ext_ack *extack);
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -210,11 +210,6 @@ struct fib_entry_notifier_info {
+ 	u32 tb_id;
+ };
+ 
+-struct fib_rule_notifier_info {
+-	struct fib_notifier_info info; /* must be first */
+-	struct fib_rule *rule;
+-};
+-
+ struct fib_nh_notifier_info {
+ 	struct fib_notifier_info info; /* must be first */
+ 	struct fib_nh *fib_nh;
+@@ -230,13 +225,6 @@ int __net_init fib4_notifier_init(struct
+ void __net_exit fib4_notifier_exit(struct net *net);
+ 
+ void fib_notify(struct net *net, struct notifier_block *nb);
+-#ifdef CONFIG_IP_MULTIPLE_TABLES
+-void fib_rules_notify(struct net *net, struct notifier_block *nb);
+-#else
+-static inline void fib_rules_notify(struct net *net, struct notifier_block *nb)
+-{
+-}
+-#endif
+ 
+ struct fib_table {
+ 	struct hlist_node	tb_hlist;
+@@ -307,6 +295,16 @@ static inline bool fib4_rule_default(con
+ 	return true;
+ }
+ 
++static inline int fib4_rules_dump(struct net *net, struct notifier_block *nb)
++{
++	return 0;
++}
++
++static inline unsigned int fib4_rules_seq_read(struct net *net)
++{
++	return 0;
++}
++
+ #else /* CONFIG_IP_MULTIPLE_TABLES */
+ int __net_init fib4_rules_init(struct net *net);
+ void __net_exit fib4_rules_exit(struct net *net);
+@@ -352,6 +350,8 @@ out:
+ }
+ 
+ bool fib4_rule_default(const struct fib_rule *rule);
++int fib4_rules_dump(struct net *net, struct notifier_block *nb);
++unsigned int fib4_rules_seq_read(struct net *net);
+ 
+ #endif /* CONFIG_IP_MULTIPLE_TABLES */
+ 
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@ -299,6 +299,67 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(fib_rules_lookup);
+ 
++static int call_fib_rule_notifier(struct notifier_block *nb, struct net *net,
++				  enum fib_event_type event_type,
++				  struct fib_rule *rule, int family)
++{
++	struct fib_rule_notifier_info info = {
++		.info.family = family,
++		.rule = rule,
++	};
++
++	return call_fib_notifier(nb, net, event_type, &info.info);
++}
++
++static int call_fib_rule_notifiers(struct net *net,
++				   enum fib_event_type event_type,
++				   struct fib_rule *rule,
++				   struct fib_rules_ops *ops)
++{
++	struct fib_rule_notifier_info info = {
++		.info.family = ops->family,
++		.rule = rule,
++	};
++
++	ops->fib_rules_seq++;
++	return call_fib_notifiers(net, event_type, &info.info);
++}
++
++/* Called with rcu_read_lock() */
++int fib_rules_dump(struct net *net, struct notifier_block *nb, int family)
++{
++	struct fib_rules_ops *ops;
++	struct fib_rule *rule;
++
++	ops = lookup_rules_ops(net, family);
++	if (!ops)
++		return -EAFNOSUPPORT;
++	list_for_each_entry_rcu(rule, &ops->rules_list, list)
++		call_fib_rule_notifier(nb, net, FIB_EVENT_RULE_ADD, rule,
++				       family);
++	rules_ops_put(ops);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(fib_rules_dump);
++
++unsigned int fib_rules_seq_read(struct net *net, int family)
++{
++	unsigned int fib_rules_seq;
++	struct fib_rules_ops *ops;
++
++	ASSERT_RTNL();
++
++	ops = lookup_rules_ops(net, family);
++	if (!ops)
++		return 0;
++	fib_rules_seq = ops->fib_rules_seq;
++	rules_ops_put(ops);
++
++	return fib_rules_seq;
++}
++EXPORT_SYMBOL_GPL(fib_rules_seq_read);
++
+ static int validate_rulemsg(struct fib_rule_hdr *frh, struct nlattr **tb,
+ 			    struct fib_rules_ops *ops)
+ {
+@@ -549,6 +610,7 @@ int fib_nl_newrule(struct sk_buff *skb,
+ 	if (rule->tun_id)
+ 		ip_tunnel_need_metadata();
+ 
++	call_fib_rule_notifiers(net, FIB_EVENT_RULE_ADD, rule, ops);
+ 	notify_rule_change(RTM_NEWRULE, rule, ops, nlh, NETLINK_CB(skb).portid);
+ 	flush_route_cache(ops);
+ 	rules_ops_put(ops);
+@@ -688,6 +750,7 @@ int fib_nl_delrule(struct sk_buff *skb,
+ 			}
+ 		}
+ 
++		call_fib_rule_notifiers(net, FIB_EVENT_RULE_DEL, rule, ops);
+ 		notify_rule_change(RTM_DELRULE, rule, ops, nlh,
+ 				   NETLINK_CB(skb).portid);
+ 		fib_rule_put(rule);
+--- a/net/ipv4/fib_notifier.c
++++ b/net/ipv4/fib_notifier.c
+@@ -29,12 +29,17 @@ static unsigned int fib4_seq_read(struct
+ {
+ 	ASSERT_RTNL();
+ 
+-	return net->ipv4.fib_seq;
++	return net->ipv4.fib_seq + fib4_rules_seq_read(net);
+ }
+ 
+ static int fib4_dump(struct net *net, struct notifier_block *nb)
+ {
+-	fib_rules_notify(net, nb);
++	int err;
++
++	err = fib4_rules_dump(net, nb);
++	if (err)
++		return err;
++
+ 	fib_notify(net, nb);
+ 
+ 	return 0;
+--- a/net/ipv4/fib_rules.c
++++ b/net/ipv4/fib_rules.c
+@@ -32,7 +32,6 @@
+ #include <net/tcp.h>
+ #include <net/ip_fib.h>
+ #include <net/fib_rules.h>
+-#include <net/fib_notifier.h>
+ 
+ struct fib4_rule {
+ 	struct fib_rule		common;
+@@ -69,6 +68,16 @@ bool fib4_rule_default(const struct fib_
+ }
+ EXPORT_SYMBOL_GPL(fib4_rule_default);
+ 
++int fib4_rules_dump(struct net *net, struct notifier_block *nb)
++{
++	return fib_rules_dump(net, nb, AF_INET);
++}
++
++unsigned int fib4_rules_seq_read(struct net *net)
++{
++	return fib_rules_seq_read(net, AF_INET);
++}
++
+ int __fib_lookup(struct net *net, struct flowi4 *flp,
+ 		 struct fib_result *res, unsigned int flags)
+ {
+@@ -186,38 +195,6 @@ static struct fib_table *fib_empty_table
+ 	return NULL;
+ }
+ 
+-static int call_fib_rule_notifier(struct notifier_block *nb, struct net *net,
+-				  enum fib_event_type event_type,
+-				  struct fib_rule *rule)
+-{
+-	struct fib_rule_notifier_info info = {
+-		.rule = rule,
+-	};
+-
+-	return call_fib4_notifier(nb, net, event_type, &info.info);
+-}
+-
+-static int call_fib_rule_notifiers(struct net *net,
+-				   enum fib_event_type event_type,
+-				   struct fib_rule *rule)
+-{
+-	struct fib_rule_notifier_info info = {
+-		.rule = rule,
+-	};
+-
+-	return call_fib4_notifiers(net, event_type, &info.info);
+-}
+-
+-/* Called with rcu_read_lock() */
+-void fib_rules_notify(struct net *net, struct notifier_block *nb)
+-{
+-	struct fib_rules_ops *ops = net->ipv4.rules_ops;
+-	struct fib_rule *rule;
+-
+-	list_for_each_entry_rcu(rule, &ops->rules_list, list)
+-		call_fib_rule_notifier(nb, net, FIB_EVENT_RULE_ADD, rule);
+-}
+-
+ static const struct nla_policy fib4_rule_policy[FRA_MAX+1] = {
+ 	FRA_GENERIC_POLICY,
+ 	[FRA_FLOW]	= { .type = NLA_U32 },
+@@ -274,7 +251,6 @@ static int fib4_rule_configure(struct fi
+ 	rule4->tos = frh->tos;
+ 
+ 	net->ipv4.fib_has_custom_rules = true;
+-	call_fib_rule_notifiers(net, FIB_EVENT_RULE_ADD, rule);
+ 
+ 	err = 0;
+ errout:
+@@ -296,7 +272,6 @@ static int fib4_rule_delete(struct fib_r
+ 		net->ipv4.fib_num_tclassid_users--;
+ #endif
+ 	net->ipv4.fib_has_custom_rules = true;
+-	call_fib_rule_notifiers(net, FIB_EVENT_RULE_DEL, rule);
+ errout:
+ 	return err;
+ }

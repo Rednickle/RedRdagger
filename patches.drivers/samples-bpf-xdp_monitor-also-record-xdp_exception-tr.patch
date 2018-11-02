@@ -1,0 +1,266 @@
+From: Jesper Dangaard Brouer <brouer@redhat.com>
+Date: Fri, 6 Oct 2017 10:41:46 +0200
+Subject: samples/bpf: xdp_monitor also record xdp_exception tracepoint
+Patch-mainline: v4.15-rc1
+Git-commit: 280b058d4801cb431477dc101a776e4b24995f2f
+References: bsc#1109837
+
+Also monitor the tracepoint xdp_exception.  This tracepoint is usually
+invoked by the drivers.  Programs themselves can activate this by
+returning XDP_ABORTED, which will drop the packet but also trigger the
+tracepoint.  This is useful for distinguishing intentional (XDP_DROP)
+vs. ebpf-program error cases that cased a drop (XDP_ABORTED).
+
+Drivers also use this tracepoint for reporting on XDP actions that are
+unknown to the specific driver.  This can help the user to detect if a
+driver e.g. doesn't implement XDP_REDIRECT yet.
+
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ samples/bpf/xdp_monitor_kern.c |   38 ++++++++++++++
+ samples/bpf/xdp_monitor_user.c |  108 +++++++++++++++++++++++++++++++----------
+ 2 files changed, 121 insertions(+), 25 deletions(-)
+
+--- a/samples/bpf/xdp_monitor_kern.c
++++ b/samples/bpf/xdp_monitor_kern.c
+@@ -13,6 +13,14 @@ struct bpf_map_def SEC("maps") redirect_
+ 	/* TODO: have entries for all possible errno's */
+ };
+ 
++#define XDP_UNKNOWN	XDP_REDIRECT + 1
++struct bpf_map_def SEC("maps") exception_cnt = {
++	.type		= BPF_MAP_TYPE_PERCPU_ARRAY,
++	.key_size	= sizeof(u32),
++	.value_size	= sizeof(u64),
++	.max_entries	= XDP_UNKNOWN + 1,
++};
++
+ /* Tracepoint format: /sys/kernel/debug/tracing/events/xdp/xdp_redirect/format
+  * Code in:                kernel/include/trace/events/xdp.h
+  */
+@@ -44,7 +52,7 @@ int xdp_redirect_collect_stat(struct xdp
+ 
+ 	cnt  = bpf_map_lookup_elem(&redirect_err_cnt, &key);
+ 	if (!cnt)
+-		return 0;
++		return 1;
+ 	*cnt += 1;
+ 
+ 	return 0; /* Indicate event was filtered (no further processing)*/
+@@ -82,3 +90,31 @@ int trace_xdp_redirect_map(struct xdp_re
+ {
+ 	return xdp_redirect_collect_stat(ctx);
+ }
++
++/* Tracepoint format: /sys/kernel/debug/tracing/events/xdp/xdp_exception/format
++ * Code in:                kernel/include/trace/events/xdp.h
++ */
++struct xdp_exception_ctx {
++	u64 __pad;	// First 8 bytes are not accessible by bpf code
++	int prog_id;	//	offset:8;  size:4; signed:1;
++	u32 act;	//	offset:12; size:4; signed:0;
++	int ifindex;	//	offset:16; size:4; signed:1;
++};
++
++SEC("tracepoint/xdp/xdp_exception")
++int trace_xdp_exception(struct xdp_exception_ctx *ctx)
++{
++	u64 *cnt;;
++	u32 key;
++
++	key = ctx->act;
++	if (key > XDP_REDIRECT)
++		key = XDP_UNKNOWN;
++
++	cnt = bpf_map_lookup_elem(&exception_cnt, &key);
++	if (!cnt)
++		return 1;
++	*cnt += 1;
++
++	return 0;
++}
+--- a/samples/bpf/xdp_monitor_user.c
++++ b/samples/bpf/xdp_monitor_user.c
+@@ -89,6 +89,23 @@ static const char *err2str(int err)
+ 		return redir_names[err];
+ 	return NULL;
+ }
++/* enum xdp_action */
++#define XDP_UNKNOWN	XDP_REDIRECT + 1
++#define XDP_ACTION_MAX (XDP_UNKNOWN + 1)
++static const char *xdp_action_names[XDP_ACTION_MAX] = {
++	[XDP_ABORTED]	= "XDP_ABORTED",
++	[XDP_DROP]	= "XDP_DROP",
++	[XDP_PASS]	= "XDP_PASS",
++	[XDP_TX]	= "XDP_TX",
++	[XDP_REDIRECT]	= "XDP_REDIRECT",
++	[XDP_UNKNOWN]	= "XDP_UNKNOWN",
++};
++static const char *action2str(int action)
++{
++	if (action < XDP_ACTION_MAX)
++		return xdp_action_names[action];
++	return NULL;
++}
+ 
+ struct record {
+ 	__u64 counter;
+@@ -97,6 +114,7 @@ struct record {
+ 
+ struct stats_record {
+ 	struct record xdp_redir[REDIR_RES_MAX];
++	struct record xdp_exception[XDP_ACTION_MAX];
+ };
+ 
+ static void stats_print_headers(bool err_only)
+@@ -104,39 +122,72 @@ static void stats_print_headers(bool err
+ 	if (err_only)
+ 		printf("\n%s\n", __doc_err_only__);
+ 
+-	printf("%-14s %-10s %-18s %-9s\n",
+-	       "XDP_REDIRECT", "pps ", "pps-human-readable", "measure-period");
++	printf("%-14s %-11s %-10s %-18s %-9s\n",
++	       "ACTION", "result", "pps ", "pps-human-readable", "measure-period");
++}
++
++static double calc_period(struct record *r, struct record *p)
++{
++	double period_ = 0;
++	__u64 period = 0;
++
++	period = r->timestamp - p->timestamp;
++	if (period > 0)
++		period_ = ((double) period / NANOSEC_PER_SEC);
++
++	return period_;
++}
++
++static double calc_pps(struct record *r, struct record *p, double period)
++{
++	__u64 packets = 0;
++	double pps = 0;
++
++	if (period > 0) {
++		packets = r->counter - p->counter;
++		pps = packets / period;
++	}
++	return pps;
+ }
+ 
+ static void stats_print(struct stats_record *rec,
+ 			struct stats_record *prev,
+ 			bool err_only)
+ {
++	double period = 0, pps = 0;
++	struct record *r, *p;
+ 	int i = 0;
+ 
++	char *fmt = "%-14s %-11s %-10.0f %'-18.0f %f\n";
++
++	/* tracepoint: xdp:xdp_redirect_* */
+ 	if (err_only)
+ 		i = REDIR_ERROR;
+ 
+ 	for (; i < REDIR_RES_MAX; i++) {
+-		struct record *r = &rec->xdp_redir[i];
+-		struct record *p = &prev->xdp_redir[i];
+-		__u64 period  = 0;
+-		__u64 packets = 0;
+-		double pps = 0;
+-		double period_ = 0;
++		r = &rec->xdp_redir[i];
++		p = &prev->xdp_redir[i];
+ 
+ 		if (p->timestamp) {
+-			packets = r->counter - p->counter;
+-			period  = r->timestamp - p->timestamp;
+-			if (period > 0) {
+-				period_ = ((double) period / NANOSEC_PER_SEC);
+-				pps = packets / period_;
+-			}
++			period = calc_period(r, p);
++			pps = calc_pps(r, p, period);
+ 		}
++		printf(fmt, "XDP_REDIRECT", err2str(i), pps, pps, period);
++	}
+ 
+-		printf("%-14s %-10.0f %'-18.0f %f\n",
+-		       err2str(i), pps, pps, period_);
++	/* tracepoint: xdp:xdp_exception */
++	for (i = 0; i < XDP_ACTION_MAX; i++) {
++		r = &rec->xdp_exception[i];
++		p = &prev->xdp_exception[i];
++		if (p->timestamp) {
++			period = calc_period(r, p);
++			pps = calc_pps(r, p, period);
++		}
++		if (pps > 0)
++			printf(fmt, action2str(i), "Exception",
++			       pps, pps, period);
+ 	}
++	printf("\n");
+ }
+ 
+ static __u64 get_key32_value64_percpu(int fd, __u32 key)
+@@ -160,25 +211,33 @@ static __u64 get_key32_value64_percpu(in
+ 	return sum;
+ }
+ 
+-static bool stats_collect(int fd, struct stats_record *rec)
++static bool stats_collect(struct stats_record *rec)
+ {
++	int fd;
+ 	int i;
+ 
+ 	/* TODO: Detect if someone unloaded the perf event_fd's, as
+ 	 * this can happen by someone running perf-record -e
+ 	 */
+ 
++	fd = map_data[0].fd; /* map0: redirect_err_cnt */
+ 	for (i = 0; i < REDIR_RES_MAX; i++) {
+ 		rec->xdp_redir[i].timestamp = gettime();
+ 		rec->xdp_redir[i].counter = get_key32_value64_percpu(fd, i);
+ 	}
++
++	fd = map_data[1].fd; /* map1: exception_cnt */
++	for (i = 0; i < XDP_ACTION_MAX; i++) {
++		rec->xdp_exception[i].timestamp = gettime();
++		rec->xdp_exception[i].counter = get_key32_value64_percpu(fd, i);
++	}
++
+ 	return true;
+ }
+ 
+ static void stats_poll(int interval, bool err_only)
+ {
+ 	struct stats_record rec, prev;
+-	int map_fd;
+ 
+ 	memset(&rec, 0, sizeof(rec));
+ 
+@@ -190,16 +249,17 @@ static void stats_poll(int interval, boo
+ 		printf("\n%s", __doc__);
+ 
+ 	/* TODO Need more advanced stats on error types */
+-	if (verbose)
+-		printf(" - Stats map: %s\n", map_data[0].name);
+-	map_fd = map_data[0].fd;
+-
+-	stats_print_headers(err_only);
++	if (verbose) {
++		printf(" - Stats map0: %s\n", map_data[0].name);
++		printf(" - Stats map1: %s\n", map_data[1].name);
++		printf("\n");
++	}
+ 	fflush(stdout);
+ 
+ 	while (1) {
+ 		memcpy(&prev, &rec, sizeof(rec));
+-		stats_collect(map_fd, &rec);
++		stats_collect(&rec);
++		stats_print_headers(err_only);
+ 		stats_print(&rec, &prev, err_only);
+ 		fflush(stdout);
+ 		sleep(interval);

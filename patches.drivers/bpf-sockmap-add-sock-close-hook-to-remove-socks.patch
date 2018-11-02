@@ -1,0 +1,287 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Mon, 5 Feb 2018 10:17:49 -0800
+Subject: bpf: sockmap, add sock close() hook to remove socks
+Patch-mainline: v4.16-rc1
+Git-commit: 1aa12bdf1bfb95db7e75bfecf0e39a65f4e8fbf8
+References: bsc#1109837
+
+The selftests test_maps program was leaving dangling BPF sockmap
+programs around because not all psock elements were removed from
+the map. The elements in turn hold a reference on the BPF program
+they are attached to causing BPF programs to stay open even after
+test_maps has completed.
+
+The original intent was that sk_state_change() would be called
+when TCP socks went through TCP_CLOSE state. However, because
+socks may be in SOCK_DEAD state or the sock may be a listening
+socket the event is not always triggered.
+
+To resolve this use the ULP infrastructure and register our own
+proto close() handler. This fixes the above case.
+
+Fixes: 174a79ff9515 ("bpf: sockmap with sk redirect support")
+Reported-by: Prashant Bhole <bhole_prashant_q7@lab.ntt.co.jp>
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/tcp.h    |    2 
+ kernel/bpf/sockmap.c |  168 ++++++++++++++++++++++++++++++---------------------
+ 2 files changed, 103 insertions(+), 67 deletions(-)
+
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2012,6 +2012,7 @@ enum hrtimer_restart tcp_pace_kick(struc
+ 
+ enum {
+ 	TCP_ULP_TLS,
++	TCP_ULP_BPF,
+ };
+ 
+ struct tcp_ulp_ops {
+@@ -2030,6 +2031,7 @@ struct tcp_ulp_ops {
+ int tcp_register_ulp(struct tcp_ulp_ops *type);
+ void tcp_unregister_ulp(struct tcp_ulp_ops *type);
+ int tcp_set_ulp(struct sock *sk, const char *name);
++int tcp_set_ulp_id(struct sock *sk, const int ulp);
+ void tcp_get_available_ulp(char *buf, size_t len);
+ void tcp_cleanup_ulp(struct sock *sk);
+ 
+--- a/kernel/bpf/sockmap.c
++++ b/kernel/bpf/sockmap.c
+@@ -86,9 +86,10 @@ struct smap_psock {
+ 	struct work_struct tx_work;
+ 	struct work_struct gc_work;
+ 
++	struct proto *sk_proto;
++	void (*save_close)(struct sock *sk, long timeout);
+ 	void (*save_data_ready)(struct sock *sk);
+ 	void (*save_write_space)(struct sock *sk);
+-	void (*save_state_change)(struct sock *sk);
+ };
+ 
+ static inline struct smap_psock *smap_psock_sk(const struct sock *sk)
+@@ -96,12 +97,102 @@ static inline struct smap_psock *smap_ps
+ 	return rcu_dereference_sk_user_data(sk);
+ }
+ 
++static struct proto tcp_bpf_proto;
++static int bpf_tcp_init(struct sock *sk)
++{
++	struct smap_psock *psock;
++
++	rcu_read_lock();
++	psock = smap_psock_sk(sk);
++	if (unlikely(!psock)) {
++		rcu_read_unlock();
++		return -EINVAL;
++	}
++
++	if (unlikely(psock->sk_proto)) {
++		rcu_read_unlock();
++		return -EBUSY;
++	}
++
++	psock->save_close = sk->sk_prot->close;
++	psock->sk_proto = sk->sk_prot;
++	sk->sk_prot = &tcp_bpf_proto;
++	rcu_read_unlock();
++	return 0;
++}
++
++static void bpf_tcp_release(struct sock *sk)
++{
++	struct smap_psock *psock;
++
++	rcu_read_lock();
++	psock = smap_psock_sk(sk);
++
++	if (likely(psock)) {
++		sk->sk_prot = psock->sk_proto;
++		psock->sk_proto = NULL;
++	}
++	rcu_read_unlock();
++}
++
++static void smap_release_sock(struct smap_psock *psock, struct sock *sock);
++
++static void bpf_tcp_close(struct sock *sk, long timeout)
++{
++	void (*close_fun)(struct sock *sk, long timeout);
++	struct smap_psock_map_entry *e, *tmp;
++	struct smap_psock *psock;
++	struct sock *osk;
++
++	rcu_read_lock();
++	psock = smap_psock_sk(sk);
++	if (unlikely(!psock)) {
++		rcu_read_unlock();
++		return sk->sk_prot->close(sk, timeout);
++	}
++
++	/* The psock may be destroyed anytime after exiting the RCU critial
++	 * section so by the time we use close_fun the psock may no longer
++	 * be valid. However, bpf_tcp_close is called with the sock lock
++	 * held so the close hook and sk are still valid.
++	 */
++	close_fun = psock->save_close;
++
++	write_lock_bh(&sk->sk_callback_lock);
++	list_for_each_entry_safe(e, tmp, &psock->maps, list) {
++		osk = cmpxchg(e->entry, sk, NULL);
++		if (osk == sk) {
++			list_del(&e->list);
++			smap_release_sock(psock, sk);
++		}
++	}
++	write_unlock_bh(&sk->sk_callback_lock);
++	rcu_read_unlock();
++	close_fun(sk, timeout);
++}
++
+ enum __sk_action {
+ 	__SK_DROP = 0,
+ 	__SK_PASS,
+ 	__SK_REDIRECT,
+ };
+ 
++static struct tcp_ulp_ops bpf_tcp_ulp_ops __read_mostly = {
++	.name		= "bpf_tcp",
++	.uid		= TCP_ULP_BPF,
++	.user_visible	= false,
++	.owner		= NULL,
++	.init		= bpf_tcp_init,
++	.release	= bpf_tcp_release,
++};
++
++static int bpf_tcp_ulp_register(void)
++{
++	tcp_bpf_proto = tcp_prot;
++	tcp_bpf_proto.close = bpf_tcp_close;
++	return tcp_register_ulp(&bpf_tcp_ulp_ops);
++}
++
+ static int smap_verdict_func(struct smap_psock *psock, struct sk_buff *skb)
+ {
+ 	struct bpf_prog *prog = READ_ONCE(psock->bpf_verdict);
+@@ -166,68 +257,6 @@ static void smap_report_sk_error(struct
+ 	sk->sk_error_report(sk);
+ }
+ 
+-static void smap_release_sock(struct smap_psock *psock, struct sock *sock);
+-
+-/* Called with lock_sock(sk) held */
+-static void smap_state_change(struct sock *sk)
+-{
+-	struct smap_psock_map_entry *e, *tmp;
+-	struct smap_psock *psock;
+-	struct socket_wq *wq;
+-	struct sock *osk;
+-
+-	rcu_read_lock();
+-
+-	/* Allowing transitions into an established syn_recv states allows
+-	 * for early binding sockets to a smap object before the connection
+-	 * is established.
+-	 */
+-	switch (sk->sk_state) {
+-	case TCP_SYN_SENT:
+-	case TCP_SYN_RECV:
+-	case TCP_ESTABLISHED:
+-		break;
+-	case TCP_CLOSE_WAIT:
+-	case TCP_CLOSING:
+-	case TCP_LAST_ACK:
+-	case TCP_FIN_WAIT1:
+-	case TCP_FIN_WAIT2:
+-	case TCP_LISTEN:
+-		break;
+-	case TCP_CLOSE:
+-		/* Only release if the map entry is in fact the sock in
+-		 * question. There is a case where the operator deletes
+-		 * the sock from the map, but the TCP sock is closed before
+-		 * the psock is detached. Use cmpxchg to verify correct
+-		 * sock is removed.
+-		 */
+-		psock = smap_psock_sk(sk);
+-		if (unlikely(!psock))
+-			break;
+-		write_lock_bh(&sk->sk_callback_lock);
+-		list_for_each_entry_safe(e, tmp, &psock->maps, list) {
+-			osk = cmpxchg(e->entry, sk, NULL);
+-			if (osk == sk) {
+-				list_del(&e->list);
+-				smap_release_sock(psock, sk);
+-			}
+-		}
+-		write_unlock_bh(&sk->sk_callback_lock);
+-		break;
+-	default:
+-		psock = smap_psock_sk(sk);
+-		if (unlikely(!psock))
+-			break;
+-		smap_report_sk_error(psock, EPIPE);
+-		break;
+-	}
+-
+-	wq = rcu_dereference(sk->sk_wq);
+-	if (skwq_has_sleeper(wq))
+-		wake_up_interruptible_all(&wq->wait);
+-	rcu_read_unlock();
+-}
+-
+ static void smap_read_sock_strparser(struct strparser *strp,
+ 				     struct sk_buff *skb)
+ {
+@@ -322,10 +351,8 @@ static void smap_stop_sock(struct smap_p
+ 		return;
+ 	sk->sk_data_ready = psock->save_data_ready;
+ 	sk->sk_write_space = psock->save_write_space;
+-	sk->sk_state_change = psock->save_state_change;
+ 	psock->save_data_ready = NULL;
+ 	psock->save_write_space = NULL;
+-	psock->save_state_change = NULL;
+ 	strp_stop(&psock->strp);
+ 	psock->strp_enabled = false;
+ }
+@@ -350,6 +377,7 @@ static void smap_release_sock(struct sma
+ 	if (psock->refcnt)
+ 		return;
+ 
++	tcp_cleanup_ulp(sock);
+ 	smap_stop_sock(psock, sock);
+ 	clear_bit(SMAP_TX_RUNNING, &psock->state);
+ 	rcu_assign_sk_user_data(sock, NULL);
+@@ -427,10 +455,8 @@ static void smap_start_sock(struct smap_
+ 		return;
+ 	psock->save_data_ready = sk->sk_data_ready;
+ 	psock->save_write_space = sk->sk_write_space;
+-	psock->save_state_change = sk->sk_state_change;
+ 	sk->sk_data_ready = smap_data_ready;
+ 	sk->sk_write_space = smap_write_space;
+-	sk->sk_state_change = smap_state_change;
+ 	psock->strp_enabled = true;
+ }
+ 
+@@ -509,6 +535,10 @@ static struct bpf_map *sock_map_alloc(un
+ 	if (attr->value_size > KMALLOC_MAX_SIZE)
+ 		return ERR_PTR(-E2BIG);
+ 
++	err = bpf_tcp_ulp_register();
++	if (err && err != -EEXIST)
++		return ERR_PTR(err);
++
+ 	stab = kzalloc(sizeof(*stab), GFP_USER);
+ 	if (!stab)
+ 		return ERR_PTR(-ENOMEM);
+@@ -754,6 +784,10 @@ static int sock_map_ctx_update_elem(stru
+ 			goto out_progs;
+ 		}
+ 
++		err = tcp_set_ulp_id(sock, TCP_ULP_BPF);
++		if (err)
++			goto out_progs;
++
+ 		set_bit(SMAP_TX_RUNNING, &psock->state);
+ 	}
+ 

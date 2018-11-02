@@ -1,0 +1,265 @@
+From: David Ahern <dsahern@gmail.com>
+Date: Wed, 18 Oct 2017 09:56:52 -0700
+Subject: ipv6: addrconf: cleanup locking in ipv6_add_addr
+Patch-mainline: v4.15-rc1
+Git-commit: f3d9832e56c48e4ca50bab0457e21bcaade4536d
+References: bsc#1112374
+
+ipv6_add_addr is called in process context with rtnl lock held
+(e.g., manual config of an address) or during softirq processing
+(e.g., autoconf and address from a router advertisement).
+
+Currently, ipv6_add_addr calls rcu_read_lock_bh shortly after entry
+and does not call unlock until exit, minus the call around the address
+validator notifier. Similarly, addrconf_hash_lock is taken after the
+validator notifier and held until exit. This forces the allocation of
+inet6_ifaddr to always be atomic.
+
+Refactor ipv6_add_addr as follows:
+1. add an input boolean to discriminate the call path (process context
+   or softirq). This new flag controls whether the alloc can be done
+   with GFP_KERNEL or GFP_ATOMIC.
+
+2. Move the rcu_read_lock_bh and unlock calls only around functions that
+   do rcu updates.
+
+3. Remove the in6_dev_hold and put added by 3ad7d2468f79f ("Ipvlan should
+   return an error when an address is already in use."). This was done
+   presumably because rcu_read_unlock_bh needs to be called before calling
+   the validator. Since rcu_read_lock is not needed before the validator
+   runs revert the hold and put added by 3ad7d2468f79f and only do the
+   hold when setting ifp->idev.
+
+4. move duplicate address check and insertion of new address in the global
+   address hash into a helper. The helper is called after an ifa is
+   allocated and filled in.
+
+This allows the ifa for manually configured addresses to be done with
+GFP_KERNEL and reduces the overall amount of time with rcu_read_lock held
+and hash table spinlock held.
+
+Signed-off-by: David Ahern <dsahern@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ net/ipv6/addrconf.c |  104 ++++++++++++++++++++++++++++++----------------------
+ 1 file changed, 60 insertions(+), 44 deletions(-)
+
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -953,18 +953,43 @@ static u32 inet6_addr_hash(const struct
+ 	return hash_32(ipv6_addr_hash(addr), IN6_ADDR_HSIZE_SHIFT);
+ }
+ 
++static int ipv6_add_addr_hash(struct net_device *dev, struct inet6_ifaddr *ifa)
++{
++	unsigned int hash;
++	int err = 0;
++
++	spin_lock(&addrconf_hash_lock);
++
++	/* Ignore adding duplicate addresses on an interface */
++	if (ipv6_chk_same_addr(dev_net(dev), &ifa->addr, dev)) {
++		ADBG("ipv6_add_addr: already assigned\n");
++		err = -EEXIST;
++		goto out;
++	}
++
++	/* Add to big hash table */
++	hash = inet6_addr_hash(&ifa->addr);
++	hlist_add_head_rcu(&ifa->addr_lst, &inet6_addr_lst[hash]);
++
++out:
++	spin_unlock(&addrconf_hash_lock);
++
++	return err;
++}
++
+ /* On success it returns ifp with increased reference count */
+ 
+ static struct inet6_ifaddr *
+ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
+ 	      const struct in6_addr *peer_addr, int pfxlen,
+-	      int scope, u32 flags, u32 valid_lft, u32 prefered_lft)
++	      int scope, u32 flags, u32 valid_lft, u32 prefered_lft,
++	      bool can_block)
+ {
++	gfp_t gfp_flags = can_block ? GFP_KERNEL : GFP_ATOMIC;
+ 	struct net *net = dev_net(idev->dev);
+ 	struct inet6_ifaddr *ifa = NULL;
+-	struct rt6_info *rt;
++	struct rt6_info *rt = NULL;
+ 	struct in6_validator_info i6vi;
+-	unsigned int hash;
+ 	int err = 0;
+ 	int addr_type = ipv6_addr_type(addr);
+ 
+@@ -974,42 +999,24 @@ ipv6_add_addr(struct inet6_dev *idev, co
+ 	     addr_type & IPV6_ADDR_LOOPBACK))
+ 		return ERR_PTR(-EADDRNOTAVAIL);
+ 
+-	rcu_read_lock_bh();
+-
+-	in6_dev_hold(idev);
+-
+ 	if (idev->dead) {
+ 		err = -ENODEV;			/*XXX*/
+-		goto out2;
++		goto out;
+ 	}
+ 
+ 	if (idev->cnf.disable_ipv6) {
+ 		err = -EACCES;
+-		goto out2;
++		goto out;
+ 	}
+ 
+ 	i6vi.i6vi_addr = *addr;
+ 	i6vi.i6vi_dev = idev;
+-	rcu_read_unlock_bh();
+-
+ 	err = inet6addr_validator_notifier_call_chain(NETDEV_UP, &i6vi);
+-
+-	rcu_read_lock_bh();
+ 	err = notifier_to_errno(err);
+-	if (err)
+-		goto out2;
+-
+-	spin_lock(&addrconf_hash_lock);
+-
+-	/* Ignore adding duplicate addresses on an interface */
+-	if (ipv6_chk_same_addr(dev_net(idev->dev), addr, idev->dev)) {
+-		ADBG("ipv6_add_addr: already assigned\n");
+-		err = -EEXIST;
++	if (err < 0)
+ 		goto out;
+-	}
+-
+-	ifa = kzalloc(sizeof(struct inet6_ifaddr), GFP_ATOMIC);
+ 
++	ifa = kzalloc(sizeof(*ifa), gfp_flags);
+ 	if (!ifa) {
+ 		ADBG("ipv6_add_addr: malloc failed\n");
+ 		err = -ENOBUFS;
+@@ -1019,6 +1026,7 @@ ipv6_add_addr(struct inet6_dev *idev, co
+ 	rt = addrconf_dst_alloc(idev, addr, false);
+ 	if (IS_ERR(rt)) {
+ 		err = PTR_ERR(rt);
++		rt = NULL;
+ 		goto out;
+ 	}
+ 
+@@ -1049,16 +1057,21 @@ ipv6_add_addr(struct inet6_dev *idev, co
+ 	ifa->rt = rt;
+ 
+ 	ifa->idev = idev;
++	in6_dev_hold(idev);
++
+ 	/* For caller */
+ 	in6_ifa_hold(ifa);
+ 
+-	/* Add to big hash table */
+-	hash = inet6_addr_hash(addr);
++	rcu_read_lock_bh();
+ 
+-	hlist_add_head_rcu(&ifa->addr_lst, &inet6_addr_lst[hash]);
+-	spin_unlock(&addrconf_hash_lock);
++	err = ipv6_add_addr_hash(idev->dev, ifa);
++	if (err < 0) {
++		rcu_read_unlock_bh();
++		goto out;
++	}
+ 
+ 	write_lock(&idev->lock);
++
+ 	/* Add to inet6_dev unicast addr list. */
+ 	ipv6_link_dev_addr(idev, ifa);
+ 
+@@ -1069,21 +1082,23 @@ ipv6_add_addr(struct inet6_dev *idev, co
+ 
+ 	in6_ifa_hold(ifa);
+ 	write_unlock(&idev->lock);
+-out2:
++
+ 	rcu_read_unlock_bh();
+ 
+-	if (likely(err == 0))
+-		inet6addr_notifier_call_chain(NETDEV_UP, ifa);
+-	else {
+-		kfree(ifa);
+-		in6_dev_put(idev);
++	inet6addr_notifier_call_chain(NETDEV_UP, ifa);
++out:
++	if (unlikely(err < 0)) {
++		if (rt)
++			ip6_rt_put(rt);
++		if (ifa) {
++			if (ifa->idev)
++				in6_dev_put(ifa->idev);
++			kfree(ifa);
++		}
+ 		ifa = ERR_PTR(err);
+ 	}
+ 
+ 	return ifa;
+-out:
+-	spin_unlock(&addrconf_hash_lock);
+-	goto out2;
+ }
+ 
+ enum cleanup_prefix_rt_t {
+@@ -1330,7 +1345,7 @@ retry:
+ 
+ 	ift = ipv6_add_addr(idev, &addr, NULL, tmp_plen,
+ 			    ipv6_addr_scope(&addr), addr_flags,
+-			    tmp_valid_lft, tmp_prefered_lft);
++			    tmp_valid_lft, tmp_prefered_lft, true);
+ 	if (IS_ERR(ift)) {
+ 		in6_ifa_put(ifp);
+ 		in6_dev_put(idev);
+@@ -2025,7 +2040,7 @@ void addrconf_dad_failure(struct inet6_i
+ 
+ 		ifp2 = ipv6_add_addr(idev, &new_addr, NULL, pfxlen,
+ 				     scope, flags, valid_lft,
+-				     preferred_lft);
++				     preferred_lft, false);
+ 		if (IS_ERR(ifp2))
+ 			goto lock_errdad;
+ 
+@@ -2483,7 +2498,7 @@ int addrconf_prefix_rcv_add_addr(struct
+ 					    pinfo->prefix_len,
+ 					    addr_type&IPV6_ADDR_SCOPE_MASK,
+ 					    addr_flags, valid_lft,
+-					    prefered_lft);
++					    prefered_lft, false);
+ 
+ 		if (IS_ERR_OR_NULL(ifp))
+ 			return -1;
+@@ -2852,7 +2867,7 @@ static int inet6_addr_add(struct net *ne
+ 	}
+ 
+ 	ifp = ipv6_add_addr(idev, pfx, peer_pfx, plen, scope, ifa_flags,
+-			    valid_lft, prefered_lft);
++			    valid_lft, prefered_lft, true);
+ 
+ 	if (!IS_ERR(ifp)) {
+ 		if (!(ifa_flags & IFA_F_NOPREFIXROUTE)) {
+@@ -2967,7 +2982,8 @@ static void add_addr(struct inet6_dev *i
+ 
+ 	ifp = ipv6_add_addr(idev, addr, NULL, plen,
+ 			    scope, IFA_F_PERMANENT,
+-			    INFINITY_LIFE_TIME, INFINITY_LIFE_TIME);
++			    INFINITY_LIFE_TIME, INFINITY_LIFE_TIME,
++			    true);
+ 	if (!IS_ERR(ifp)) {
+ 		spin_lock_bh(&ifp->lock);
+ 		ifp->flags &= ~IFA_F_TENTATIVE;
+@@ -3109,7 +3125,7 @@ void addrconf_add_linklocal(struct inet6
+ #endif
+ 
+ 	ifp = ipv6_add_addr(idev, addr, NULL, 64, IFA_LINK, addr_flags,
+-			    INFINITY_LIFE_TIME, INFINITY_LIFE_TIME);
++			    INFINITY_LIFE_TIME, INFINITY_LIFE_TIME, true);
+ 	if (!IS_ERR(ifp)) {
+ 		addrconf_prefix_route(&ifp->addr, ifp->prefix_len, idev->dev, 0, 0);
+ 		addrconf_dad_start(ifp);

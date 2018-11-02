@@ -1,0 +1,617 @@
+From: Leo Yan <leo.yan@linaro.org>
+Date: Mon, 26 Feb 2018 09:19:12 +0800
+Subject: samples/bpf: Add program for CPU state statistics
+Patch-mainline: v4.17-rc1
+Git-commit: c53507778998d45543b27266742d04cd384de356
+References: bsc#1109837
+
+CPU is active when have running tasks on it and CPUFreq governor can
+select different operating points (OPP) according to different workload;
+we use 'pstate' to present CPU state which have running tasks with one
+specific OPP.  On the other hand, CPU is idle which only idle task on
+it, CPUIdle governor can select one specific idle state to power off
+hardware logics; we use 'cstate' to present CPU idle state.
+
+Based on trace events 'cpu_idle' and 'cpu_frequency' we can accomplish
+the duration statistics for every state.  Every time when CPU enters
+into or exits from idle states, the trace event 'cpu_idle' is recorded;
+trace event 'cpu_frequency' records the event for CPU OPP changing, so
+it's easily to know how long time the CPU stays in the specified OPP,
+and the CPU must be not in any idle state.
+
+This patch is to utilize the mentioned trace events for pstate and
+cstate statistics.  To achieve more accurate profiling data, the program
+uses below sequence to insure CPU running/idle time aren't missed:
+
+- Before profiling the user space program wakes up all CPUs for once, so
+  can avoid to missing account time for CPU staying in idle state for
+  long time; the program forces to set 'scaling_max_freq' to lowest
+  frequency and then restore 'scaling_max_freq' to highest frequency,
+  this can ensure the frequency to be set to lowest frequency and later
+  after start to run workload the frequency can be easily to be changed
+  to higher frequency;
+
+- User space program reads map data and update statistics for every 5s,
+  so this is same with other sample bpf programs for avoiding big
+  overload introduced by bpf program self;
+
+- When send signal to terminate program, the signal handler wakes up
+  all CPUs, set lowest frequency and restore highest frequency to
+  'scaling_max_freq'; this is exactly same with the first step so
+  avoid to missing account CPU pstate and cstate time during last
+  stage.  Finally it reports the latest statistics.
+
+The program has been tested on Hikey board with octa CA53 CPUs, below
+is one example for statistics result, the format mainly follows up
+Jesper Dangaard Brouer suggestion.
+
+Jesper reminds to 'get printf to pretty print with thousands separators
+use %' and setlocale(LC_NUMERIC, "en_US")', tried three different arm64
+GCC toolchains (5.4.0 20160609, 6.2.1 20161016, 6.3.0 20170516) but all
+of them cannot support printf flag character %' on arm64 platform, so go
+back print number without grouping mode.
+
+CPU states statistics:
+state(ms)  cstate-0    cstate-1    cstate-2    pstate-0    pstate-1    pstate-2    pstate-3    pstate-4
+CPU-0      767         6111        111863      561         31          756         853         190
+CPU-1      241         10606       107956      484         125         646         990         85
+CPU-2      413         19721       98735       636         84          696         757         89
+CPU-3      84          11711       79989       17516       909         4811        5773        341
+CPU-4      152         19610       98229       444         53          649         708         1283
+CPU-5      185         8781        108697      666         91          671         677         1365
+CPU-6      157         21964       95825       581         67          566         684         1284
+CPU-7      125         15238       102704      398         20          665         786         1197
+
+Cc: Daniel Lezcano <daniel.lezcano@linaro.org>
+Cc: Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Leo Yan <leo.yan@linaro.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ samples/bpf/Makefile       |    4 
+ samples/bpf/cpustat_kern.c |  281 +++++++++++++++++++++++++++++++++++++++++++++
+ samples/bpf/cpustat_user.c |  219 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 504 insertions(+)
+ create mode 100644 samples/bpf/cpustat_kern.c
+ create mode 100644 samples/bpf/cpustat_user.c
+
+--- a/samples/bpf/Makefile
++++ b/samples/bpf/Makefile
+@@ -45,6 +45,7 @@ hostprogs-y += xdp_redirect_cpu
+ hostprogs-y += xdp_monitor
+ hostprogs-y += xdp_rxq_info
+ hostprogs-y += syscall_tp
++hostprogs-y += cpustat
+ 
+ # Libbpf dependencies
+ LIBBPF := ../../tools/lib/bpf/bpf.o ../../tools/lib/bpf/nlattr.o
+@@ -95,6 +96,7 @@ xdp_redirect_cpu-objs := bpf_load.o $(LI
+ xdp_monitor-objs := bpf_load.o $(LIBBPF) xdp_monitor_user.o
+ xdp_rxq_info-objs := bpf_load.o $(LIBBPF) xdp_rxq_info_user.o
+ syscall_tp-objs := bpf_load.o $(LIBBPF) syscall_tp_user.o
++cpustat-objs := bpf_load.o $(LIBBPF) cpustat_user.o
+ 
+ # Tell kbuild to always build the programs
+ always := $(hostprogs-y)
+@@ -146,6 +148,7 @@ always += xdp_monitor_kern.o
+ always += xdp_rxq_info_kern.o
+ always += xdp2skb_meta_kern.o
+ always += syscall_tp_kern.o
++always += cpustat_kern.o
+ 
+ HOSTCFLAGS += -I$(objtree)/usr/include
+ HOSTCFLAGS += -I$(srctree)/tools/lib/
+@@ -190,6 +193,7 @@ HOSTLOADLIBES_xdp_redirect_cpu += -lelf
+ HOSTLOADLIBES_xdp_monitor += -lelf
+ HOSTLOADLIBES_xdp_rxq_info += -lelf
+ HOSTLOADLIBES_syscall_tp += -lelf
++HOSTLOADLIBES_cpustat += -lelf
+ 
+ # Allows pointing LLC/CLANG to a LLVM backend with bpf support, redefine on cmdline:
+ #  make samples/bpf/ LLC=~/git/llvm/build/bin/llc CLANG=~/git/llvm/build/bin/clang
+--- /dev/null
++++ b/samples/bpf/cpustat_kern.c
+@@ -0,0 +1,281 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/version.h>
++#include <linux/ptrace.h>
++#include <uapi/linux/bpf.h>
++#include "bpf_helpers.h"
++
++/*
++ * The CPU number, cstate number and pstate number are based
++ * on 96boards Hikey with octa CA53 CPUs.
++ *
++ * Every CPU have three idle states for cstate:
++ *   WFI, CPU_OFF, CLUSTER_OFF
++ *
++ * Every CPU have 5 operating points:
++ *   208MHz, 432MHz, 729MHz, 960MHz, 1200MHz
++ *
++ * This code is based on these assumption and other platforms
++ * need to adjust these definitions.
++ */
++#define MAX_CPU			8
++#define MAX_PSTATE_ENTRIES	5
++#define MAX_CSTATE_ENTRIES	3
++
++static int cpu_opps[] = { 208000, 432000, 729000, 960000, 1200000 };
++
++/*
++ * my_map structure is used to record cstate and pstate index and
++ * timestamp (Idx, Ts), when new event incoming we need to update
++ * combination for new state index and timestamp (Idx`, Ts`).
++ *
++ * Based on (Idx, Ts) and (Idx`, Ts`) we can calculate the time
++ * interval for the previous state: Duration(Idx) = Ts` - Ts.
++ *
++ * Every CPU has one below array for recording state index and
++ * timestamp, and record for cstate and pstate saperately:
++ *
++ * +--------------------------+
++ * | cstate timestamp         |
++ * +--------------------------+
++ * | cstate index             |
++ * +--------------------------+
++ * | pstate timestamp         |
++ * +--------------------------+
++ * | pstate index             |
++ * +--------------------------+
++ */
++#define MAP_OFF_CSTATE_TIME	0
++#define MAP_OFF_CSTATE_IDX	1
++#define MAP_OFF_PSTATE_TIME	2
++#define MAP_OFF_PSTATE_IDX	3
++#define MAP_OFF_NUM		4
++
++struct bpf_map_def SEC("maps") my_map = {
++	.type = BPF_MAP_TYPE_ARRAY,
++	.key_size = sizeof(u32),
++	.value_size = sizeof(u64),
++	.max_entries = MAX_CPU * MAP_OFF_NUM,
++};
++
++/* cstate_duration records duration time for every idle state per CPU */
++struct bpf_map_def SEC("maps") cstate_duration = {
++	.type = BPF_MAP_TYPE_ARRAY,
++	.key_size = sizeof(u32),
++	.value_size = sizeof(u64),
++	.max_entries = MAX_CPU * MAX_CSTATE_ENTRIES,
++};
++
++/* pstate_duration records duration time for every operating point per CPU */
++struct bpf_map_def SEC("maps") pstate_duration = {
++	.type = BPF_MAP_TYPE_ARRAY,
++	.key_size = sizeof(u32),
++	.value_size = sizeof(u64),
++	.max_entries = MAX_CPU * MAX_PSTATE_ENTRIES,
++};
++
++/*
++ * The trace events for cpu_idle and cpu_frequency are taken from:
++ * /sys/kernel/debug/tracing/events/power/cpu_idle/format
++ * /sys/kernel/debug/tracing/events/power/cpu_frequency/format
++ *
++ * These two events have same format, so define one common structure.
++ */
++struct cpu_args {
++	u64 pad;
++	u32 state;
++	u32 cpu_id;
++};
++
++/* calculate pstate index, returns MAX_PSTATE_ENTRIES for failure */
++static u32 find_cpu_pstate_idx(u32 frequency)
++{
++	u32 i;
++
++	for (i = 0; i < sizeof(cpu_opps) / sizeof(u32); i++) {
++		if (frequency == cpu_opps[i])
++			return i;
++	}
++
++	return i;
++}
++
++SEC("tracepoint/power/cpu_idle")
++int bpf_prog1(struct cpu_args *ctx)
++{
++	u64 *cts, *pts, *cstate, *pstate, prev_state, cur_ts, delta;
++	u32 key, cpu, pstate_idx;
++	u64 *val;
++
++	if (ctx->cpu_id > MAX_CPU)
++		return 0;
++
++	cpu = ctx->cpu_id;
++
++	key = cpu * MAP_OFF_NUM + MAP_OFF_CSTATE_TIME;
++	cts = bpf_map_lookup_elem(&my_map, &key);
++	if (!cts)
++		return 0;
++
++	key = cpu * MAP_OFF_NUM + MAP_OFF_CSTATE_IDX;
++	cstate = bpf_map_lookup_elem(&my_map, &key);
++	if (!cstate)
++		return 0;
++
++	key = cpu * MAP_OFF_NUM + MAP_OFF_PSTATE_TIME;
++	pts = bpf_map_lookup_elem(&my_map, &key);
++	if (!pts)
++		return 0;
++
++	key = cpu * MAP_OFF_NUM + MAP_OFF_PSTATE_IDX;
++	pstate = bpf_map_lookup_elem(&my_map, &key);
++	if (!pstate)
++		return 0;
++
++	prev_state = *cstate;
++	*cstate = ctx->state;
++
++	if (!*cts) {
++		*cts = bpf_ktime_get_ns();
++		return 0;
++	}
++
++	cur_ts = bpf_ktime_get_ns();
++	delta = cur_ts - *cts;
++	*cts = cur_ts;
++
++	/*
++	 * When state doesn't equal to (u32)-1, the cpu will enter
++	 * one idle state; for this case we need to record interval
++	 * for the pstate.
++	 *
++	 *                 OPP2
++	 *            +---------------------+
++	 *     OPP1   |                     |
++	 *   ---------+                     |
++	 *                                  |  Idle state
++	 *                                  +---------------
++	 *
++	 *            |<- pstate duration ->|
++	 *            ^                     ^
++	 *           pts                  cur_ts
++	 */
++	if (ctx->state != (u32)-1) {
++
++		/* record pstate after have first cpu_frequency event */
++		if (!*pts)
++			return 0;
++
++		delta = cur_ts - *pts;
++
++		pstate_idx = find_cpu_pstate_idx(*pstate);
++		if (pstate_idx >= MAX_PSTATE_ENTRIES)
++			return 0;
++
++		key = cpu * MAX_PSTATE_ENTRIES + pstate_idx;
++		val = bpf_map_lookup_elem(&pstate_duration, &key);
++		if (val)
++			__sync_fetch_and_add((long *)val, delta);
++
++	/*
++	 * When state equal to (u32)-1, the cpu just exits from one
++	 * specific idle state; for this case we need to record
++	 * interval for the pstate.
++	 *
++	 *       OPP2
++	 *   -----------+
++	 *              |                          OPP1
++	 *              |                     +-----------
++	 *              |     Idle state      |
++	 *              +---------------------+
++	 *
++	 *              |<- cstate duration ->|
++	 *              ^                     ^
++	 *             cts                  cur_ts
++	 */
++	} else {
++
++		key = cpu * MAX_CSTATE_ENTRIES + prev_state;
++		val = bpf_map_lookup_elem(&cstate_duration, &key);
++		if (val)
++			__sync_fetch_and_add((long *)val, delta);
++	}
++
++	/* Update timestamp for pstate as new start time */
++	if (*pts)
++		*pts = cur_ts;
++
++	return 0;
++}
++
++SEC("tracepoint/power/cpu_frequency")
++int bpf_prog2(struct cpu_args *ctx)
++{
++	u64 *pts, *cstate, *pstate, prev_state, cur_ts, delta;
++	u32 key, cpu, pstate_idx;
++	u64 *val;
++
++	cpu = ctx->cpu_id;
++
++	key = cpu * MAP_OFF_NUM + MAP_OFF_PSTATE_TIME;
++	pts = bpf_map_lookup_elem(&my_map, &key);
++	if (!pts)
++		return 0;
++
++	key = cpu * MAP_OFF_NUM + MAP_OFF_PSTATE_IDX;
++	pstate = bpf_map_lookup_elem(&my_map, &key);
++	if (!pstate)
++		return 0;
++
++	key = cpu * MAP_OFF_NUM + MAP_OFF_CSTATE_IDX;
++	cstate = bpf_map_lookup_elem(&my_map, &key);
++	if (!cstate)
++		return 0;
++
++	prev_state = *pstate;
++	*pstate = ctx->state;
++
++	if (!*pts) {
++		*pts = bpf_ktime_get_ns();
++		return 0;
++	}
++
++	cur_ts = bpf_ktime_get_ns();
++	delta = cur_ts - *pts;
++	*pts = cur_ts;
++
++	/* When CPU is in idle, bail out to skip pstate statistics */
++	if (*cstate != (u32)(-1))
++		return 0;
++
++	/*
++	 * The cpu changes to another different OPP (in below diagram
++	 * change frequency from OPP3 to OPP1), need recording interval
++	 * for previous frequency OPP3 and update timestamp as start
++	 * time for new frequency OPP1.
++	 *
++	 *                 OPP3
++	 *            +---------------------+
++	 *     OPP2   |                     |
++	 *   ---------+                     |
++	 *                                  |    OPP1
++	 *                                  +---------------
++	 *
++	 *            |<- pstate duration ->|
++	 *            ^                     ^
++	 *           pts                  cur_ts
++	 */
++	pstate_idx = find_cpu_pstate_idx(*pstate);
++	if (pstate_idx >= MAX_PSTATE_ENTRIES)
++		return 0;
++
++	key = cpu * MAX_PSTATE_ENTRIES + pstate_idx;
++	val = bpf_map_lookup_elem(&pstate_duration, &key);
++	if (val)
++		__sync_fetch_and_add((long *)val, delta);
++
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";
++u32 _version SEC("version") = LINUX_VERSION_CODE;
+--- /dev/null
++++ b/samples/bpf/cpustat_user.c
+@@ -0,0 +1,219 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#define _GNU_SOURCE
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <signal.h>
++#include <sched.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <linux/bpf.h>
++#include <locale.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/time.h>
++#include <sys/resource.h>
++#include <sys/wait.h>
++
++#include "libbpf.h"
++#include "bpf_load.h"
++
++#define MAX_CPU			8
++#define MAX_PSTATE_ENTRIES	5
++#define MAX_CSTATE_ENTRIES	3
++#define MAX_STARS		40
++
++#define CPUFREQ_MAX_SYSFS_PATH	"/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
++#define CPUFREQ_LOWEST_FREQ	"208000"
++#define CPUFREQ_HIGHEST_FREQ	"12000000"
++
++struct cpu_stat_data {
++	unsigned long cstate[MAX_CSTATE_ENTRIES];
++	unsigned long pstate[MAX_PSTATE_ENTRIES];
++};
++
++static struct cpu_stat_data stat_data[MAX_CPU];
++
++static void cpu_stat_print(void)
++{
++	int i, j;
++	char state_str[sizeof("cstate-9")];
++	struct cpu_stat_data *data;
++
++	/* Clear screen */
++	printf("\033[2J");
++
++	/* Header */
++	printf("\nCPU states statistics:\n");
++	printf("%-10s ", "state(ms)");
++
++	for (i = 0; i < MAX_CSTATE_ENTRIES; i++) {
++		sprintf(state_str, "cstate-%d", i);
++		printf("%-11s ", state_str);
++	}
++
++	for (i = 0; i < MAX_PSTATE_ENTRIES; i++) {
++		sprintf(state_str, "pstate-%d", i);
++		printf("%-11s ", state_str);
++	}
++
++	printf("\n");
++
++	for (j = 0; j < MAX_CPU; j++) {
++		data = &stat_data[j];
++
++		printf("CPU-%-6d ", j);
++		for (i = 0; i < MAX_CSTATE_ENTRIES; i++)
++			printf("%-11ld ", data->cstate[i] / 1000000);
++
++		for (i = 0; i < MAX_PSTATE_ENTRIES; i++)
++			printf("%-11ld ", data->pstate[i] / 1000000);
++
++		printf("\n");
++	}
++}
++
++static void cpu_stat_update(int cstate_fd, int pstate_fd)
++{
++	unsigned long key, value;
++	int c, i;
++
++	for (c = 0; c < MAX_CPU; c++) {
++		for (i = 0; i < MAX_CSTATE_ENTRIES; i++) {
++			key = c * MAX_CSTATE_ENTRIES + i;
++			bpf_map_lookup_elem(cstate_fd, &key, &value);
++			stat_data[c].cstate[i] = value;
++		}
++
++		for (i = 0; i < MAX_PSTATE_ENTRIES; i++) {
++			key = c * MAX_PSTATE_ENTRIES + i;
++			bpf_map_lookup_elem(pstate_fd, &key, &value);
++			stat_data[c].pstate[i] = value;
++		}
++	}
++}
++
++/*
++ * This function is copied from 'idlestat' tool function
++ * idlestat_wake_all() in idlestate.c.
++ *
++ * It sets the self running task affinity to cpus one by one so can wake up
++ * the specific CPU to handle scheduling; this results in all cpus can be
++ * waken up once and produce ftrace event 'trace_cpu_idle'.
++ */
++static int cpu_stat_inject_cpu_idle_event(void)
++{
++	int rcpu, i, ret;
++	cpu_set_t cpumask;
++	cpu_set_t original_cpumask;
++
++	ret = sysconf(_SC_NPROCESSORS_CONF);
++	if (ret < 0)
++		return -1;
++
++	rcpu = sched_getcpu();
++	if (rcpu < 0)
++		return -1;
++
++	/* Keep track of the CPUs we will run on */
++	sched_getaffinity(0, sizeof(original_cpumask), &original_cpumask);
++
++	for (i = 0; i < ret; i++) {
++
++		/* Pointless to wake up ourself */
++		if (i == rcpu)
++			continue;
++
++		/* Pointless to wake CPUs we will not run on */
++		if (!CPU_ISSET(i, &original_cpumask))
++			continue;
++
++		CPU_ZERO(&cpumask);
++		CPU_SET(i, &cpumask);
++
++		sched_setaffinity(0, sizeof(cpumask), &cpumask);
++	}
++
++	/* Enable all the CPUs of the original mask */
++	sched_setaffinity(0, sizeof(original_cpumask), &original_cpumask);
++	return 0;
++}
++
++/*
++ * It's possible to have no any frequency change for long time and cannot
++ * get ftrace event 'trace_cpu_frequency' for long period, this introduces
++ * big deviation for pstate statistics.
++ *
++ * To solve this issue, below code forces to set 'scaling_max_freq' to 208MHz
++ * for triggering ftrace event 'trace_cpu_frequency' and then recovery back to
++ * the maximum frequency value 1.2GHz.
++ */
++static int cpu_stat_inject_cpu_frequency_event(void)
++{
++	int len, fd;
++
++	fd = open(CPUFREQ_MAX_SYSFS_PATH, O_WRONLY);
++	if (fd < 0) {
++		printf("failed to open scaling_max_freq, errno=%d\n", errno);
++		return fd;
++	}
++
++	len = write(fd, CPUFREQ_LOWEST_FREQ, strlen(CPUFREQ_LOWEST_FREQ));
++	if (len < 0) {
++		printf("failed to open scaling_max_freq, errno=%d\n", errno);
++		goto err;
++	}
++
++	len = write(fd, CPUFREQ_HIGHEST_FREQ, strlen(CPUFREQ_HIGHEST_FREQ));
++	if (len < 0) {
++		printf("failed to open scaling_max_freq, errno=%d\n", errno);
++		goto err;
++	}
++
++err:
++	close(fd);
++	return len;
++}
++
++static void int_exit(int sig)
++{
++	cpu_stat_inject_cpu_idle_event();
++	cpu_stat_inject_cpu_frequency_event();
++	cpu_stat_update(map_fd[1], map_fd[2]);
++	cpu_stat_print();
++	exit(0);
++}
++
++int main(int argc, char **argv)
++{
++	char filename[256];
++	int ret;
++
++	snprintf(filename, sizeof(filename), "%s_kern.o", argv[0]);
++
++	if (load_bpf_file(filename)) {
++		printf("%s", bpf_log_buf);
++		return 1;
++	}
++
++	ret = cpu_stat_inject_cpu_idle_event();
++	if (ret < 0)
++		return 1;
++
++	ret = cpu_stat_inject_cpu_frequency_event();
++	if (ret < 0)
++		return 1;
++
++	signal(SIGINT, int_exit);
++	signal(SIGTERM, int_exit);
++
++	while (1) {
++		cpu_stat_update(map_fd[1], map_fd[2]);
++		cpu_stat_print();
++		sleep(5);
++	}
++
++	return 0;
++}

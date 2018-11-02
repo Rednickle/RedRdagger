@@ -1,0 +1,179 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Thu, 11 Jan 2018 20:29:17 -0800
+Subject: nfp: bpf: implement bpf map offload
+Patch-mainline: v4.16-rc1
+Git-commit: 1bba4c413a328bfd216d59a212bec371e032391b
+References: bsc#1109837
+
+Plug in to the stack's map offload callbacks for BPF map offload.
+Get next call needs some special handling on the FW side, since
+we can't send a NULL pointer to the FW there is a get first entry
+FW command.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/main.c    |    1 
+ drivers/net/ethernet/netronome/nfp/bpf/main.h    |    4 
+ drivers/net/ethernet/netronome/nfp/bpf/offload.c |  104 +++++++++++++++++++++++
+ 3 files changed, 109 insertions(+)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -381,6 +381,7 @@ static void nfp_bpf_clean(struct nfp_app
+ 
+ 	WARN_ON(!skb_queue_empty(&bpf->cmsg_replies));
+ 	WARN_ON(!list_empty(&bpf->map_list));
++	WARN_ON(bpf->maps_in_use || bpf->map_elems_in_use);
+ 	kfree(bpf);
+ }
+ 
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -108,6 +108,8 @@ enum pkt_vec {
+  * @cmsg_wq:		work queue for waiting for cmsg replies
+  *
+  * @map_list:		list of offloaded maps
++ * @maps_in_use:	number of currently offloaded maps
++ * @map_elems_in_use:	number of elements allocated to offloaded maps
+  *
+  * @adjust_head:	adjust head capability
+  * @flags:		extra flags for adjust head
+@@ -138,6 +140,8 @@ struct nfp_app_bpf {
+ 	struct wait_queue_head cmsg_wq;
+ 
+ 	struct list_head map_list;
++	unsigned int maps_in_use;
++	unsigned int map_elems_in_use;
+ 
+ 	struct nfp_bpf_cap_adjust_head {
+ 		u32 flags;
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@ -36,6 +36,9 @@
+  * Netronome network device driver: TC offload functions for PF and VF
+  */
+ 
++#define pr_fmt(fmt)	"NFP net bpf: " fmt
++
++#include <linux/bpf.h>
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+ #include <linux/pci.h>
+@@ -153,6 +156,103 @@ static int nfp_bpf_destroy(struct nfp_ne
+ 	return 0;
+ }
+ 
++static int
++nfp_bpf_map_get_next_key(struct bpf_offloaded_map *offmap,
++			 void *key, void *next_key)
++{
++	if (!key)
++		return nfp_bpf_ctrl_getfirst_entry(offmap, next_key);
++	return nfp_bpf_ctrl_getnext_entry(offmap, key, next_key);
++}
++
++static int
++nfp_bpf_map_delete_elem(struct bpf_offloaded_map *offmap, void *key)
++{
++	return nfp_bpf_ctrl_del_entry(offmap, key);
++}
++
++static const struct bpf_map_dev_ops nfp_bpf_map_ops = {
++	.map_get_next_key	= nfp_bpf_map_get_next_key,
++	.map_lookup_elem	= nfp_bpf_ctrl_lookup_entry,
++	.map_update_elem	= nfp_bpf_ctrl_update_entry,
++	.map_delete_elem	= nfp_bpf_map_delete_elem,
++};
++
++static int
++nfp_bpf_map_alloc(struct nfp_app_bpf *bpf, struct bpf_offloaded_map *offmap)
++{
++	struct nfp_bpf_map *nfp_map;
++	long long int res;
++
++	if (!bpf->maps.types)
++		return -EOPNOTSUPP;
++
++	if (offmap->map.map_flags ||
++	    offmap->map.numa_node != NUMA_NO_NODE) {
++		pr_info("map flags are not supported\n");
++		return -EINVAL;
++	}
++
++	if (!(bpf->maps.types & 1 << offmap->map.map_type)) {
++		pr_info("map type not supported\n");
++		return -EOPNOTSUPP;
++	}
++	if (bpf->maps.max_maps == bpf->maps_in_use) {
++		pr_info("too many maps for a device\n");
++		return -ENOMEM;
++	}
++	if (bpf->maps.max_elems - bpf->map_elems_in_use <
++	    offmap->map.max_entries) {
++		pr_info("map with too many elements: %u, left: %u\n",
++			offmap->map.max_entries,
++			bpf->maps.max_elems - bpf->map_elems_in_use);
++		return -ENOMEM;
++	}
++	if (offmap->map.key_size > bpf->maps.max_key_sz ||
++	    offmap->map.value_size > bpf->maps.max_val_sz ||
++	    round_up(offmap->map.key_size, 8) +
++	    round_up(offmap->map.value_size, 8) > bpf->maps.max_elem_sz) {
++		pr_info("elements don't fit in device constraints\n");
++		return -ENOMEM;
++	}
++
++	nfp_map = kzalloc(sizeof(*nfp_map), GFP_USER);
++	if (!nfp_map)
++		return -ENOMEM;
++
++	offmap->dev_priv = nfp_map;
++	nfp_map->offmap = offmap;
++	nfp_map->bpf = bpf;
++
++	res = nfp_bpf_ctrl_alloc_map(bpf, &offmap->map);
++	if (res < 0) {
++		kfree(nfp_map);
++		return res;
++	}
++
++	nfp_map->tid = res;
++	offmap->dev_ops = &nfp_bpf_map_ops;
++	bpf->maps_in_use++;
++	bpf->map_elems_in_use += offmap->map.max_entries;
++	list_add_tail(&nfp_map->l, &bpf->map_list);
++
++	return 0;
++}
++
++static int
++nfp_bpf_map_free(struct nfp_app_bpf *bpf, struct bpf_offloaded_map *offmap)
++{
++	struct nfp_bpf_map *nfp_map = offmap->dev_priv;
++
++	nfp_bpf_ctrl_free_map(bpf, nfp_map);
++	list_del_init(&nfp_map->l);
++	bpf->map_elems_in_use -= offmap->map.max_entries;
++	bpf->maps_in_use--;
++	kfree(nfp_map);
++
++	return 0;
++}
++
+ int nfp_ndo_bpf(struct nfp_app *app, struct nfp_net *nn, struct netdev_bpf *bpf)
+ {
+ 	switch (bpf->command) {
+@@ -162,6 +262,10 @@ int nfp_ndo_bpf(struct nfp_app *app, str
+ 		return nfp_bpf_translate(nn, bpf->offload.prog);
+ 	case BPF_OFFLOAD_DESTROY:
+ 		return nfp_bpf_destroy(nn, bpf->offload.prog);
++	case BPF_OFFLOAD_MAP_ALLOC:
++		return nfp_bpf_map_alloc(app->priv, bpf->offmap);
++	case BPF_OFFLOAD_MAP_FREE:
++		return nfp_bpf_map_free(app->priv, bpf->offmap);
+ 	default:
+ 		return -EINVAL;
+ 	}

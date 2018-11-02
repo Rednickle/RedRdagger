@@ -1,0 +1,262 @@
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Sun, 2 Jul 2017 02:13:26 +0200
+Subject: bpf: add bpf_skb_adjust_room helper
+Patch-mainline: v4.13-rc1
+Git-commit: 2be7e212d5419a400d051c84ca9fdd083e5aacac
+References: bsc#1109837
+
+This work adds a helper that can be used to adjust net room of an
+skb. The helper is generic and can be further extended in future.
+Main use case is for having a programmatic way to add/remove room to
+v4/v6 header options along with cls_bpf on egress and ingress hook
+of the data path. It reuses most of the infrastructure that we added
+for the bpf_skb_change_type() helper which can be used in nat64
+translations. Similarly, the helper only takes care of adjusting the
+room so that related data is populated and csum adapted out of the
+BPF program using it.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/uapi/linux/bpf.h       |   16 ++++-
+ net/core/filter.c              |  126 +++++++++++++++++++++++++++++++++++++++--
+ tools/include/uapi/linux/bpf.h |   16 ++++-
+ 3 files changed, 151 insertions(+), 7 deletions(-)
+
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -528,6 +528,14 @@ union bpf_attr {
+  *     @optval: pointer to option value
+  *     @optlen: length of optval in byes
+  *     Return: 0 or negative error
++ *
++ * int bpf_skb_adjust_room(skb, len_diff, mode, flags)
++ *     Grow or shrink room in sk_buff.
++ *     @skb: pointer to skb
++ *     @len_diff: (signed) amount of room to grow/shrink
++ *     @mode: operation mode (enum bpf_adj_room_mode)
++ *     @flags: reserved for future use
++ *     Return: 0 on success or negative error code
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -579,7 +587,8 @@ union bpf_attr {
+ 	FN(get_socket_cookie),		\
+ 	FN(get_socket_uid),		\
+ 	FN(set_hash),			\
+-	FN(setsockopt),
++	FN(setsockopt),			\
++	FN(skb_adjust_room),
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+  * function eBPF program intends to call
+@@ -629,6 +638,11 @@ enum bpf_func_id {
+ /* BPF_FUNC_perf_event_output for sk_buff input context. */
+ #define BPF_F_CTXLEN_MASK		(0xfffffULL << 32)
+ 
++/* Mode for BPF_FUNC_skb_adjust_room helper. */
++enum bpf_adj_room_mode {
++	BPF_ADJ_ROOM_NET,
++};
++
+ /* user accessible mirror of in-kernel sk_buff.
+  * new fields can only be added to the end of this structure
+  */
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -2154,6 +2154,124 @@ static const struct bpf_func_proto bpf_s
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ 
++static u32 bpf_skb_net_base_len(const struct sk_buff *skb)
++{
++	switch (skb->protocol) {
++	case htons(ETH_P_IP):
++		return sizeof(struct iphdr);
++	case htons(ETH_P_IPV6):
++		return sizeof(struct ipv6hdr);
++	default:
++		return ~0U;
++	}
++}
++
++static int bpf_skb_net_grow(struct sk_buff *skb, u32 len_diff)
++{
++	u32 off = skb_mac_header_len(skb) + bpf_skb_net_base_len(skb);
++	int ret;
++
++	ret = skb_cow(skb, len_diff);
++	if (unlikely(ret < 0))
++		return ret;
++
++	ret = bpf_skb_net_hdr_push(skb, off, len_diff);
++	if (unlikely(ret < 0))
++		return ret;
++
++	if (skb_is_gso(skb)) {
++		/* Due to header grow, MSS needs to be downgraded. */
++		skb_shinfo(skb)->gso_size -= len_diff;
++		/* Header must be checked, and gso_segs recomputed. */
++		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
++		skb_shinfo(skb)->gso_segs = 0;
++	}
++
++	return 0;
++}
++
++static int bpf_skb_net_shrink(struct sk_buff *skb, u32 len_diff)
++{
++	u32 off = skb_mac_header_len(skb) + bpf_skb_net_base_len(skb);
++	int ret;
++
++	ret = skb_unclone(skb, GFP_ATOMIC);
++	if (unlikely(ret < 0))
++		return ret;
++
++	ret = bpf_skb_net_hdr_pop(skb, off, len_diff);
++	if (unlikely(ret < 0))
++		return ret;
++
++	if (skb_is_gso(skb)) {
++		/* Due to header shrink, MSS can be upgraded. */
++		skb_shinfo(skb)->gso_size += len_diff;
++		/* Header must be checked, and gso_segs recomputed. */
++		skb_shinfo(skb)->gso_type |= SKB_GSO_DODGY;
++		skb_shinfo(skb)->gso_segs = 0;
++	}
++
++	return 0;
++}
++
++static u32 __bpf_skb_max_len(const struct sk_buff *skb)
++{
++	return skb->dev->mtu + skb->dev->hard_header_len;
++}
++
++static int bpf_skb_adjust_net(struct sk_buff *skb, s32 len_diff)
++{
++	bool trans_same = skb->transport_header == skb->network_header;
++	u32 len_cur, len_diff_abs = abs(len_diff);
++	u32 len_min = bpf_skb_net_base_len(skb);
++	u32 len_max = __bpf_skb_max_len(skb);
++	__be16 proto = skb->protocol;
++	bool shrink = len_diff < 0;
++	int ret;
++
++	if (unlikely(len_diff_abs > 0xfffU))
++		return -EFAULT;
++	if (unlikely(proto != htons(ETH_P_IP) &&
++		     proto != htons(ETH_P_IPV6)))
++		return -ENOTSUPP;
++
++	len_cur = skb->len - skb_network_offset(skb);
++	if (skb_transport_header_was_set(skb) && !trans_same)
++		len_cur = skb_network_header_len(skb);
++	if ((shrink && (len_diff_abs >= len_cur ||
++			len_cur - len_diff_abs < len_min)) ||
++	    (!shrink && (skb->len + len_diff_abs > len_max &&
++			 !skb_is_gso(skb))))
++		return -ENOTSUPP;
++
++	ret = shrink ? bpf_skb_net_shrink(skb, len_diff_abs) :
++		       bpf_skb_net_grow(skb, len_diff_abs);
++
++	bpf_compute_data_end(skb);
++	return 0;
++}
++
++BPF_CALL_4(bpf_skb_adjust_room, struct sk_buff *, skb, s32, len_diff,
++	   u32, mode, u64, flags)
++{
++	if (unlikely(flags))
++		return -EINVAL;
++	if (likely(mode == BPF_ADJ_ROOM_NET))
++		return bpf_skb_adjust_net(skb, len_diff);
++
++	return -ENOTSUPP;
++}
++
++static const struct bpf_func_proto bpf_skb_adjust_room_proto = {
++	.func		= bpf_skb_adjust_room,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_ANYTHING,
++	.arg3_type	= ARG_ANYTHING,
++	.arg4_type	= ARG_ANYTHING,
++};
++
+ static u32 __bpf_skb_min_len(const struct sk_buff *skb)
+ {
+ 	u32 min_len = skb_network_offset(skb);
+@@ -2166,11 +2284,6 @@ static u32 __bpf_skb_min_len(const struc
+ 	return min_len;
+ }
+ 
+-static u32 __bpf_skb_max_len(const struct sk_buff *skb)
+-{
+-	return skb->dev->mtu + skb->dev->hard_header_len;
+-}
+-
+ static int bpf_skb_grow_rcsum(struct sk_buff *skb, unsigned int new_len)
+ {
+ 	unsigned int old_len = skb->len;
+@@ -2307,6 +2420,7 @@ bool bpf_helper_changes_pkt_data(void *f
+ 	    func == bpf_skb_change_proto ||
+ 	    func == bpf_skb_change_head ||
+ 	    func == bpf_skb_change_tail ||
++	    func == bpf_skb_adjust_room ||
+ 	    func == bpf_skb_pull_data ||
+ 	    func == bpf_clone_redirect ||
+ 	    func == bpf_l3_csum_replace ||
+@@ -2849,6 +2963,8 @@ tc_cls_act_func_proto(enum bpf_func_id f
+ 		return &bpf_skb_change_proto_proto;
+ 	case BPF_FUNC_skb_change_type:
+ 		return &bpf_skb_change_type_proto;
++	case BPF_FUNC_skb_adjust_room:
++		return &bpf_skb_adjust_room_proto;
+ 	case BPF_FUNC_skb_change_tail:
+ 		return &bpf_skb_change_tail_proto;
+ 	case BPF_FUNC_skb_get_tunnel_key:
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -508,6 +508,14 @@ union bpf_attr {
+  *     @optval: pointer to option value
+  *     @optlen: length of optval in byes
+  *     Return: 0 or negative error
++ *
++ * int bpf_skb_adjust_room(skb, len_diff, mode, flags)
++ *     Grow or shrink room in sk_buff.
++ *     @skb: pointer to skb
++ *     @len_diff: (signed) amount of room to grow/shrink
++ *     @mode: operation mode (enum bpf_adj_room_mode)
++ *     @flags: reserved for future use
++ *     Return: 0 on success or negative error code
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -559,7 +567,8 @@ union bpf_attr {
+ 	FN(get_socket_cookie),		\
+ 	FN(get_socket_uid),		\
+ 	FN(set_hash),			\
+-	FN(setsockopt),
++	FN(setsockopt),			\
++	FN(skb_adjust_room),
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+  * function eBPF program intends to call
+@@ -609,6 +618,11 @@ enum bpf_func_id {
+ /* BPF_FUNC_perf_event_output for sk_buff input context. */
+ #define BPF_F_CTXLEN_MASK		(0xfffffULL << 32)
+ 
++/* Mode for BPF_FUNC_skb_adjust_room helper. */
++enum bpf_adj_room_mode {
++	BPF_ADJ_ROOM_NET_OPTS,
++};
++
+ /* user accessible mirror of in-kernel sk_buff.
+  * new fields can only be added to the end of this structure
+  */

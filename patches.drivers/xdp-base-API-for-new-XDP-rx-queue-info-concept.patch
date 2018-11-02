@@ -1,0 +1,186 @@
+From: Jesper Dangaard Brouer <brouer@redhat.com>
+Date: Wed, 3 Jan 2018 11:25:13 +0100
+Subject: xdp: base API for new XDP rx-queue info concept
+Patch-mainline: v4.16-rc1
+Git-commit: aecd67b60722dd24353b0bc50e78a55b30707dcd
+References: bsc#1109837
+
+This patch only introduce the core data structures and API functions.
+All XDP enabled drivers must use the API before this info can used.
+
+There is a need for XDP to know more about the RX-queue a given XDP
+frames have arrived on.  For both the XDP bpf-prog and kernel side.
+
+Instead of extending xdp_buff each time new info is needed, the patch
+creates a separate read-mostly struct xdp_rxq_info, that contains this
+info.  We stress this data/cache-line is for read-only info.  This is
+NOT for dynamic per packet info, use the data_meta for such use-cases.
+
+The performance advantage is this info can be setup at RX-ring init
+time, instead of updating N-members in xdp_buff.  A possible (driver
+level) micro optimization is that xdp_buff->rxq assignment could be
+done once per XDP/NAPI loop.  The extra pointer deref only happens for
+program needing access to this info (thus, no slowdown to existing
+use-cases).
+
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/filter.h |    2 +
+ include/net/xdp.h      |   47 ++++++++++++++++++++++++++++++++++
+ net/core/Makefile      |    2 -
+ net/core/xdp.c         |   67 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 117 insertions(+), 1 deletion(-)
+ create mode 100644 include/net/xdp.h
+ create mode 100644 net/core/xdp.c
+
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -18,6 +18,7 @@
+ #include <linux/cryptohash.h>
+ #include <linux/kallsyms.h>
+ 
++#include <net/xdp.h>
+ #include <net/sch_generic.h>
+ 
+ #ifdef CONFIG_ARCH_HAS_SET_MEMORY
+@@ -505,6 +506,7 @@ struct xdp_buff {
+ 	void *data_end;
+ 	void *data_meta;
+ 	void *data_hard_start;
++	struct xdp_rxq_info *rxq;
+ };
+ 
+ /* Compute the linear packet data range [data, data_end) which
+--- /dev/null
++++ b/include/net/xdp.h
+@@ -0,0 +1,47 @@
++/* include/net/xdp.h
++ *
++ * Copyright (c) 2017 Jesper Dangaard Brouer, Red Hat Inc.
++ * Released under terms in GPL version 2.  See COPYING.
++ */
++#ifndef __LINUX_NET_XDP_H__
++#define __LINUX_NET_XDP_H__
++
++/**
++ * DOC: XDP RX-queue information
++ *
++ * The XDP RX-queue info (xdp_rxq_info) is associated with the driver
++ * level RX-ring queues.  It is information that is specific to how
++ * the driver have configured a given RX-ring queue.
++ *
++ * Each xdp_buff frame received in the driver carry a (pointer)
++ * reference to this xdp_rxq_info structure.  This provides the XDP
++ * data-path read-access to RX-info for both kernel and bpf-side
++ * (limited subset).
++ *
++ * For now, direct access is only safe while running in NAPI/softirq
++ * context.  Contents is read-mostly and must not be updated during
++ * driver NAPI/softirq poll.
++ *
++ * The driver usage API is a register and unregister API.
++ *
++ * The struct is not directly tied to the XDP prog.  A new XDP prog
++ * can be attached as long as it doesn't change the underlying
++ * RX-ring.  If the RX-ring does change significantly, the NIC driver
++ * naturally need to stop the RX-ring before purging and reallocating
++ * memory.  In that process the driver MUST call unregistor (which
++ * also apply for driver shutdown and unload).  The register API is
++ * also mandatory during RX-ring setup.
++ */
++
++struct xdp_rxq_info {
++	struct net_device *dev;
++	u32 queue_index;
++	u32 reg_state;
++} ____cacheline_aligned; /* perf critical, avoid false-sharing */
++
++int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
++		     struct net_device *dev, u32 queue_index);
++void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq);
++void xdp_rxq_info_unused(struct xdp_rxq_info *xdp_rxq);
++
++#endif /* __LINUX_NET_XDP_H__ */
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -10,7 +10,7 @@ obj-$(CONFIG_SYSCTL) += sysctl_net_core.
+ obj-y		     += dev.o ethtool.o dev_addr_lists.o dst.o netevent.o \
+ 			neighbour.o rtnetlink.o utils.o link_watch.o filter.o \
+ 			sock_diag.o dev_ioctl.o tso.o sock_reuseport.o \
+-			fib_notifier.o
++			fib_notifier.o xdp.o
+ 
+ obj-$(CONFIG_XFRM) += flow.o
+ obj-y += net-sysfs.o
+--- /dev/null
++++ b/net/core/xdp.c
+@@ -0,0 +1,67 @@
++/* net/core/xdp.c
++ *
++ * Copyright (c) 2017 Jesper Dangaard Brouer, Red Hat Inc.
++ * Released under terms in GPL version 2.  See COPYING.
++ */
++#include <linux/types.h>
++#include <linux/mm.h>
++
++#include <net/xdp.h>
++
++#define REG_STATE_NEW		0x0
++#define REG_STATE_REGISTERED	0x1
++#define REG_STATE_UNREGISTERED	0x2
++#define REG_STATE_UNUSED	0x3
++
++void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq)
++{
++	/* Simplify driver cleanup code paths, allow unreg "unused" */
++	if (xdp_rxq->reg_state == REG_STATE_UNUSED)
++		return;
++
++	WARN(!(xdp_rxq->reg_state == REG_STATE_REGISTERED), "Driver BUG");
++
++	xdp_rxq->reg_state = REG_STATE_UNREGISTERED;
++	xdp_rxq->dev = NULL;
++}
++EXPORT_SYMBOL_GPL(xdp_rxq_info_unreg);
++
++static void xdp_rxq_info_init(struct xdp_rxq_info *xdp_rxq)
++{
++	memset(xdp_rxq, 0, sizeof(*xdp_rxq));
++}
++
++/* Returns 0 on success, negative on failure */
++int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
++		     struct net_device *dev, u32 queue_index)
++{
++	if (xdp_rxq->reg_state == REG_STATE_UNUSED) {
++		WARN(1, "Driver promised not to register this");
++		return -EINVAL;
++	}
++
++	if (xdp_rxq->reg_state == REG_STATE_REGISTERED) {
++		WARN(1, "Missing unregister, handled but fix driver");
++		xdp_rxq_info_unreg(xdp_rxq);
++	}
++
++	if (!dev) {
++		WARN(1, "Missing net_device from driver");
++		return -ENODEV;
++	}
++
++	/* State either UNREGISTERED or NEW */
++	xdp_rxq_info_init(xdp_rxq);
++	xdp_rxq->dev = dev;
++	xdp_rxq->queue_index = queue_index;
++
++	xdp_rxq->reg_state = REG_STATE_REGISTERED;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xdp_rxq_info_reg);
++
++void xdp_rxq_info_unused(struct xdp_rxq_info *xdp_rxq)
++{
++	xdp_rxq->reg_state = REG_STATE_UNUSED;
++}
++EXPORT_SYMBOL_GPL(xdp_rxq_info_unused);

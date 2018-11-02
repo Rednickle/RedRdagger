@@ -1,0 +1,306 @@
+From: Petr Machata <petrm@mellanox.com>
+Date: Sat, 2 Sep 2017 23:49:25 +0200
+Subject: mlxsw: spectrum_router: Support IPv4 underlay decap
+Patch-mainline: v4.14-rc1
+Git-commit: 4607f6d26950ffb3c4c8e5b2db42f364f19dd26c
+References: bsc#1112374
+
+Unlike encapsulation, which is represented by a next hop forwarding to
+an IPIP tunnel, decapsulation is a type of local route. It is created
+for local routes whose prefix corresponds to the local address of one of
+offloaded IPIP tunnels. When the tunnel is removed (i.e. all the encap
+next hops are removed), the decap offload is migrated back to a trap for
+resolution in slow path.
+
+This patch assumes that decap route is already present when encap route
+is added. A follow-up patch will fix this issue.
+
+Note that this patch only supports IPv4 underlay. Support for IPv6
+underlay will be subject to follow-up work apart from this patchset.
+
+Signed-off-by: Petr Machata <petrm@mellanox.com>
+Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h   |    7 
+ drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c |  141 +++++++++++++++++-
+ drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h |    3 
+ 3 files changed, 146 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
+@@ -36,6 +36,7 @@
+ #define _MLXSW_IPIP_H_
+ 
+ #include "spectrum_router.h"
++#include <net/ip_fib.h>
+ 
+ enum mlxsw_sp_ipip_type {
+ 	MLXSW_SP_IPIP_TYPE_MAX,
+@@ -46,6 +47,7 @@ struct mlxsw_sp_ipip_entry {
+ 	struct net_device *ol_dev; /* Overlay. */
+ 	struct mlxsw_sp_rif_ipip_lb *ol_lb;
+ 	unsigned int ref_count; /* Number of next hops using the tunnel. */
++	struct mlxsw_sp_fib_entry *decap_fib_entry;
+ 	struct list_head ipip_list_node;
+ };
+ 
+@@ -64,6 +66,11 @@ struct mlxsw_sp_ipip_ops {
+ 	struct mlxsw_sp_rif_ipip_lb_config
+ 	(*ol_loopback_config)(struct mlxsw_sp *mlxsw_sp,
+ 			      const struct net_device *ol_dev);
++
++	int (*fib_entry_op)(struct mlxsw_sp *mlxsw_sp,
++			    struct mlxsw_sp_ipip_entry *ipip_entry,
++			    enum mlxsw_reg_ralue_op op,
++			    u32 tunnel_index);
+ };
+ 
+ extern const struct mlxsw_sp_ipip_ops *mlxsw_sp_ipip_ops_arr[];
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@ -381,6 +381,14 @@ enum mlxsw_sp_fib_entry_type {
+ 	MLXSW_SP_FIB_ENTRY_TYPE_REMOTE,
+ 	MLXSW_SP_FIB_ENTRY_TYPE_LOCAL,
+ 	MLXSW_SP_FIB_ENTRY_TYPE_TRAP,
++
++	/* This is a special case of local delivery, where a packet should be
++	 * decapsulated on reception. Note that there is no corresponding ENCAP,
++	 * because that's a type of next hop, not of FIB entry. (There can be
++	 * several next hops in a REMOTE entry, and some of them may be
++	 * encapsulating entries.)
++	 */
++	MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP,
+ };
+ 
+ struct mlxsw_sp_nexthop_group;
+@@ -394,12 +402,18 @@ struct mlxsw_sp_fib_node {
+ 	struct mlxsw_sp_fib_key key;
+ };
+ 
++struct mlxsw_sp_fib_entry_decap {
++	struct mlxsw_sp_ipip_entry *ipip_entry;
++	u32 tunnel_index;
++};
++
+ struct mlxsw_sp_fib_entry {
+ 	struct list_head list;
+ 	struct mlxsw_sp_fib_node *fib_node;
+ 	enum mlxsw_sp_fib_entry_type type;
+ 	struct list_head nexthop_group_node;
+ 	struct mlxsw_sp_nexthop_group *nh_group;
++	struct mlxsw_sp_fib_entry_decap decap; /* Valid for decap entries. */
+ };
+ 
+ struct mlxsw_sp_fib4_entry {
+@@ -1031,6 +1045,48 @@ mlxsw_sp_ipip_entry_saddr_matches(struct
+ 	       mlxsw_sp_l3addr_eq(&tun_saddr, &saddr);
+ }
+ 
++static int
++mlxsw_sp_fib_entry_decap_init(struct mlxsw_sp *mlxsw_sp,
++			      struct mlxsw_sp_fib_entry *fib_entry,
++			      struct mlxsw_sp_ipip_entry *ipip_entry)
++{
++	u32 tunnel_index;
++	int err;
++
++	err = mlxsw_sp_kvdl_alloc(mlxsw_sp, 1, &tunnel_index);
++	if (err)
++		return err;
++
++	ipip_entry->decap_fib_entry = fib_entry;
++	fib_entry->decap.ipip_entry = ipip_entry;
++	fib_entry->decap.tunnel_index = tunnel_index;
++	return 0;
++}
++
++static void mlxsw_sp_fib_entry_decap_fini(struct mlxsw_sp *mlxsw_sp,
++					  struct mlxsw_sp_fib_entry *fib_entry)
++{
++	/* Unlink this node from the IPIP entry that it's the decap entry of. */
++	fib_entry->decap.ipip_entry->decap_fib_entry = NULL;
++	fib_entry->decap.ipip_entry = NULL;
++	mlxsw_sp_kvdl_free(mlxsw_sp, fib_entry->decap.tunnel_index);
++}
++
++static int mlxsw_sp_fib_entry_update(struct mlxsw_sp *mlxsw_sp,
++				     struct mlxsw_sp_fib_entry *fib_entry);
++
++static void
++mlxsw_sp_ipip_entry_demote_decap(struct mlxsw_sp *mlxsw_sp,
++				 struct mlxsw_sp_ipip_entry *ipip_entry)
++{
++	struct mlxsw_sp_fib_entry *fib_entry = ipip_entry->decap_fib_entry;
++
++	mlxsw_sp_fib_entry_decap_fini(mlxsw_sp, fib_entry);
++	fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_TRAP;
++
++	mlxsw_sp_fib_entry_update(mlxsw_sp, fib_entry);
++}
++
+ static struct mlxsw_sp_ipip_entry *
+ mlxsw_sp_ipip_entry_get(struct mlxsw_sp *mlxsw_sp,
+ 			enum mlxsw_sp_ipip_type ipipt,
+@@ -1076,10 +1132,51 @@ mlxsw_sp_ipip_entry_put(struct mlxsw_sp
+ {
+ 	if (--ipip_entry->ref_count == 0) {
+ 		list_del(&ipip_entry->ipip_list_node);
++		if (ipip_entry->decap_fib_entry)
++			mlxsw_sp_ipip_entry_demote_decap(mlxsw_sp, ipip_entry);
+ 		mlxsw_sp_ipip_entry_destroy(ipip_entry);
+ 	}
+ }
+ 
++static bool
++mlxsw_sp_ipip_entry_matches_decap(struct mlxsw_sp *mlxsw_sp,
++				  const struct net_device *ul_dev,
++				  enum mlxsw_sp_l3proto ul_proto,
++				  union mlxsw_sp_l3addr ul_dip,
++				  struct mlxsw_sp_ipip_entry *ipip_entry)
++{
++	u32 ul_tb_id = l3mdev_fib_table(ul_dev) ? : RT_TABLE_MAIN;
++	enum mlxsw_sp_ipip_type ipipt = ipip_entry->ipipt;
++	struct net_device *ipip_ul_dev;
++
++	if (mlxsw_sp->router->ipip_ops_arr[ipipt]->ul_proto != ul_proto)
++		return false;
++
++	ipip_ul_dev = __mlxsw_sp_ipip_netdev_ul_dev_get(ipip_entry->ol_dev);
++	return mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, ul_dip,
++						 ul_tb_id, ipip_entry) &&
++	       (!ipip_ul_dev || ipip_ul_dev == ul_dev);
++}
++
++/* Given decap parameters, find the corresponding IPIP entry. */
++static struct mlxsw_sp_ipip_entry *
++mlxsw_sp_ipip_entry_find_by_decap(struct mlxsw_sp *mlxsw_sp,
++				  const struct net_device *ul_dev,
++				  enum mlxsw_sp_l3proto ul_proto,
++				  union mlxsw_sp_l3addr ul_dip)
++{
++	struct mlxsw_sp_ipip_entry *ipip_entry;
++
++	list_for_each_entry(ipip_entry, &mlxsw_sp->router->ipip_list,
++			    ipip_list_node)
++		if (mlxsw_sp_ipip_entry_matches_decap(mlxsw_sp, ul_dev,
++						      ul_proto, ul_dip,
++						      ipip_entry))
++			return ipip_entry;
++
++	return NULL;
++}
++
+ struct mlxsw_sp_neigh_key {
+ 	struct neighbour *n;
+ };
+@@ -2186,9 +2283,6 @@ mlxsw_sp_nexthop_group_update(struct mlx
+ 	return 0;
+ }
+ 
+-static int mlxsw_sp_fib_entry_update(struct mlxsw_sp *mlxsw_sp,
+-				     struct mlxsw_sp_fib_entry *fib_entry);
+-
+ static bool
+ mlxsw_sp_fib_node_entry_is_first(const struct mlxsw_sp_fib_node *fib_node,
+ 				 const struct mlxsw_sp_fib_entry *fib_entry);
+@@ -2779,6 +2873,8 @@ mlxsw_sp_fib_entry_should_offload(const
+ 		return !!nh_group->adj_index_valid;
+ 	case MLXSW_SP_FIB_ENTRY_TYPE_LOCAL:
+ 		return !!nh_group->nh_rif;
++	case MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP:
++		return true;
+ 	default:
+ 		return false;
+ 	}
+@@ -2810,7 +2906,8 @@ mlxsw_sp_fib4_entry_offload_set(struct m
+ 	struct mlxsw_sp_nexthop_group *nh_grp = fib_entry->nh_group;
+ 	int i;
+ 
+-	if (fib_entry->type == MLXSW_SP_FIB_ENTRY_TYPE_LOCAL) {
++	if (fib_entry->type == MLXSW_SP_FIB_ENTRY_TYPE_LOCAL ||
++	    fib_entry->type == MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP) {
+ 		nh_grp->nexthops->key.fib_nh->nh_flags |= RTNH_F_OFFLOAD;
+ 		return;
+ 	}
+@@ -3015,6 +3112,22 @@ static int mlxsw_sp_fib_entry_op_trap(st
+ 	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ralue), ralue_pl);
+ }
+ 
++static int
++mlxsw_sp_fib_entry_op_ipip_decap(struct mlxsw_sp *mlxsw_sp,
++				 struct mlxsw_sp_fib_entry *fib_entry,
++				 enum mlxsw_reg_ralue_op op)
++{
++	struct mlxsw_sp_ipip_entry *ipip_entry = fib_entry->decap.ipip_entry;
++	const struct mlxsw_sp_ipip_ops *ipip_ops;
++
++	if (WARN_ON(!ipip_entry))
++		return -EINVAL;
++
++	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt];
++	return ipip_ops->fib_entry_op(mlxsw_sp, ipip_entry, op,
++				      fib_entry->decap.tunnel_index);
++}
++
+ static int __mlxsw_sp_fib_entry_op(struct mlxsw_sp *mlxsw_sp,
+ 				   struct mlxsw_sp_fib_entry *fib_entry,
+ 				   enum mlxsw_reg_ralue_op op)
+@@ -3026,6 +3139,9 @@ static int __mlxsw_sp_fib_entry_op(struc
+ 		return mlxsw_sp_fib_entry_op_local(mlxsw_sp, fib_entry, op);
+ 	case MLXSW_SP_FIB_ENTRY_TYPE_TRAP:
+ 		return mlxsw_sp_fib_entry_op_trap(mlxsw_sp, fib_entry, op);
++	case MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP:
++		return mlxsw_sp_fib_entry_op_ipip_decap(mlxsw_sp,
++							fib_entry, op);
+ 	}
+ 	return -EINVAL;
+ }
+@@ -3060,11 +3176,23 @@ mlxsw_sp_fib4_entry_type_set(struct mlxs
+ 			     const struct fib_entry_notifier_info *fen_info,
+ 			     struct mlxsw_sp_fib_entry *fib_entry)
+ {
++	union mlxsw_sp_l3addr dip = { .addr4 = htonl(fen_info->dst) };
++	struct net_device *dev = fen_info->fi->fib_dev;
++	struct mlxsw_sp_ipip_entry *ipip_entry;
+ 	struct fib_info *fi = fen_info->fi;
+ 
+ 	switch (fen_info->type) {
+-	case RTN_BROADCAST: /* fall through */
+ 	case RTN_LOCAL:
++		ipip_entry = mlxsw_sp_ipip_entry_find_by_decap(mlxsw_sp, dev,
++						 MLXSW_SP_L3_PROTO_IPV4, dip);
++		if (ipip_entry) {
++			fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP;
++			return mlxsw_sp_fib_entry_decap_init(mlxsw_sp,
++							     fib_entry,
++							     ipip_entry);
++		}
++		/* fall through */
++	case RTN_BROADCAST:
+ 		fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_TRAP;
+ 		return 0;
+ 	case RTN_UNREACHABLE: /* fall through */
+@@ -3557,6 +3685,9 @@ mlxsw_sp_fib4_node_entry_unlink(struct m
+ {
+ 	mlxsw_sp_fib_node_entry_del(mlxsw_sp, &fib4_entry->common);
+ 	mlxsw_sp_fib4_node_list_remove(fib4_entry);
++
++	if (fib4_entry->common.type == MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP)
++		mlxsw_sp_fib_entry_decap_fini(mlxsw_sp, &fib4_entry->common);
+ }
+ 
+ static void mlxsw_sp_fib4_entry_replace(struct mlxsw_sp *mlxsw_sp,
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+@@ -97,5 +97,8 @@ mlxsw_sp_neigh_entry_counter_update(stru
+ 				    struct mlxsw_sp_neigh_entry *neigh_entry,
+ 				    bool adding);
+ bool mlxsw_sp_neigh_ipv6_ignore(struct mlxsw_sp_neigh_entry *neigh_entry);
++union mlxsw_sp_l3addr
++mlxsw_sp_ipip_netdev_saddr(enum mlxsw_sp_l3proto proto,
++			   const struct net_device *ol_dev);
+ 
+ #endif /* _MLXSW_ROUTER_H_*/

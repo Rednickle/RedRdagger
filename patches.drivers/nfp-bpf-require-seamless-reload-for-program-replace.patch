@@ -1,0 +1,206 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Fri, 3 Nov 2017 13:56:26 -0700
+Subject: nfp: bpf: require seamless reload for program replace
+Patch-mainline: v4.15-rc1
+Git-commit: e4a91cd565e2c4e299abe9eb906c506ecc01032a
+References: bsc#1109837
+
+Firmware supports live replacement of programs for quite some
+time now.  Remove the software-fallback related logic and
+depend on the FW for program replace.  Seamless reload will
+become a requirement if maps are present, anyway.
+
+Load and start stages have to be split now, since replace
+only needs a load, start has already been done on add.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/main.c    |   11 +---
+ drivers/net/ethernet/netronome/nfp/bpf/main.h    |    2 
+ drivers/net/ethernet/netronome/nfp/bpf/offload.c |   62 +++++++++++------------
+ drivers/net/ethernet/netronome/nfp/nfp_net.h     |    2 
+ 4 files changed, 35 insertions(+), 42 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -68,7 +68,7 @@ nfp_bpf_xdp_offload(struct nfp_app *app,
+ 	if (prog && running && !xdp_running)
+ 		return -EBUSY;
+ 
+-	ret = nfp_net_bpf_offload(nn, prog, running, true);
++	ret = nfp_net_bpf_offload(nn, prog, running);
+ 	/* Stop offload if replace not possible */
+ 	if (ret && prog)
+ 		nfp_bpf_xdp_offload(app, nn, NULL);
+@@ -93,7 +93,6 @@ static int nfp_bpf_setup_tc_block_cb(enu
+ {
+ 	struct tc_cls_bpf_offload *cls_bpf = type_data;
+ 	struct nfp_net *nn = cb_priv;
+-	bool skip_sw;
+ 
+ 	if (type != TC_SETUP_CLSBPF ||
+ 	    !tc_can_offload(nn->dp.netdev) ||
+@@ -111,15 +110,13 @@ static int nfp_bpf_setup_tc_block_cb(enu
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	skip_sw = !!(cls_bpf->gen_flags & TCA_CLS_FLAGS_SKIP_SW);
+-
+ 	switch (cls_bpf->command) {
+ 	case TC_CLSBPF_REPLACE:
+-		return nfp_net_bpf_offload(nn, cls_bpf->prog, true, !skip_sw);
++		return nfp_net_bpf_offload(nn, cls_bpf->prog, true);
+ 	case TC_CLSBPF_ADD:
+-		return nfp_net_bpf_offload(nn, cls_bpf->prog, false, !skip_sw);
++		return nfp_net_bpf_offload(nn, cls_bpf->prog, false);
+ 	case TC_CLSBPF_DESTROY:
+-		return nfp_net_bpf_offload(nn, NULL, true, !skip_sw);
++		return nfp_net_bpf_offload(nn, NULL, true);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -183,6 +183,6 @@ int nfp_prog_verify(struct nfp_prog *nfp
+ struct nfp_net;
+ 
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+-			bool old_prog, bool sw_fallback);
++			bool old_prog);
+ 
+ #endif
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@ -94,14 +94,11 @@ out:
+ }
+ 
+ static void
+-nfp_net_bpf_load_and_start(struct nfp_net *nn, bool sw_fallback,
+-			   void *code, dma_addr_t dma_addr,
+-			   unsigned int code_sz, unsigned int n_instr)
++nfp_net_bpf_load(struct nfp_net *nn, void *code, dma_addr_t dma_addr,
++		 unsigned int code_sz, unsigned int n_instr)
+ {
+ 	int err;
+ 
+-	nn->dp.bpf_offload_skip_sw = !sw_fallback;
+-
+ 	nn_writew(nn, NFP_NET_CFG_BPF_SIZE, n_instr);
+ 	nn_writeq(nn, NFP_NET_CFG_BPF_ADDR, dma_addr);
+ 
+@@ -110,14 +107,19 @@ nfp_net_bpf_load_and_start(struct nfp_ne
+ 	if (err)
+ 		nn_err(nn, "FW command error while loading BPF: %d\n", err);
+ 
++	dma_free_coherent(nn->dp.dev, code_sz, code, dma_addr);
++}
++
++static void nfp_net_bpf_start(struct nfp_net *nn)
++{
++	int err;
++
+ 	/* Enable passing packets through BPF function */
+ 	nn->dp.ctrl |= NFP_NET_CFG_CTRL_BPF;
+ 	nn_writel(nn, NFP_NET_CFG_CTRL, nn->dp.ctrl);
+ 	err = nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_GEN);
+ 	if (err)
+ 		nn_err(nn, "FW command error while enabling BPF: %d\n", err);
+-
+-	dma_free_coherent(nn->dp.dev, code_sz, code, dma_addr);
+ }
+ 
+ static int nfp_net_bpf_stop(struct nfp_net *nn)
+@@ -127,13 +129,12 @@ static int nfp_net_bpf_stop(struct nfp_n
+ 
+ 	nn->dp.ctrl &= ~NFP_NET_CFG_CTRL_BPF;
+ 	nn_writel(nn, NFP_NET_CFG_CTRL, nn->dp.ctrl);
+-	nn->dp.bpf_offload_skip_sw = 0;
+ 
+ 	return nfp_net_reconfig(nn, NFP_NET_CFG_UPDATE_GEN);
+ }
+ 
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+-			bool old_prog, bool sw_fallback)
++			bool old_prog)
+ {
+ 	struct nfp_bpf_result res;
+ 	dma_addr_t dma_addr;
+@@ -141,37 +142,34 @@ int nfp_net_bpf_offload(struct nfp_net *
+ 	void *code;
+ 	int err;
+ 
+-	/* There is nothing stopping us from implementing seamless
+-	 * replace but the simple method of loading I adopted in
+-	 * the firmware does not handle atomic replace (i.e. we have to
+-	 * stop the BPF offload and re-enable it).  Leaking-in a few
+-	 * frames which didn't have BPF applied in the hardware should
+-	 * be fine if software fallback is available, though.
+-	 */
+-	if (prog && old_prog && nn->dp.bpf_offload_skip_sw)
+-		return -EBUSY;
++	if (prog && old_prog) {
++		u8 cap;
++
++		cap = nn_readb(nn, NFP_NET_CFG_BPF_CAP);
++		if (!(cap & NFP_NET_BPF_CAP_RELO)) {
++			nn_err(nn, "FW does not support live reload\n");
++			return -EBUSY;
++		}
++	}
+ 
+ 	/* Something else is loaded, different program type? */
+ 	if (!old_prog && nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
+ 		return -EBUSY;
+ 
+-	max_instr = nn_readw(nn, NFP_NET_CFG_BPF_MAX_LEN);
+-	code = NULL;
++	if (old_prog && !prog)
++		return nfp_net_bpf_stop(nn);
+ 
+-	if (prog) {
+-		err = nfp_net_bpf_offload_prepare(nn, prog, &res, &code,
+-						  &dma_addr, max_instr);
+-		if (err)
+-			return err;
+-	}
++	max_instr = nn_readw(nn, NFP_NET_CFG_BPF_MAX_LEN);
+ 
+-	if (old_prog)
+-		nfp_net_bpf_stop(nn);
++	err = nfp_net_bpf_offload_prepare(nn, prog, &res, &code, &dma_addr,
++					  max_instr);
++	if (err)
++		return err;
+ 
+-	if (prog)
+-		nfp_net_bpf_load_and_start(nn, sw_fallback, code,
+-					   dma_addr, max_instr * sizeof(u64),
+-					   res.n_instr);
++	nfp_net_bpf_load(nn, code, dma_addr, max_instr * sizeof(u64),
++			 res.n_instr);
++	if (!old_prog)
++		nfp_net_bpf_start(nn);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -476,7 +476,6 @@ struct nfp_stat_pair {
+  * @dev:		Backpointer to struct device
+  * @netdev:		Backpointer to net_device structure
+  * @is_vf:		Is the driver attached to a VF?
+- * @bpf_offload_skip_sw:  Offloaded BPF program will not be rerun by cls_bpf
+  * @bpf_offload_xdp:	Offloaded BPF program is XDP
+  * @chained_metadata_format:  Firemware will use new metadata format
+  * @rx_dma_dir:		Mapping direction for RX buffers
+@@ -502,7 +501,6 @@ struct nfp_net_dp {
+ 	struct net_device *netdev;
+ 
+ 	u8 is_vf:1;
+-	u8 bpf_offload_skip_sw:1;
+ 	u8 bpf_offload_xdp:1;
+ 	u8 chained_metadata_format:1;
+ 

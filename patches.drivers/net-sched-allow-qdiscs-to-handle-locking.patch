@@ -1,0 +1,166 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Thu, 7 Dec 2017 09:54:25 -0800
+Subject: net: sched: allow qdiscs to handle locking
+Patch-mainline: v4.16-rc1
+Git-commit: 6b3ba9146fe64b9bebb6346c9dcfe3b4851de2d7
+References: bsc#1109837
+
+This patch adds a flag for queueing disciplines to indicate the stack
+does not need to use the qdisc lock to protect operations. This can
+be used to build lockless scheduling algorithms and improving
+performance.
+
+The flag is checked in the tx path and the qdisc lock is only taken
+if it is not set. For now use a conditional if statement. Later we
+could be more aggressive if it proves worthwhile and use a static key
+or wrap this in a likely().
+
+Also the lockless case drops the TCQ_F_CAN_BYPASS logic. The reason
+for this is synchronizing a qlen counter across threads proves to
+cost more than doing the enqueue/dequeue operations when tested with
+pktgen.
+
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/sch_generic.h |    1 +
+ net/core/dev.c            |   26 ++++++++++++++++++++++----
+ net/sched/sch_generic.c   |   30 ++++++++++++++++++++----------
+ 3 files changed, 43 insertions(+), 14 deletions(-)
+
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -70,6 +70,7 @@ struct Qdisc {
+ 				      * qdisc_tree_decrease_qlen() should stop.
+ 				      */
+ #define TCQ_F_INVISIBLE		0x80 /* invisible by default in dump */
++#define TCQ_F_NOLOCK		0x100 /* qdisc does not require locking */
+ #define TCQ_F_OFFLOADED		0x200 /* qdisc is offloaded to HW */
+ 	u32			limit;
+ 	const struct Qdisc_ops	*ops;
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3168,6 +3168,21 @@ static inline int __dev_xmit_skb(struct
+ 	int rc;
+ 
+ 	qdisc_calculate_pkt_len(skb, q);
++
++	if (q->flags & TCQ_F_NOLOCK) {
++		if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
++			__qdisc_drop(skb, &to_free);
++			rc = NET_XMIT_DROP;
++		} else {
++			rc = q->enqueue(skb, q, &to_free) & NET_XMIT_MASK;
++			__qdisc_run(q);
++		}
++
++		if (unlikely(to_free))
++			kfree_skb_list(to_free);
++		return rc;
++	}
++
+ 	/*
+ 	 * Heuristic to force contended enqueues to serialize on a
+ 	 * separate lock before trying to get qdisc main lock.
+@@ -4150,19 +4165,22 @@ static __latent_entropy void net_tx_acti
+ 
+ 		while (head) {
+ 			struct Qdisc *q = head;
+-			spinlock_t *root_lock;
++			spinlock_t *root_lock = NULL;
+ 
+ 			head = head->next_sched;
+ 
+-			root_lock = qdisc_lock(q);
+-			spin_lock(root_lock);
++			if (!(q->flags & TCQ_F_NOLOCK)) {
++				root_lock = qdisc_lock(q);
++				spin_lock(root_lock);
++			}
+ 			/* We need to make sure head->next_sched is read
+ 			 * before clearing __QDISC_STATE_SCHED
+ 			 */
+ 			smp_mb__before_atomic();
+ 			clear_bit(__QDISC_STATE_SCHED, &q->state);
+ 			qdisc_run(q);
+-			spin_unlock(root_lock);
++			if (root_lock)
++				spin_unlock(root_lock);
+ 		}
+ 	}
+ }
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -171,7 +171,8 @@ int sch_direct_xmit(struct sk_buff *skb,
+ 	int ret = NETDEV_TX_BUSY;
+ 
+ 	/* And release qdisc */
+-	spin_unlock(root_lock);
++	if (root_lock)
++		spin_unlock(root_lock);
+ 
+ 	/* Note that we validate skb (GSO, checksum, ...) outside of locks */
+ 	if (validate)
+@@ -184,10 +185,13 @@ int sch_direct_xmit(struct sk_buff *skb,
+ 
+ 		HARD_TX_UNLOCK(dev, txq);
+ 	} else {
+-		spin_lock(root_lock);
++		if (root_lock)
++			spin_lock(root_lock);
+ 		return qdisc_qlen(q);
+ 	}
+-	spin_lock(root_lock);
++
++	if (root_lock)
++		spin_lock(root_lock);
+ 
+ 	if (dev_xmit_complete(ret)) {
+ 		/* Driver sent out skb successfully or skb was consumed */
+@@ -228,9 +232,9 @@ int sch_direct_xmit(struct sk_buff *skb,
+  */
+ static inline int qdisc_restart(struct Qdisc *q, int *packets)
+ {
++	spinlock_t *root_lock = NULL;
+ 	struct netdev_queue *txq;
+ 	struct net_device *dev;
+-	spinlock_t *root_lock;
+ 	struct sk_buff *skb;
+ 	bool validate;
+ 
+@@ -239,7 +243,9 @@ static inline int qdisc_restart(struct Q
+ 	if (unlikely(!skb))
+ 		return 0;
+ 
+-	root_lock = qdisc_lock(q);
++	if (!(q->flags & TCQ_F_NOLOCK))
++		root_lock = qdisc_lock(q);
++
+ 	dev = qdisc_dev(q);
+ 	txq = skb_get_tx_queue(dev, skb);
+ 
+@@ -895,14 +901,18 @@ static bool some_qdisc_is_busy(struct ne
+ 
+ 		dev_queue = netdev_get_tx_queue(dev, i);
+ 		q = dev_queue->qdisc_sleeping;
+-		root_lock = qdisc_lock(q);
+ 
+-		spin_lock_bh(root_lock);
++		if (q->flags & TCQ_F_NOLOCK) {
++			val = test_bit(__QDISC_STATE_SCHED, &q->state);
++		} else {
++			root_lock = qdisc_lock(q);
++			spin_lock_bh(root_lock);
+ 
+-		val = (qdisc_is_running(q) ||
+-		       test_bit(__QDISC_STATE_SCHED, &q->state));
++			val = (qdisc_is_running(q) ||
++			       test_bit(__QDISC_STATE_SCHED, &q->state));
+ 
+-		spin_unlock_bh(root_lock);
++			spin_unlock_bh(root_lock);
++		}
+ 
+ 		if (val)
+ 			return true;

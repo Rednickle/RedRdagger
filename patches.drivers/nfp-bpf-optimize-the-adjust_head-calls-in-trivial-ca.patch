@@ -1,0 +1,195 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Thu, 14 Dec 2017 21:29:19 -0800
+Subject: nfp: bpf: optimize the adjust_head calls in trivial cases
+Patch-mainline: v4.16-rc1
+Git-commit: 8231f8444110c346a7d28756abbca11c956d5803
+References: bsc#1109837
+
+If the program is simple and has only one adjust head call
+with constant parameters, we can check that the call will
+always succeed at translation time.  We need to track the
+location of the call and make sure parameters are always
+the same.  We also have to check the parameters against
+datapath constraints and ETH_HLEN.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/jit.c      |   22 ++++++++++
+ drivers/net/ethernet/netronome/nfp/bpf/main.c     |    2 
+ drivers/net/ethernet/netronome/nfp/bpf/main.h     |    8 +++
+ drivers/net/ethernet/netronome/nfp/bpf/verifier.c |   46 +++++++++++++++++++++-
+ 4 files changed, 76 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -1217,6 +1217,28 @@ static int adjust_head(struct nfp_prog *
+ 
+ 	adjust_head = &nfp_prog->bpf->adjust_head;
+ 
++	/* Optimized version - 5 vs 14 cycles */
++	if (nfp_prog->adjust_head_location != UINT_MAX) {
++		if (WARN_ON_ONCE(nfp_prog->adjust_head_location != meta->n))
++			return -EINVAL;
++
++		emit_alu(nfp_prog, pptr_reg(nfp_prog),
++			 reg_a(2 * 2), ALU_OP_ADD, pptr_reg(nfp_prog));
++		emit_alu(nfp_prog, plen_reg(nfp_prog),
++			 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++		emit_alu(nfp_prog, pv_len(nfp_prog),
++			 pv_len(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++
++		wrp_immed(nfp_prog, reg_both(0), 0);
++		wrp_immed(nfp_prog, reg_both(1), 0);
++
++		/* TODO: when adjust head is guaranteed to succeed we can
++		 * also eliminate the following if (r0 == 0) branch.
++		 */
++
++		return 0;
++	}
++
+ 	ret_einval = nfp_prog_current_offset(nfp_prog) + 14;
+ 	end = ret_einval + 2;
+ 
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -182,6 +182,8 @@ nfp_bpf_parse_cap_adjust_head(struct nfp
+ 	bpf->adjust_head.flags = readl(&cap->flags);
+ 	bpf->adjust_head.off_min = readl(&cap->off_min);
+ 	bpf->adjust_head.off_max = readl(&cap->off_max);
++	bpf->adjust_head.guaranteed_sub = readl(&cap->guaranteed_sub);
++	bpf->adjust_head.guaranteed_add = readl(&cap->guaranteed_add);
+ 
+ 	if (bpf->adjust_head.off_min > bpf->adjust_head.off_max) {
+ 		nfp_err(cpp, "invalid adjust_head TLV: min > max\n");
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -86,6 +86,8 @@ enum pkt_vec {
+  * @flags:		extra flags for adjust head
+  * @off_min:		minimal packet offset within buffer required
+  * @off_max:		maximum packet offset within buffer required
++ * @guaranteed_sub:	amount of negative adjustment guaranteed possible
++ * @guaranteed_add:	amount of positive adjustment guaranteed possible
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -94,6 +96,8 @@ struct nfp_app_bpf {
+ 		u32 flags;
+ 		int off_min;
+ 		int off_max;
++		int guaranteed_sub;
++		int guaranteed_add;
+ 	} adjust_head;
+ };
+ 
+@@ -116,6 +120,7 @@ typedef int (*instr_cb_t)(struct nfp_pro
+  * @ptr: pointer type for memory operations
+  * @ldst_gather_len: memcpy length gathered from load/store sequence
+  * @paired_st: the paired store insn at the head of the sequence
++ * @arg2: arg2 for call instructions
+  * @ptr_not_const: pointer is not always constant
+  * @jmp_dst: destination info for jump instructions
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+@@ -135,6 +140,7 @@ struct nfp_insn_meta {
+ 			bool ptr_not_const;
+ 		};
+ 		struct nfp_insn_meta *jmp_dst;
++		struct bpf_reg_state arg2;
+ 	};
+ 	unsigned int off;
+ 	unsigned short n;
+@@ -193,6 +199,7 @@ static inline bool is_mbpf_store(const s
+  * @n_translated: number of successfully translated instructions (for errors)
+  * @error: error code if something went wrong
+  * @stack_depth: max stack depth from the verifier
++ * @adjust_head_location: if program has single adjust head call - the insn no.
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
+@@ -216,6 +223,7 @@ struct nfp_prog {
+ 	int error;
+ 
+ 	unsigned int stack_depth;
++	unsigned int adjust_head_location;
+ 
+ 	struct list_head insns;
+ };
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -69,9 +69,47 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_p
+ 	return meta;
+ }
+ 
++static void
++nfp_record_adjust_head(struct nfp_app_bpf *bpf, struct nfp_prog *nfp_prog,
++		       struct nfp_insn_meta *meta,
++		       const struct bpf_reg_state *reg2)
++{
++	unsigned int location =	UINT_MAX;
++	int imm;
++
++	/* Datapath usually can give us guarantees on how much adjust head
++	 * can be done without the need for any checks.  Optimize the simple
++	 * case where there is only one adjust head by a constant.
++	 */
++	if (reg2->type != SCALAR_VALUE || !tnum_is_const(reg2->var_off))
++		goto exit_set_location;
++	imm = reg2->var_off.value;
++	/* Translator will skip all checks, we need to guarantee min pkt len */
++	if (imm > ETH_ZLEN - ETH_HLEN)
++		goto exit_set_location;
++	if (imm > (int)bpf->adjust_head.guaranteed_add ||
++	    imm < -bpf->adjust_head.guaranteed_sub)
++		goto exit_set_location;
++
++	if (nfp_prog->adjust_head_location) {
++		/* Only one call per program allowed */
++		if (nfp_prog->adjust_head_location != meta->n)
++			goto exit_set_location;
++
++		if (meta->arg2.var_off.value != imm)
++			goto exit_set_location;
++	}
++
++	location = meta->n;
++exit_set_location:
++	nfp_prog->adjust_head_location = location;
++}
++
+ static int
+-nfp_bpf_check_call(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++nfp_bpf_check_call(struct nfp_prog *nfp_prog, struct bpf_verifier_env *env,
++		   struct nfp_insn_meta *meta)
+ {
++	const struct bpf_reg_state *reg2 = cur_regs(env) + BPF_REG_2;
+ 	struct nfp_app_bpf *bpf = nfp_prog->bpf;
+ 	u32 func_id = meta->insn.imm;
+ 
+@@ -85,12 +123,16 @@ nfp_bpf_check_call(struct nfp_prog *nfp_
+ 			pr_warn("adjust_head: FW requires shifting metadata, not supported by the driver\n");
+ 			return -EOPNOTSUPP;
+ 		}
++
++		nfp_record_adjust_head(bpf, nfp_prog, meta, reg2);
+ 		break;
+ 	default:
+ 		pr_warn("unsupported function id: %d\n", func_id);
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	meta->arg2 = *reg2;
++
+ 	return 0;
+ }
+ 
+@@ -204,7 +246,7 @@ nfp_verify_insn(struct bpf_verifier_env
+ 	}
+ 
+ 	if (meta->insn.code == (BPF_JMP | BPF_CALL))
+-		return nfp_bpf_check_call(nfp_prog, meta);
++		return nfp_bpf_check_call(nfp_prog, env, meta);
+ 	if (meta->insn.code == (BPF_JMP | BPF_EXIT))
+ 		return nfp_bpf_check_exit(nfp_prog, env);
+ 
