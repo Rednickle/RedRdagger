@@ -1,0 +1,256 @@
+From 57b8daa70a179bc23cc4240420ab6fbcdd7faf77 Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Fri, 20 Apr 2018 22:51:11 +1000
+Subject: [PATCH] KVM: PPC: Book3S HV: Snapshot timebase offset on guest entry
+
+References: bsc#1061840, bsc#1086196
+Patch-mainline: v4.17-rc7
+Git-commit: 57b8daa70a179bc23cc4240420ab6fbcdd7faf77
+
+Currently, the HV KVM guest entry/exit code adds the timebase offset
+from the vcore struct to the timebase on guest entry, and subtracts
+it on guest exit.  Which is fine, except that it is possible for
+userspace to change the offset using the SET_ONE_REG interface while
+the vcore is running, as there is only one timebase offset per vcore
+but potentially multiple VCPUs in the vcore.  If that were to happen,
+KVM would subtract a different offset on guest exit from that which
+it had added on guest entry, leading to the timebase being out of sync
+between cores in the host, which then leads to bad things happening
+such as hangs and spurious watchdog timeouts.
+
+To fix this, we add a new field 'tb_offset_applied' to the vcore struct
+which stores the offset that is currently applied to the timebase.
+This value is set from the vcore tb_offset field on guest entry, and
+is what is subtracted from the timebase on guest exit.  Since it is
+zero when the timebase offset is not applied, we can simplify the
+logic in kvmhv_start_timing and kvmhv_accumulate_time.
+
+In addition, we had secondary threads reading the timebase while
+running concurrently with code on the primary thread which would
+eventually add or subtract the timebase offset from the timebase.
+This occurred while saving or restoring the DEC register value on
+the secondary threads.  Although no specific incorrect behaviour has
+been observed, this is a race which should be fixed.  To fix it, we
+move the DEC saving code to just before we call kvmhv_commence_exit,
+and the DEC restoring code to after the point where we have waited
+for the primary thread to switch the MMU context and add the timebase
+offset.  That way we are sure that the timebase contains the guest
+timebase value in both cases.
+
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/kvm_book3s.h   |  1 +
+ arch/powerpc/kernel/asm-offsets.c       |  1 +
+ arch/powerpc/kvm/book3s_hv.c            |  1 +
+ arch/powerpc/kvm/book3s_hv_rmhandlers.S | 89 ++++++++++++++++-----------------
+ 4 files changed, 47 insertions(+), 45 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 4c02a7378d06..e7377b73cfec 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -96,6 +96,7 @@ struct kvmppc_vcore {
+ 	struct kvm_vcpu *runner;
+ 	struct kvm *kvm;
+ 	u64 tb_offset;		/* guest timebase - host timebase */
++	u64 tb_offset_applied;	/* timebase offset currently in force */
+ 	ulong lpcr;
+ 	u32 arch_compat;
+ 	ulong pcr;
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 6bee65f3cfd3..373dc1d6ef44 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -562,6 +562,7 @@ int main(void)
+ 	OFFSET(VCORE_NAPPING_THREADS, kvmppc_vcore, napping_threads);
+ 	OFFSET(VCORE_KVM, kvmppc_vcore, kvm);
+ 	OFFSET(VCORE_TB_OFFSET, kvmppc_vcore, tb_offset);
++	OFFSET(VCORE_TB_OFFSET_APPL, kvmppc_vcore, tb_offset_applied);
+ 	OFFSET(VCORE_LPCR, kvmppc_vcore, lpcr);
+ 	OFFSET(VCORE_PCR, kvmppc_vcore, pcr);
+ 	OFFSET(VCORE_DPDES, kvmppc_vcore, dpdes);
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 4d07fca5121c..9963f65c212b 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -2441,6 +2441,7 @@ static void init_vcore_to_run(struct kvmppc_vcore *vc)
+ 	vc->in_guest = 0;
+ 	vc->napping_threads = 0;
+ 	vc->conferring_threads = 0;
++	vc->tb_offset_applied = 0;
+ }
+ 
+ static bool can_dynamic_split(struct kvmppc_vcore *vc, struct core_info *cip)
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index bd63fa8a08b5..25c32e421b57 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -692,6 +692,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
+ 22:	ld	r8,VCORE_TB_OFFSET(r5)
+ 	cmpdi	r8,0
+ 	beq	37f
++	std	r8, VCORE_TB_OFFSET_APPL(r5)
+ 	mftb	r6		/* current host timebase */
+ 	add	r8,r8,r6
+ 	mtspr	SPRN_TBU40,r8	/* update upper 40 bits */
+@@ -940,18 +941,6 @@ FTR_SECTION_ELSE
+ ALT_FTR_SECTION_END_IFCLR(CPU_FTR_ARCH_300)
+ 8:
+ 
+-	/*
+-	 * Set the decrementer to the guest decrementer.
+-	 */
+-	ld	r8,VCPU_DEC_EXPIRES(r4)
+-	/* r8 is a host timebase value here, convert to guest TB */
+-	ld	r5,HSTATE_KVM_VCORE(r13)
+-	ld	r6,VCORE_TB_OFFSET(r5)
+-	add	r8,r8,r6
+-	mftb	r7
+-	subf	r3,r7,r8
+-	mtspr	SPRN_DEC,r3
+-
+ 	ld	r5, VCPU_SPRG0(r4)
+ 	ld	r6, VCPU_SPRG1(r4)
+ 	ld	r7, VCPU_SPRG2(r4)
+@@ -1005,6 +994,18 @@ ALT_FTR_SECTION_END_IFCLR(CPU_FTR_ARCH_300)
+ 	mtspr	SPRN_LPCR,r8
+ 	isync
+ 
++	/*
++	 * Set the decrementer to the guest decrementer.
++	 */
++	ld	r8,VCPU_DEC_EXPIRES(r4)
++	/* r8 is a host timebase value here, convert to guest TB */
++	ld	r5,HSTATE_KVM_VCORE(r13)
++	ld	r6,VCORE_TB_OFFSET_APPL(r5)
++	add	r8,r8,r6
++	mftb	r7
++	subf	r3,r7,r8
++	mtspr	SPRN_DEC,r3
++
+ 	/* Check if HDEC expires soon */
+ 	mfspr	r3, SPRN_HDEC
+ 	EXTEND_HDEC(r3)
+@@ -1597,8 +1598,27 @@ END_MMU_FTR_SECTION_IFSET(MMU_FTR_TYPE_RADIX)
+ 
+ guest_bypass:
+ 	stw	r12, STACK_SLOT_TRAP(r1)
+-	mr 	r3, r12
++
++	/* Save DEC */
++	/* Do this before kvmhv_commence_exit so we know TB is guest TB */
++	ld	r3, HSTATE_KVM_VCORE(r13)
++	mfspr	r5,SPRN_DEC
++	mftb	r6
++	/* On P9, if the guest has large decr enabled, don't sign extend */
++BEGIN_FTR_SECTION
++	ld	r4, VCORE_LPCR(r3)
++	andis.	r4, r4, LPCR_LD@h
++	bne	16f
++END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
++	extsw	r5,r5
++16:	add	r5,r5,r6
++	/* r5 is a guest timebase value here, convert to host TB */
++	ld	r4,VCORE_TB_OFFSET_APPL(r3)
++	subf	r5,r4,r5
++	std	r5,VCPU_DEC_EXPIRES(r9)
++
+ 	/* Increment exit count, poke other threads to exit */
++	mr 	r3, r12
+ 	bl	kvmhv_commence_exit
+ 	nop
+ 	ld	r9, HSTATE_KVM_VCPU(r13)
+@@ -1639,23 +1659,6 @@ guest_bypass:
+ 	mtspr	SPRN_PURR,r3
+ 	mtspr	SPRN_SPURR,r4
+ 
+-	/* Save DEC */
+-	ld	r3, HSTATE_KVM_VCORE(r13)
+-	mfspr	r5,SPRN_DEC
+-	mftb	r6
+-	/* On P9, if the guest has large decr enabled, don't sign extend */
+-BEGIN_FTR_SECTION
+-	ld	r4, VCORE_LPCR(r3)
+-	andis.	r4, r4, LPCR_LD@h
+-	bne	16f
+-END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
+-	extsw	r5,r5
+-16:	add	r5,r5,r6
+-	/* r5 is a guest timebase value here, convert to host TB */
+-	ld	r4,VCORE_TB_OFFSET(r3)
+-	subf	r5,r4,r5
+-	std	r5,VCPU_DEC_EXPIRES(r9)
+-
+ BEGIN_FTR_SECTION
+ 	b	8f
+ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+@@ -2017,9 +2020,11 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ 
+ 27:
+ 	/* Subtract timebase offset from timebase */
+-	ld	r8,VCORE_TB_OFFSET(r5)
++	ld	r8, VCORE_TB_OFFSET_APPL(r5)
+ 	cmpdi	r8,0
+ 	beq	17f
++	li	r0, 0
++	std	r0, VCORE_TB_OFFSET_APPL(r5)
+ 	mftb	r6			/* current guest timebase */
+ 	subf	r8,r8,r6
+ 	mtspr	SPRN_TBU40,r8		/* update upper 40 bits */
+@@ -2700,7 +2705,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_300)
+ 	add	r3, r3, r5
+ 	ld	r4, HSTATE_KVM_VCPU(r13)
+ 	ld	r5, HSTATE_KVM_VCORE(r13)
+-	ld	r6, VCORE_TB_OFFSET(r5)
++	ld	r6, VCORE_TB_OFFSET_APPL(r5)
+ 	subf	r3, r6, r3	/* convert to host TB value */
+ 	std	r3, VCPU_DEC_EXPIRES(r4)
+ 
+@@ -2799,7 +2804,7 @@ END_FTR_SECTION(CPU_FTR_TM | CPU_FTR_P9_TM_HV_ASSIST, 0)
+ 	/* Restore guest decrementer */
+ 	ld	r3, VCPU_DEC_EXPIRES(r4)
+ 	ld	r5, HSTATE_KVM_VCORE(r13)
+-	ld	r6, VCORE_TB_OFFSET(r5)
++	ld	r6, VCORE_TB_OFFSET_APPL(r5)
+ 	add	r3, r3, r6	/* convert host TB to guest TB value */
+ 	mftb	r7
+ 	subf	r3, r7, r3
+@@ -3606,12 +3611,9 @@ kvmppc_fix_pmao:
+  */
+ kvmhv_start_timing:
+ 	ld	r5, HSTATE_KVM_VCORE(r13)
+-	lbz	r6, VCORE_IN_GUEST(r5)
+-	cmpwi	r6, 0
+-	beq	5f				/* if in guest, need to */
+-	ld	r6, VCORE_TB_OFFSET(r5)		/* subtract timebase offset */
+-5:	mftb	r5
+-	subf	r5, r6, r5
++	ld	r6, VCORE_TB_OFFSET_APPL(r5)
++	mftb	r5
++	subf	r5, r6, r5	/* subtract current timebase offset */
+ 	std	r3, VCPU_CUR_ACTIVITY(r4)
+ 	std	r5, VCPU_ACTIVITY_START(r4)
+ 	blr
+@@ -3622,15 +3624,12 @@ kvmhv_start_timing:
+  */
+ kvmhv_accumulate_time:
+ 	ld	r5, HSTATE_KVM_VCORE(r13)
+-	lbz	r8, VCORE_IN_GUEST(r5)
+-	cmpwi	r8, 0
+-	beq	4f				/* if in guest, need to */
+-	ld	r8, VCORE_TB_OFFSET(r5)		/* subtract timebase offset */
+-4:	ld	r5, VCPU_CUR_ACTIVITY(r4)
++	ld	r8, VCORE_TB_OFFSET_APPL(r5)
++	ld	r5, VCPU_CUR_ACTIVITY(r4)
+ 	ld	r6, VCPU_ACTIVITY_START(r4)
+ 	std	r3, VCPU_CUR_ACTIVITY(r4)
+ 	mftb	r7
+-	subf	r7, r8, r7
++	subf	r7, r8, r7	/* subtract current timebase offset */
+ 	std	r7, VCPU_ACTIVITY_START(r4)
+ 	cmpdi	r5, 0
+ 	beqlr
+-- 
+2.13.7
+
