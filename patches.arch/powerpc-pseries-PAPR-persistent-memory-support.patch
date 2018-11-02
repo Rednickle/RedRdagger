@@ -1,0 +1,355 @@
+From 4c5d87db497832c493ed296157bd1749dddc69f1 Mon Sep 17 00:00:00 2001
+From: Oliver O'Halloran <oohall@gmail.com>
+Date: Mon, 15 Oct 2018 10:18:27 +1100
+Subject: [PATCH] powerpc/pseries: PAPR persistent memory support
+
+References: FATE#326628, bsc#1113295
+Patch-mainline: v4.20-rc1
+Git-commit: 4c5d87db497832c493ed296157bd1749dddc69f1
+
+This patch implements support for discovering storage class memory
+devices at boot and for handling hotplug of new regions via RTAS
+hotplug events.
+
+Signed-off-by: Oliver O'Halloran <oohall@gmail.com>
+[mpe: Fix CONFIG_MEMORY_HOTPLUG=n build]
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/firmware.h       |   4 +-
+ arch/powerpc/include/asm/hvcall.h         |  10 +-
+ arch/powerpc/include/asm/rtas.h           |   2 +
+ arch/powerpc/kernel/rtasd.c               |   2 +
+ arch/powerpc/platforms/pseries/Makefile   |   2 +-
+ arch/powerpc/platforms/pseries/dlpar.c    |   4 +
+ arch/powerpc/platforms/pseries/firmware.c |   1 +
+ arch/powerpc/platforms/pseries/pmem.c     | 164 ++++++++++++++++++++++++++++++
+ arch/powerpc/platforms/pseries/pseries.h  |   5 +
+ arch/powerpc/platforms/pseries/ras.c      |   3 +-
+ 10 files changed, 193 insertions(+), 4 deletions(-)
+ create mode 100644 arch/powerpc/platforms/pseries/pmem.c
+
+diff --git a/arch/powerpc/include/asm/firmware.h b/arch/powerpc/include/asm/firmware.h
+index 2aca2655fe30..00bc42d95679 100644
+--- a/arch/powerpc/include/asm/firmware.h
++++ b/arch/powerpc/include/asm/firmware.h
+@@ -53,6 +53,7 @@
+ #define FW_FEATURE_DRMEM_V2	ASM_CONST(0x0000000400000000)
+ #define FW_FEATURE_DRC_INFO	ASM_CONST(0x0000000800000000)
+ #define FW_FEATURE_BLOCK_REMOVE ASM_CONST(0x0000001000000000)
++#define FW_FEATURE_PAPR_SCM 	ASM_CONST(0x0000002000000000)
+ 
+ #ifndef __ASSEMBLY__
+ 
+@@ -70,7 +71,8 @@ enum {
+ 		FW_FEATURE_SET_MODE | FW_FEATURE_BEST_ENERGY |
+ 		FW_FEATURE_TYPE1_AFFINITY | FW_FEATURE_PRRN |
+ 		FW_FEATURE_HPT_RESIZE | FW_FEATURE_DRMEM_V2 |
+-		FW_FEATURE_DRC_INFO | FW_FEATURE_BLOCK_REMOVE,
++		FW_FEATURE_DRC_INFO | FW_FEATURE_BLOCK_REMOVE |
++		FW_FEATURE_PAPR_SCM,
+ 	FW_FEATURE_PSERIES_ALWAYS = 0,
+ 	FW_FEATURE_POWERNV_POSSIBLE = FW_FEATURE_OPAL,
+ 	FW_FEATURE_POWERNV_ALWAYS = 0,
+diff --git a/arch/powerpc/include/asm/hvcall.h b/arch/powerpc/include/asm/hvcall.h
+index c349d3960d63..5a2c5ea57b73 100644
+--- a/arch/powerpc/include/asm/hvcall.h
++++ b/arch/powerpc/include/asm/hvcall.h
+@@ -296,7 +296,15 @@
+ #define H_INT_ESB               0x3C8
+ #define H_INT_SYNC              0x3CC
+ #define H_INT_RESET             0x3D0
+-#define MAX_HCALL_OPCODE	H_INT_RESET
++#define H_SCM_READ_METADATA     0x3E4
++#define H_SCM_WRITE_METADATA    0x3E8
++#define H_SCM_BIND_MEM          0x3EC
++#define H_SCM_UNBIND_MEM        0x3F0
++#define H_SCM_QUERY_BLOCK_MEM_BINDING 0x3F4
++#define H_SCM_QUERY_LOGICAL_MEM_BINDING 0x3F8
++#define H_SCM_MEM_QUERY	        0x3FC
++#define H_SCM_BLOCK_CLEAR       0x400
++#define MAX_HCALL_OPCODE	H_SCM_BLOCK_CLEAR
+ 
+ /* H_VIOCTL functions */
+ #define H_GET_VIOA_DUMP_SIZE	0x01
+diff --git a/arch/powerpc/include/asm/rtas.h b/arch/powerpc/include/asm/rtas.h
+index 0183e9595acc..bb38dd67d47d 100644
+--- a/arch/powerpc/include/asm/rtas.h
++++ b/arch/powerpc/include/asm/rtas.h
+@@ -125,6 +125,7 @@ struct rtas_suspend_me_data {
+ #define RTAS_TYPE_INFO			0xE2
+ #define RTAS_TYPE_DEALLOC		0xE3
+ #define RTAS_TYPE_DUMP			0xE4
++#define RTAS_TYPE_HOTPLUG		0xE5
+ /* I don't add PowerMGM events right now, this is a different topic */ 
+ #define RTAS_TYPE_PMGM_POWER_SW_ON	0x60
+ #define RTAS_TYPE_PMGM_POWER_SW_OFF	0x61
+@@ -329,6 +330,7 @@ struct pseries_hp_errorlog {
+ #define PSERIES_HP_ELOG_RESOURCE_MEM	2
+ #define PSERIES_HP_ELOG_RESOURCE_SLOT	3
+ #define PSERIES_HP_ELOG_RESOURCE_PHB	4
++#define PSERIES_HP_ELOG_RESOURCE_PMEM   6
+ 
+ #define PSERIES_HP_ELOG_ACTION_ADD	1
+ #define PSERIES_HP_ELOG_ACTION_REMOVE	2
+diff --git a/arch/powerpc/kernel/rtasd.c b/arch/powerpc/kernel/rtasd.c
+index c1378661b12f..38cadae4ca4f 100644
+--- a/arch/powerpc/kernel/rtasd.c
++++ b/arch/powerpc/kernel/rtasd.c
+@@ -91,6 +91,8 @@ static char *rtas_event_type(int type)
+ 			return "Dump Notification Event";
+ 		case RTAS_TYPE_PRRN:
+ 			return "Platform Resource Reassignment Event";
++		case RTAS_TYPE_HOTPLUG:
++			return "Hotplug Event";
+ 	}
+ 
+ 	return rtas_type[0];
+diff --git a/arch/powerpc/platforms/pseries/Makefile b/arch/powerpc/platforms/pseries/Makefile
+index 7e89d5c47068..892b27ced973 100644
+--- a/arch/powerpc/platforms/pseries/Makefile
++++ b/arch/powerpc/platforms/pseries/Makefile
+@@ -13,7 +13,7 @@ obj-$(CONFIG_KEXEC_CORE)	+= kexec.o
+ obj-$(CONFIG_PSERIES_ENERGY)	+= pseries_energy.o
+ 
+ obj-$(CONFIG_HOTPLUG_CPU)	+= hotplug-cpu.o
+-obj-$(CONFIG_MEMORY_HOTPLUG)	+= hotplug-memory.o
++obj-$(CONFIG_MEMORY_HOTPLUG)	+= hotplug-memory.o pmem.o
+ 
+ obj-$(CONFIG_HVC_CONSOLE)	+= hvconsole.o
+ obj-$(CONFIG_HVCS)		+= hvcserver.o
+diff --git a/arch/powerpc/platforms/pseries/dlpar.c b/arch/powerpc/platforms/pseries/dlpar.c
+index 052c4f2ba0a0..7625546caefd 100644
+--- a/arch/powerpc/platforms/pseries/dlpar.c
++++ b/arch/powerpc/platforms/pseries/dlpar.c
+@@ -355,6 +355,10 @@ int handle_dlpar_errorlog(struct pseries_hp_errorlog *hp_elog)
+ 	case PSERIES_HP_ELOG_RESOURCE_CPU:
+ 		rc = dlpar_cpu(hp_elog);
+ 		break;
++	case PSERIES_HP_ELOG_RESOURCE_PMEM:
++		rc = dlpar_hp_pmem(hp_elog);
++		break;
++
+ 	default:
+ 		pr_warn_ratelimited("Invalid resource (%d) specified\n",
+ 				    hp_elog->resource);
+diff --git a/arch/powerpc/platforms/pseries/firmware.c b/arch/powerpc/platforms/pseries/firmware.c
+index 1624501386f4..608ecad0178f 100644
+--- a/arch/powerpc/platforms/pseries/firmware.c
++++ b/arch/powerpc/platforms/pseries/firmware.c
+@@ -66,6 +66,7 @@ hypertas_fw_features_table[] = {
+ 	{FW_FEATURE_BEST_ENERGY,	"hcall-best-energy-1*"},
+ 	{FW_FEATURE_HPT_RESIZE,		"hcall-hpt-resize"},
+ 	{FW_FEATURE_BLOCK_REMOVE,	"hcall-block-remove"},
++	{FW_FEATURE_PAPR_SCM,		"hcall-scm"},
+ };
+ 
+ /* Build up the firmware features bitmask using the contents of
+diff --git a/arch/powerpc/platforms/pseries/pmem.c b/arch/powerpc/platforms/pseries/pmem.c
+new file mode 100644
+index 000000000000..a27f40eb57b1
+--- /dev/null
++++ b/arch/powerpc/platforms/pseries/pmem.c
+@@ -0,0 +1,164 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Handles hot and cold plug of persistent memory regions on pseries.
++ */
++
++#define pr_fmt(fmt)     "pseries-pmem: " fmt
++
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/sched.h>	/* for idle_task_exit */
++#include <linux/sched/hotplug.h>
++#include <linux/cpu.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/slab.h>
++#include <asm/prom.h>
++#include <asm/rtas.h>
++#include <asm/firmware.h>
++#include <asm/machdep.h>
++#include <asm/vdso_datapage.h>
++#include <asm/plpar_wrappers.h>
++#include <asm/topology.h>
++
++#include "pseries.h"
++#include "offline_states.h"
++
++static struct device_node *pmem_node;
++
++static ssize_t pmem_drc_add_node(u32 drc_index)
++{
++	struct device_node *dn;
++	int rc;
++
++	pr_debug("Attempting to add pmem node, drc index: %x\n", drc_index);
++
++	rc = dlpar_acquire_drc(drc_index);
++	if (rc) {
++		pr_err("Failed to acquire DRC, rc: %d, drc index: %x\n",
++			rc, drc_index);
++		return -EINVAL;
++	}
++
++	dn = dlpar_configure_connector(cpu_to_be32(drc_index), pmem_node);
++	if (!dn) {
++		pr_err("configure-connector failed for drc %x\n", drc_index);
++		dlpar_release_drc(drc_index);
++		return -EINVAL;
++	}
++
++	/* NB: The of reconfig notifier creates platform device from the node */
++	rc = dlpar_attach_node(dn, pmem_node);
++	if (rc) {
++		pr_err("Failed to attach node %s, rc: %d, drc index: %x\n",
++			dn->name, rc, drc_index);
++
++		if (dlpar_release_drc(drc_index))
++			dlpar_free_cc_nodes(dn);
++
++		return rc;
++	}
++
++	pr_info("Successfully added %pOF, drc index: %x\n", dn, drc_index);
++
++	return 0;
++}
++
++static ssize_t pmem_drc_remove_node(u32 drc_index)
++{
++	struct device_node *dn;
++	uint32_t index;
++	int rc;
++
++	for_each_child_of_node(pmem_node, dn) {
++		if (of_property_read_u32(dn, "ibm,my-drc-index", &index))
++			continue;
++		if (index == drc_index)
++			break;
++	}
++
++	if (!dn) {
++		pr_err("Attempting to remove unused DRC index %x\n", drc_index);
++		return -ENODEV;
++	}
++
++	pr_debug("Attempting to remove %pOF, drc index: %x\n", dn, drc_index);
++
++	/* * NB: tears down the ibm,pmemory device as a side-effect */
++	rc = dlpar_detach_node(dn);
++	if (rc)
++		return rc;
++
++	rc = dlpar_release_drc(drc_index);
++	if (rc) {
++		pr_err("Failed to release drc (%x) for CPU %s, rc: %d\n",
++			drc_index, dn->name, rc);
++		dlpar_attach_node(dn, pmem_node);
++		return rc;
++	}
++
++	pr_info("Successfully removed PMEM with drc index: %x\n", drc_index);
++
++	return 0;
++}
++
++int dlpar_hp_pmem(struct pseries_hp_errorlog *hp_elog)
++{
++	u32 count, drc_index;
++	int rc;
++
++	/* slim chance, but we might get a hotplug event while booting */
++	if (!pmem_node)
++		pmem_node = of_find_node_by_type(NULL, "ibm,persistent-memory");
++	if (!pmem_node) {
++		pr_err("Hotplug event for a pmem device, but none exists\n");
++		return -ENODEV;
++	}
++
++	if (hp_elog->id_type != PSERIES_HP_ELOG_ID_DRC_INDEX) {
++		pr_err("Unsupported hotplug event type %d\n",
++				hp_elog->id_type);
++		return -EINVAL;
++	}
++
++	count = hp_elog->_drc_u.drc_count;
++	drc_index = hp_elog->_drc_u.drc_index;
++
++	lock_device_hotplug();
++
++	if (hp_elog->action == PSERIES_HP_ELOG_ACTION_ADD) {
++		rc = pmem_drc_add_node(drc_index);
++	} else if (hp_elog->action == PSERIES_HP_ELOG_ACTION_REMOVE) {
++		rc = pmem_drc_remove_node(drc_index);
++	} else {
++		pr_err("Unsupported hotplug action (%d)\n", hp_elog->action);
++		rc = -EINVAL;
++	}
++
++	unlock_device_hotplug();
++	return rc;
++}
++
++const struct of_device_id drc_pmem_match[] = {
++	{ .type = "ibm,persistent-memory", },
++	{}
++};
++
++static int pseries_pmem_init(void)
++{
++	pmem_node = of_find_node_by_type(NULL, "ibm,persistent-memory");
++	if (!pmem_node)
++		return 0;
++
++	/*
++	 * The generic OF bus probe/populate handles creating platform devices
++	 * from the child (ibm,pmemory) nodes. The generic code registers an of
++	 * reconfig notifier to handle the hot-add/remove cases too.
++	 */
++	of_platform_bus_probe(pmem_node, drc_pmem_match, NULL);
++
++	return 0;
++}
++machine_arch_initcall(pseries, pseries_pmem_init);
+diff --git a/arch/powerpc/platforms/pseries/pseries.h b/arch/powerpc/platforms/pseries/pseries.h
+index 72c0b8986536..7dee8c5d3363 100644
+--- a/arch/powerpc/platforms/pseries/pseries.h
++++ b/arch/powerpc/platforms/pseries/pseries.h
+@@ -65,11 +65,16 @@ int handle_dlpar_errorlog(struct pseries_hp_errorlog *hp_errlog);
+ 
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ int dlpar_memory(struct pseries_hp_errorlog *hp_elog);
++int dlpar_hp_pmem(struct pseries_hp_errorlog *hp_elog);
+ #else
+ static inline int dlpar_memory(struct pseries_hp_errorlog *hp_elog)
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int dlpar_hp_pmem(struct pseries_hp_errorlog *hp_elog)
++{
++	return -EOPNOTSUPP;
++}
+ #endif
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+diff --git a/arch/powerpc/platforms/pseries/ras.c b/arch/powerpc/platforms/pseries/ras.c
+index 2a9c28e4d4f9..d97d52772789 100644
+--- a/arch/powerpc/platforms/pseries/ras.c
++++ b/arch/powerpc/platforms/pseries/ras.c
+@@ -333,7 +333,8 @@ static irqreturn_t ras_hotplug_interrupt(int irq, void *dev_id)
+ 	 * hotplug events on the ras_log_buf to be handled by rtas_errd.
+ 	 */
+ 	if (hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_MEM ||
+-	    hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_CPU)
++	    hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_CPU ||
++	    hp_elog->resource == PSERIES_HP_ELOG_RESOURCE_PMEM)
+ 		queue_hotplug_event(hp_elog);
+ 	else
+ 		log_error(ras_log_buf, ERR_TYPE_RTAS_LOG, 0);
+-- 
+2.13.7
+
