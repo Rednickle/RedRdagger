@@ -1,0 +1,231 @@
+From: Moni Shoua <monis@mellanox.com>
+Date: Tue, 2 Jan 2018 16:19:31 +0200
+Subject: IB/mlx5: Handle type IB_QPT_DRIVER when creating a QP
+Patch-mainline: v4.16-rc1
+Git-commit: b4aaa1f0b415cf8aa79742cbed56a2d75cfc5102
+References: bsc#1103991 FATE#326007
+
+The QP type IB_QPT_DRIVER doesn't describe the transport or the service
+that the QP provides but those are known only to the hardware driver.
+The actual type of the QP is stored in the hardware driver context (i.e.
+mlx5_qp) under the field qp_sub_type.
+
+Take the real QP type and any extra data that is required to create the QP
+from the driver channel and modify the QP initial attributes before continuing
+with create_qp().
+
+Downstream patches from this series will add support for both DCI and
+DCT driver QPs.
+
+Signed-off-by: Moni Shoua <monis@mellanox.com>
+Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/mlx5_ib.h |   10 +++
+ drivers/infiniband/hw/mlx5/qp.c      |  103 ++++++++++++++++++++++++++++++++++-
+ include/uapi/rdma/mlx5-abi.h         |    7 ++
+ 3 files changed, 118 insertions(+), 2 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -206,6 +206,8 @@ struct mlx5_ib_flow_db {
+  * creates the actual hardware QP.
+  */
+ #define MLX5_IB_QPT_HW_GSI	IB_QPT_RESERVED2
++#define MLX5_IB_QPT_DCI		IB_QPT_RESERVED3
++#define MLX5_IB_QPT_DCT		IB_QPT_RESERVED4
+ #define MLX5_IB_WR_UMR		IB_WR_RESERVED1
+ 
+ #define MLX5_IB_UMR_OCTOWORD	       16
+@@ -366,12 +368,18 @@ struct mlx5_bf {
+ 	struct mlx5_sq_bfreg   *bfreg;
+ };
+ 
++struct mlx5_ib_dct {
++	struct mlx5_core_dct    mdct;
++	u32                     *in;
++};
++
+ struct mlx5_ib_qp {
+ 	struct ib_qp		ibqp;
+ 	union {
+ 		struct mlx5_ib_qp_trans trans_qp;
+ 		struct mlx5_ib_raw_packet_qp raw_packet_qp;
+ 		struct mlx5_ib_rss_qp rss_qp;
++		struct mlx5_ib_dct dct;
+ 	};
+ 	struct mlx5_buf		buf;
+ 
+@@ -410,6 +418,8 @@ struct mlx5_ib_qp {
+ 	u32			rate_limit;
+ 	u32                     underlay_qpn;
+ 	bool			tunnel_offload_en;
++	/* storage for qp sub type when core qp type is IB_QPT_DRIVER */
++	enum ib_qp_type		qp_sub_type;
+ };
+ 
+ struct mlx5_ib_cq_buf {
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -2115,20 +2115,108 @@ static const char *ib_qp_type_str(enum i
+ 		return "IB_QPT_RAW_PACKET";
+ 	case MLX5_IB_QPT_REG_UMR:
+ 		return "MLX5_IB_QPT_REG_UMR";
++	case IB_QPT_DRIVER:
++		return "IB_QPT_DRIVER";
+ 	case IB_QPT_MAX:
+ 	default:
+ 		return "Invalid QP type";
+ 	}
+ }
+ 
++static struct ib_qp *mlx5_ib_create_dct(struct ib_pd *pd,
++					struct ib_qp_init_attr *attr,
++					struct mlx5_ib_create_qp *ucmd)
++{
++	struct mlx5_ib_dev *dev;
++	struct mlx5_ib_qp *qp;
++	int err = 0;
++	u32 uidx = MLX5_IB_DEFAULT_UIDX;
++	void *dctc;
++
++	if (!attr->srq || !attr->recv_cq)
++		return ERR_PTR(-EINVAL);
++
++	dev = to_mdev(pd->device);
++
++	err = get_qp_user_index(to_mucontext(pd->uobject->context),
++				ucmd, sizeof(*ucmd), &uidx);
++	if (err)
++		return ERR_PTR(err);
++
++	qp = kzalloc(sizeof(*qp), GFP_KERNEL);
++	if (!qp)
++		return ERR_PTR(-ENOMEM);
++
++	qp->dct.in = kzalloc(MLX5_ST_SZ_BYTES(create_dct_in), GFP_KERNEL);
++	if (!qp->dct.in) {
++		err = -ENOMEM;
++		goto err_free;
++	}
++
++	dctc = MLX5_ADDR_OF(create_dct_in, qp->dct.in, dct_context_entry);
++	qp->driver_qp_type = MLX5_IB_QPT_DCT;
++	MLX5_SET(dctc, dctc, pd, to_mpd(pd)->pdn);
++	MLX5_SET(dctc, dctc, srqn_xrqn, to_msrq(attr->srq)->msrq.srqn);
++	MLX5_SET(dctc, dctc, cqn, to_mcq(attr->recv_cq)->mcq.cqn);
++	MLX5_SET64(dctc, dctc, dc_access_key, ucmd->access_key);
++	MLX5_SET(dctc, dctc, user_index, uidx);
++
++	qp->state = IB_QPS_RESET;
++
++	return &qp->ibqp;
++err_free:
++	kfree(qp);
++	return ERR_PTR(err);
++}
++
++static int set_mlx_qp_type(struct mlx5_ib_dev *dev,
++			   struct ib_qp_init_attr *init_attr,
++			   struct mlx5_ib_create_qp *ucmd,
++			   struct ib_udata *udata)
++{
++	enum { MLX_QP_FLAGS = MLX5_QP_FLAG_TYPE_DCT | MLX5_QP_FLAG_TYPE_DCI };
++	int err;
++
++	if (!udata)
++		return -EINVAL;
++
++	if (udata->inlen < sizeof(*ucmd)) {
++		mlx5_ib_dbg(dev, "create_qp user command is smaller than expected\n");
++		return -EINVAL;
++	}
++	err = ib_copy_from_udata(ucmd, udata, sizeof(*ucmd));
++	if (err)
++		return err;
++
++	if ((ucmd->flags & MLX_QP_FLAGS) == MLX5_QP_FLAG_TYPE_DCI) {
++		init_attr->qp_type = MLX5_IB_QPT_DCI;
++	} else {
++		if ((ucmd->flags & MLX_QP_FLAGS) == MLX5_QP_FLAG_TYPE_DCT) {
++			init_attr->qp_type = MLX5_IB_QPT_DCT;
++		} else {
++			mlx5_ib_dbg(dev, "Invalid QP flags\n");
++			return -EINVAL;
++		}
++	}
++
++	if (!MLX5_CAP_GEN(dev->mdev, dct)) {
++		mlx5_ib_dbg(dev, "DC transport is not supported\n");
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
+ struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd,
+-				struct ib_qp_init_attr *init_attr,
++				struct ib_qp_init_attr *verbs_init_attr,
+ 				struct ib_udata *udata)
+ {
+ 	struct mlx5_ib_dev *dev;
+ 	struct mlx5_ib_qp *qp;
+ 	u16 xrcdn = 0;
+ 	int err;
++	struct ib_qp_init_attr mlx_init_attr;
++	struct ib_qp_init_attr *init_attr = verbs_init_attr;
+ 
+ 	if (pd) {
+ 		dev = to_mdev(pd->device);
+@@ -2153,6 +2241,16 @@ struct ib_qp *mlx5_ib_create_qp(struct i
+ 		dev = to_mdev(to_mxrcd(init_attr->xrcd)->ibxrcd.device);
+ 	}
+ 
++	if (init_attr->qp_type == IB_QPT_DRIVER) {
++		struct mlx5_ib_create_qp ucmd;
++
++		init_attr = &mlx_init_attr;
++		memcpy(init_attr, verbs_init_attr, sizeof(*verbs_init_attr));
++		err = set_mlx_qp_type(dev, init_attr, &ucmd, udata);
++		if (err)
++			return ERR_PTR(err);
++	}
++
+ 	switch (init_attr->qp_type) {
+ 	case IB_QPT_XRC_TGT:
+ 	case IB_QPT_XRC_INI:
+@@ -2214,6 +2312,9 @@ struct ib_qp *mlx5_ib_create_qp(struct i
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
++	if (verbs_init_attr->qp_type == IB_QPT_DRIVER)
++		qp->qp_sub_type = init_attr->qp_type;
++
+ 	return &qp->ibqp;
+ }
+ 
+--- a/include/uapi/rdma/mlx5-abi.h
++++ b/include/uapi/rdma/mlx5-abi.h
+@@ -41,6 +41,8 @@ enum {
+ 	MLX5_QP_FLAG_SCATTER_CQE	= 1 << 1,
+ 	MLX5_QP_FLAG_TUNNEL_OFFLOADS	= 1 << 2,
+ 	MLX5_QP_FLAG_BFREG_INDEX	= 1 << 3,
++	MLX5_QP_FLAG_TYPE_DCT		= 1 << 4,
++	MLX5_QP_FLAG_TYPE_DCI		= 1 << 5,
+ };
+ 
+ enum {
+@@ -283,7 +285,10 @@ struct mlx5_ib_create_qp {
+ 	__u32	flags;
+ 	__u32	uidx;
+ 	__u32	bfreg_index;
+-	__u64	sq_buf_addr;
++	union {
++		__u64	sq_buf_addr;
++		__u64	access_key;
++	};
+ };
+ 
+ /* RX Hash function flags */
