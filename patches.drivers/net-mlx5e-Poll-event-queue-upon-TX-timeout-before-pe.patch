@@ -1,0 +1,150 @@
+From: Eran Ben Elisha <eranbe@mellanox.com>
+Date: Tue, 19 Dec 2017 14:52:29 +0200
+Subject: net/mlx5e: Poll event queue upon TX timeout before performing full
+ channels recovery
+Patch-mainline: v4.16-rc1
+Git-commit: 7ca560b5af70b5f578c9bf32c8fbfbd68d22252f
+References: bsc#1103990 FATE#326006
+
+Up until this patch, on every TX timeout we would try to do channels
+recovery.  However, in case of a lost interrupt for an EQ, the channel
+associated to it cannot be recovered if reopened as it would never get
+another interrupt on sent/received traffic, and eventually ends up with
+another TX timeout (Restarting the EQ is not part of channel recovery).
+
+This patch adds a mechanism for explicitly polling EQ in case of a TX
+timeout in order to recover from a lost interrupt. If this is not the
+case (no pending EQEs), perform a channels full recovery as usual.
+
+Once a lost EQE is recovered, it triggers the NAPI to run and handle all
+pending completions. This will free some budget in the bql (via calling
+netdev_tx_completed_queue) or by clearing pending TXWQEs and waking up
+the queue.  One of the above actions will move the queue to be ready for
+transmit again.
+
+Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c   |   51 ++++++++++++++------
+ drivers/net/ethernet/mellanox/mlx5/core/eq.c        |   18 +++++++
+ drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h |    1 
+ 3 files changed, 55 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -3757,10 +3757,37 @@ static netdev_features_t mlx5e_features_
+ 	return features;
+ }
+ 
++static bool mlx5e_tx_timeout_eq_recover(struct net_device *dev,
++					struct mlx5e_txqsq *sq)
++{
++	struct mlx5e_priv *priv = netdev_priv(dev);
++	struct mlx5_core_dev *mdev = priv->mdev;
++	int irqn_not_used, eqn;
++	struct mlx5_eq *eq;
++	u32 eqe_count;
++
++	if (mlx5_vector2eqn(mdev, sq->cq.mcq.vector, &eqn, &irqn_not_used))
++		return false;
++
++	eq = mlx5_eqn2eq(mdev, eqn);
++	if (IS_ERR(eq))
++		return false;
++
++	netdev_err(dev, "EQ 0x%x: Cons = 0x%x, irqn = 0x%x\n",
++		   eqn, eq->cons_index, eq->irqn);
++
++	eqe_count = mlx5_eq_poll_irq_disabled(eq);
++	if (!eqe_count)
++		return false;
++
++	netdev_err(dev, "Recover %d eqes on EQ 0x%x\n", eqe_count, eq->eqn);
++	return true;
++}
++
+ static void mlx5e_tx_timeout(struct net_device *dev)
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+-	bool sched_work = false;
++	bool reopen_channels = false;
+ 	int i;
+ 
+ 	netdev_err(dev, "TX timeout detected\n");
+@@ -3768,29 +3795,23 @@ static void mlx5e_tx_timeout(struct net_
+ 	for (i = 0; i < priv->channels.num * priv->channels.params.num_tc; i++) {
+ 		struct netdev_queue *dev_queue = netdev_get_tx_queue(dev, i);
+ 		struct mlx5e_txqsq *sq = priv->txq2sq[i];
+-		struct mlx5_core_dev *mdev = priv->mdev;
+-		int irqn_not_used, eqn;
+-		struct mlx5_eq *eq;
+ 
+ 		if (!netif_xmit_stopped(dev_queue))
+ 			continue;
+-		sched_work = true;
+-		clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ 		netdev_err(dev, "TX timeout on queue: %d, SQ: 0x%x, CQ: 0x%x, SQ Cons: 0x%x SQ Prod: 0x%x, usecs since last trans: %u\n",
+ 			   i, sq->sqn, sq->cq.mcq.cqn, sq->cc, sq->pc,
+ 			   jiffies_to_usecs(jiffies - dev_queue->trans_start));
+ 
+-		if (mlx5_vector2eqn(mdev, sq->cq.mcq.vector, &eqn,
+-				    &irqn_not_used))
+-			continue;
+-
+-		eq = mlx5_eqn2eq(mdev, eqn);
+-		if (!IS_ERR(eq))
+-			netdev_err(dev, "EQ 0x%x: Cons = 0x%x, irqn = 0x%x\n",
+-				   eqn, eq->cons_index, eq->irqn);
++		/* If we recover a lost interrupt, most likely TX timeout will
++		 * be resolved, skip reopening channels
++		 */
++		if (!mlx5e_tx_timeout_eq_recover(dev, sq)) {
++			clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
++			reopen_channels = true;
++		}
+ 	}
+ 
+-	if (sched_work && test_bit(MLX5E_STATE_OPENED, &priv->state))
++	if (reopen_channels && test_bit(MLX5E_STATE_OPENED, &priv->state))
+ 		schedule_work(&priv->tx_timeout_work);
+ }
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@ -534,6 +534,24 @@ static irqreturn_t mlx5_eq_int(int irq,
+ 	return IRQ_HANDLED;
+ }
+ 
++/* Some architectures don't latch interrupts when they are disabled, so using
++ * mlx5_eq_poll_irq_disabled could end up losing interrupts while trying to
++ * avoid losing them.  It is not recommended to use it, unless this is the last
++ * resort.
++ */
++u32 mlx5_eq_poll_irq_disabled(struct mlx5_eq *eq)
++{
++	u32 count_eqe;
++
++	disable_irq(eq->irqn);
++	count_eqe = eq->cons_index;
++	mlx5_eq_int(eq->irqn, eq);
++	count_eqe = eq->cons_index - count_eqe;
++	enable_irq(eq->irqn);
++
++	return count_eqe;
++}
++
+ static void init_eq_buf(struct mlx5_eq *eq)
+ {
+ 	struct mlx5_eqe *eqe;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -116,6 +116,7 @@ int mlx5_destroy_scheduling_element_cmd(
+ int mlx5_wait_for_vf_pages(struct mlx5_core_dev *dev);
+ u64 mlx5_read_internal_timer(struct mlx5_core_dev *dev);
+ struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn);
++u32 mlx5_eq_poll_irq_disabled(struct mlx5_eq *eq);
+ void mlx5_cq_tasklet_cb(unsigned long data);
+ 
+ int mlx5_query_pcam_reg(struct mlx5_core_dev *dev, u32 *pcam, u8 feature_group,
