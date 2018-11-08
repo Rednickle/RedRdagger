@@ -1,0 +1,297 @@
+From: Matan Barak <matanb@mellanox.com>
+Date: Wed, 28 Mar 2018 09:27:46 +0300
+Subject: IB/uverbs: Add action_handle flow steering specification
+Patch-mainline: v4.17-rc1
+Git-commit: 9b828441976ef719f1008a9855fff95a45e474b8
+References: bsc#1103992 FATE#326009
+
+Binding a flow_action to flow steering rule requires using a new
+specification. Therefore, adding such an IB_FLOW_SPEC_ACTION_HANDLE flow
+specification.
+
+Flow steering rules could use flow_action(s) and as of that we need to
+avoid deleting flow_action(s) as long as they're being used.
+Moreover, when the attached rules are deleted, action_handle reference
+count should be decremented. Introducing a new mechanism of flow
+resources to keep track on the attached action_handle(s). Later on, this
+mechanism should be extended to other attached flow steering resources
+like flow counters.
+
+Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+Signed-off-by: Matan Barak <matanb@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/uverbs.h           |    8 ++
+ drivers/infiniband/core/uverbs_cmd.c       |   86 ++++++++++++++++++++++++++---
+ drivers/infiniband/core/uverbs_std_types.c |   14 ++++
+ include/rdma/ib_verbs.h                    |    8 ++
+ include/uapi/rdma/ib_user_verbs.h          |   13 ++++
+ 5 files changed, 121 insertions(+), 8 deletions(-)
+
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -203,11 +203,18 @@ struct ib_ucq_object {
+ 	u32			async_events_reported;
+ };
+ 
++struct ib_uflow_resources;
++struct ib_uflow_object {
++	struct ib_uobject		uobject;
++	struct ib_uflow_resources	*resources;
++};
++
+ extern const struct file_operations uverbs_event_fops;
+ void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue);
+ struct file *ib_uverbs_alloc_async_event_file(struct ib_uverbs_file *uverbs_file,
+ 					      struct ib_device *ib_dev);
+ void ib_uverbs_free_async_event_file(struct ib_uverbs_file *uverbs_file);
++void ib_uverbs_flow_resources_free(struct ib_uflow_resources *uflow_res);
+ 
+ void ib_uverbs_release_ucq(struct ib_uverbs_file *file,
+ 			   struct ib_uverbs_completion_event_file *ev_file,
+@@ -254,6 +261,7 @@ struct ib_uverbs_flow_spec {
+ 		struct ib_uverbs_flow_spec_ipv6    ipv6;
+ 		struct ib_uverbs_flow_spec_action_tag	flow_tag;
+ 		struct ib_uverbs_flow_spec_action_drop	drop;
++		struct ib_uverbs_flow_spec_action_handle action;
+ 	};
+ };
+ 
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -2739,8 +2739,52 @@ out_put:
+ 	return ret ? ret : in_len;
+ }
+ 
+-static int kern_spec_to_ib_spec_action(struct ib_uverbs_flow_spec *kern_spec,
+-				       union ib_flow_spec *ib_spec)
++struct ib_uflow_resources {
++	size_t			max;
++	size_t			num;
++	struct ib_flow_action	*collection[0];
++};
++
++static struct ib_uflow_resources *flow_resources_alloc(size_t num_specs)
++{
++	struct ib_uflow_resources *resources;
++
++	resources =
++		kmalloc(sizeof(*resources) +
++			num_specs * sizeof(*resources->collection), GFP_KERNEL);
++
++	if (!resources)
++		return NULL;
++
++	resources->num = 0;
++	resources->max = num_specs;
++
++	return resources;
++}
++
++void ib_uverbs_flow_resources_free(struct ib_uflow_resources *uflow_res)
++{
++	unsigned int i;
++
++	for (i = 0; i < uflow_res->num; i++)
++		atomic_dec(&uflow_res->collection[i]->usecnt);
++
++	kfree(uflow_res);
++}
++
++static void flow_resources_add(struct ib_uflow_resources *uflow_res,
++			       struct ib_flow_action *action)
++{
++	WARN_ON(uflow_res->num >= uflow_res->max);
++
++	atomic_inc(&action->usecnt);
++	uflow_res->collection[uflow_res->num++] = action;
++}
++
++static int kern_spec_to_ib_spec_action(struct ib_ucontext *ucontext,
++				       struct ib_uverbs_flow_spec *kern_spec,
++				       union ib_flow_spec *ib_spec,
++				       struct ib_uflow_resources *uflow_res)
+ {
+ 	ib_spec->type = kern_spec->type;
+ 	switch (ib_spec->type) {
+@@ -2759,6 +2803,21 @@ static int kern_spec_to_ib_spec_action(s
+ 
+ 		ib_spec->drop.size = sizeof(struct ib_flow_spec_action_drop);
+ 		break;
++	case IB_FLOW_SPEC_ACTION_HANDLE:
++		if (kern_spec->action.size !=
++		    sizeof(struct ib_uverbs_flow_spec_action_handle))
++			return -EOPNOTSUPP;
++		ib_spec->action.act = uobj_get_obj_read(flow_action,
++							UVERBS_OBJECT_FLOW_ACTION,
++							kern_spec->action.handle,
++							ucontext);
++		if (!ib_spec->action.act)
++			return -EINVAL;
++		ib_spec->action.size =
++			sizeof(struct ib_flow_spec_action_handle);
++		flow_resources_add(uflow_res, ib_spec->action.act);
++		uobj_put_obj_read(ib_spec->action.act);
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -2900,14 +2959,17 @@ static int kern_spec_to_ib_spec_filter(s
+ 						     kern_filter_sz, ib_spec);
+ }
+ 
+-static int kern_spec_to_ib_spec(struct ib_uverbs_flow_spec *kern_spec,
+-				union ib_flow_spec *ib_spec)
++static int kern_spec_to_ib_spec(struct ib_ucontext *ucontext,
++				struct ib_uverbs_flow_spec *kern_spec,
++				union ib_flow_spec *ib_spec,
++				struct ib_uflow_resources *uflow_res)
+ {
+ 	if (kern_spec->reserved)
+ 		return -EINVAL;
+ 
+ 	if (kern_spec->type >= IB_FLOW_SPEC_ACTION_TAG)
+-		return kern_spec_to_ib_spec_action(kern_spec, ib_spec);
++		return kern_spec_to_ib_spec_action(ucontext, kern_spec, ib_spec,
++						   uflow_res);
+ 	else
+ 		return kern_spec_to_ib_spec_filter(kern_spec, ib_spec);
+ }
+@@ -3322,10 +3384,12 @@ int ib_uverbs_ex_create_flow(struct ib_u
+ 	struct ib_uverbs_create_flow	  cmd;
+ 	struct ib_uverbs_create_flow_resp resp;
+ 	struct ib_uobject		  *uobj;
++	struct ib_uflow_object		  *uflow;
+ 	struct ib_flow			  *flow_id;
+ 	struct ib_uverbs_flow_attr	  *kern_flow_attr;
+ 	struct ib_flow_attr		  *flow_attr;
+ 	struct ib_qp			  *qp;
++	struct ib_uflow_resources	  *uflow_res;
+ 	int err = 0;
+ 	void *kern_spec;
+ 	void *ib_spec;
+@@ -3403,6 +3467,11 @@ int ib_uverbs_ex_create_flow(struct ib_u
+ 		err = -ENOMEM;
+ 		goto err_put;
+ 	}
++	uflow_res = flow_resources_alloc(cmd.flow_attr.num_of_specs);
++	if (!uflow_res) {
++		err = -ENOMEM;
++		goto err_free_flow_attr;
++	}
+ 
+ 	flow_attr->type = kern_flow_attr->type;
+ 	flow_attr->priority = kern_flow_attr->priority;
+@@ -3417,7 +3486,8 @@ int ib_uverbs_ex_create_flow(struct ib_u
+ 	     cmd.flow_attr.size > offsetof(struct ib_uverbs_flow_spec, reserved) &&
+ 	     cmd.flow_attr.size >=
+ 	     ((struct ib_uverbs_flow_spec *)kern_spec)->size; i++) {
+-		err = kern_spec_to_ib_spec(kern_spec, ib_spec);
++		err = kern_spec_to_ib_spec(file->ucontext, kern_spec, ib_spec,
++					   uflow_res);
+ 		if (err)
+ 			goto err_free;
+ 		flow_attr->size +=
+@@ -3439,6 +3509,8 @@ int ib_uverbs_ex_create_flow(struct ib_u
+ 	}
+ 	flow_id->uobject = uobj;
+ 	uobj->object = flow_id;
++	uflow = container_of(uobj, typeof(*uflow), uobject);
++	uflow->resources = uflow_res;
+ 
+ 	memset(&resp, 0, sizeof(resp));
+ 	resp.flow_handle = uobj->id;
+@@ -3457,6 +3529,8 @@ int ib_uverbs_ex_create_flow(struct ib_u
+ err_copy:
+ 	ib_destroy_flow(flow_id);
+ err_free:
++	ib_uverbs_flow_resources_free(uflow_res);
++err_free_flow_attr:
+ 	kfree(flow_attr);
+ err_put:
+ 	uobj_put_obj_read(qp);
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@ -48,7 +48,16 @@ static int uverbs_free_ah(struct ib_uobj
+ static int uverbs_free_flow(struct ib_uobject *uobject,
+ 			    enum rdma_remove_reason why)
+ {
+-	return ib_destroy_flow((struct ib_flow *)uobject->object);
++	int ret;
++	struct ib_flow *flow = (struct ib_flow *)uobject->object;
++	struct ib_uflow_object *uflow =
++		container_of(uobject, struct ib_uflow_object, uobject);
++
++	ret = ib_destroy_flow(flow);
++	if (!ret)
++		ib_uverbs_flow_resources_free(uflow->resources);
++
++	return ret;
+ }
+ 
+ static int uverbs_free_mw(struct ib_uobject *uobject,
+@@ -268,7 +277,8 @@ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJEC
+ 			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_ah));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_FLOW,
+-			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_flow));
++			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
++						      0, uverbs_free_flow));
+ 
+ DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_WQ,
+ 			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), 0,
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1832,6 +1832,7 @@ enum ib_flow_spec_type {
+ 	/* Actions */
+ 	IB_FLOW_SPEC_ACTION_TAG         = 0x1000,
+ 	IB_FLOW_SPEC_ACTION_DROP        = 0x1001,
++	IB_FLOW_SPEC_ACTION_HANDLE	= 0x1002,
+ };
+ #define IB_FLOW_SPEC_LAYER_MASK	0xF0
+ #define IB_FLOW_SPEC_SUPPORT_LAYERS 8
+@@ -1965,6 +1966,12 @@ struct ib_flow_spec_action_drop {
+ 	u16			      size;
+ };
+ 
++struct ib_flow_spec_action_handle {
++	enum ib_flow_spec_type	      type;
++	u16			      size;
++	struct ib_flow_action	     *act;
++};
++
+ union ib_flow_spec {
+ 	struct {
+ 		u32			type;
+@@ -1978,6 +1985,7 @@ union ib_flow_spec {
+ 	struct ib_flow_spec_tunnel      tunnel;
+ 	struct ib_flow_spec_action_tag  flow_tag;
+ 	struct ib_flow_spec_action_drop drop;
++	struct ib_flow_spec_action_handle action;
+ };
+ 
+ struct ib_flow_attr {
+--- a/include/uapi/rdma/ib_user_verbs.h
++++ b/include/uapi/rdma/ib_user_verbs.h
+@@ -983,6 +983,19 @@ struct ib_uverbs_flow_spec_action_drop {
+ 	};
+ };
+ 
++struct ib_uverbs_flow_spec_action_handle {
++	union {
++		struct ib_uverbs_flow_spec_hdr hdr;
++		struct {
++			__u32 type;
++			__u16 size;
++			__u16 reserved;
++		};
++	};
++	__u32			      handle;
++	__u32			      reserved1;
++};
++
+ struct ib_uverbs_flow_tunnel_filter {
+ 	__be32 tunnel_id;
+ };
