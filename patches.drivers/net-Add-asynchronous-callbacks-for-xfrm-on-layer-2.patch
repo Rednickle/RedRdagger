@@ -1,0 +1,495 @@
+From: Steffen Klassert <steffen.klassert@secunet.com>
+Date: Wed, 20 Dec 2017 10:41:36 +0100
+Subject: net: Add asynchronous callbacks for xfrm on layer 2.
+Patch-mainline: v4.16-rc1
+Git-commit: f53c723902d1ac5f0b0a11d7c9dcbff748dde74e
+References: bsc#1103990 FATE#326006
+
+This patch implements asynchronous crypto callbacks
+and a backlog handler that can be used when IPsec
+is done at layer 2 in the TX path. It also extends
+the skb validate functions so that we can update
+the driver transmit return codes based on async
+crypto operation or to indicate that we queued the
+packet in a backlog queue.
+
+Joint work with: Aviv Heller <avivh@mellanox.com>
+
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/netdevice.h |    6 +-
+ include/net/xfrm.h        |   22 ++++++++--
+ net/core/dev.c            |   16 +++++--
+ net/ipv4/esp4.c           |   24 +++++++++--
+ net/ipv6/esp6.c           |   24 +++++++++--
+ net/packet/af_packet.c    |    3 -
+ net/sched/sch_generic.c   |   16 ++++++-
+ net/xfrm/xfrm_device.c    |  100 +++++++++++++++++++++++++++++++++++++---------
+ 8 files changed, 175 insertions(+), 36 deletions(-)
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2788,7 +2788,9 @@ struct softnet_data {
+ 	struct Qdisc		*output_queue;
+ 	struct Qdisc		**output_queue_tailp;
+ 	struct sk_buff		*completion_queue;
+-
++#ifdef CONFIG_XFRM_OFFLOAD
++	struct sk_buff_head	xfrm_backlog;
++#endif
+ #ifdef CONFIG_RPS
+ 	/* input_queue_head should be written by cpu owning this struct,
+ 	 * and only read by other cpus. Worth using a cache line.
+@@ -3319,7 +3321,7 @@ int dev_get_phys_port_id(struct net_devi
+ int dev_get_phys_port_name(struct net_device *dev,
+ 			   char *name, size_t len);
+ int dev_change_proto_down(struct net_device *dev, bool proto_down);
+-struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev);
++struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev, bool *again);
+ struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ 				    struct netdev_queue *txq, int *ret);
+ 
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -1016,6 +1016,7 @@ struct xfrm_offload {
+ #define	XFRM_GSO_SEGMENT	16
+ #define	XFRM_GRO		32
+ #define	XFRM_ESP_NO_TRAILER	64
++#define	XFRM_DEV_RESUME		128
+ 
+ 	__u32			status;
+ #define CRYPTO_SUCCESS				1
+@@ -1845,21 +1846,28 @@ static inline struct xfrm_state *xfrm_in
+ {
+ 	return skb->sp->xvec[skb->sp->len - 1];
+ }
++#endif
++
+ static inline struct xfrm_offload *xfrm_offload(struct sk_buff *skb)
+ {
++#ifdef CONFIG_XFRM
+ 	struct sec_path *sp = skb->sp;
+ 
+ 	if (!sp || !sp->olen || sp->len != sp->olen)
+ 		return NULL;
+ 
+ 	return &sp->ovec[sp->olen - 1];
+-}
++#else
++	return NULL;
+ #endif
++}
+ 
+ void __net_init xfrm_dev_init(void);
+ 
+ #ifdef CONFIG_XFRM_OFFLOAD
+-struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features);
++void xfrm_dev_resume(struct sk_buff *skb);
++void xfrm_dev_backlog(struct softnet_data *sd);
++struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again);
+ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+ 		       struct xfrm_user_offload *xuo);
+ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x);
+@@ -1898,7 +1906,15 @@ static inline void xfrm_dev_state_free(s
+ 	}
+ }
+ #else
+-static inline struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features)
++static inline void xfrm_dev_resume(struct sk_buff *skb)
++{
++}
++
++static inline void xfrm_dev_backlog(struct softnet_data *sd)
++{
++}
++
++static inline struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again)
+ {
+ 	return skb;
+ }
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3054,7 +3054,7 @@ int skb_csum_hwoffload_help(struct sk_bu
+ }
+ EXPORT_SYMBOL(skb_csum_hwoffload_help);
+ 
+-static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev)
++static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
+ {
+ 	netdev_features_t features;
+ 
+@@ -3094,7 +3094,7 @@ static struct sk_buff *validate_xmit_skb
+ 		}
+ 	}
+ 
+-	skb = validate_xmit_xfrm(skb, features);
++	skb = validate_xmit_xfrm(skb, features, again);
+ 
+ 	return skb;
+ 
+@@ -3105,7 +3105,7 @@ out_null:
+ 	return NULL;
+ }
+ 
+-struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev)
++struct sk_buff *validate_xmit_skb_list(struct sk_buff *skb, struct net_device *dev, bool *again)
+ {
+ 	struct sk_buff *next, *head = NULL, *tail;
+ 
+@@ -3116,7 +3116,7 @@ struct sk_buff *validate_xmit_skb_list(s
+ 		/* in case skb wont be segmented, point to itself */
+ 		skb->prev = skb;
+ 
+-		skb = validate_xmit_skb(skb, dev);
++		skb = validate_xmit_skb(skb, dev, again);
+ 		if (!skb)
+ 			continue;
+ 
+@@ -3454,6 +3454,7 @@ static int __dev_queue_xmit(struct sk_bu
+ 	struct netdev_queue *txq;
+ 	struct Qdisc *q;
+ 	int rc = -ENOMEM;
++	bool again = false;
+ 
+ 	skb_reset_mac_header(skb);
+ 
+@@ -3515,7 +3516,7 @@ static int __dev_queue_xmit(struct sk_bu
+ 				     XMIT_RECURSION_LIMIT))
+ 				goto recursion_alert;
+ 
+-			skb = validate_xmit_skb(skb, dev);
++			skb = validate_xmit_skb(skb, dev, &again);
+ 			if (!skb)
+ 				goto out;
+ 
+@@ -4199,6 +4200,8 @@ static __latent_entropy void net_tx_acti
+ 				spin_unlock(root_lock);
+ 		}
+ 	}
++
++	xfrm_dev_backlog(sd);
+ }
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_ATM_LANE)
+@@ -8869,6 +8872,9 @@ static int __init net_dev_init(void)
+ 
+ 		skb_queue_head_init(&sd->input_pkt_queue);
+ 		skb_queue_head_init(&sd->process_queue);
++#ifdef CONFIG_XFRM_OFFLOAD
++		skb_queue_head_init(&sd->xfrm_backlog);
++#endif
+ 		INIT_LIST_HEAD(&sd->poll_list);
+ 		sd->output_queue_tailp = &sd->output_queue;
+ #ifdef CONFIG_RPS
+--- a/net/ipv4/esp4.c
++++ b/net/ipv4/esp4.c
+@@ -121,14 +121,32 @@ static void esp_ssg_unref(struct xfrm_st
+ static void esp_output_done(struct crypto_async_request *base, int err)
+ {
+ 	struct sk_buff *skb = base->data;
++	struct xfrm_offload *xo = xfrm_offload(skb);
+ 	void *tmp;
+-	struct dst_entry *dst = skb_dst(skb);
+-	struct xfrm_state *x = dst->xfrm;
++	struct xfrm_state *x;
++
++	if (xo && (xo->flags & XFRM_DEV_RESUME))
++		x = skb->sp->xvec[skb->sp->len - 1];
++	else
++		x = skb_dst(skb)->xfrm;
+ 
+ 	tmp = ESP_SKB_CB(skb)->tmp;
+ 	esp_ssg_unref(x, tmp);
+ 	kfree(tmp);
+-	xfrm_output_resume(skb, err);
++
++	if (xo && (xo->flags & XFRM_DEV_RESUME)) {
++		if (err) {
++			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
++			kfree_skb(skb);
++			return;
++		}
++
++		skb_push(skb, skb->data - skb_mac_header(skb));
++		secpath_reset(skb);
++		xfrm_dev_resume(skb);
++	} else {
++		xfrm_output_resume(skb, err);
++	}
+ }
+ 
+ /* Move ESP header back into place. */
+--- a/net/ipv6/esp6.c
++++ b/net/ipv6/esp6.c
+@@ -143,14 +143,32 @@ static void esp_ssg_unref(struct xfrm_st
+ static void esp_output_done(struct crypto_async_request *base, int err)
+ {
+ 	struct sk_buff *skb = base->data;
++	struct xfrm_offload *xo = xfrm_offload(skb);
+ 	void *tmp;
+-	struct dst_entry *dst = skb_dst(skb);
+-	struct xfrm_state *x = dst->xfrm;
++	struct xfrm_state *x;
++
++	if (xo && (xo->flags & XFRM_DEV_RESUME))
++		x = skb->sp->xvec[skb->sp->len - 1];
++	else
++		x = skb_dst(skb)->xfrm;
+ 
+ 	tmp = ESP_SKB_CB(skb)->tmp;
+ 	esp_ssg_unref(x, tmp);
+ 	kfree(tmp);
+-	xfrm_output_resume(skb, err);
++
++	if (xo && (xo->flags & XFRM_DEV_RESUME)) {
++		if (err) {
++			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
++			kfree_skb(skb);
++			return;
++		}
++
++		skb_push(skb, skb->data - skb_mac_header(skb));
++		secpath_reset(skb);
++		xfrm_dev_resume(skb);
++	} else {
++		xfrm_output_resume(skb, err);
++	}
+ }
+ 
+ /* Move ESP header back into place. */
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -254,12 +254,13 @@ static int packet_direct_xmit(struct sk_
+ 	struct sk_buff *orig_skb = skb;
+ 	struct netdev_queue *txq;
+ 	int ret = NETDEV_TX_BUSY;
++	bool again = false;
+ 
+ 	if (unlikely(!netif_running(dev) ||
+ 		     !netif_carrier_ok(dev)))
+ 		goto drop;
+ 
+-	skb = validate_xmit_skb_list(skb, dev);
++	skb = validate_xmit_skb_list(skb, dev, &again);
+ 	if (skb != orig_skb)
+ 		goto drop;
+ 
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -31,6 +31,7 @@
+ #include <net/sch_generic.h>
+ #include <net/pkt_sched.h>
+ #include <net/dst.h>
++#include <net/xfrm.h>
+ 
+ /* Qdisc to use by default */
+ const struct Qdisc_ops *default_qdisc_ops = &pfifo_fast_ops;
+@@ -229,6 +230,8 @@ static struct sk_buff *dequeue_skb(struc
+ 
+ 		/* skb in gso_skb were already validated */
+ 		*validate = false;
++		if (xfrm_offload(skb))
++			*validate = true;
+ 		/* check the reason of requeuing without tx lock first */
+ 		txq = skb_get_tx_queue(txq->dev, skb);
+ 		if (!netif_xmit_frozen_or_stopped(txq)) {
+@@ -282,6 +285,7 @@ bool sch_direct_xmit(struct sk_buff *skb
+ 		     spinlock_t *root_lock, bool validate)
+ {
+ 	int ret = NETDEV_TX_BUSY;
++	bool again = false;
+ 
+ 	/* And release qdisc */
+ 	if (root_lock)
+@@ -289,7 +293,17 @@ bool sch_direct_xmit(struct sk_buff *skb
+ 
+ 	/* Note that we validate skb (GSO, checksum, ...) outside of locks */
+ 	if (validate)
+-		skb = validate_xmit_skb_list(skb, dev);
++		skb = validate_xmit_skb_list(skb, dev, &again);
++
++#ifdef CONFIG_XFRM_OFFLOAD
++	if (unlikely(again)) {
++		if (root_lock)
++			spin_lock(root_lock);
++
++		dev_requeue_skb(skb, q);
++		return false;
++	}
++#endif
+ 
+ 	if (likely(skb)) {
+ 		HARD_TX_LOCK(dev, txq, smp_processor_id());
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -23,12 +23,13 @@
+ #include <linux/notifier.h>
+ 
+ #ifdef CONFIG_XFRM_OFFLOAD
+-struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features)
++struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t features, bool *again)
+ {
+ 	int err;
+-	__u32 seq;
++	unsigned long flags;
+ 	struct xfrm_state *x;
+ 	struct sk_buff *skb2;
++	struct softnet_data *sd;
+ 	netdev_features_t esp_features = features;
+ 	struct xfrm_offload *xo = xfrm_offload(skb);
+ 
+@@ -42,6 +43,16 @@ struct sk_buff *validate_xmit_xfrm(struc
+ 	if (xo->flags & XFRM_GRO || x->xso.flags & XFRM_OFFLOAD_INBOUND)
+ 		return skb;
+ 
++	local_irq_save(flags);
++	sd = this_cpu_ptr(&softnet_data);
++	err = !skb_queue_empty(&sd->xfrm_backlog);
++	local_irq_restore(flags);
++
++	if (err) {
++		*again = true;
++		return skb;
++	}
++
+ 	if (skb_is_gso(skb)) {
+ 		struct net_device *dev = skb->dev;
+ 
+@@ -54,23 +65,26 @@ struct sk_buff *validate_xmit_xfrm(struc
+ 
+ 			segs = skb_gso_segment(skb, esp_features);
+ 			if (IS_ERR(segs)) {
+-				XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+ 				kfree_skb(skb);
++				atomic_long_inc(&dev->tx_dropped);
+ 				return NULL;
+ 			} else {
+ 				consume_skb(skb);
+ 				skb = segs;
+ 			}
+-		} else {
+-			return skb;
+ 		}
+ 	}
+ 
+ 	if (!skb->next) {
+ 		x->outer_mode->xmit(x, skb);
+ 
++		xo->flags |= XFRM_DEV_RESUME;
++
+ 		err = x->type_offload->xmit(x, skb, esp_features);
+ 		if (err) {
++			if (err == -EINPROGRESS)
++				return NULL;
++
+ 			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+ 			kfree_skb(skb);
+ 			return NULL;
+@@ -82,36 +96,37 @@ struct sk_buff *validate_xmit_xfrm(struc
+ 	}
+ 
+ 	skb2 = skb;
+-	seq = xo->seq.low;
+ 
+ 	do {
+ 		struct sk_buff *nskb = skb2->next;
++		skb2->next = NULL;
+ 
+ 		xo = xfrm_offload(skb2);
+-		xo->flags |= XFRM_GSO_SEGMENT;
+-		xo->seq.low = seq;
+-		xo->seq.hi = xfrm_replay_seqhi(x, seq);
+-
+-		if(!(features & NETIF_F_HW_ESP))
+-			xo->flags |= CRYPTO_FALLBACK;
++		xo->flags |= XFRM_DEV_RESUME;
+ 
+ 		x->outer_mode->xmit(x, skb2);
+ 
+ 		err = x->type_offload->xmit(x, skb2, esp_features);
+-		if (err) {
++		if (!err) {
++			skb2->next = nskb;
++		} else if (err != -EINPROGRESS) {
+ 			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTSTATEPROTOERROR);
+ 			skb2->next = nskb;
+ 			kfree_skb_list(skb2);
+ 			return NULL;
+-		}
++		} else {
++			if (skb == skb2)
++				skb = nskb;
++
++			if (!skb)
++				return NULL;
+ 
+-		if (!skb_is_gso(skb2))
+-			seq++;
+-		else
+-			seq += skb_shinfo(skb2)->gso_segs;
++			goto skip_push;
++		}
+ 
+ 		skb_push(skb2, skb2->data - skb_mac_header(skb2));
+ 
++skip_push:
+ 		skb2 = nskb;
+ 	} while (skb2);
+ 
+@@ -206,6 +221,55 @@ ok:
+ 	return true;
+ }
+ EXPORT_SYMBOL_GPL(xfrm_dev_offload_ok);
++
++void xfrm_dev_resume(struct sk_buff *skb)
++{
++	struct net_device *dev = skb->dev;
++	int ret = NETDEV_TX_BUSY;
++	struct netdev_queue *txq;
++	struct softnet_data *sd;
++	unsigned long flags;
++
++	rcu_read_lock();
++	txq = netdev_pick_tx(dev, skb, NULL);
++
++	HARD_TX_LOCK(dev, txq, smp_processor_id());
++	if (!netif_xmit_frozen_or_stopped(txq))
++		skb = dev_hard_start_xmit(skb, dev, txq, &ret);
++	HARD_TX_UNLOCK(dev, txq);
++
++	if (!dev_xmit_complete(ret)) {
++		local_irq_save(flags);
++		sd = this_cpu_ptr(&softnet_data);
++		skb_queue_tail(&sd->xfrm_backlog, skb);
++		raise_softirq_irqoff(NET_TX_SOFTIRQ);
++		local_irq_restore(flags);
++	}
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(xfrm_dev_resume);
++
++void xfrm_dev_backlog(struct softnet_data *sd)
++{
++	struct sk_buff_head *xfrm_backlog = &sd->xfrm_backlog;
++	struct sk_buff_head list;
++	struct sk_buff *skb;
++
++	if (skb_queue_empty(xfrm_backlog))
++		return;
++
++	__skb_queue_head_init(&list);
++
++	spin_lock(&xfrm_backlog->lock);
++	skb_queue_splice_init(xfrm_backlog, &list);
++	spin_unlock(&xfrm_backlog->lock);
++
++	while (!skb_queue_empty(&list)) {
++		skb = __skb_dequeue(&list);
++		xfrm_dev_resume(skb);
++	}
++
++}
+ #endif
+ 
+ int xfrm_dev_register(struct net_device *dev)
