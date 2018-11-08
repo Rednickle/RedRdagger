@@ -1,0 +1,211 @@
+From: Yossi Kuperman <yossiku@mellanox.com>
+Date: Sun, 22 Oct 2017 19:45:45 +0300
+Subject: net/mlx5e: IPSec, Add support for ESP trailer removal by hardware
+Patch-mainline: v4.17-rc1
+Git-commit: 788a8210764ce2977095010931959c87b60c2f51
+References: bsc#1103990 FATE#326006
+
+Current hardware decrypts and authenticates incoming ESP packets.
+Subsequently, the software extracts the nexthdr field, truncates the
+trailer and adjusts csum accordingly.
+
+With this patch and a capable device, the trailer is being removed
+by the hardware and the nexthdr field is conveyed via PET. This way
+we avoid both the need to access the trailer (cache miss) and to
+compute its relative checksum, which significantly improve
+the performance.
+
+Experiment shows that trailer removal improves the performance by
+2Gbps, (netperf). Both forwarding and host-to-host configurations.
+
+Signed-off-by: Yossi Kuperman <yossiku@mellanox.com>
+Signed-off-by: Aviad Yehezkel <aviadye@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec.h         |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c      |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h      |    1 
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c |   10 +
+ drivers/net/ethernet/mellanox/mlx5/core/fpga/ipsec.c          |   54 ++++++++++
+ include/linux/mlx5/mlx5_ifc_fpga.h                            |   13 ++
+ 6 files changed, 80 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/accel/ipsec.h
+@@ -43,6 +43,7 @@ enum {
+ 	MLX5_ACCEL_IPSEC_IPV6 = BIT(2),
+ 	MLX5_ACCEL_IPSEC_ESP = BIT(3),
+ 	MLX5_ACCEL_IPSEC_LSO = BIT(4),
++	MLX5_ACCEL_IPSEC_NO_TRAILER = BIT(5),
+ };
+ 
+ #define MLX5_IPSEC_SADB_IP_AH       BIT(7)
+@@ -55,6 +56,7 @@ enum {
+ enum {
+ 	MLX5_IPSEC_CMD_ADD_SA = 0,
+ 	MLX5_IPSEC_CMD_DEL_SA = 1,
++	MLX5_IPSEC_CMD_SET_CAP = 5,
+ };
+ 
+ enum mlx5_accel_ipsec_enc_mode {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -378,6 +378,8 @@ int mlx5e_ipsec_init(struct mlx5e_priv *
+ 	ida_init(&ipsec->halloc);
+ 	ipsec->en_priv = priv;
+ 	ipsec->en_priv->ipsec = ipsec;
++	ipsec->no_trailer = !!(mlx5_accel_ipsec_device_caps(priv->mdev) &
++			       MLX5_ACCEL_IPSEC_NO_TRAILER);
+ 	netdev_dbg(priv->netdev, "IPSec attached to netdevice\n");
+ 	return 0;
+ }
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
+@@ -77,6 +77,7 @@ struct mlx5e_ipsec_stats {
+ struct mlx5e_ipsec {
+ 	struct mlx5e_priv *en_priv;
+ 	DECLARE_HASHTABLE(sadb_rx, MLX5E_IPSEC_SADB_RX_BITS);
++	bool no_trailer;
+ 	spinlock_t sadb_rx_lock; /* Protects sadb_rx and halloc */
+ 	struct ida halloc;
+ 	struct mlx5e_ipsec_sw_stats sw_stats;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
+@@ -42,10 +42,11 @@
+ enum {
+ 	MLX5E_IPSEC_RX_SYNDROME_DECRYPTED = 0x11,
+ 	MLX5E_IPSEC_RX_SYNDROME_AUTH_FAILED = 0x12,
++	MLX5E_IPSEC_RX_SYNDROME_BAD_PROTO = 0x17,
+ };
+ 
+ struct mlx5e_ipsec_rx_metadata {
+-	unsigned char   reserved;
++	unsigned char   nexthdr;
+ 	__be32		sa_handle;
+ } __packed;
+ 
+@@ -301,10 +302,17 @@ mlx5e_ipsec_build_sp(struct net_device *
+ 	switch (mdata->syndrome) {
+ 	case MLX5E_IPSEC_RX_SYNDROME_DECRYPTED:
+ 		xo->status = CRYPTO_SUCCESS;
++		if (likely(priv->ipsec->no_trailer)) {
++			xo->flags |= XFRM_ESP_NO_TRAILER;
++			xo->proto = mdata->content.rx.nexthdr;
++		}
+ 		break;
+ 	case MLX5E_IPSEC_RX_SYNDROME_AUTH_FAILED:
+ 		xo->status = CRYPTO_TUNNEL_ESP_AUTH_FAILED;
+ 		break;
++	case MLX5E_IPSEC_RX_SYNDROME_BAD_PROTO:
++		xo->status = CRYPTO_INVALID_PROTOCOL;
++		break;
+ 	default:
+ 		atomic64_inc(&priv->ipsec->sw_stats.ipsec_rx_drop_syndrome);
+ 		return NULL;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/ipsec.c
+@@ -273,6 +273,9 @@ u32 mlx5_fpga_ipsec_device_caps(struct m
+ 	if (MLX5_GET(ipsec_extended_cap, fdev->ipsec->caps, lso))
+ 		ret |= MLX5_ACCEL_IPSEC_LSO;
+ 
++	if (MLX5_GET(ipsec_extended_cap, fdev->ipsec->caps, rx_no_trailer))
++		ret |= MLX5_ACCEL_IPSEC_NO_TRAILER;
++
+ 	return ret;
+ }
+ 
+@@ -335,6 +338,46 @@ out:
+ 	return ret;
+ }
+ 
++static int mlx5_fpga_ipsec_set_caps(struct mlx5_core_dev *mdev, u32 flags)
++{
++	struct mlx5_ipsec_command_context *context;
++	struct mlx5_ifc_fpga_ipsec_cmd_cap cmd = {0};
++	int err;
++
++	cmd.cmd = htonl(MLX5_IPSEC_CMD_SET_CAP);
++	cmd.flags = htonl(flags);
++	context = mlx5_fpga_ipsec_cmd_exec(mdev, &cmd, sizeof(cmd));
++	if (IS_ERR(context)) {
++		err = PTR_ERR(context);
++		goto out;
++	}
++
++	err = mlx5_fpga_ipsec_cmd_wait(context);
++	if (err)
++		goto out;
++
++	if ((context->resp.flags & cmd.flags) != cmd.flags) {
++		mlx5_fpga_err(context->dev, "Failed to set capabilities. cmd 0x%08x vs resp 0x%08x\n",
++			      cmd.flags,
++			      context->resp.flags);
++		err = -EIO;
++	}
++
++out:
++	return err;
++}
++
++static int mlx5_fpga_ipsec_enable_supported_caps(struct mlx5_core_dev *mdev)
++{
++	u32 dev_caps = mlx5_fpga_ipsec_device_caps(mdev);
++	u32 flags = 0;
++
++	if (dev_caps & MLX5_ACCEL_IPSEC_NO_TRAILER)
++		flags |= MLX5_FPGA_IPSEC_CAP_NO_TRAILER;
++
++	return mlx5_fpga_ipsec_set_caps(mdev, flags);
++}
++
+ int mlx5_fpga_ipsec_init(struct mlx5_core_dev *mdev)
+ {
+ 	struct mlx5_fpga_conn_attr init_attr = {0};
+@@ -372,8 +415,19 @@ int mlx5_fpga_ipsec_init(struct mlx5_cor
+ 		goto error;
+ 	}
+ 	fdev->ipsec->conn = conn;
++
++	err = mlx5_fpga_ipsec_enable_supported_caps(mdev);
++	if (err) {
++		mlx5_fpga_err(fdev, "Failed to enable IPSec extended capabilities: %d\n",
++			      err);
++		goto err_destroy_conn;
++	}
++
+ 	return 0;
+ 
++err_destroy_conn:
++	mlx5_fpga_sbu_conn_destroy(conn);
++
+ error:
+ 	kfree(fdev->ipsec);
+ 	fdev->ipsec = NULL;
+--- a/include/linux/mlx5/mlx5_ifc_fpga.h
++++ b/include/linux/mlx5/mlx5_ifc_fpga.h
+@@ -373,7 +373,8 @@ struct mlx5_ifc_fpga_destroy_qp_out_bits
+ struct mlx5_ifc_ipsec_extended_cap_bits {
+ 	u8         encapsulation[0x20];
+ 
+-	u8         reserved_0[0x15];
++	u8         reserved_0[0x14];
++	u8         rx_no_trailer[0x1];
+ 	u8         ipv4_fragment[0x1];
+ 	u8         ipv6[0x1];
+ 	u8         esn[0x1];
+@@ -445,4 +446,14 @@ struct mlx5_ifc_fpga_ipsec_cmd_resp {
+ 	u8 reserved[24];
+ } __packed;
+ 
++enum mlx5_ifc_fpga_ipsec_cap {
++	MLX5_FPGA_IPSEC_CAP_NO_TRAILER = BIT(0),
++};
++
++struct mlx5_ifc_fpga_ipsec_cmd_cap {
++	__be32 cmd;
++	__be32 flags;
++	u8 reserved[24];
++} __packed;
++
+ #endif /* MLX5_IFC_FPGA_H */
