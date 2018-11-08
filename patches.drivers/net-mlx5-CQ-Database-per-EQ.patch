@@ -1,0 +1,375 @@
+From: Saeed Mahameed <saeedm@mellanox.com>
+Date: Fri, 19 Jan 2018 16:13:01 -0800
+Subject: net/mlx5: CQ Database per EQ
+Patch-mainline: v4.17-rc1
+Git-commit: 02d92f7903647119e125b24f5470f96cee0d4b4b
+References: bsc#1103990 FATE#326006
+
+Before this patch the driver had one CQ database protected via one
+spinlock, this spinlock is meant to synchronize between CQ
+adding/removing and CQ IRQ interrupt handling.
+
+On a system with large number of CPUs and on a work load that requires
+lots of interrupts, this global spinlock becomes a very nasty hotspot
+and introduces a contention between the active cores, which will
+significantly hurt performance and becomes a bottleneck that prevents
+seamless cpu scaling.
+
+To solve this we simply move the CQ database and its spinlock to be per
+EQ (IRQ), thus per core.
+
+Tested with:
+system: 2 sockets, 14 cores per socket, hyperthreading, 2x14x2=56 cores
+netperf command: ./super_netperf 200 -P 0 -t TCP_RR  -H <server> -l 30 -- -r 300,300 -o -s 1M,1M -S 1M,1M
+
+WITHOUT THIS PATCH:
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft %steal  %guest  %gnice   %idle
+Average:     all    4.32    0.00   36.15    0.09    0.00   34.02   0.00    0.00    0.00   25.41
+
+Samples: 2M of event 'cycles:pp', Event count (approx.): 1554616897271
+Overhead  Command          Shared Object                 Symbol
++   14.28%  swapper          [kernel.vmlinux]              [k] intel_idle
++   12.25%  swapper          [kernel.vmlinux]              [k] queued_spin_lock_slowpath
++   10.29%  netserver        [kernel.vmlinux]              [k] queued_spin_lock_slowpath
++    1.32%  netserver        [kernel.vmlinux]              [k] mlx5e_xmit
+
+WITH THIS PATCH:
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+Average:     all    4.27    0.00   34.31    0.01    0.00   18.71    0.00    0.00    0.00   42.69
+
+Samples: 2M of event 'cycles:pp', Event count (approx.): 1498132937483
+Overhead  Command          Shared Object             Symbol
++   23.33%  swapper          [kernel.vmlinux]          [k] intel_idle
++    1.69%  netserver        [kernel.vmlinux]          [k] mlx5e_xmit
+
+Tested-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Reviewed-by: Gal Pressman <galp@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/cq.c   |   69 ++++++++++++++-----------
+ drivers/net/ethernet/mellanox/mlx5/core/eq.c   |   10 ++-
+ drivers/net/ethernet/mellanox/mlx5/core/main.c |    8 +-
+ include/linux/mlx5/cq.h                        |    3 -
+ include/linux/mlx5/driver.h                    |   22 +++----
+ 5 files changed, 62 insertions(+), 50 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/cq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/cq.c
+@@ -86,10 +86,10 @@ static void mlx5_add_cq_to_tasklet(struc
+ 	spin_unlock_irqrestore(&tasklet_ctx->lock, flags);
+ }
+ 
+-void mlx5_cq_completion(struct mlx5_core_dev *dev, u32 cqn)
++void mlx5_cq_completion(struct mlx5_eq *eq, u32 cqn)
+ {
++	struct mlx5_cq_table *table = &eq->cq_table;
+ 	struct mlx5_core_cq *cq;
+-	struct mlx5_cq_table *table = &dev->priv.cq_table;
+ 
+ 	spin_lock(&table->lock);
+ 	cq = radix_tree_lookup(&table->tree, cqn);
+@@ -98,7 +98,7 @@ void mlx5_cq_completion(struct mlx5_core
+ 	spin_unlock(&table->lock);
+ 
+ 	if (!cq) {
+-		mlx5_core_warn(dev, "Completion event for bogus CQ 0x%x\n", cqn);
++		mlx5_core_warn(eq->dev, "Completion event for bogus CQ 0x%x\n", cqn);
+ 		return;
+ 	}
+ 
+@@ -110,9 +110,9 @@ void mlx5_cq_completion(struct mlx5_core
+ 		complete(&cq->free);
+ }
+ 
+-void mlx5_cq_event(struct mlx5_core_dev *dev, u32 cqn, int event_type)
++void mlx5_cq_event(struct mlx5_eq *eq, u32 cqn, int event_type)
+ {
+-	struct mlx5_cq_table *table = &dev->priv.cq_table;
++	struct mlx5_cq_table *table = &eq->cq_table;
+ 	struct mlx5_core_cq *cq;
+ 
+ 	spin_lock(&table->lock);
+@@ -124,7 +124,7 @@ void mlx5_cq_event(struct mlx5_core_dev
+ 	spin_unlock(&table->lock);
+ 
+ 	if (!cq) {
+-		mlx5_core_warn(dev, "Async event for bogus CQ 0x%x\n", cqn);
++		mlx5_core_warn(eq->dev, "Async event for bogus CQ 0x%x\n", cqn);
+ 		return;
+ 	}
+ 
+@@ -137,19 +137,22 @@ void mlx5_cq_event(struct mlx5_core_dev
+ int mlx5_core_create_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
+ 			u32 *in, int inlen)
+ {
+-	struct mlx5_cq_table *table = &dev->priv.cq_table;
+ 	u32 out[MLX5_ST_SZ_DW(create_cq_out)];
+ 	u32 din[MLX5_ST_SZ_DW(destroy_cq_in)];
+ 	u32 dout[MLX5_ST_SZ_DW(destroy_cq_out)];
+ 	int eqn = MLX5_GET(cqc, MLX5_ADDR_OF(create_cq_in, in, cq_context),
+ 			   c_eqn);
+-	struct mlx5_eq *eq;
++	struct mlx5_eq *eq, *async_eq;
++	struct mlx5_cq_table *table;
+ 	int err;
+ 
++	async_eq = &dev->priv.eq_table.async_eq;
+ 	eq = mlx5_eqn2eq(dev, eqn);
+ 	if (IS_ERR(eq))
+ 		return PTR_ERR(eq);
+ 
++	table = &eq->cq_table;
++
+ 	memset(out, 0, sizeof(out));
+ 	MLX5_SET(create_cq_in, in, opcode, MLX5_CMD_OP_CREATE_CQ);
+ 	err = mlx5_cmd_exec(dev, in, inlen, out, sizeof(out));
+@@ -159,6 +162,7 @@ int mlx5_core_create_cq(struct mlx5_core
+ 	cq->cqn = MLX5_GET(create_cq_out, out, cqn);
+ 	cq->cons_index = 0;
+ 	cq->arm_sn     = 0;
++	cq->eq         = eq;
+ 	refcount_set(&cq->refcount, 1);
+ 	init_completion(&cq->free);
+ 	if (!cq->comp)
+@@ -167,12 +171,20 @@ int mlx5_core_create_cq(struct mlx5_core
+ 	cq->tasklet_ctx.priv = &eq->tasklet_ctx;
+ 	INIT_LIST_HEAD(&cq->tasklet_ctx.list);
+ 
++	/* Add to comp EQ CQ tree to recv comp events */
+ 	spin_lock_irq(&table->lock);
+ 	err = radix_tree_insert(&table->tree, cq->cqn, cq);
+ 	spin_unlock_irq(&table->lock);
+ 	if (err)
+ 		goto err_cmd;
+ 
++	/* Add to async EQ CQ tree to recv Async events */
++	spin_lock_irq(&async_eq->cq_table.lock);
++	err = radix_tree_insert(&async_eq->cq_table.tree, cq->cqn, cq);
++	spin_unlock_irq(&async_eq->cq_table.lock);
++	if (err)
++		goto err_cq_table;
++
+ 	cq->pid = current->pid;
+ 	err = mlx5_debug_cq_add(dev, cq);
+ 	if (err)
+@@ -183,6 +195,10 @@ int mlx5_core_create_cq(struct mlx5_core
+ 
+ 	return 0;
+ 
++err_cq_table:
++	spin_lock_irq(&table->lock);
++	radix_tree_delete(&table->tree, cq->cqn);
++	spin_unlock_irq(&table->lock);
+ err_cmd:
+ 	memset(din, 0, sizeof(din));
+ 	memset(dout, 0, sizeof(dout));
+@@ -195,21 +211,34 @@ EXPORT_SYMBOL(mlx5_core_create_cq);
+ 
+ int mlx5_core_destroy_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq)
+ {
+-	struct mlx5_cq_table *table = &dev->priv.cq_table;
++	struct mlx5_cq_table *asyn_eq_cq_table = &dev->priv.eq_table.async_eq.cq_table;
++	struct mlx5_cq_table *table = &cq->eq->cq_table;
+ 	u32 out[MLX5_ST_SZ_DW(destroy_cq_out)] = {0};
+ 	u32 in[MLX5_ST_SZ_DW(destroy_cq_in)] = {0};
+ 	struct mlx5_core_cq *tmp;
+ 	int err;
+ 
++	spin_lock_irq(&asyn_eq_cq_table->lock);
++	tmp = radix_tree_delete(&asyn_eq_cq_table->tree, cq->cqn);
++	spin_unlock_irq(&asyn_eq_cq_table->lock);
++	if (!tmp) {
++		mlx5_core_warn(dev, "cq 0x%x not found in async eq cq tree\n", cq->cqn);
++		return -EINVAL;
++	}
++	if (tmp != cq) {
++		mlx5_core_warn(dev, "corruption on cqn 0x%x in async eq cq tree\n", cq->cqn);
++		return -EINVAL;
++	}
++
+ 	spin_lock_irq(&table->lock);
+ 	tmp = radix_tree_delete(&table->tree, cq->cqn);
+ 	spin_unlock_irq(&table->lock);
+ 	if (!tmp) {
+-		mlx5_core_warn(dev, "cq 0x%x not found in tree\n", cq->cqn);
++		mlx5_core_warn(dev, "cq 0x%x not found in comp eq cq tree\n", cq->cqn);
+ 		return -EINVAL;
+ 	}
+ 	if (tmp != cq) {
+-		mlx5_core_warn(dev, "corruption on srqn 0x%x\n", cq->cqn);
++		mlx5_core_warn(dev, "corruption on cqn 0x%x in comp eq cq tree\n", cq->cqn);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -270,21 +299,3 @@ int mlx5_core_modify_cq_moderation(struc
+ 	return mlx5_core_modify_cq(dev, cq, in, sizeof(in));
+ }
+ EXPORT_SYMBOL(mlx5_core_modify_cq_moderation);
+-
+-int mlx5_init_cq_table(struct mlx5_core_dev *dev)
+-{
+-	struct mlx5_cq_table *table = &dev->priv.cq_table;
+-	int err;
+-
+-	memset(table, 0, sizeof(*table));
+-	spin_lock_init(&table->lock);
+-	INIT_RADIX_TREE(&table->tree, GFP_ATOMIC);
+-	err = mlx5_cq_debugfs_init(dev);
+-
+-	return err;
+-}
+-
+-void mlx5_cleanup_cq_table(struct mlx5_core_dev *dev)
+-{
+-	mlx5_cq_debugfs_cleanup(dev);
+-}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@ -415,7 +415,7 @@ static irqreturn_t mlx5_eq_int(int irq,
+ 		switch (eqe->type) {
+ 		case MLX5_EVENT_TYPE_COMP:
+ 			cqn = be32_to_cpu(eqe->data.comp.cqn) & 0xffffff;
+-			mlx5_cq_completion(dev, cqn);
++			mlx5_cq_completion(eq, cqn);
+ 			break;
+ 		case MLX5_EVENT_TYPE_DCT_DRAINED:
+ 			rsn = be32_to_cpu(eqe->data.dct.dctn) & 0xffffff;
+@@ -472,7 +472,7 @@ static irqreturn_t mlx5_eq_int(int irq,
+ 			cqn = be32_to_cpu(eqe->data.cq_err.cqn) & 0xffffff;
+ 			mlx5_core_warn(dev, "CQ error on CQN 0x%x, syndrome 0x%x\n",
+ 				       cqn, eqe->data.cq_err.syndrome);
+-			mlx5_cq_event(dev, cqn, eqe->type);
++			mlx5_cq_event(eq, cqn, eqe->type);
+ 			break;
+ 
+ 		case MLX5_EVENT_TYPE_PAGE_REQUEST:
+@@ -567,6 +567,7 @@ int mlx5_create_map_eq(struct mlx5_core_
+ 		       int nent, u64 mask, const char *name,
+ 		       enum mlx5_eq_type type)
+ {
++	struct mlx5_cq_table *cq_table = &eq->cq_table;
+ 	u32 out[MLX5_ST_SZ_DW(create_eq_out)] = {0};
+ 	struct mlx5_priv *priv = &dev->priv;
+ 	irq_handler_t handler;
+@@ -576,6 +577,11 @@ int mlx5_create_map_eq(struct mlx5_core_
+ 	u32 *in;
+ 	int err;
+ 
++	/* Init CQ table */
++	memset(cq_table, 0, sizeof(*cq_table));
++	spin_lock_init(&cq_table->lock);
++	INIT_RADIX_TREE(&cq_table->tree, GFP_ATOMIC);
++
+ 	eq->type = type;
+ 	eq->nent = roundup_pow_of_two(nent + MLX5_NUM_SPARE_EQE);
+ 	eq->cons_index = 0;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -942,9 +942,9 @@ static int mlx5_init_once(struct mlx5_co
+ 		goto out;
+ 	}
+ 
+-	err = mlx5_init_cq_table(dev);
++	err = mlx5_cq_debugfs_init(dev);
+ 	if (err) {
+-		dev_err(&pdev->dev, "failed to initialize cq table\n");
++		dev_err(&pdev->dev, "failed to initialize cq debugfs\n");
+ 		goto err_eq_cleanup;
+ 	}
+ 
+@@ -1002,7 +1002,7 @@ err_tables_cleanup:
+ 	mlx5_cleanup_mkey_table(dev);
+ 	mlx5_cleanup_srq_table(dev);
+ 	mlx5_cleanup_qp_table(dev);
+-	mlx5_cleanup_cq_table(dev);
++	mlx5_cq_debugfs_cleanup(dev);
+ 
+ err_eq_cleanup:
+ 	mlx5_eq_cleanup(dev);
+@@ -1023,7 +1023,7 @@ static void mlx5_cleanup_once(struct mlx
+ 	mlx5_cleanup_mkey_table(dev);
+ 	mlx5_cleanup_srq_table(dev);
+ 	mlx5_cleanup_qp_table(dev);
+-	mlx5_cleanup_cq_table(dev);
++	mlx5_cq_debugfs_cleanup(dev);
+ 	mlx5_eq_cleanup(dev);
+ }
+ 
+--- a/include/linux/mlx5/cq.h
++++ b/include/linux/mlx5/cq.h
+@@ -60,6 +60,7 @@ struct mlx5_core_cq {
+ 	} tasklet_ctx;
+ 	int			reset_notify_added;
+ 	struct list_head	reset_notify;
++	struct mlx5_eq		*eq;
+ };
+ 
+ 
+@@ -171,8 +172,6 @@ static inline void mlx5_cq_arm(struct ml
+ 	mlx5_write64(doorbell, uar_page + MLX5_CQ_DOORBELL, NULL);
+ }
+ 
+-int mlx5_init_cq_table(struct mlx5_core_dev *dev);
+-void mlx5_cleanup_cq_table(struct mlx5_core_dev *dev);
+ int mlx5_core_create_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
+ 			u32 *in, int inlen);
+ int mlx5_core_destroy_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq);
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -375,8 +375,15 @@ struct mlx5_eq_pagefault {
+ 	mempool_t		*pool;
+ };
+ 
++struct mlx5_cq_table {
++	/* protect radix tree */
++	spinlock_t		lock;
++	struct radix_tree_root	tree;
++};
++
+ struct mlx5_eq {
+ 	struct mlx5_core_dev   *dev;
++	struct mlx5_cq_table	cq_table;
+ 	__be32 __iomem	       *doorbell;
+ 	u32			cons_index;
+ 	struct mlx5_buf		buf;
+@@ -526,13 +533,6 @@ struct mlx5_core_health {
+ 	struct delayed_work		recover_work;
+ };
+ 
+-struct mlx5_cq_table {
+-	/* protect radix tree
+-	 */
+-	spinlock_t		lock;
+-	struct radix_tree_root	tree;
+-};
+-
+ struct mlx5_qp_table {
+ 	/* protect radix tree
+ 	 */
+@@ -654,10 +654,6 @@ struct mlx5_priv {
+ 	struct dentry	       *cmdif_debugfs;
+ 	/* end: qp staff */
+ 
+-	/* start: cq staff */
+-	struct mlx5_cq_table	cq_table;
+-	/* end: cq staff */
+-
+ 	/* start: mkey staff */
+ 	struct mlx5_mkey_table	mkey_table;
+ 	/* end: mkey staff */
+@@ -1053,12 +1049,12 @@ int mlx5_eq_init(struct mlx5_core_dev *d
+ void mlx5_eq_cleanup(struct mlx5_core_dev *dev);
+ void mlx5_fill_page_array(struct mlx5_buf *buf, __be64 *pas);
+ void mlx5_fill_page_frag_array(struct mlx5_frag_buf *frag_buf, __be64 *pas);
+-void mlx5_cq_completion(struct mlx5_core_dev *dev, u32 cqn);
++void mlx5_cq_completion(struct mlx5_eq *eq, u32 cqn);
+ void mlx5_rsc_event(struct mlx5_core_dev *dev, u32 rsn, int event_type);
+ void mlx5_srq_event(struct mlx5_core_dev *dev, u32 srqn, int event_type);
+ struct mlx5_core_srq *mlx5_core_get_srq(struct mlx5_core_dev *dev, u32 srqn);
+ void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool forced);
+-void mlx5_cq_event(struct mlx5_core_dev *dev, u32 cqn, int event_type);
++void mlx5_cq_event(struct mlx5_eq *eq, u32 cqn, int event_type);
+ int mlx5_create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq, u8 vecidx,
+ 		       int nent, u64 mask, const char *name,
+ 		       enum mlx5_eq_type type);
