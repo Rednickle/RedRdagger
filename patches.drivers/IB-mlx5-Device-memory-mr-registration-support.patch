@@ -1,0 +1,139 @@
+From: Ariel Levkovich <lariel@mellanox.com>
+Date: Thu, 5 Apr 2018 18:53:29 +0300
+Subject: IB/mlx5: Device memory mr registration support
+Patch-mainline: v4.17-rc1
+Git-commit: 6c29f57ea4751c4887627521027cd72aba831a97
+References: bsc#1103991 FATE#326007
+
+Adding mlx5_ib driver implementation for reg_dm_mr callback
+which allows registering device memory (DM) as an MR for
+local and remote access.
+
+Signed-off-by: Ariel Levkovich <lariel@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/main.c    |    1 
+ drivers/infiniband/hw/mlx5/mlx5_ib.h |    9 ++++
+ drivers/infiniband/hw/mlx5/mr.c      |   74 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 84 insertions(+)
+
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -5232,6 +5232,7 @@ int mlx5_ib_stage_caps_init(struct mlx5_
+ 	if (MLX5_CAP_DEV_MEM(mdev, memic)) {
+ 		dev->ib_dev.alloc_dm = mlx5_ib_alloc_dm;
+ 		dev->ib_dev.dealloc_dm = mlx5_ib_dealloc_dm;
++		dev->ib_dev.reg_dm_mr = mlx5_ib_reg_dm_mr;
+ 	}
+ 
+ 	dev->ib_dev.create_flow	= mlx5_ib_create_flow;
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -540,6 +540,12 @@ struct mlx5_ib_dm {
+ 
+ #define MLX5_IB_MTT_PRESENT (MLX5_IB_MTT_READ | MLX5_IB_MTT_WRITE)
+ 
++#define MLX5_IB_DM_ALLOWED_ACCESS (IB_ACCESS_LOCAL_WRITE   |\
++				   IB_ACCESS_REMOTE_WRITE  |\
++				   IB_ACCESS_REMOTE_READ   |\
++				   IB_ACCESS_REMOTE_ATOMIC |\
++				   IB_ZERO_BASED)
++
+ struct mlx5_ib_mr {
+ 	struct ib_mr		ibmr;
+ 	void			*descs;
+@@ -1075,6 +1081,9 @@ struct ib_dm *mlx5_ib_alloc_dm(struct ib
+ 			       struct ib_dm_alloc_attr *attr,
+ 			       struct uverbs_attr_bundle *attrs);
+ int mlx5_ib_dealloc_dm(struct ib_dm *ibdm);
++struct ib_mr *mlx5_ib_reg_dm_mr(struct ib_pd *pd, struct ib_dm *dm,
++				struct ib_dm_mr_attr *attr,
++				struct uverbs_attr_bundle *attrs);
+ 
+ #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ void mlx5_ib_internal_fill_odp_caps(struct mlx5_ib_dev *dev);
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -1232,6 +1232,80 @@ static void set_mr_fileds(struct mlx5_ib
+ 	mr->access_flags = access_flags;
+ }
+ 
++static struct ib_mr *mlx5_ib_get_memic_mr(struct ib_pd *pd, u64 memic_addr,
++					  u64 length, int acc)
++{
++	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++	int inlen = MLX5_ST_SZ_BYTES(create_mkey_in);
++	struct mlx5_core_dev *mdev = dev->mdev;
++	struct mlx5_ib_mr *mr;
++	void *mkc;
++	u32 *in;
++	int err;
++
++	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
++	if (!mr)
++		return ERR_PTR(-ENOMEM);
++
++	in = kzalloc(inlen, GFP_KERNEL);
++	if (!in) {
++		err = -ENOMEM;
++		goto err_free;
++	}
++
++	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
++
++	MLX5_SET(mkc, mkc, access_mode_1_0, MLX5_MKC_ACCESS_MODE_MEMIC & 0x3);
++	MLX5_SET(mkc, mkc, access_mode_4_2,
++		 (MLX5_MKC_ACCESS_MODE_MEMIC >> 2) & 0x7);
++	MLX5_SET(mkc, mkc, a, !!(acc & IB_ACCESS_REMOTE_ATOMIC));
++	MLX5_SET(mkc, mkc, rw, !!(acc & IB_ACCESS_REMOTE_WRITE));
++	MLX5_SET(mkc, mkc, rr, !!(acc & IB_ACCESS_REMOTE_READ));
++	MLX5_SET(mkc, mkc, lw, !!(acc & IB_ACCESS_LOCAL_WRITE));
++	MLX5_SET(mkc, mkc, lr, 1);
++
++	MLX5_SET64(mkc, mkc, len, length);
++	MLX5_SET(mkc, mkc, pd, to_mpd(pd)->pdn);
++	MLX5_SET(mkc, mkc, qpn, 0xffffff);
++	MLX5_SET64(mkc, mkc, start_addr,
++		   memic_addr - pci_resource_start(dev->mdev->pdev, 0));
++
++	err = mlx5_core_create_mkey(mdev, &mr->mmkey, in, inlen);
++	if (err)
++		goto err_in;
++
++	kfree(in);
++
++	mr->umem = NULL;
++	set_mr_fileds(dev, mr, 0, length, acc);
++
++	return &mr->ibmr;
++
++err_in:
++	kfree(in);
++
++err_free:
++	kfree(mr);
++
++	return ERR_PTR(err);
++}
++
++struct ib_mr *mlx5_ib_reg_dm_mr(struct ib_pd *pd, struct ib_dm *dm,
++				struct ib_dm_mr_attr *attr,
++				struct uverbs_attr_bundle *attrs)
++{
++	struct mlx5_ib_dm *mdm = to_mdm(dm);
++	u64 memic_addr;
++
++	if (attr->access_flags & ~MLX5_IB_DM_ALLOWED_ACCESS)
++		return ERR_PTR(-EINVAL);
++
++	memic_addr = mdm->dev_addr + attr->offset;
++
++	return mlx5_ib_get_memic_mr(pd, memic_addr, attr->length,
++				    attr->access_flags);
++}
++
+ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
+ 				  u64 virt_addr, int access_flags,
+ 				  struct ib_udata *udata)
