@@ -1,0 +1,181 @@
+From: Martin Wilck <mwilck@suse.com>
+Date: Wed, 14 Feb 2018 21:45:43 +0100
+Subject: rdma_rxe: make rxe work over 802.1q VLAN devices
+Patch-mainline: v4.17-rc1
+Git-commit: 43c9fc509fa59d602f9c303d02b33db015022881
+References: bsc#1103992 FATE#326009
+
+This patch fixes RDMA/rxe over 802.1q VLAN devices.
+
+Without it, I observed the following behavior:
+
+a) adding a VLAN device to RXE via rxe_net_add() creates a non-functional
+   RDMA device. This is caused by the logic in enum_all_gids_of_dev_cb() /
+   is_eth_port_of_netdev(), which only considers networks connected to
+   "upper devices" of the configured network device, resulting in an empty
+   set of gids for a VLAN interface that is an "upper device" itself.
+   Later attempts to connect via this rdma device fail in cma_acuire_dev()
+   because no gids can be resolved.
+
+b) adding the master device of the VLAN device instead seems to work
+   initially, target addresses via VLAN devices are resolved successfully.
+   But the connection times out because no 802.1q VLAN headers are
+   inserted in the ethernet packets, which are therefore never received.
+   This happens because the RXE layer sends the packets via the master
+   device rather than the VLAN device.
+
+The problem could be solved by changing either a) or b). My thinking was
+that the logic in a) was created deliberately, thus I decided to work on
+b). It turns out that the information about the VLAN interface for the gid
+at hand is available in the AV information. My patch converts the RXE code
+to use this netdev instead of rxe->ndev. With this change, RXE over vlan
+works on my test system.
+
+Signed-off-by: Martin Wilck <mwilck@suse.com>
+Reviewed-by: Moni Shoua <monis@mellanox.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/sw/rxe/rxe_net.c  |   54 +++++++++++++++++++++++++++++++----
+ drivers/infiniband/sw/rxe/rxe_recv.c |    2 -
+ 2 files changed, 49 insertions(+), 7 deletions(-)
+
+--- a/drivers/infiniband/sw/rxe/rxe_net.c
++++ b/drivers/infiniband/sw/rxe/rxe_net.c
+@@ -182,11 +182,39 @@ static struct dst_entry *rxe_find_route6
+ 
+ #endif
+ 
++/*
++ * Derive the net_device from the av.
++ * For physical devices, this will just return rxe->ndev.
++ * But for VLAN devices, it will return the vlan dev.
++ * Caller should dev_put() the returned net_device.
++ */
++static struct net_device *rxe_netdev_from_av(struct rxe_dev *rxe,
++					     int port_num,
++					     struct rxe_av *av)
++{
++	union ib_gid gid;
++	struct ib_gid_attr attr;
++	struct net_device *ndev = rxe->ndev;
++
++	if (ib_get_cached_gid(&rxe->ib_dev, port_num, av->grh.sgid_index,
++			      &gid, &attr) == 0 &&
++	    attr.ndev && attr.ndev != ndev)
++		ndev = attr.ndev;
++	else
++		/* Only to ensure that caller may call dev_put() */
++		dev_hold(ndev);
++
++	return ndev;
++}
++
+ static struct dst_entry *rxe_find_route(struct rxe_dev *rxe,
+ 					struct rxe_qp *qp,
+ 					struct rxe_av *av)
+ {
+ 	struct dst_entry *dst = NULL;
++	struct net_device *ndev;
++
++	ndev = rxe_netdev_from_av(rxe, qp->attr.port_num, av);
+ 
+ 	if (qp_type(qp) == IB_QPT_RC)
+ 		dst = sk_dst_get(qp->sk->sk);
+@@ -201,14 +229,14 @@ static struct dst_entry *rxe_find_route(
+ 
+ 			saddr = &av->sgid_addr._sockaddr_in.sin_addr;
+ 			daddr = &av->dgid_addr._sockaddr_in.sin_addr;
+-			dst = rxe_find_route4(rxe->ndev, saddr, daddr);
++			dst = rxe_find_route4(ndev, saddr, daddr);
+ 		} else if (av->network_type == RDMA_NETWORK_IPV6) {
+ 			struct in6_addr *saddr6;
+ 			struct in6_addr *daddr6;
+ 
+ 			saddr6 = &av->sgid_addr._sockaddr_in6.sin6_addr;
+ 			daddr6 = &av->dgid_addr._sockaddr_in6.sin6_addr;
+-			dst = rxe_find_route6(rxe->ndev, saddr6, daddr6);
++			dst = rxe_find_route6(ndev, saddr6, daddr6);
+ #if IS_ENABLED(CONFIG_IPV6)
+ 			if (dst)
+ 				qp->dst_cookie =
+@@ -217,6 +245,7 @@ static struct dst_entry *rxe_find_route(
+ 		}
+ 	}
+ 
++	dev_put(ndev);
+ 	return dst;
+ }
+ 
+@@ -224,9 +253,14 @@ static int rxe_udp_encap_recv(struct soc
+ {
+ 	struct udphdr *udph;
+ 	struct net_device *ndev = skb->dev;
++	struct net_device *rdev = ndev;
+ 	struct rxe_dev *rxe = net_to_rxe(ndev);
+ 	struct rxe_pkt_info *pkt = SKB_TO_PKT(skb);
+ 
++	if (!rxe && is_vlan_dev(rdev)) {
++		rdev = vlan_dev_real_dev(ndev);
++		rxe = net_to_rxe(rdev);
++	}
+ 	if (!rxe)
+ 		goto drop;
+ 
+@@ -498,6 +532,10 @@ struct sk_buff *rxe_init_packet(struct r
+ {
+ 	unsigned int hdr_len;
+ 	struct sk_buff *skb;
++	struct net_device *ndev;
++	const int port_num = 1;
++
++	ndev = rxe_netdev_from_av(rxe, port_num, av);
+ 
+ 	if (av->network_type == RDMA_NETWORK_IPV4)
+ 		hdr_len = ETH_HLEN + sizeof(struct udphdr) +
+@@ -506,26 +544,30 @@ struct sk_buff *rxe_init_packet(struct r
+ 		hdr_len = ETH_HLEN + sizeof(struct udphdr) +
+ 			sizeof(struct ipv6hdr);
+ 
+-	skb = alloc_skb(paylen + hdr_len + LL_RESERVED_SPACE(rxe->ndev),
++	skb = alloc_skb(paylen + hdr_len + LL_RESERVED_SPACE(ndev),
+ 			GFP_ATOMIC);
+-	if (unlikely(!skb))
++
++	if (unlikely(!skb)) {
++		dev_put(ndev);
+ 		return NULL;
++	}
+ 
+ 	skb_reserve(skb, hdr_len + LL_RESERVED_SPACE(rxe->ndev));
+ 
+-	skb->dev	= rxe->ndev;
++	skb->dev	= ndev;
+ 	if (av->network_type == RDMA_NETWORK_IPV4)
+ 		skb->protocol = htons(ETH_P_IP);
+ 	else
+ 		skb->protocol = htons(ETH_P_IPV6);
+ 
+ 	pkt->rxe	= rxe;
+-	pkt->port_num	= 1;
++	pkt->port_num	= port_num;
+ 	pkt->hdr	= skb_put(skb, paylen);
+ 	pkt->mask	|= RXE_GRH_MASK;
+ 
+ 	memset(pkt->hdr, 0, paylen);
+ 
++	dev_put(ndev);
+ 	return skb;
+ }
+ 
+--- a/drivers/infiniband/sw/rxe/rxe_recv.c
++++ b/drivers/infiniband/sw/rxe/rxe_recv.c
+@@ -347,7 +347,7 @@ static int rxe_match_dgid(struct rxe_dev
+ 
+ 	return ib_find_cached_gid_by_port(&rxe->ib_dev, pdgid,
+ 					  IB_GID_TYPE_ROCE_UDP_ENCAP,
+-					  1, rxe->ndev, NULL);
++					  1, skb->dev, NULL);
+ }
+ 
+ /* rxe_rcv is called from the interface driver */
