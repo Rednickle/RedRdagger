@@ -1,0 +1,179 @@
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Mon, 4 Dec 2017 21:07:37 -0500
+Subject: [PATCH] dm: introduce DM_TYPE_NVME_BIO_BASED
+Git-commit: 22c11858e8002592c59ebb762e4e42dc634bf84f
+Patch-mainline: v4.16-rc1
+References: bsc#1104967,FATE#325924
+
+If dm_table_determine_type() establishes DM_TYPE_NVME_BIO_BASED then
+all devices in the DM table do not support partial completions.  Also,
+the table has a single immutable target that doesn't require DM core to
+split bios.
+
+This will enable adding NVMe optimizations to bio-based DM.
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/md/dm-table.c         | 54 ++++++++++++++++++++++++++++++++++++++-----
+ drivers/md/dm.c               |  2 ++
+ include/linux/device-mapper.h |  1 +
+ 3 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 504e79bc3a55..ad4ac294dd57 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -866,7 +866,8 @@ EXPORT_SYMBOL(dm_consume_args);
+ static bool __table_type_bio_based(enum dm_queue_mode table_type)
+ {
+ 	return (table_type == DM_TYPE_BIO_BASED ||
+-		table_type == DM_TYPE_DAX_BIO_BASED);
++		table_type == DM_TYPE_DAX_BIO_BASED ||
++		table_type == DM_TYPE_NVME_BIO_BASED);
+ }
+ 
+ static bool __table_type_request_based(enum dm_queue_mode table_type)
+@@ -909,6 +910,8 @@ static bool dm_table_supports_dax(struct dm_table *t)
+ 	return true;
+ }
+ 
++static bool dm_table_does_not_support_partial_completion(struct dm_table *t);
++
+ static int dm_table_determine_type(struct dm_table *t)
+ {
+ 	unsigned i;
+@@ -923,6 +926,14 @@ static int dm_table_determine_type(struct dm_table *t)
+ 		/* target already set the table's type */
+ 		if (t->type == DM_TYPE_BIO_BASED)
+ 			return 0;
++		else if (t->type == DM_TYPE_NVME_BIO_BASED) {
++			if (!dm_table_does_not_support_partial_completion(t)) {
++				DMERR("nvme bio-based is only possible with devices"
++				      " that don't support partial completion");
++				return -EINVAL;
++			}
++			/* Fallthru, also verify all devices are blk-mq */
++		}
+ 		BUG_ON(t->type == DM_TYPE_DAX_BIO_BASED);
+ 		goto verify_rq_based;
+ 	}
+@@ -937,8 +948,8 @@ static int dm_table_determine_type(struct dm_table *t)
+ 			bio_based = 1;
+ 
+ 		if (bio_based && request_based) {
+-			DMWARN("Inconsistent table: different target types"
+-			       " can't be mixed up");
++			DMERR("Inconsistent table: different target types"
++			      " can't be mixed up");
+ 			return -EINVAL;
+ 		}
+ 	}
+@@ -959,8 +970,14 @@ static int dm_table_determine_type(struct dm_table *t)
+ 		/* We must use this table as bio-based */
+ 		t->type = DM_TYPE_BIO_BASED;
+ 		if (dm_table_supports_dax(t) ||
+-		    (list_empty(devices) && live_md_type == DM_TYPE_DAX_BIO_BASED))
++		    (list_empty(devices) && live_md_type == DM_TYPE_DAX_BIO_BASED)) {
+ 			t->type = DM_TYPE_DAX_BIO_BASED;
++		} else if ((dm_table_get_immutable_target(t) &&
++			    dm_table_does_not_support_partial_completion(t)) ||
++			   (list_empty(devices) && live_md_type == DM_TYPE_NVME_BIO_BASED)) {
++			t->type = DM_TYPE_NVME_BIO_BASED;
++			goto verify_rq_based;
++		}
+ 		return 0;
+ 	}
+ 
+@@ -980,7 +997,8 @@ static int dm_table_determine_type(struct dm_table *t)
+ 	 * (e.g. request completion process for partial completion.)
+ 	 */
+ 	if (t->num_targets > 1) {
+-		DMWARN("Request-based dm doesn't support multiple targets yet");
++		DMERR("%s DM doesn't support multiple targets",
++		      t->type == DM_TYPE_NVME_BIO_BASED ? "nvme bio-based" : "request-based");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -997,6 +1015,15 @@ static int dm_table_determine_type(struct dm_table *t)
+ 		return 0;
+ 	}
+ 
++	tgt = dm_table_get_immutable_target(t);
++	if (!tgt) {
++		DMERR("table load rejected: immutable target is required");
++		return -EINVAL;
++	} else if (tgt->max_io_len) {
++		DMERR("table load rejected: immutable target that splits IO is not supported");
++		return -EINVAL;
++	}
++
+ 	/* Non-request-stackable devices can't be used for request-based dm */
+ 	list_for_each_entry(dd, devices, list) {
+ 		struct request_queue *q = bdev_get_queue(dd->dm_dev->bdev);
+@@ -1018,7 +1045,8 @@ static int dm_table_determine_type(struct dm_table *t)
+ 	}
+ 	t->all_blk_mq = mq_count > 0;
+ 
+-	if (t->type == DM_TYPE_MQ_REQUEST_BASED && !t->all_blk_mq) {
++	if (!t->all_blk_mq &&
++	    (t->type == DM_TYPE_MQ_REQUEST_BASED || t->type == DM_TYPE_NVME_BIO_BASED)) {
+ 		DMERR("table load rejected: all devices are not blk-mq request-stackable");
+ 		return -EINVAL;
+ 	}
+@@ -1708,6 +1736,20 @@ static bool dm_table_all_devices_attribute(struct dm_table *t,
+ 	return true;
+ }
+ 
++static int device_no_partial_completion(struct dm_target *ti, struct dm_dev *dev,
++					sector_t start, sector_t len, void *data)
++{
++	char b[BDEVNAME_SIZE];
++
++	/* For now, NVMe devices are the only devices of this class */
++	return (strncmp(bdevname(dev->bdev, b), "nvme", 3) == 0);
++}
++
++static bool dm_table_does_not_support_partial_completion(struct dm_table *t)
++{
++	return dm_table_all_devices_attribute(t, device_no_partial_completion);
++}
++
+ static int device_not_write_same_capable(struct dm_target *ti, struct dm_dev *dev,
+ 					 sector_t start, sector_t len, void *data)
+ {
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index cbb4ae5051fc..a1bd7a6ff522 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -2073,6 +2073,7 @@ int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
+ 		break;
+ 	case DM_TYPE_BIO_BASED:
+ 	case DM_TYPE_DAX_BIO_BASED:
++	case DM_TYPE_NVME_BIO_BASED:
+ 		dm_init_normal_md_queue(md);
+ 		blk_queue_make_request(md->queue, dm_make_request);
+ 		break;
+@@ -2780,6 +2781,7 @@ struct dm_md_mempools *dm_alloc_md_mempools(struct mapped_device *md, enum dm_qu
+ 	switch (type) {
+ 	case DM_TYPE_BIO_BASED:
+ 	case DM_TYPE_DAX_BIO_BASED:
++	case DM_TYPE_NVME_BIO_BASED:
+ 		pool_size = max(dm_get_reserved_bio_based_ios(), min_pool_size);
+ 		front_pad = roundup(per_io_data_size, __alignof__(struct dm_target_io)) + offsetof(struct dm_target_io, clone);
+ 		io_front_pad = roundup(front_pad,  __alignof__(struct dm_io)) + offsetof(struct dm_io, tio);
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index 0e518d2ee280..41ec228b02a6 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -28,6 +28,7 @@ enum dm_queue_mode {
+ 	DM_TYPE_REQUEST_BASED	 = 2,
+ 	DM_TYPE_MQ_REQUEST_BASED = 3,
+ 	DM_TYPE_DAX_BIO_BASED	 = 4,
++	DM_TYPE_NVME_BIO_BASED	 = 5,
+ };
+ 
+ typedef enum { STATUSTYPE_INFO, STATUSTYPE_TABLE } status_type_t;
+-- 
+2.16.4
+
