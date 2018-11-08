@@ -1,0 +1,592 @@
+From: Yonatan Cohen <yonatanc@mellanox.com>
+Date: Tue, 2 Jan 2018 16:08:06 +0200
+Subject: IB/mlx5: Implement fragmented completion queue (CQ)
+Patch-mainline: v4.17-rc1
+Git-commit: 388ca8be00370db132464e27f745b8a0add19fcb
+References: bsc#1103991 FATE#326007
+
+The current implementation of create CQ requires contiguous
+memory, such requirement is problematic once the memory is
+fragmented or the system is low in memory, it causes for
+failures in dma_zalloc_coherent().
+
+This patch implements new scheme of fragmented CQ to overcome
+this issue by introducing new type: 'struct mlx5_frag_buf_ctrl'
+to allocate fragmented buffers, rather than contiguous ones.
+
+Base the Completion Queues (CQs) on this new fragmented buffer.
+
+It fixes following crashes:
+kworker/29:0: page allocation failure: order:6, mode:0x80d0
+CPU: 29 PID: 8374 Comm: kworker/29:0 Tainted: G OE 3.10.0
+Workqueue: ib_cm cm_work_handler [ib_cm]
+Call Trace:
+[<>] dump_stack+0x19/0x1b
+[<>] warn_alloc_failed+0x110/0x180
+[<>] __alloc_pages_slowpath+0x6b7/0x725
+[<>] __alloc_pages_nodemask+0x405/0x420
+[<>] dma_generic_alloc_coherent+0x8f/0x140
+[<>] x86_swiotlb_alloc_coherent+0x21/0x50
+[<>] mlx5_dma_zalloc_coherent_node+0xad/0x110 [mlx5_core]
+[<>] ? mlx5_db_alloc_node+0x69/0x1b0 [mlx5_core]
+[<>] mlx5_buf_alloc_node+0x3e/0xa0 [mlx5_core]
+[<>] mlx5_buf_alloc+0x14/0x20 [mlx5_core]
+[<>] create_cq_kernel+0x90/0x1f0 [mlx5_ib]
+[<>] mlx5_ib_create_cq+0x3b0/0x4e0 [mlx5_ib]
+
+Signed-off-by: Yonatan Cohen <yonatanc@mellanox.com>
+Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/cq.c                 |   66 ++++++++++++++----------
+ drivers/infiniband/hw/mlx5/mlx5_ib.h            |    6 +-
+ drivers/net/ethernet/mellanox/mlx5/core/alloc.c |   37 +++++++++----
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c |   11 ++--
+ drivers/net/ethernet/mellanox/mlx5/core/wq.c    |   18 ++----
+ drivers/net/ethernet/mellanox/mlx5/core/wq.h    |   22 ++------
+ include/linux/mlx5/driver.h                     |   51 +++++++++++++-----
+ 7 files changed, 125 insertions(+), 86 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -64,14 +64,9 @@ static void mlx5_ib_cq_event(struct mlx5
+ 	}
+ }
+ 
+-static void *get_cqe_from_buf(struct mlx5_ib_cq_buf *buf, int n, int size)
+-{
+-	return mlx5_buf_offset(&buf->buf, n * size);
+-}
+-
+ static void *get_cqe(struct mlx5_ib_cq *cq, int n)
+ {
+-	return get_cqe_from_buf(&cq->buf, n, cq->mcq.cqe_sz);
++	return mlx5_frag_buf_get_wqe(&cq->buf.fbc, n);
+ }
+ 
+ static u8 sw_ownership_bit(int n, int nent)
+@@ -404,7 +399,7 @@ static void handle_atomics(struct mlx5_i
+ 
+ static void free_cq_buf(struct mlx5_ib_dev *dev, struct mlx5_ib_cq_buf *buf)
+ {
+-	mlx5_buf_free(dev->mdev, &buf->buf);
++	mlx5_frag_buf_free(dev->mdev, &buf->fbc.frag_buf);
+ }
+ 
+ static void get_sig_err_item(struct mlx5_sig_err_cqe *cqe,
+@@ -725,12 +720,25 @@ int mlx5_ib_arm_cq(struct ib_cq *ibcq, e
+ 	return ret;
+ }
+ 
+-static int alloc_cq_buf(struct mlx5_ib_dev *dev, struct mlx5_ib_cq_buf *buf,
+-			int nent, int cqe_size)
+-{
++static int alloc_cq_frag_buf(struct mlx5_ib_dev *dev,
++			     struct mlx5_ib_cq_buf *buf,
++			     int nent,
++			     int cqe_size)
++{
++	struct mlx5_frag_buf_ctrl *c = &buf->fbc;
++	struct mlx5_frag_buf *frag_buf = &c->frag_buf;
++	u32 cqc_buff[MLX5_ST_SZ_DW(cqc)] = {0};
+ 	int err;
+ 
+-	err = mlx5_buf_alloc(dev->mdev, nent * cqe_size, &buf->buf);
++	MLX5_SET(cqc, cqc_buff, log_cq_size, ilog2(cqe_size));
++	MLX5_SET(cqc, cqc_buff, cqe_sz, (cqe_size == 128) ? 1 : 0);
++
++	mlx5_core_init_cq_frag_buf(&buf->fbc, cqc_buff);
++
++	err = mlx5_frag_buf_alloc_node(dev->mdev,
++				       nent * cqe_size,
++				       frag_buf,
++				       dev->mdev->priv.numa_node);
+ 	if (err)
+ 		return err;
+ 
+@@ -863,14 +871,15 @@ static void destroy_cq_user(struct mlx5_
+ 	ib_umem_release(cq->buf.umem);
+ }
+ 
+-static void init_cq_buf(struct mlx5_ib_cq *cq, struct mlx5_ib_cq_buf *buf)
++static void init_cq_frag_buf(struct mlx5_ib_cq *cq,
++			     struct mlx5_ib_cq_buf *buf)
+ {
+ 	int i;
+ 	void *cqe;
+ 	struct mlx5_cqe64 *cqe64;
+ 
+ 	for (i = 0; i < buf->nent; i++) {
+-		cqe = get_cqe_from_buf(buf, i, buf->cqe_size);
++		cqe = get_cqe(cq, i);
+ 		cqe64 = buf->cqe_size == 64 ? cqe : cqe + 64;
+ 		cqe64->op_own = MLX5_CQE_INVALID << 4;
+ 	}
+@@ -892,14 +901,15 @@ static int create_cq_kernel(struct mlx5_
+ 	cq->mcq.arm_db     = cq->db.db + 1;
+ 	cq->mcq.cqe_sz = cqe_size;
+ 
+-	err = alloc_cq_buf(dev, &cq->buf, entries, cqe_size);
++	err = alloc_cq_frag_buf(dev, &cq->buf, entries, cqe_size);
+ 	if (err)
+ 		goto err_db;
+ 
+-	init_cq_buf(cq, &cq->buf);
++	init_cq_frag_buf(cq, &cq->buf);
+ 
+ 	*inlen = MLX5_ST_SZ_BYTES(create_cq_in) +
+-		 MLX5_FLD_SZ_BYTES(create_cq_in, pas[0]) * cq->buf.buf.npages;
++		 MLX5_FLD_SZ_BYTES(create_cq_in, pas[0]) *
++		 cq->buf.fbc.frag_buf.npages;
+ 	*cqb = kvzalloc(*inlen, GFP_KERNEL);
+ 	if (!*cqb) {
+ 		err = -ENOMEM;
+@@ -907,11 +917,12 @@ static int create_cq_kernel(struct mlx5_
+ 	}
+ 
+ 	pas = (__be64 *)MLX5_ADDR_OF(create_cq_in, *cqb, pas);
+-	mlx5_fill_page_array(&cq->buf.buf, pas);
++	mlx5_fill_page_frag_array(&cq->buf.fbc.frag_buf, pas);
+ 
+ 	cqc = MLX5_ADDR_OF(create_cq_in, *cqb, cq_context);
+ 	MLX5_SET(cqc, cqc, log_page_size,
+-		 cq->buf.buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);
++		 cq->buf.fbc.frag_buf.page_shift -
++		 MLX5_ADAPTER_PAGE_SHIFT);
+ 
+ 	*index = dev->mdev->priv.uar->index;
+ 
+@@ -1213,11 +1224,11 @@ static int resize_kernel(struct mlx5_ib_
+ 	if (!cq->resize_buf)
+ 		return -ENOMEM;
+ 
+-	err = alloc_cq_buf(dev, cq->resize_buf, entries, cqe_size);
++	err = alloc_cq_frag_buf(dev, cq->resize_buf, entries, cqe_size);
+ 	if (err)
+ 		goto ex;
+ 
+-	init_cq_buf(cq, cq->resize_buf);
++	init_cq_frag_buf(cq, cq->resize_buf);
+ 
+ 	return 0;
+ 
+@@ -1262,9 +1273,8 @@ static int copy_resize_cqes(struct mlx5_
+ 	}
+ 
+ 	while ((scqe64->op_own >> 4) != MLX5_CQE_RESIZE_CQ) {
+-		dcqe = get_cqe_from_buf(cq->resize_buf,
+-					(i + 1) & (cq->resize_buf->nent),
+-					dsize);
++		dcqe = mlx5_frag_buf_get_wqe(&cq->resize_buf->fbc,
++					     (i + 1) & cq->resize_buf->nent);
+ 		dcqe64 = dsize == 64 ? dcqe : dcqe + 64;
+ 		sw_own = sw_ownership_bit(i + 1, cq->resize_buf->nent);
+ 		memcpy(dcqe, scqe, dsize);
+@@ -1330,8 +1340,11 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq
+ 		cqe_size = 64;
+ 		err = resize_kernel(dev, cq, entries, cqe_size);
+ 		if (!err) {
+-			npas = cq->resize_buf->buf.npages;
+-			page_shift = cq->resize_buf->buf.page_shift;
++			struct mlx5_frag_buf_ctrl *c;
++
++			c = &cq->resize_buf->fbc;
++			npas = c->frag_buf.npages;
++			page_shift = c->frag_buf.page_shift;
+ 		}
+ 	}
+ 
+@@ -1352,7 +1365,8 @@ int mlx5_ib_resize_cq(struct ib_cq *ibcq
+ 		mlx5_ib_populate_pas(dev, cq->resize_umem, page_shift,
+ 				     pas, 0);
+ 	else
+-		mlx5_fill_page_array(&cq->resize_buf->buf, pas);
++		mlx5_fill_page_frag_array(&cq->resize_buf->fbc.frag_buf,
++					  pas);
+ 
+ 	MLX5_SET(modify_cq_in, in,
+ 		 modify_field_select_resize_field_select.resize_field_select.resize_field_select,
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -371,7 +371,7 @@ struct mlx5_ib_qp {
+ 		struct mlx5_ib_rss_qp rss_qp;
+ 		struct mlx5_ib_dct dct;
+ 	};
+-	struct mlx5_buf		buf;
++	struct mlx5_frag_buf	buf;
+ 
+ 	struct mlx5_db		db;
+ 	struct mlx5_ib_wq	rq;
+@@ -413,7 +413,7 @@ struct mlx5_ib_qp {
+ };
+ 
+ struct mlx5_ib_cq_buf {
+-	struct mlx5_buf		buf;
++	struct mlx5_frag_buf_ctrl fbc;
+ 	struct ib_umem		*umem;
+ 	int			cqe_size;
+ 	int			nent;
+@@ -495,7 +495,7 @@ struct mlx5_ib_wc {
+ struct mlx5_ib_srq {
+ 	struct ib_srq		ibsrq;
+ 	struct mlx5_core_srq	msrq;
+-	struct mlx5_buf		buf;
++	struct mlx5_frag_buf	buf;
+ 	struct mlx5_db		db;
+ 	u64		       *wrid;
+ 	/* protect SRQ hanlding
+--- a/drivers/net/ethernet/mellanox/mlx5/core/alloc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/alloc.c
+@@ -71,19 +71,24 @@ static void *mlx5_dma_zalloc_coherent_no
+ }
+ 
+ int mlx5_buf_alloc_node(struct mlx5_core_dev *dev, int size,
+-			struct mlx5_buf *buf, int node)
++			struct mlx5_frag_buf *buf, int node)
+ {
+ 	dma_addr_t t;
+ 
+ 	buf->size = size;
+ 	buf->npages       = 1;
+ 	buf->page_shift   = (u8)get_order(size) + PAGE_SHIFT;
+-	buf->direct.buf   = mlx5_dma_zalloc_coherent_node(dev, size,
+-							  &t, node);
+-	if (!buf->direct.buf)
++
++	buf->frags = kzalloc(sizeof(*buf->frags), GFP_KERNEL);
++	if (!buf->frags)
+ 		return -ENOMEM;
+ 
+-	buf->direct.map = t;
++	buf->frags->buf   = mlx5_dma_zalloc_coherent_node(dev, size,
++							  &t, node);
++	if (!buf->frags->buf)
++		goto err_out;
++
++	buf->frags->map = t;
+ 
+ 	while (t & ((1 << buf->page_shift) - 1)) {
+ 		--buf->page_shift;
+@@ -91,18 +96,24 @@ int mlx5_buf_alloc_node(struct mlx5_core
+ 	}
+ 
+ 	return 0;
++err_out:
++	kfree(buf->frags);
++	return -ENOMEM;
+ }
+ 
+-int mlx5_buf_alloc(struct mlx5_core_dev *dev, int size, struct mlx5_buf *buf)
++int mlx5_buf_alloc(struct mlx5_core_dev *dev,
++		   int size, struct mlx5_frag_buf *buf)
+ {
+ 	return mlx5_buf_alloc_node(dev, size, buf, dev->priv.numa_node);
+ }
+-EXPORT_SYMBOL_GPL(mlx5_buf_alloc);
++EXPORT_SYMBOL(mlx5_buf_alloc);
+ 
+-void mlx5_buf_free(struct mlx5_core_dev *dev, struct mlx5_buf *buf)
++void mlx5_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf)
+ {
+-	dma_free_coherent(&dev->pdev->dev, buf->size, buf->direct.buf,
+-			  buf->direct.map);
++	dma_free_coherent(&dev->pdev->dev, buf->size, buf->frags->buf,
++			  buf->frags->map);
++
++	kfree(buf->frags);
+ }
+ EXPORT_SYMBOL_GPL(mlx5_buf_free);
+ 
+@@ -147,6 +158,7 @@ err_free_buf:
+ err_out:
+ 	return -ENOMEM;
+ }
++EXPORT_SYMBOL_GPL(mlx5_frag_buf_alloc_node);
+ 
+ void mlx5_frag_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf)
+ {
+@@ -162,6 +174,7 @@ void mlx5_frag_buf_free(struct mlx5_core
+ 	}
+ 	kfree(buf->frags);
+ }
++EXPORT_SYMBOL_GPL(mlx5_frag_buf_free);
+ 
+ static struct mlx5_db_pgdir *mlx5_alloc_db_pgdir(struct mlx5_core_dev *dev,
+ 						 int node)
+@@ -275,13 +288,13 @@ void mlx5_db_free(struct mlx5_core_dev *
+ }
+ EXPORT_SYMBOL_GPL(mlx5_db_free);
+ 
+-void mlx5_fill_page_array(struct mlx5_buf *buf, __be64 *pas)
++void mlx5_fill_page_array(struct mlx5_frag_buf *buf, __be64 *pas)
+ {
+ 	u64 addr;
+ 	int i;
+ 
+ 	for (i = 0; i < buf->npages; i++) {
+-		addr = buf->direct.map + (i << buf->page_shift);
++		addr = buf->frags->map + (i << buf->page_shift);
+ 
+ 		pas[i] = cpu_to_be64(addr);
+ 	}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -53,7 +53,7 @@ static inline bool mlx5e_rx_hw_stamp(str
+ static inline void mlx5e_read_cqe_slot(struct mlx5e_cq *cq, u32 cqcc,
+ 				       void *data)
+ {
+-	u32 ci = cqcc & cq->wq.sz_m1;
++	u32 ci = cqcc & cq->wq.fbc.sz_m1;
+ 
+ 	memcpy(data, mlx5_cqwq_get_wqe(&cq->wq, ci), sizeof(struct mlx5_cqe64));
+ }
+@@ -75,9 +75,10 @@ static inline void mlx5e_read_mini_arr_s
+ 
+ static inline void mlx5e_cqes_update_owner(struct mlx5e_cq *cq, u32 cqcc, int n)
+ {
+-	u8 op_own = (cqcc >> cq->wq.log_sz) & 1;
+-	u32 wq_sz = 1 << cq->wq.log_sz;
+-	u32 ci = cqcc & cq->wq.sz_m1;
++	struct mlx5_frag_buf_ctrl *fbc = &cq->wq.fbc;
++	u8 op_own = (cqcc >> fbc->log_sz) & 1;
++	u32 wq_sz = 1 << fbc->log_sz;
++	u32 ci = cqcc & fbc->sz_m1;
+ 	u32 ci_top = min_t(u32, wq_sz, ci + n);
+ 
+ 	for (; ci < ci_top; ci++, n--) {
+@@ -102,7 +103,7 @@ static inline void mlx5e_decompress_cqe(
+ 	cq->title.byte_cnt     = cq->mini_arr[cq->mini_arr_idx].byte_cnt;
+ 	cq->title.check_sum    = cq->mini_arr[cq->mini_arr_idx].checksum;
+ 	cq->title.op_own      &= 0xf0;
+-	cq->title.op_own      |= 0x01 & (cqcc >> cq->wq.log_sz);
++	cq->title.op_own      |= 0x01 & (cqcc >> cq->wq.fbc.log_sz);
+ 	cq->title.wqe_counter  = cpu_to_be16(cq->decmprs_wqe_counter);
+ 
+ 	if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.c
+@@ -41,7 +41,7 @@ u32 mlx5_wq_cyc_get_size(struct mlx5_wq_
+ 
+ u32 mlx5_cqwq_get_size(struct mlx5_cqwq *wq)
+ {
+-	return wq->sz_m1 + 1;
++	return wq->fbc.sz_m1 + 1;
+ }
+ 
+ u32 mlx5_wq_ll_get_size(struct mlx5_wq_ll *wq)
+@@ -62,7 +62,7 @@ static u32 mlx5_wq_qp_get_byte_size(stru
+ 
+ static u32 mlx5_cqwq_get_byte_size(struct mlx5_cqwq *wq)
+ {
+-	return mlx5_cqwq_get_size(wq) << wq->log_stride;
++	return mlx5_cqwq_get_size(wq) << wq->fbc.log_stride;
+ }
+ 
+ static u32 mlx5_wq_ll_get_byte_size(struct mlx5_wq_ll *wq)
+@@ -92,7 +92,7 @@ int mlx5_wq_cyc_create(struct mlx5_core_
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->buf = wq_ctrl->buf.direct.buf;
++	wq->buf = wq_ctrl->buf.frags->buf;
+ 	wq->db  = wq_ctrl->db.db;
+ 
+ 	wq_ctrl->mdev = mdev;
+@@ -130,7 +130,7 @@ int mlx5_wq_qp_create(struct mlx5_core_d
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->rq.buf = wq_ctrl->buf.direct.buf;
++	wq->rq.buf = wq_ctrl->buf.frags->buf;
+ 	wq->sq.buf = wq->rq.buf + mlx5_wq_cyc_get_byte_size(&wq->rq);
+ 	wq->rq.db  = &wq_ctrl->db.db[MLX5_RCV_DBR];
+ 	wq->sq.db  = &wq_ctrl->db.db[MLX5_SND_DBR];
+@@ -151,11 +151,7 @@ int mlx5_cqwq_create(struct mlx5_core_de
+ {
+ 	int err;
+ 
+-	wq->log_stride	= 6 + MLX5_GET(cqc, cqc, cqe_sz);
+-	wq->log_sz	= MLX5_GET(cqc, cqc, log_cq_size);
+-	wq->sz_m1	= (1 << wq->log_sz) - 1;
+-	wq->log_frag_strides = PAGE_SHIFT - wq->log_stride;
+-	wq->frag_sz_m1	= (1 << wq->log_frag_strides) - 1;
++	mlx5_core_init_cq_frag_buf(&wq->fbc, cqc);
+ 
+ 	err = mlx5_db_alloc_node(mdev, &wq_ctrl->db, param->db_numa_node);
+ 	if (err) {
+@@ -172,7 +168,7 @@ int mlx5_cqwq_create(struct mlx5_core_de
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->frag_buf = wq_ctrl->frag_buf;
++	wq->fbc.frag_buf = wq_ctrl->frag_buf;
+ 	wq->db  = wq_ctrl->db.db;
+ 
+ 	wq_ctrl->mdev = mdev;
+@@ -209,7 +205,7 @@ int mlx5_wq_ll_create(struct mlx5_core_d
+ 		goto err_db_free;
+ 	}
+ 
+-	wq->buf = wq_ctrl->buf.direct.buf;
++	wq->buf = wq_ctrl->buf.frags->buf;
+ 	wq->db  = wq_ctrl->db.db;
+ 
+ 	for (i = 0; i < wq->sz_m1; i++) {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.h
+@@ -45,7 +45,7 @@ struct mlx5_wq_param {
+ 
+ struct mlx5_wq_ctrl {
+ 	struct mlx5_core_dev	*mdev;
+-	struct mlx5_buf		buf;
++	struct mlx5_frag_buf	buf;
+ 	struct mlx5_db		db;
+ };
+ 
+@@ -68,14 +68,9 @@ struct mlx5_wq_qp {
+ };
+ 
+ struct mlx5_cqwq {
+-	struct mlx5_frag_buf	frag_buf;
+-	__be32			*db;
+-	u32			sz_m1;
+-	u32			frag_sz_m1;
+-	u32			cc; /* consumer counter */
+-	u8			log_sz;
+-	u8			log_stride;
+-	u8			log_frag_strides;
++	struct mlx5_frag_buf_ctrl fbc;
++	__be32			  *db;
++	u32			  cc; /* consumer counter */
+ };
+ 
+ struct mlx5_wq_ll {
+@@ -131,20 +126,17 @@ static inline int mlx5_wq_cyc_cc_bigger(
+ 
+ static inline u32 mlx5_cqwq_get_ci(struct mlx5_cqwq *wq)
+ {
+-	return wq->cc & wq->sz_m1;
++	return wq->cc & wq->fbc.sz_m1;
+ }
+ 
+ static inline void *mlx5_cqwq_get_wqe(struct mlx5_cqwq *wq, u32 ix)
+ {
+-	unsigned int frag = (ix >> wq->log_frag_strides);
+-
+-	return wq->frag_buf.frags[frag].buf +
+-		((wq->frag_sz_m1 & ix) << wq->log_stride);
++	return mlx5_frag_buf_get_wqe(&wq->fbc, ix);
+ }
+ 
+ static inline u32 mlx5_cqwq_get_wrap_cnt(struct mlx5_cqwq *wq)
+ {
+-	return wq->cc >> wq->log_sz;
++	return wq->cc >> wq->fbc.log_sz;
+ }
+ 
+ static inline void mlx5_cqwq_pop(struct mlx5_cqwq *wq)
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -345,13 +345,6 @@ struct mlx5_buf_list {
+ 	dma_addr_t		map;
+ };
+ 
+-struct mlx5_buf {
+-	struct mlx5_buf_list	direct;
+-	int			npages;
+-	int			size;
+-	u8			page_shift;
+-};
+-
+ struct mlx5_frag_buf {
+ 	struct mlx5_buf_list	*frags;
+ 	int			npages;
+@@ -359,6 +352,15 @@ struct mlx5_frag_buf {
+ 	u8			page_shift;
+ };
+ 
++struct mlx5_frag_buf_ctrl {
++	struct mlx5_frag_buf	frag_buf;
++	u32			sz_m1;
++	u32			frag_sz_m1;
++	u8			log_sz;
++	u8			log_stride;
++	u8			log_frag_strides;
++};
++
+ struct mlx5_eq_tasklet {
+ 	struct list_head list;
+ 	struct list_head process_list;
+@@ -386,7 +388,7 @@ struct mlx5_eq {
+ 	struct mlx5_cq_table	cq_table;
+ 	__be32 __iomem	       *doorbell;
+ 	u32			cons_index;
+-	struct mlx5_buf		buf;
++	struct mlx5_frag_buf	buf;
+ 	int			size;
+ 	unsigned int		irqn;
+ 	u8			eqn;
+@@ -932,9 +934,9 @@ struct mlx5_hca_vport_context {
+ 	bool			grh_required;
+ };
+ 
+-static inline void *mlx5_buf_offset(struct mlx5_buf *buf, int offset)
++static inline void *mlx5_buf_offset(struct mlx5_frag_buf *buf, int offset)
+ {
+-		return buf->direct.buf + offset;
++		return buf->frags->buf + offset;
+ }
+ 
+ #define STRUCT_FIELD(header, field) \
+@@ -973,6 +975,25 @@ static inline u32 mlx5_base_mkey(const u
+ 	return key & 0xffffff00u;
+ }
+ 
++static inline void mlx5_core_init_cq_frag_buf(struct mlx5_frag_buf_ctrl *fbc,
++					      void *cqc)
++{
++	fbc->log_stride	= 6 + MLX5_GET(cqc, cqc, cqe_sz);
++	fbc->log_sz	= MLX5_GET(cqc, cqc, log_cq_size);
++	fbc->sz_m1	= (1 << fbc->log_sz) - 1;
++	fbc->log_frag_strides = PAGE_SHIFT - fbc->log_stride;
++	fbc->frag_sz_m1	= (1 << fbc->log_frag_strides) - 1;
++}
++
++static inline void *mlx5_frag_buf_get_wqe(struct mlx5_frag_buf_ctrl *fbc,
++					  u32 ix)
++{
++	unsigned int frag = (ix >> fbc->log_frag_strides);
++
++	return fbc->frag_buf.frags[frag].buf +
++		((fbc->frag_sz_m1 & ix) << fbc->log_stride);
++}
++
+ int mlx5_cmd_init(struct mlx5_core_dev *dev);
+ void mlx5_cmd_cleanup(struct mlx5_core_dev *dev);
+ void mlx5_cmd_use_events(struct mlx5_core_dev *dev);
+@@ -998,9 +1019,10 @@ void mlx5_drain_health_wq(struct mlx5_co
+ void mlx5_drain_health_recovery(struct mlx5_core_dev *dev);
+ void mlx5_trigger_health_work(struct mlx5_core_dev *dev);
+ int mlx5_buf_alloc_node(struct mlx5_core_dev *dev, int size,
+-			struct mlx5_buf *buf, int node);
+-int mlx5_buf_alloc(struct mlx5_core_dev *dev, int size, struct mlx5_buf *buf);
+-void mlx5_buf_free(struct mlx5_core_dev *dev, struct mlx5_buf *buf);
++			struct mlx5_frag_buf *buf, int node);
++int mlx5_buf_alloc(struct mlx5_core_dev *dev,
++		   int size, struct mlx5_frag_buf *buf);
++void mlx5_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf);
+ int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
+ 			     struct mlx5_frag_buf *buf, int node);
+ void mlx5_frag_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf);
+@@ -1045,7 +1067,8 @@ int mlx5_satisfy_startup_pages(struct ml
+ int mlx5_reclaim_startup_pages(struct mlx5_core_dev *dev);
+ void mlx5_register_debugfs(void);
+ void mlx5_unregister_debugfs(void);
+-void mlx5_fill_page_array(struct mlx5_buf *buf, __be64 *pas);
++
++void mlx5_fill_page_array(struct mlx5_frag_buf *buf, __be64 *pas);
+ void mlx5_fill_page_frag_array(struct mlx5_frag_buf *frag_buf, __be64 *pas);
+ void mlx5_rsc_event(struct mlx5_core_dev *dev, u32 rsn, int event_type);
+ void mlx5_srq_event(struct mlx5_core_dev *dev, u32 srqn, int event_type);
