@@ -1,0 +1,324 @@
+From: Aviad Yehezkel <aviadye@mellanox.com>
+Date: Wed, 28 Mar 2018 09:27:50 +0300
+Subject: IB/mlx5: Add implementation for create and destroy action_xfrm
+Patch-mainline: v4.17-rc1
+Git-commit: c6475a0bca30fc2f9e5e4c48935f08973c2780ef
+References: bsc#1103991 FATE#326007
+
+Adding implementation in mlx5 driver to create and destroy action_xfrm
+object. This merely call the accel layer.
+
+A user may pass MLX5_IB_XFRM_FLAGS_REQUIRE_METADATA flag which states
+that [s]he expects a metadata header to be added to the payload. This
+header represents information regarding the transformation's state.
+
+Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+Signed-off-by: Matan Barak <matanb@mellanox.com>
+Signed-off-by: Aviad Yehezkel <aviadye@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/mlx5/main.c         |  133 +++++++++++++++++++++++++++++-
+ drivers/infiniband/hw/mlx5/mlx5_ib.h      |   16 +++
+ include/uapi/rdma/mlx5_user_ioctl_cmds.h  |   44 +++++++++
+ include/uapi/rdma/mlx5_user_ioctl_verbs.h |   43 +++++++++
+ 4 files changed, 235 insertions(+), 1 deletion(-)
+ create mode 100644 include/uapi/rdma/mlx5_user_ioctl_cmds.h
+ create mode 100644 include/uapi/rdma/mlx5_user_ioctl_verbs.h
+
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -60,7 +60,10 @@
+ #include "ib_rep.h"
+ #include "cmd.h"
+ #include <linux/mlx5/fs_helpers.h>
++#include <linux/mlx5/accel.h>
+ #include <rdma/uverbs_std_types.h>
++#include <rdma/mlx5_user_ioctl_verbs.h>
++#include <rdma/mlx5_user_ioctl_cmds.h>
+ 
+ #define UVERBS_MODULE_NAME mlx5_ib
+ #include <rdma/uverbs_named_ioctl.h>
+@@ -3103,6 +3106,122 @@ unlock:
+ 	return ERR_PTR(err);
+ }
+ 
++static u32 mlx5_ib_flow_action_flags_to_accel_xfrm_flags(u32 mlx5_flags)
++{
++	u32 flags = 0;
++
++	if (mlx5_flags & MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA)
++		flags |= MLX5_ACCEL_XFRM_FLAG_REQUIRE_METADATA;
++
++	return flags;
++}
++
++#define MLX5_FLOW_ACTION_ESP_CREATE_LAST_SUPPORTED	MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA
++static struct ib_flow_action *
++mlx5_ib_create_flow_action_esp(struct ib_device *device,
++			       const struct ib_flow_action_attrs_esp *attr,
++			       struct uverbs_attr_bundle *attrs)
++{
++	struct mlx5_ib_dev *mdev = to_mdev(device);
++	struct ib_uverbs_flow_action_esp_keymat_aes_gcm *aes_gcm;
++	struct mlx5_accel_esp_xfrm_attrs accel_attrs = {};
++	struct mlx5_ib_flow_action *action;
++	u64 action_flags;
++	u64 flags;
++	int err = 0;
++
++	if (IS_UVERBS_COPY_ERR(uverbs_copy_from(&action_flags, attrs,
++						MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS)))
++		return ERR_PTR(-EFAULT);
++
++	if (action_flags >= (MLX5_FLOW_ACTION_ESP_CREATE_LAST_SUPPORTED << 1))
++		return ERR_PTR(-EOPNOTSUPP);
++
++	flags = mlx5_ib_flow_action_flags_to_accel_xfrm_flags(action_flags);
++
++	/* We current only support a subset of the standard features. Only a
++	 * keymat of type AES_GCM, with icv_len == 16, iv_algo == SEQ and esn
++	 * (with overlap). Full offload mode isn't supported.
++	 */
++	if (!attr->keymat || attr->replay || attr->encap ||
++	    attr->spi || attr->seq || attr->tfc_pad ||
++	    attr->hard_limit_pkts ||
++	    (attr->flags & ~(IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED |
++			     IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ENCRYPT)))
++		return ERR_PTR(-EOPNOTSUPP);
++
++	if (attr->keymat->protocol !=
++	    IB_UVERBS_FLOW_ACTION_ESP_KEYMAT_AES_GCM)
++		return ERR_PTR(-EOPNOTSUPP);
++
++	aes_gcm = &attr->keymat->keymat.aes_gcm;
++
++	if (aes_gcm->icv_len != 16 ||
++	    aes_gcm->iv_algo != IB_UVERBS_FLOW_ACTION_IV_ALGO_SEQ)
++		return ERR_PTR(-EOPNOTSUPP);
++
++	action = kmalloc(sizeof(*action), GFP_KERNEL);
++	if (!action)
++		return ERR_PTR(-ENOMEM);
++
++	action->esp_aes_gcm.ib_flags = attr->flags;
++	memcpy(&accel_attrs.keymat.aes_gcm.aes_key, &aes_gcm->aes_key,
++	       sizeof(accel_attrs.keymat.aes_gcm.aes_key));
++	accel_attrs.keymat.aes_gcm.key_len = aes_gcm->key_len * 8;
++	memcpy(&accel_attrs.keymat.aes_gcm.salt, &aes_gcm->salt,
++	       sizeof(accel_attrs.keymat.aes_gcm.salt));
++	memcpy(&accel_attrs.keymat.aes_gcm.seq_iv, &aes_gcm->iv,
++	       sizeof(accel_attrs.keymat.aes_gcm.seq_iv));
++	accel_attrs.keymat.aes_gcm.icv_len = aes_gcm->icv_len * 8;
++	accel_attrs.keymat.aes_gcm.iv_algo = MLX5_ACCEL_ESP_AES_GCM_IV_ALGO_SEQ;
++	accel_attrs.keymat_type = MLX5_ACCEL_ESP_KEYMAT_AES_GCM;
++
++	accel_attrs.esn = attr->esn;
++	if (attr->flags & IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED)
++		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_TRIGGERED;
++	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW)
++		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP;
++
++	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ENCRYPT)
++		accel_attrs.action |= MLX5_ACCEL_ESP_ACTION_ENCRYPT;
++
++	action->esp_aes_gcm.ctx =
++		mlx5_accel_esp_create_xfrm(mdev->mdev, &accel_attrs, flags);
++	if (IS_ERR(action->esp_aes_gcm.ctx)) {
++		err = PTR_ERR(action->esp_aes_gcm.ctx);
++		goto err_parse;
++	}
++
++	action->esp_aes_gcm.ib_flags = attr->flags;
++
++	return &action->ib_action;
++
++err_parse:
++	kfree(action);
++	return ERR_PTR(err);
++}
++
++static int mlx5_ib_destroy_flow_action(struct ib_flow_action *action)
++{
++	struct mlx5_ib_flow_action *maction = to_mflow_act(action);
++
++	switch (action->type) {
++	case IB_FLOW_ACTION_ESP:
++		/*
++		 * We only support aes_gcm by now, so we implicitly know this is
++		 * the underline crypto.
++		 */
++		mlx5_accel_esp_destroy_xfrm(maction->esp_aes_gcm.ctx);
++		break;
++	default:
++		WARN_ON(true);
++		break;
++	}
++
++	kfree(maction);
++	return 0;
++}
++
+ static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+@@ -4554,13 +4673,23 @@ static void mlx5_ib_cleanup_multiport_ma
+ 	mlx5_nic_vport_disable_roce(dev->mdev);
+ }
+ 
+-#define NUM_TREES	0
++ADD_UVERBS_ATTRIBUTES_SIMPLE(mlx5_ib_flow_action, UVERBS_OBJECT_FLOW_ACTION,
++			     UVERBS_METHOD_FLOW_ACTION_ESP_CREATE,
++			     &UVERBS_ATTR_PTR_IN(MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS,
++						 UVERBS_ATTR_TYPE(u64),
++						 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
++
++#define NUM_TREES	1
+ static int populate_specs_root(struct mlx5_ib_dev *dev)
+ {
+ 	const struct uverbs_object_tree_def *default_root[NUM_TREES + 1] = {
+ 		uverbs_default_get_objects()};
+ 	size_t num_trees = 1;
+ 
++	if (mlx5_accel_ipsec_device_caps(dev->mdev) & MLX5_ACCEL_IPSEC_CAP_DEVICE &&
++	    !WARN_ON(num_trees >= ARRAY_SIZE(default_root)))
++		default_root[num_trees++] = &mlx5_ib_flow_action;
++
+ 	dev->ib_dev.specs_root =
+ 		uverbs_alloc_spec_tree(num_trees, default_root);
+ 
+@@ -4802,6 +4931,8 @@ int mlx5_ib_stage_caps_init(struct mlx5_
+ 	dev->ib_dev.uverbs_ex_cmd_mask |=
+ 			(1ull << IB_USER_VERBS_EX_CMD_CREATE_FLOW) |
+ 			(1ull << IB_USER_VERBS_EX_CMD_DESTROY_FLOW);
++	dev->ib_dev.create_flow_action_esp = mlx5_ib_create_flow_action_esp;
++	dev->ib_dev.destroy_flow_action = mlx5_ib_destroy_flow_action;
+ 	dev->ib_dev.driver_id = RDMA_DRIVER_MLX5;
+ 
+ 	err = init_node_data(dev);
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -772,6 +772,16 @@ struct mlx5_ib_multiport_info {
+ 	bool unaffiliate;
+ };
+ 
++struct mlx5_ib_flow_action {
++	struct ib_flow_action		ib_action;
++	union {
++		struct {
++			u64			    ib_flags;
++			struct mlx5_accel_esp_xfrm *ctx;
++		} esp_aes_gcm;
++	};
++};
++
+ struct mlx5_ib_dev {
+ 	struct ib_device		ib_dev;
+ 	struct mlx5_core_dev		*mdev;
+@@ -895,6 +905,12 @@ static inline struct mlx5_ib_mw *to_mmw(
+ 	return container_of(ibmw, struct mlx5_ib_mw, ibmw);
+ }
+ 
++static inline struct mlx5_ib_flow_action *
++to_mflow_act(struct ib_flow_action *ibact)
++{
++	return container_of(ibact, struct mlx5_ib_flow_action, ib_action);
++}
++
+ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
+ 			struct mlx5_db *db);
+ void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db);
+--- /dev/null
++++ b/include/uapi/rdma/mlx5_user_ioctl_cmds.h
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (c) 2018, Mellanox Technologies inc.  All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef MLX5_USER_IOCTL_CMDS_H
++#define MLX5_USER_IOCTL_CMDS_H
++
++#include <rdma/ib_user_ioctl_cmds.h>
++
++enum mlx5_ib_create_flow_action_attrs {
++	/* This attribute belong to the driver namespace */
++	MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS = (1U << UVERBS_ID_NS_SHIFT),
++};
++
++#endif
++
+--- /dev/null
++++ b/include/uapi/rdma/mlx5_user_ioctl_verbs.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (c) 2018, Mellanox Technologies inc.  All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef MLX5_USER_IOCTL_VERBS_H
++#define MLX5_USER_IOCTL_VERBS_H
++
++#include <linux/types.h>
++
++enum mlx5_ib_uapi_flow_action_flags {
++	MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA	= 1 << 0,
++};
++
++#endif
++
