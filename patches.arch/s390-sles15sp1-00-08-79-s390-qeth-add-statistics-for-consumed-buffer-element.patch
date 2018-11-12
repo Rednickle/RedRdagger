@@ -1,0 +1,222 @@
+From: Julian Wiedmann <jwi@linux.ibm.com>
+Subject: s390/qeth: add statistics for consumed buffer elements
+Patch-mainline: v4.19-rc1
+Git-commit: d2a274b25be7218f8400037868a756640e8a4b0d
+References: FATE#326350, LTC#169511, bsc#1113509
+
+Summary:     qeth: performance improvements
+Description: This adds recent functional and performance improvements for the
+             qeth network driver.
+             Primarily this brings Scatter-Gather support for HiperSockets,
+             reduced CPU consumption in the L3 IPv4 transmit path for OSA,
+             improved Promiscuous Mode performance due to IFF_UNICAST_FLT,
+             support for Scatter-Gather on z/VM virtual NICs, and
+             support for delayed GRO flushing.
+
+             For sanity & stability reasons, this effectively constitutes a
+             backport of the qeth device driver from 4.19 mainline.
+             
+
+Upstream-Description:
+
+             s390/qeth: add statistics for consumed buffer elements
+
+             Nowadays an skb fragment typically spans over multiple pages. So replace
+             the obsolete, SG-only 'fragments' counter with one that tracks the
+             consumed buffer elements. This is what actually matters for performance.
+
+             Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+             Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/s390/net/qeth_core.h      |    2 +-
+ drivers/s390/net/qeth_core_main.c |    4 ++--
+ drivers/s390/net/qeth_l2_main.c   |   13 +++++++------
+ drivers/s390/net/qeth_l3_main.c   |   28 ++++++++++++++--------------
+ 4 files changed, 24 insertions(+), 23 deletions(-)
+
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -102,6 +102,7 @@ struct qeth_dbf_info {
+ struct qeth_perf_stats {
+ 	unsigned int bufs_rec;
+ 	unsigned int bufs_sent;
++	unsigned int buf_elements_sent;
+ 
+ 	unsigned int skbs_sent_pack;
+ 	unsigned int bufs_sent_pack;
+@@ -135,7 +136,6 @@ struct qeth_perf_stats {
+ 	unsigned int large_send_bytes;
+ 	unsigned int large_send_cnt;
+ 	unsigned int sg_skbs_sent;
+-	unsigned int sg_frags_sent;
+ 	/* initial values when measuring starts */
+ 	unsigned long initial_rx_packets;
+ 	unsigned long initial_tx_packets;
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -5968,7 +5968,7 @@ static struct {
+ 	{"tx skbs packing"},
+ 	{"tx buffers packing"},
+ 	{"tx sg skbs"},
+-	{"tx sg frags"},
++	{"tx buffer elements"},
+ /* 10 */{"rx sg skbs"},
+ 	{"rx sg frags"},
+ 	{"rx sg page allocs"},
+@@ -6027,7 +6027,7 @@ void qeth_core_get_ethtool_stats(struct
+ 	data[6] = card->perf_stats.skbs_sent_pack;
+ 	data[7] = card->perf_stats.bufs_sent_pack;
+ 	data[8] = card->perf_stats.sg_skbs_sent;
+-	data[9] = card->perf_stats.sg_frags_sent;
++	data[9] = card->perf_stats.buf_elements_sent;
+ 	data[10] = card->perf_stats.sg_skbs_rx;
+ 	data[11] = card->perf_stats.sg_frags_rx;
+ 	data[12] = card->perf_stats.sg_alloc_page_rx;
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@ -672,10 +672,11 @@ static int qeth_l2_xmit_osa(struct qeth_
+ 			    int ipv)
+ {
+ 	int push_len = sizeof(struct qeth_hdr);
+-	unsigned int elements, nr_frags;
+ 	unsigned int hdr_elements = 0;
+ 	struct qeth_hdr *hdr = NULL;
+ 	unsigned int hd_len = 0;
++	unsigned int elements;
++	bool is_sg;
+ 	int rc;
+ 
+ 	/* fix hardware limitation: as long as we do not have sbal
+@@ -693,7 +694,6 @@ static int qeth_l2_xmit_osa(struct qeth_
+ 		if (rc)
+ 			return rc;
+ 	}
+-	nr_frags = skb_shinfo(skb)->nr_frags;
+ 
+ 	rc = skb_cow_head(skb, push_len);
+ 	if (rc)
+@@ -720,15 +720,16 @@ static int qeth_l2_xmit_osa(struct qeth_
+ 	}
+ 	elements += hdr_elements;
+ 
++	is_sg = skb_is_nonlinear(skb);
+ 	/* TODO: remove the skb_orphan() once TX completion is fast enough */
+ 	skb_orphan(skb);
+ 	rc = qeth_do_send_packet(card, queue, skb, hdr, 0, hd_len, elements);
+ out:
+ 	if (!rc) {
+-		if (card->options.performance_stats && nr_frags) {
+-			card->perf_stats.sg_skbs_sent++;
+-			/* nr_frags + skb->data */
+-			card->perf_stats.sg_frags_sent += nr_frags + 1;
++		if (card->options.performance_stats) {
++			card->perf_stats.buf_elements_sent += elements;
++			if (is_sg)
++				card->perf_stats.sg_skbs_sent++;
+ 		}
+ 	} else {
+ 		if (hd_len)
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -2172,12 +2172,13 @@ static int qeth_l3_xmit_offload(struct q
+ 				int cast_type)
+ {
+ 	const unsigned int hw_hdr_len = sizeof(struct qeth_hdr);
+-	unsigned int frame_len, nr_frags;
+ 	unsigned char eth_hdr[ETH_HLEN];
+ 	unsigned int hdr_elements = 0;
+ 	struct qeth_hdr *hdr = NULL;
+ 	int elements, push_len, rc;
+ 	unsigned int hd_len = 0;
++	unsigned int frame_len;
++	bool is_sg;
+ 
+ 	/* compress skb to fit into one IO buffer: */
+ 	if (!qeth_get_elements_no(card, skb, 0, 0)) {
+@@ -2200,7 +2201,6 @@ static int qeth_l3_xmit_offload(struct q
+ 	skb_copy_from_linear_data(skb, eth_hdr, ETH_HLEN);
+ 	skb_pull(skb, ETH_HLEN);
+ 	frame_len = skb->len;
+-	nr_frags = skb_shinfo(skb)->nr_frags;
+ 
+ 	push_len = qeth_push_hdr(skb, &hdr, hw_hdr_len);
+ 	if (push_len < 0)
+@@ -2223,6 +2223,7 @@ static int qeth_l3_xmit_offload(struct q
+ 	else
+ 		qeth_l3_fill_header(card, hdr, skb, ipv, cast_type, frame_len);
+ 
++	is_sg = skb_is_nonlinear(skb);
+ 	if (IS_IQD(card)) {
+ 		rc = qeth_do_send_packet_fast(queue, skb, hdr, 0, hd_len);
+ 	} else {
+@@ -2233,10 +2234,10 @@ static int qeth_l3_xmit_offload(struct q
+ 	}
+ out:
+ 	if (!rc) {
+-		if (card->options.performance_stats && nr_frags) {
+-			card->perf_stats.sg_skbs_sent++;
+-			/* nr_frags + skb->data */
+-			card->perf_stats.sg_frags_sent += nr_frags + 1;
++		if (card->options.performance_stats) {
++			card->perf_stats.buf_elements_sent += elements;
++			if (is_sg)
++				card->perf_stats.sg_skbs_sent++;
+ 		}
+ 	} else {
+ 		if (!push_len)
+@@ -2254,14 +2255,14 @@ out:
+ static int qeth_l3_xmit(struct qeth_card *card, struct sk_buff *skb,
+ 			struct qeth_qdio_out_q *queue, int ipv, int cast_type)
+ {
+-	unsigned int hd_len, nr_frags;
+ 	int elements, len, rc;
+ 	__be16 *tag;
+ 	struct qeth_hdr *hdr = NULL;
+ 	int hdr_elements = 0;
+ 	struct sk_buff *new_skb = NULL;
+ 	int tx_bytes = skb->len;
+-	bool use_tso;
++	unsigned int hd_len;
++	bool use_tso, is_sg;
+ 
+ 	/* Ignore segment size from skb_is_gso(), 1 page is always used. */
+ 	use_tso = skb_is_gso(skb) &&
+@@ -2303,7 +2304,6 @@ static int qeth_l3_xmit(struct qeth_card
+ 		if (rc)
+ 			goto out;
+ 	}
+-	nr_frags = skb_shinfo(new_skb)->nr_frags;
+ 
+ 	if (use_tso) {
+ 		hdr = skb_push(new_skb, sizeof(struct qeth_hdr_tso));
+@@ -2340,6 +2340,8 @@ static int qeth_l3_xmit(struct qeth_card
+ 		rc = -EINVAL;
+ 		goto out;
+ 	}
++
++	is_sg = skb_is_nonlinear(new_skb);
+ 	rc = qeth_do_send_packet(card, queue, new_skb, hdr, hd_len, hd_len,
+ 				 elements);
+ out:
+@@ -2347,15 +2349,13 @@ out:
+ 		if (new_skb != skb)
+ 			dev_kfree_skb_any(skb);
+ 		if (card->options.performance_stats) {
++			card->perf_stats.buf_elements_sent += elements;
++			if (is_sg)
++				card->perf_stats.sg_skbs_sent++;
+ 			if (use_tso) {
+ 				card->perf_stats.large_send_bytes += tx_bytes;
+ 				card->perf_stats.large_send_cnt++;
+ 			}
+-			if (nr_frags) {
+-				card->perf_stats.sg_skbs_sent++;
+-				/* nr_frags + skb->data */
+-				card->perf_stats.sg_frags_sent += nr_frags + 1;
+-			}
+ 		}
+ 	} else {
+ 		if (new_skb != skb)
