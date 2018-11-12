@@ -1,0 +1,187 @@
+From: Julian Wiedmann <jwi@linux.ibm.com>
+Subject: s390/qeth: streamline l3_fill_header()
+Patch-mainline: v4.16-rc1
+Git-commit: 910a0a8fe396441807545219d4cc093048250a98
+References: FATE#326350, LTC#169511, bsc#1113509
+
+Summary:     qeth: performance improvements
+Description: This adds recent functional and performance improvements for the
+             qeth network driver.
+             Primarily this brings Scatter-Gather support for HiperSockets,
+             reduced CPU consumption in the L3 IPv4 transmit path for OSA,
+             improved Promiscuous Mode performance due to IFF_UNICAST_FLT,
+             support for Scatter-Gather on z/VM virtual NICs, and
+             support for delayed GRO flushing.
+
+             For sanity & stability reasons, this effectively constitutes a
+             backport of the qeth device driver from 4.19 mainline.
+             
+
+Upstream-Description:
+
+             s390/qeth: streamline l3_fill_header()
+
+             Consolidate the cast type translation, move the passthru path out of
+             the RCU-guarded section, and use the appropriate rtable helpers when
+             determining the next-hop address.
+
+             Signed-off-by: Julian Wiedmann <jwi@linux.vnet.ibm.com>
+             Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/s390/net/qeth_l3_main.c |  103 ++++++++++++++++++----------------------
+ 1 file changed, 48 insertions(+), 55 deletions(-)
+
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -22,12 +22,15 @@
+ #include <linux/inetdevice.h>
+ #include <linux/igmp.h>
+ #include <linux/slab.h>
++#include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
++#include <linux/skbuff.h>
+ 
+ #include <net/ip.h>
+ #include <net/arp.h>
+ #include <net/route.h>
+ #include <net/ipv6.h>
++#include <net/ip6_route.h>
+ #include <net/ip6_fib.h>
+ #include <net/ip6_checksum.h>
+ #include <net/iucv/af_iucv.h>
+@@ -885,27 +888,6 @@ static int qeth_l3_deregister_addr_entry
+ 	return rc;
+ }
+ 
+-static u8 qeth_l3_get_qeth_hdr_flags4(int cast_type)
+-{
+-	if (cast_type == RTN_MULTICAST)
+-		return QETH_CAST_MULTICAST;
+-	if (cast_type == RTN_BROADCAST)
+-		return QETH_CAST_BROADCAST;
+-	return QETH_CAST_UNICAST;
+-}
+-
+-static u8 qeth_l3_get_qeth_hdr_flags6(int cast_type)
+-{
+-	u8 ct = QETH_HDR_PASSTHRU | QETH_HDR_IPV6;
+-	if (cast_type == RTN_MULTICAST)
+-		return ct | QETH_CAST_MULTICAST;
+-	if (cast_type == RTN_ANYCAST)
+-		return ct | QETH_CAST_ANYCAST;
+-	if (cast_type == RTN_BROADCAST)
+-		return ct | QETH_CAST_BROADCAST;
+-	return ct | QETH_CAST_UNICAST;
+-}
+-
+ static int qeth_l3_setadapter_parms(struct qeth_card *card)
+ {
+ 	int rc = 0;
+@@ -2402,14 +2384,23 @@ static void qeth_l3_fill_af_iucv_hdr(str
+ 	memcpy(hdr->hdr.l3.next_hop.ipv6_addr, daddr, 16);
+ }
+ 
+-static void qeth_l3_fill_header(struct qeth_card *card, struct qeth_hdr *hdr,
+-		struct sk_buff *skb, int ipv, int cast_type)
++static u8 qeth_l3_cast_type_to_flag(int cast_type)
+ {
+-	struct dst_entry *dst;
++	if (cast_type == RTN_MULTICAST)
++		return QETH_CAST_MULTICAST;
++	if (cast_type == RTN_ANYCAST)
++		return QETH_CAST_ANYCAST;
++	if (cast_type == RTN_BROADCAST)
++		return QETH_CAST_BROADCAST;
++	return QETH_CAST_UNICAST;
++}
+ 
++static void qeth_l3_fill_header(struct qeth_card *card, struct qeth_hdr *hdr,
++				struct sk_buff *skb, int ipv, int cast_type)
++{
+ 	memset(hdr, 0, sizeof(struct qeth_hdr));
+ 	hdr->hdr.l3.id = QETH_HEADER_TYPE_LAYER3;
+-	hdr->hdr.l3.ext_flags = 0;
++	hdr->hdr.l3.length = skb->len - sizeof(struct qeth_hdr);
+ 
+ 	/*
+ 	 * before we're going to overwrite this location with next hop ip.
+@@ -2423,44 +2414,46 @@ static void qeth_l3_fill_header(struct q
+ 		hdr->hdr.l3.vlan_id = skb_vlan_tag_get(skb);
+ 	}
+ 
+-	hdr->hdr.l3.length = skb->len - sizeof(struct qeth_hdr);
++	/* OSA only: */
++	if (!ipv) {
++		hdr->hdr.l3.flags = QETH_HDR_PASSTHRU;
++		if (ether_addr_equal_64bits(eth_hdr(skb)->h_dest,
++					    skb->dev->broadcast))
++			hdr->hdr.l3.flags |= QETH_CAST_BROADCAST;
++		else
++			hdr->hdr.l3.flags |= (cast_type == RTN_MULTICAST) ?
++				QETH_CAST_MULTICAST : QETH_CAST_UNICAST;
++		return;
++	}
+ 
++	hdr->hdr.l3.flags = qeth_l3_cast_type_to_flag(cast_type);
+ 	rcu_read_lock();
+-	dst = skb_dst(skb);
+ 	if (ipv == 4) {
+-		struct rtable *rt = (struct rtable *) dst;
+-		__be32 *pkey = &ip_hdr(skb)->daddr;
++		struct rtable *rt = skb_rtable(skb);
+ 
+-		if (rt && rt->rt_gateway)
+-			pkey = &rt->rt_gateway;
++		*((__be32 *) &hdr->hdr.l3.next_hop.ipv4.addr) = (rt) ?
++				rt_nexthop(rt, ip_hdr(skb)->daddr) :
++				ip_hdr(skb)->daddr;
++	} else {
++		/* IPv6 */
++		const struct dst_entry *dst = skb_dst(skb);
++		const struct in6_addr *next_hop;
++		const struct rt6_info *rt;
+ 
+-		/* IPv4 */
+-		hdr->hdr.l3.flags = qeth_l3_get_qeth_hdr_flags4(cast_type);
+-		memset(hdr->hdr.l3.next_hop.ipv4.res, 0, 12);
+-		*((__be32 *) &hdr->hdr.l3.next_hop.ipv4.addr) = *pkey;
+-	} else if (ipv == 6) {
+-		struct rt6_info *rt = (struct rt6_info *) dst;
+-		struct in6_addr *pkey = &ipv6_hdr(skb)->daddr;
++		if (dst)
++			rt = container_of(dst, struct rt6_info, dst);
++		else
++			rt = NULL;
+ 
+ 		if (rt && !ipv6_addr_any(&rt->rt6i_gateway))
+-			pkey = &rt->rt6i_gateway;
++			next_hop = &rt->rt6i_gateway;
++		else
++			next_hop = &ipv6_hdr(skb)->daddr;
++		memcpy(hdr->hdr.l3.next_hop.ipv6_addr, next_hop, 16);
+ 
+-		/* IPv6 */
+-		hdr->hdr.l3.flags = qeth_l3_get_qeth_hdr_flags6(cast_type);
+-		if (card->info.type == QETH_CARD_TYPE_IQD)
+-			hdr->hdr.l3.flags &= ~QETH_HDR_PASSTHRU;
+-		memcpy(hdr->hdr.l3.next_hop.ipv6_addr, pkey, 16);
+-	} else {
+-		if (ether_addr_equal_64bits(eth_hdr(skb)->h_dest,
+-					    skb->dev->broadcast)) {
+-			/* broadcast? */
+-			hdr->hdr.l3.flags = QETH_CAST_BROADCAST |
+-						QETH_HDR_PASSTHRU;
+-		} else {
+-			hdr->hdr.l3.flags = (cast_type == RTN_MULTICAST) ?
+-				QETH_CAST_MULTICAST | QETH_HDR_PASSTHRU :
+-				QETH_CAST_UNICAST | QETH_HDR_PASSTHRU;
+-		}
++		hdr->hdr.l3.flags |= QETH_HDR_IPV6;
++		if (card->info.type != QETH_CARD_TYPE_IQD)
++			hdr->hdr.l3.flags |= QETH_HDR_PASSTHRU;
+ 	}
+ 	rcu_read_unlock();
+ }
