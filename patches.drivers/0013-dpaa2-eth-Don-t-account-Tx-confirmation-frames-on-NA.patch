@@ -1,0 +1,171 @@
+From: Ioana Ciocoi Radulescu <ruxandra.radulescu@nxp.com>
+Date: Mon, 8 Oct 2018 14:16:31 +0000
+Subject: dpaa2-eth: Don't account Tx confirmation frames on NAPI poll
+
+Git-commit: 68049a5f4dcefdad248f37201a30461f687b0719
+Patch-mainline: v4.20-rc1
+References: fate#326572
+
+Until now, both Rx and Tx confirmation frames handled during
+NAPI poll were counted toward the NAPI budget. However, Tx
+confirmations are lighter to process than Rx frames, which can
+skew the amount of work actually done inside one NAPI cycle.
+
+Update the code to only count Rx frames toward the NAPI budget
+and set a separate threshold on how many Tx conf frames can be
+processed in one poll cycle.
+
+The NAPI poll routine stops when either the budget is consumed
+by Rx frames or when Tx confirmation frames reach this threshold.
+
+Signed-off-by: Ioana Radulescu <ruxandra.radulescu@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Mian Yousaf Kaukab <yousaf.kaukab@suse.com>
+---
+ drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c | 68 +++++++++++++++---------
+ drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h |  5 ++
+ 2 files changed, 47 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+index 108c137ea593..156080d42a6c 100644
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+@@ -289,10 +289,11 @@ static void dpaa2_eth_rx(struct dpaa2_eth_priv *priv,
+  *
+  * Observance of NAPI budget is not our concern, leaving that to the caller.
+  */
+-static int consume_frames(struct dpaa2_eth_channel *ch)
++static int consume_frames(struct dpaa2_eth_channel *ch,
++			  enum dpaa2_eth_fq_type *type)
+ {
+ 	struct dpaa2_eth_priv *priv = ch->priv;
+-	struct dpaa2_eth_fq *fq;
++	struct dpaa2_eth_fq *fq = NULL;
+ 	struct dpaa2_dq *dq;
+ 	const struct dpaa2_fd *fd;
+ 	int cleaned = 0;
+@@ -311,12 +312,23 @@ static int consume_frames(struct dpaa2_eth_channel *ch)
+ 
+ 		fd = dpaa2_dq_fd(dq);
+ 		fq = (struct dpaa2_eth_fq *)(uintptr_t)dpaa2_dq_fqd_ctx(dq);
+-		fq->stats.frames++;
+ 
+ 		fq->consume(priv, ch, fd, &ch->napi, fq->flowid);
+ 		cleaned++;
+ 	} while (!is_last);
+ 
++	if (!cleaned)
++		return 0;
++
++	fq->stats.frames += cleaned;
++	ch->stats.frames += cleaned;
++
++	/* A dequeue operation only pulls frames from a single queue
++	 * into the store. Return the frame queue type as an out param.
++	 */
++	if (type)
++		*type = fq->type;
++
+ 	return cleaned;
+ }
+ 
+@@ -921,14 +933,16 @@ static int pull_channel(struct dpaa2_eth_channel *ch)
+ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct dpaa2_eth_channel *ch;
+-	int cleaned = 0, store_cleaned;
+ 	struct dpaa2_eth_priv *priv;
++	int rx_cleaned = 0, txconf_cleaned = 0;
++	enum dpaa2_eth_fq_type type;
++	int store_cleaned;
+ 	int err;
+ 
+ 	ch = container_of(napi, struct dpaa2_eth_channel, napi);
+ 	priv = ch->priv;
+ 
+-	while (cleaned < budget) {
++	do {
+ 		err = pull_channel(ch);
+ 		if (unlikely(err))
+ 			break;
+@@ -936,30 +950,32 @@ static int dpaa2_eth_poll(struct napi_struct *napi, int budget)
+ 		/* Refill pool if appropriate */
+ 		refill_pool(priv, ch, priv->bpid);
+ 
+-		store_cleaned = consume_frames(ch);
+-		cleaned += store_cleaned;
++		store_cleaned = consume_frames(ch, &type);
++		if (type == DPAA2_RX_FQ)
++			rx_cleaned += store_cleaned;
++		else
++			txconf_cleaned += store_cleaned;
+ 
+-		/* If we have enough budget left for a full store,
+-		 * try a new pull dequeue, otherwise we're done here
++		/* If we either consumed the whole NAPI budget with Rx frames
++		 * or we reached the Tx confirmations threshold, we're done.
+ 		 */
+-		if (store_cleaned == 0 ||
+-		    cleaned > budget - DPAA2_ETH_STORE_SIZE)
+-			break;
+-	}
+-
+-	if (cleaned < budget && napi_complete_done(napi, cleaned)) {
+-		/* Re-enable data available notifications */
+-		do {
+-			err = dpaa2_io_service_rearm(ch->dpio, &ch->nctx);
+-			cpu_relax();
+-		} while (err == -EBUSY);
+-		WARN_ONCE(err, "CDAN notifications rearm failed on core %d",
+-			  ch->nctx.desired_cpu);
+-	}
++		if (rx_cleaned >= budget ||
++		    txconf_cleaned >= DPAA2_ETH_TXCONF_PER_NAPI)
++			return budget;
++	} while (store_cleaned);
+ 
+-	ch->stats.frames += cleaned;
++	/* We didn't consume the entire budget, so finish napi and
++	 * re-enable data availability notifications
++	 */
++	napi_complete_done(napi, rx_cleaned);
++	do {
++		err = dpaa2_io_service_rearm(ch->dpio, &ch->nctx);
++		cpu_relax();
++	} while (err == -EBUSY);
++	WARN_ONCE(err, "CDAN notifications rearm failed on core %d",
++		  ch->nctx.desired_cpu);
+ 
+-	return cleaned;
++	return max(rx_cleaned, 1);
+ }
+ 
+ static void enable_ch_napi(struct dpaa2_eth_priv *priv)
+@@ -1076,7 +1092,7 @@ static u32 drain_channel(struct dpaa2_eth_priv *priv,
+ 
+ 	do {
+ 		pull_channel(ch);
+-		drained = consume_frames(ch);
++		drained = consume_frames(ch, NULL);
+ 		total += drained;
+ 	} while (drained);
+ 
+diff --git a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h
+index 7a7a3e7bcde2..452a8e9c4f0e 100644
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h
+@@ -40,6 +40,11 @@
+  */
+ #define DPAA2_ETH_TAILDROP_THRESH	(64 * 1024)
+ 
++/* Maximum number of Tx confirmation frames to be processed
++ * in a single NAPI call
++ */
++#define DPAA2_ETH_TXCONF_PER_NAPI	256
++
+ /* Buffer quota per queue. Must be large enough such that for minimum sized
+  * frames taildrop kicks in before the bpool gets depleted, so we compute
+  * how many 64B frames fit inside the taildrop threshold and add a margin
+-- 
+2.11.0
+
