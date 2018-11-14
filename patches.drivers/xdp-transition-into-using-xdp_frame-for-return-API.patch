@@ -1,0 +1,251 @@
+From: Jesper Dangaard Brouer <brouer@redhat.com>
+Date: Tue, 17 Apr 2018 16:46:32 +0200
+Subject: xdp: transition into using xdp_frame for return API
+Patch-mainline: v4.18-rc1
+Git-commit: 039930945a72d9af5ff04ae9b9e60658a52e0770
+References: bsc#1109837 bsc#1111981 FATE#326312 FATE#326313 bsc#1113994 FATE#326315 FATE#326317
+
+Changing API xdp_return_frame() to take struct xdp_frame as argument,
+seems like a natural choice. But there are some subtle performance
+details here that needs extra care, which is a deliberate choice.
+
+When de-referencing xdp_frame on a remote CPU during DMA-TX
+completion, result in the cache-line is change to "Shared"
+state. Later when the page is reused for RX, then this xdp_frame
+cache-line is written, which change the state to "Modified".
+
+This situation already happens (naturally) for, virtio_net, tun and
+cpumap as the xdp_frame pointer is the queued object.  In tun and
+cpumap, the ptr_ring is used for efficiently transferring cache-lines
+(with pointers) between CPUs. Thus, the only option is to
+de-referencing xdp_frame.
+
+It is only the ixgbe driver that had an optimization, in which it can
+avoid doing the de-reference of xdp_frame.  The driver already have
+TX-ring queue, which (in case of remote DMA-TX completion) have to be
+transferred between CPUs anyhow.  In this data area, we stored a
+struct xdp_mem_info and a data pointer, which allowed us to avoid
+de-referencing xdp_frame.
+
+To compensate for this, a prefetchw is used for telling the cache
+coherency protocol about our access pattern.  My benchmarks show that
+this prefetchw is enough to compensate the ixgbe driver.
+
+V7: Adjust for commit d9314c474d4f ("i40e: add support for XDP_REDIRECT")
+V8: Adjust for commit bd658dda4237 ("net/mlx5e: Separate dma base address
+and offset in dma_sync call")
+
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/i40e/i40e_txrx.c     |    5 ++---
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h        |    4 +---
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c   |   17 +++++++++++------
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c |    1 +
+ drivers/net/tun.c                               |    4 ++--
+ drivers/net/virtio_net.c                        |    2 +-
+ include/net/xdp.h                               |    2 +-
+ kernel/bpf/cpumap.c                             |    6 +++---
+ net/core/xdp.c                                  |    4 +++-
+ 9 files changed, 25 insertions(+), 20 deletions(-)
+
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -637,8 +637,7 @@ static void i40e_unmap_and_free_tx_resou
+ 		if (tx_buffer->tx_flags & I40E_TX_FLAGS_FD_SB)
+ 			kfree(tx_buffer->raw_buf);
+ 		else if (ring_is_xdp(ring))
+-			xdp_return_frame(tx_buffer->xdpf->data,
+-					 &tx_buffer->xdpf->mem);
++			xdp_return_frame(tx_buffer->xdpf);
+ 		else
+ 			dev_kfree_skb_any(tx_buffer->skb);
+ 		if (dma_unmap_len(tx_buffer, len))
+@@ -841,7 +840,7 @@ static bool i40e_clean_tx_irq(struct i40
+ 
+ 		/* free the skb/XDP data */
+ 		if (ring_is_xdp(tx_ring))
+-			xdp_return_frame(tx_buf->xdpf->data, &tx_buf->xdpf->mem);
++			xdp_return_frame(tx_buf->xdpf);
+ 		else
+ 			napi_consume_skb(tx_buf->skb, napi_budget);
+ 
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -240,8 +240,7 @@ struct ixgbe_tx_buffer {
+ 	unsigned long time_stamp;
+ 	union {
+ 		struct sk_buff *skb;
+-		/* XDP uses address ptr on irq_clean */
+-		void *data;
++		struct xdp_frame *xdpf;
+ 	};
+ 	unsigned int bytecount;
+ 	unsigned short gso_segs;
+@@ -249,7 +248,6 @@ struct ixgbe_tx_buffer {
+ 	DEFINE_DMA_UNMAP_ADDR(dma);
+ 	DEFINE_DMA_UNMAP_LEN(len);
+ 	u32 tx_flags;
+-	struct xdp_mem_info xdp_mem;
+ };
+ 
+ struct ixgbe_rx_buffer {
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -1216,7 +1216,7 @@ static bool ixgbe_clean_tx_irq(struct ix
+ 
+ 		/* free the skb */
+ 		if (ring_is_xdp(tx_ring))
+-			xdp_return_frame(tx_buffer->data, &tx_buffer->xdp_mem);
++			xdp_return_frame(tx_buffer->xdpf);
+ 		else
+ 			napi_consume_skb(tx_buffer->skb, napi_budget);
+ 
+@@ -2386,6 +2386,7 @@ static int ixgbe_clean_rx_irq(struct ixg
+ 			xdp.data_hard_start = xdp.data -
+ 					      ixgbe_rx_offset(rx_ring);
+ 			xdp.data_end = xdp.data + size;
++			prefetchw(xdp.data_hard_start); /* xdp_frame write */
+ 
+ 			skb = ixgbe_run_xdp(adapter, rx_ring, &xdp);
+ 		}
+@@ -5797,7 +5798,7 @@ static void ixgbe_clean_tx_ring(struct i
+ 
+ 		/* Free all the Tx ring sk_buffs */
+ 		if (ring_is_xdp(tx_ring))
+-			xdp_return_frame(tx_buffer->data, &tx_buffer->xdp_mem);
++			xdp_return_frame(tx_buffer->xdpf);
+ 		else
+ 			dev_kfree_skb_any(tx_buffer->skb);
+ 
+@@ -8348,16 +8349,21 @@ static int ixgbe_xmit_xdp_ring(struct ix
+ 	struct ixgbe_ring *ring = adapter->xdp_ring[smp_processor_id()];
+ 	struct ixgbe_tx_buffer *tx_buffer;
+ 	union ixgbe_adv_tx_desc *tx_desc;
++	struct xdp_frame *xdpf;
+ 	u32 len, cmd_type;
+ 	dma_addr_t dma;
+ 	u16 i;
+ 
+-	len = xdp->data_end - xdp->data;
++	xdpf = convert_to_xdp_frame(xdp);
++	if (unlikely(!xdpf))
++		return -EOVERFLOW;
++
++	len = xdpf->len;
+ 
+ 	if (unlikely(!ixgbe_desc_unused(ring)))
+ 		return IXGBE_XDP_CONSUMED;
+ 
+-	dma = dma_map_single(ring->dev, xdp->data, len, DMA_TO_DEVICE);
++	dma = dma_map_single(ring->dev, xdpf->data, len, DMA_TO_DEVICE);
+ 	if (dma_mapping_error(ring->dev, dma))
+ 		return IXGBE_XDP_CONSUMED;
+ 
+@@ -8372,8 +8378,7 @@ static int ixgbe_xmit_xdp_ring(struct ix
+ 
+ 	dma_unmap_len_set(tx_buffer, len, len);
+ 	dma_unmap_addr_set(tx_buffer, dma, dma);
+-	tx_buffer->data = xdp->data;
+-	tx_buffer->xdp_mem = xdp->rxq->mem;
++	tx_buffer->xdpf = xdpf;
+ 
+ 	tx_desc->read.buffer_addr = cpu_to_le64(dma);
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -910,6 +910,7 @@ struct sk_buff *skb_from_cqe(struct mlx5
+ 
+ 	dma_sync_single_range_for_cpu(rq->pdev, di->addr, wi->offset,
+ 				      frag_size, DMA_FROM_DEVICE);
++	prefetchw(va); /* xdp_frame data area */
+ 	prefetch(data);
+ 	wi->offset += frag_size;
+ 
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -662,7 +662,7 @@ void tun_ptr_free(void *ptr)
+ 	if (tun_is_xdp_frame(ptr)) {
+ 		struct xdp_frame *xdpf = tun_ptr_to_xdp(ptr);
+ 
+-		xdp_return_frame(xdpf->data, &xdpf->mem);
++		xdp_return_frame(xdpf);
+ 	} else {
+ 		__skb_array_destroy_skb(ptr);
+ 	}
+@@ -2196,7 +2196,7 @@ static ssize_t tun_do_read(struct tun_st
+ 		struct xdp_frame *xdpf = tun_ptr_to_xdp(ptr);
+ 
+ 		ret = tun_put_user_xdp(tun, tfile, xdpf, to);
+-		xdp_return_frame(xdpf->data, &xdpf->mem);
++		xdp_return_frame(xdpf);
+ 	} else {
+ 		struct sk_buff *skb = ptr;
+ 
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -434,7 +434,7 @@ static int __virtnet_xdp_xmit(struct vir
+ 
+ 	/* Free up any pending old buffers before queueing new ones. */
+ 	while ((xdpf_sent = virtqueue_get_buf(sq->vq, &len)) != NULL)
+-		xdp_return_frame(xdpf_sent->data, &xdpf_sent->mem);
++		xdp_return_frame(xdpf_sent);
+ 
+ 	xdpf = convert_to_xdp_frame(xdp);
+ 	if (unlikely(!xdpf))
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -103,7 +103,7 @@ struct xdp_frame *convert_to_xdp_frame(s
+ 	return xdp_frame;
+ }
+ 
+-void xdp_return_frame(void *data, struct xdp_mem_info *mem);
++void xdp_return_frame(struct xdp_frame *xdpf);
+ 
+ int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+ 		     struct net_device *dev, u32 queue_index);
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -219,7 +219,7 @@ static void __cpu_map_ring_cleanup(struc
+ 
+ 	while ((xdpf = ptr_ring_consume(ring)))
+ 		if (WARN_ON_ONCE(xdpf))
+-			xdp_return_frame(xdpf->data, &xdpf->mem);
++			xdp_return_frame(xdpf);
+ }
+ 
+ static void put_cpu_map_entry(struct bpf_cpu_map_entry *rcpu)
+@@ -275,7 +275,7 @@ static int cpu_map_kthread_run(void *dat
+ 
+ 			skb = cpu_map_build_skb(rcpu, xdpf);
+ 			if (!skb) {
+-				xdp_return_frame(xdpf->data, &xdpf->mem);
++				xdp_return_frame(xdpf);
+ 				continue;
+ 			}
+ 
+@@ -578,7 +578,7 @@ static int bq_flush_to_queue(struct bpf_
+ 		err = __ptr_ring_produce(q, xdpf);
+ 		if (err) {
+ 			drops++;
+-			xdp_return_frame(xdpf->data, &xdpf->mem);
++			xdp_return_frame(xdpf);
+ 		}
+ 		processed++;
+ 	}
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -308,9 +308,11 @@ err:
+ }
+ EXPORT_SYMBOL_GPL(xdp_rxq_info_reg_mem_model);
+ 
+-void xdp_return_frame(void *data, struct xdp_mem_info *mem)
++void xdp_return_frame(struct xdp_frame *xdpf)
+ {
++	struct xdp_mem_info *mem = &xdpf->mem;
+ 	struct xdp_mem_allocator *xa;
++	void *data = xdpf->data;
+ 	struct page *page;
+ 
+ 	switch (mem->type) {
