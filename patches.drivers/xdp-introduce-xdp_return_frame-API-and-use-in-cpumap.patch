@@ -1,0 +1,209 @@
+From: Jesper Dangaard Brouer <brouer@redhat.com>
+Date: Tue, 17 Apr 2018 16:45:26 +0200
+Subject: xdp: introduce xdp_return_frame API and use in cpumap
+Patch-mainline: v4.18-rc1
+Git-commit: 5ab073ffd326480a6185d096e9703f62ef92b86c
+References: bsc#1109837
+
+Introduce an xdp_return_frame API, and convert over cpumap as
+the first user, given it have queued XDP frame structure to leverage.
+
+V3: Cleanup and remove C99 style comments, pointed out by Alex Duyck.
+V6: Remove comment that id will be added later (Req by Alex Duyck)
+V8: Rename enum mem_type to xdp_mem_type (found by kbuild test robot)
+
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/xdp.h   |   27 +++++++++++++++++++++++
+ kernel/bpf/cpumap.c |   60 +++++++++++++++++++++++++++++++---------------------
+ net/core/xdp.c      |   18 +++++++++++++++
+ 3 files changed, 81 insertions(+), 24 deletions(-)
+
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -33,16 +33,43 @@
+  * also mandatory during RX-ring setup.
+  */
+ 
++enum xdp_mem_type {
++	MEM_TYPE_PAGE_SHARED = 0, /* Split-page refcnt based model */
++	MEM_TYPE_PAGE_ORDER0,     /* Orig XDP full page model */
++	MEM_TYPE_MAX,
++};
++
++struct xdp_mem_info {
++	u32 type; /* enum xdp_mem_type, but known size type */
++};
++
+ struct xdp_rxq_info {
+ 	struct net_device *dev;
+ 	u32 queue_index;
+ 	u32 reg_state;
++	struct xdp_mem_info mem;
+ } ____cacheline_aligned; /* perf critical, avoid false-sharing */
+ 
++
++static inline
++void xdp_return_frame(void *data, struct xdp_mem_info *mem)
++{
++	if (mem->type == MEM_TYPE_PAGE_SHARED)
++		page_frag_free(data);
++
++	if (mem->type == MEM_TYPE_PAGE_ORDER0) {
++		struct page *page = virt_to_page(data); /* Assumes order0 page*/
++
++		put_page(page);
++	}
++}
++
+ int xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
+ 		     struct net_device *dev, u32 queue_index);
+ void xdp_rxq_info_unreg(struct xdp_rxq_info *xdp_rxq);
+ void xdp_rxq_info_unused(struct xdp_rxq_info *xdp_rxq);
+ bool xdp_rxq_info_is_reg(struct xdp_rxq_info *xdp_rxq);
++int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
++			       enum xdp_mem_type type, void *allocator);
+ 
+ #endif /* __LINUX_NET_XDP_H__ */
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -19,6 +19,7 @@
+ #include <linux/bpf.h>
+ #include <linux/filter.h>
+ #include <linux/ptr_ring.h>
++#include <net/xdp.h>
+ 
+ #include <linux/sched.h>
+ #include <linux/workqueue.h>
+@@ -137,27 +138,6 @@ free_cmap:
+ 	return ERR_PTR(err);
+ }
+ 
+-static void __cpu_map_queue_destructor(void *ptr)
+-{
+-	/* The tear-down procedure should have made sure that queue is
+-	 * empty.  See __cpu_map_entry_replace() and work-queue
+-	 * invoked cpu_map_kthread_stop(). Catch any broken behaviour
+-	 * gracefully and warn once.
+-	 */
+-	if (WARN_ON_ONCE(ptr))
+-		page_frag_free(ptr);
+-}
+-
+-static void put_cpu_map_entry(struct bpf_cpu_map_entry *rcpu)
+-{
+-	if (atomic_dec_and_test(&rcpu->refcnt)) {
+-		/* The queue should be empty at this point */
+-		ptr_ring_cleanup(rcpu->queue, __cpu_map_queue_destructor);
+-		kfree(rcpu->queue);
+-		kfree(rcpu);
+-	}
+-}
+-
+ static void get_cpu_map_entry(struct bpf_cpu_map_entry *rcpu)
+ {
+ 	atomic_inc(&rcpu->refcnt);
+@@ -188,6 +168,10 @@ struct xdp_pkt {
+ 	u16 len;
+ 	u16 headroom;
+ 	u16 metasize;
++	/* Lifetime of xdp_rxq_info is limited to NAPI/enqueue time,
++	 * while mem info is valid on remote CPU.
++	 */
++	struct xdp_mem_info mem;
+ 	struct net_device *dev_rx;
+ };
+ 
+@@ -213,6 +197,9 @@ static struct xdp_pkt *convert_to_xdp_pk
+ 	xdp_pkt->headroom = headroom - sizeof(*xdp_pkt);
+ 	xdp_pkt->metasize = metasize;
+ 
++	/* rxq only valid until napi_schedule ends, convert to xdp_mem_info */
++	xdp_pkt->mem = xdp->rxq->mem;
++
+ 	return xdp_pkt;
+ }
+ 
+@@ -265,6 +252,31 @@ static struct sk_buff *cpu_map_build_skb
+ 	return skb;
+ }
+ 
++static void __cpu_map_ring_cleanup(struct ptr_ring *ring)
++{
++	/* The tear-down procedure should have made sure that queue is
++	 * empty.  See __cpu_map_entry_replace() and work-queue
++	 * invoked cpu_map_kthread_stop(). Catch any broken behaviour
++	 * gracefully and warn once.
++	 */
++	struct xdp_pkt *xdp_pkt;
++
++	while ((xdp_pkt = ptr_ring_consume(ring)))
++		if (WARN_ON_ONCE(xdp_pkt))
++			xdp_return_frame(xdp_pkt, &xdp_pkt->mem);
++}
++
++static void put_cpu_map_entry(struct bpf_cpu_map_entry *rcpu)
++{
++	if (atomic_dec_and_test(&rcpu->refcnt)) {
++		/* The queue should be empty at this point */
++		__cpu_map_ring_cleanup(rcpu->queue);
++		ptr_ring_cleanup(rcpu->queue, NULL);
++		kfree(rcpu->queue);
++		kfree(rcpu);
++	}
++}
++
+ static int cpu_map_kthread_run(void *data)
+ {
+ 	struct bpf_cpu_map_entry *rcpu = data;
+@@ -307,7 +319,7 @@ static int cpu_map_kthread_run(void *dat
+ 
+ 			skb = cpu_map_build_skb(rcpu, xdp_pkt);
+ 			if (!skb) {
+-				page_frag_free(xdp_pkt);
++				xdp_return_frame(xdp_pkt, &xdp_pkt->mem);
+ 				continue;
+ 			}
+ 
+@@ -604,13 +616,13 @@ static int bq_flush_to_queue(struct bpf_
+ 	spin_lock(&q->producer_lock);
+ 
+ 	for (i = 0; i < bq->count; i++) {
+-		void *xdp_pkt = bq->q[i];
++		struct xdp_pkt *xdp_pkt = bq->q[i];
+ 		int err;
+ 
+ 		err = __ptr_ring_produce(q, xdp_pkt);
+ 		if (err) {
+ 			drops++;
+-			page_frag_free(xdp_pkt); /* Free xdp_pkt */
++			xdp_return_frame(xdp_pkt->data, &xdp_pkt->mem);
+ 		}
+ 		processed++;
+ 	}
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -71,3 +71,21 @@ bool xdp_rxq_info_is_reg(struct xdp_rxq_
+ 	return (xdp_rxq->reg_state == REG_STATE_REGISTERED);
+ }
+ EXPORT_SYMBOL_GPL(xdp_rxq_info_is_reg);
++
++int xdp_rxq_info_reg_mem_model(struct xdp_rxq_info *xdp_rxq,
++			       enum xdp_mem_type type, void *allocator)
++{
++	if (type >= MEM_TYPE_MAX)
++		return -EINVAL;
++
++	xdp_rxq->mem.type = type;
++
++	if (allocator)
++		return -EOPNOTSUPP;
++
++	/* TODO: Allocate an ID that maps to allocator pointer
++	 * See: https://www.kernel.org/doc/html/latest/core-api/idr.html
++	 */
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xdp_rxq_info_reg_mem_model);
