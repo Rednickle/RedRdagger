@@ -1,0 +1,532 @@
+From: Andrey Ignatov <rdna@fb.com>
+Date: Fri, 30 Mar 2018 15:08:05 -0700
+Subject: bpf: Hooks for sys_connect
+Patch-mainline: v4.17-rc1
+Git-commit: d74bad4e74ee373787a9ae24197c17b7cdc428d5
+References: bsc#1109837
+
+== The problem ==
+
+See description of the problem in the initial patch of this patch set.
+
+== The solution ==
+
+The patch provides much more reliable in-kernel solution for the 2nd
+part of the problem: making outgoing connecttion from desired IP.
+
+It adds new attach types `BPF_CGROUP_INET4_CONNECT` and
+`BPF_CGROUP_INET6_CONNECT` for program type
+`BPF_PROG_TYPE_CGROUP_SOCK_ADDR` that can be used to override both
+source and destination of a connection at connect(2) time.
+
+Local end of connection can be bound to desired IP using newly
+introduced BPF-helper `bpf_bind()`. It allows to bind to only IP though,
+and doesn't support binding to port, i.e. leverages
+`IP_BIND_ADDRESS_NO_PORT` socket option. There are two reasons for this:
+* looking for a free port is expensive and can affect performance
+  significantly;
+* there is no use-case for port.
+
+As for remote end (`struct sockaddr *` passed by user), both parts of it
+can be overridden, remote IP and remote port. It's useful if an
+application inside cgroup wants to connect to another application inside
+same cgroup or to itself, but knows nothing about IP assigned to the
+cgroup.
+
+Support is added for IPv4 and IPv6, for TCP and UDP.
+
+IPv4 and IPv6 have separate attach types for same reason as sys_bind
+hooks, i.e. to prevent reading from / writing to e.g. user_ip6 fields
+when user passes sockaddr_in since it'd be out-of-bound.
+
+== Implementation notes ==
+
+The patch introduces new field in `struct proto`: `pre_connect` that is
+a pointer to a function with same signature as `connect` but is called
+before it. The reason is in some cases BPF hooks should be called way
+before control is passed to `sk->sk_prot->connect`. Specifically
+`inet_dgram_connect` autobinds socket before calling
+`sk->sk_prot->connect` and there is no way to call `bpf_bind()` from
+hooks from e.g. `ip4_datagram_connect` or `ip6_datagram_connect` since
+it'd cause double-bind. On the other hand `proto.pre_connect` provides a
+flexible way to add BPF hooks for connect only for necessary `proto` and
+call them at desired time before `connect`. Since `bpf_bind()` is
+allowed to bind only to IP and autobind in `inet_dgram_connect` binds
+only port there is no chance of double-bind.
+
+bpf_bind() sets `force_bind_address_no_port` to bind to only IP despite
+of value of `bind_address_no_port` socket field.
+
+bpf_bind() sets `with_lock` to `false` when calling to __inet_bind()
+and __inet6_bind() since all call-sites, where bpf_bind() is called,
+already hold socket lock.
+
+Signed-off-by: Andrey Ignatov <rdna@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf-cgroup.h |   31 ++++++++++++++++++++++++
+ include/net/addrconf.h     |    7 +++++
+ include/net/sock.h         |    3 ++
+ include/net/udp.h          |    1 
+ include/uapi/linux/bpf.h   |   12 ++++++++-
+ kernel/bpf/syscall.c       |    8 ++++++
+ net/core/filter.c          |   57 +++++++++++++++++++++++++++++++++++++++++++++
+ net/ipv4/af_inet.c         |   13 ++++++++++
+ net/ipv4/tcp_ipv4.c        |   16 ++++++++++++
+ net/ipv4/udp.c             |   14 +++++++++++
+ net/ipv6/af_inet6.c        |    5 +++
+ net/ipv6/tcp_ipv6.c        |   16 ++++++++++++
+ net/ipv6/udp.c             |   20 +++++++++++++++
+ 13 files changed, 202 insertions(+), 1 deletion(-)
+
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -115,12 +115,38 @@ int __cgroup_bpf_check_dev_permission(sh
+ 	__ret;								       \
+ })
+ 
++#define BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, type)			       \
++({									       \
++	int __ret = 0;							       \
++	if (cgroup_bpf_enabled)	{					       \
++		lock_sock(sk);						       \
++		__ret = __cgroup_bpf_run_filter_sock_addr(sk, uaddr, type);    \
++		release_sock(sk);					       \
++	}								       \
++	__ret;								       \
++})
++
+ #define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr)			       \
+ 	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET4_BIND)
+ 
+ #define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr)			       \
+ 	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET6_BIND)
+ 
++#define BPF_CGROUP_PRE_CONNECT_ENABLED(sk) (cgroup_bpf_enabled && \
++					    sk->sk_prot->pre_connect)
++
++#define BPF_CGROUP_RUN_PROG_INET4_CONNECT(sk, uaddr)			       \
++	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET4_CONNECT)
++
++#define BPF_CGROUP_RUN_PROG_INET6_CONNECT(sk, uaddr)			       \
++	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET6_CONNECT)
++
++#define BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr)		       \
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET4_CONNECT)
++
++#define BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr)		       \
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET6_CONNECT)
++
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops)				       \
+ ({									       \
+ 	int __ret = 0;							       \
+@@ -150,11 +176,16 @@ struct cgroup_bpf {};
+ static inline void cgroup_bpf_put(struct cgroup *cgrp) {}
+ static inline int cgroup_bpf_inherit(struct cgroup *cgrp) { return 0; }
+ 
++#define BPF_CGROUP_PRE_CONNECT_ENABLED(sk) (0)
+ #define BPF_CGROUP_RUN_PROG_INET_INGRESS(sk,skb) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_EGRESS(sk,skb) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_SOCK(sk) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET4_CONNECT(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET6_CONNECT(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type,major,minor,access) ({ 0; })
+ 
+--- a/include/net/addrconf.h
++++ b/include/net/addrconf.h
+@@ -233,6 +233,13 @@ struct ipv6_stub {
+ };
+ extern const struct ipv6_stub *ipv6_stub __read_mostly;
+ 
++/* A stub used by bpf helpers. Similarly ugly as ipv6_stub */
++struct ipv6_bpf_stub {
++	int (*inet6_bind)(struct sock *sk, struct sockaddr *uaddr, int addr_len,
++			  bool force_bind_address_no_port, bool with_lock);
++};
++extern const struct ipv6_bpf_stub *ipv6_bpf_stub __read_mostly;
++
+ /*
+  * identify MLD packets for MLD filter exceptions
+  */
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1015,6 +1015,9 @@ static inline void sk_prot_clear_nulls(s
+ struct proto {
+ 	void			(*close)(struct sock *sk,
+ 					long timeout);
++	int			(*pre_connect)(struct sock *sk,
++					struct sockaddr *uaddr,
++					int addr_len);
+ 	int			(*connect)(struct sock *sk,
+ 					struct sockaddr *uaddr,
+ 					int addr_len);
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -273,6 +273,7 @@ void udp4_hwcsum(struct sk_buff *skb, __
+ int udp_rcv(struct sk_buff *skb);
+ int udp_ioctl(struct sock *sk, int cmd, unsigned long arg);
+ int udp_init_sock(struct sock *sk);
++int udp_pre_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len);
+ int __udp_disconnect(struct sock *sk, int flags);
+ int udp_disconnect(struct sock *sk, int flags);
+ unsigned int udp_poll(struct file *file, struct socket *sock, poll_table *wait);
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -147,6 +147,8 @@ enum bpf_attach_type {
+ 	BPF_SK_MSG_VERDICT,
+ 	BPF_CGROUP_INET4_BIND,
+ 	BPF_CGROUP_INET6_BIND,
++	BPF_CGROUP_INET4_CONNECT,
++	BPF_CGROUP_INET6_CONNECT,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+@@ -732,6 +734,13 @@ union bpf_attr {
+  *     @flags: reserved for future use
+  *     Return: SK_PASS
+  *
++ * int bpf_bind(ctx, addr, addr_len)
++ *     Bind socket to address. Only binding to IP is supported, no port can be
++ *     set in addr.
++ *     @ctx: pointer to context of type bpf_sock_addr
++ *     @addr: pointer to struct sockaddr to bind socket to
++ *     @addr_len: length of sockaddr structure
++ *     Return: 0 on success or negative error code
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -796,7 +805,8 @@ union bpf_attr {
+ 	FN(msg_redirect_map),		\
+ 	FN(msg_apply_bytes),		\
+ 	FN(msg_cork_bytes),		\
+-	FN(msg_pull_data),
++	FN(msg_pull_data),		\
++	FN(bind),
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+  * function eBPF program intends to call
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1160,6 +1160,8 @@ bpf_prog_load_check_attach_type(enum bpf
+ 		switch (expected_attach_type) {
+ 		case BPF_CGROUP_INET4_BIND:
+ 		case BPF_CGROUP_INET6_BIND:
++		case BPF_CGROUP_INET4_CONNECT:
++		case BPF_CGROUP_INET6_CONNECT:
+ 			return 0;
+ 		default:
+ 			return -EINVAL;
+@@ -1390,6 +1392,8 @@ static int bpf_prog_attach(const union b
+ 		break;
+ 	case BPF_CGROUP_INET4_BIND:
+ 	case BPF_CGROUP_INET6_BIND:
++	case BPF_CGROUP_INET4_CONNECT:
++	case BPF_CGROUP_INET6_CONNECT:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
+ 		break;
+ 	case BPF_CGROUP_SOCK_OPS:
+@@ -1456,6 +1460,8 @@ static int bpf_prog_detach(const union b
+ 		break;
+ 	case BPF_CGROUP_INET4_BIND:
+ 	case BPF_CGROUP_INET6_BIND:
++	case BPF_CGROUP_INET4_CONNECT:
++	case BPF_CGROUP_INET6_CONNECT:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
+ 		break;
+ 	case BPF_CGROUP_SOCK_OPS:
+@@ -1509,6 +1515,8 @@ static int bpf_prog_query(const union bp
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
+ 	case BPF_CGROUP_INET4_BIND:
+ 	case BPF_CGROUP_INET6_BIND:
++	case BPF_CGROUP_INET4_CONNECT:
++	case BPF_CGROUP_INET6_CONNECT:
+ 	case BPF_CGROUP_SOCK_OPS:
+ 	case BPF_CGROUP_DEVICE:
+ 		break;
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -33,6 +33,7 @@
+ #include <linux/if_packet.h>
+ #include <linux/if_arp.h>
+ #include <linux/gfp.h>
++#include <net/inet_common.h>
+ #include <net/ip.h>
+ #include <net/protocol.h>
+ #include <net/netlink.h>
+@@ -3642,6 +3643,52 @@ static const struct bpf_func_proto bpf_s
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ 
++const struct ipv6_bpf_stub *ipv6_bpf_stub __read_mostly;
++EXPORT_SYMBOL_GPL(ipv6_bpf_stub);
++
++BPF_CALL_3(bpf_bind, struct bpf_sock_addr_kern *, ctx, struct sockaddr *, addr,
++	   int, addr_len)
++{
++#ifdef CONFIG_INET
++	struct sock *sk = ctx->sk;
++	int err;
++
++	/* Binding to port can be expensive so it's prohibited in the helper.
++	 * Only binding to IP is supported.
++	 */
++	err = -EINVAL;
++	if (addr->sa_family == AF_INET) {
++		if (addr_len < sizeof(struct sockaddr_in))
++			return err;
++		if (((struct sockaddr_in *)addr)->sin_port != htons(0))
++			return err;
++		return __inet_bind(sk, addr, addr_len, true, false);
++#if IS_ENABLED(CONFIG_IPV6)
++	} else if (addr->sa_family == AF_INET6) {
++		if (addr_len < SIN6_LEN_RFC2133)
++			return err;
++		if (((struct sockaddr_in6 *)addr)->sin6_port != htons(0))
++			return err;
++		/* ipv6_bpf_stub cannot be NULL, since it's called from
++		 * bpf_cgroup_inet6_connect hook and ipv6 is already loaded
++		 */
++		return ipv6_bpf_stub->inet6_bind(sk, addr, addr_len, true, false);
++#endif /* CONFIG_IPV6 */
++	}
++#endif /* CONFIG_INET */
++
++	return -EAFNOSUPPORT;
++}
++
++static const struct bpf_func_proto bpf_bind_proto = {
++	.func		= bpf_bind,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_CONST_SIZE,
++};
++
+ static const struct bpf_func_proto *
+ bpf_base_func_proto(enum bpf_func_id func_id)
+ {
+@@ -3693,6 +3740,14 @@ sock_addr_func_proto(enum bpf_func_id fu
+ 	 */
+ 	case BPF_FUNC_get_current_uid_gid:
+ 		return &bpf_get_current_uid_gid_proto;
++	case BPF_FUNC_bind:
++		switch (prog->expected_attach_type) {
++		case BPF_CGROUP_INET4_CONNECT:
++		case BPF_CGROUP_INET6_CONNECT:
++			return &bpf_bind_proto;
++		default:
++			return NULL;
++		}
+ 	default:
+ 		return bpf_base_func_proto(func_id);
+ 	}
+@@ -4199,6 +4254,7 @@ static bool sock_addr_is_valid_access(in
+ 	case bpf_ctx_range(struct bpf_sock_addr, user_ip4):
+ 		switch (prog->expected_attach_type) {
+ 		case BPF_CGROUP_INET4_BIND:
++		case BPF_CGROUP_INET4_CONNECT:
+ 			break;
+ 		default:
+ 			return false;
+@@ -4207,6 +4263,7 @@ static bool sock_addr_is_valid_access(in
+ 	case bpf_ctx_range_till(struct bpf_sock_addr, user_ip6[0], user_ip6[3]):
+ 		switch (prog->expected_attach_type) {
+ 		case BPF_CGROUP_INET6_BIND:
++		case BPF_CGROUP_INET6_CONNECT:
+ 			break;
+ 		default:
+ 			return false;
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -545,12 +545,19 @@ int inet_dgram_connect(struct socket *so
+ 		       int addr_len, int flags)
+ {
+ 	struct sock *sk = sock->sk;
++	int err;
+ 
+ 	if (addr_len < sizeof(uaddr->sa_family))
+ 		return -EINVAL;
+ 	if (uaddr->sa_family == AF_UNSPEC)
+ 		return sk->sk_prot->disconnect(sk, flags);
+ 
++	if (BPF_CGROUP_PRE_CONNECT_ENABLED(sk)) {
++		err = sk->sk_prot->pre_connect(sk, uaddr, addr_len);
++		if (err)
++			return err;
++	}
++
+ 	if (!inet_sk(sk)->inet_num && inet_autobind(sk))
+ 		return -EAGAIN;
+ 	return sk->sk_prot->connect(sk, uaddr, addr_len);
+@@ -631,6 +638,12 @@ int __inet_stream_connect(struct socket
+ 		if (sk->sk_state != TCP_CLOSE)
+ 			goto out;
+ 
++		if (BPF_CGROUP_PRE_CONNECT_ENABLED(sk)) {
++			err = sk->sk_prot->pre_connect(sk, uaddr, addr_len);
++			if (err)
++				goto out;
++		}
++
+ 		err = sk->sk_prot->connect(sk, uaddr, addr_len);
+ 		if (err < 0)
+ 			goto out;
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -138,6 +138,21 @@ int tcp_twsk_unique(struct sock *sk, str
+ }
+ EXPORT_SYMBOL_GPL(tcp_twsk_unique);
+ 
++static int tcp_v4_pre_connect(struct sock *sk, struct sockaddr *uaddr,
++			      int addr_len)
++{
++	/* This check is replicated from tcp_v4_connect() and intended to
++	 * prevent BPF program called below from accessing bytes that are out
++	 * of the bound specified by user in addr_len.
++	 */
++	if (addr_len < sizeof(struct sockaddr_in))
++		return -EINVAL;
++
++	sock_owned_by_me(sk);
++
++	return BPF_CGROUP_RUN_PROG_INET4_CONNECT(sk, uaddr);
++}
++
+ /* This will initiate an outgoing connection. */
+ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ {
+@@ -2337,6 +2352,7 @@ struct proto tcp_prot = {
+ 	.name			= "TCP",
+ 	.owner			= THIS_MODULE,
+ 	.close			= tcp_close,
++	.pre_connect		= tcp_v4_pre_connect,
+ 	.connect		= tcp_v4_connect,
+ 	.disconnect		= tcp_disconnect,
+ 	.accept			= inet_csk_accept,
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1614,6 +1614,19 @@ csum_copy_err:
+ 	goto try_again;
+ }
+ 
++int udp_pre_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
++{
++	/* This check is replicated from __ip4_datagram_connect() and
++	 * intended to prevent BPF program called below from accessing bytes
++	 * that are out of the bound specified by user in addr_len.
++	 */
++	if (addr_len < sizeof(struct sockaddr_in))
++		return -EINVAL;
++
++	return BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr);
++}
++EXPORT_SYMBOL(udp_pre_connect);
++
+ int __udp_disconnect(struct sock *sk, int flags)
+ {
+ 	struct inet_sock *inet = inet_sk(sk);
+@@ -2486,6 +2499,7 @@ struct proto udp_prot = {
+ 	.owner		   = THIS_MODULE,
+ 	.close		   = udp_lib_close,
+ 	.connect	   = ip4_datagram_connect,
++	.pre_connect	   = udp_pre_connect,
+ 	.disconnect	   = udp_disconnect,
+ 	.ioctl		   = udp_ioctl,
+ 	.init		   = udp_init_sock,
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -880,6 +880,10 @@ static const struct ipv6_stub ipv6_stub_
+ 	.nd_tbl	= &nd_tbl,
+ };
+ 
++static const struct ipv6_bpf_stub ipv6_bpf_stub_impl = {
++	.inet6_bind = __inet6_bind,
++};
++
+ static int __init inet6_init(void)
+ {
+ 	struct list_head *r;
+@@ -1036,6 +1040,7 @@ static int __init inet6_init(void)
+ 	/* ensure that ipv6 stubs are visible only after ipv6 is ready */
+ 	wmb();
+ 	ipv6_stub = &ipv6_stub_impl;
++	ipv6_bpf_stub = &ipv6_bpf_stub_impl;
+ out:
+ 	return err;
+ 
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -115,6 +115,21 @@ static u32 tcp_v6_init_ts_off(const stru
+ 				   ipv6_hdr(skb)->saddr.s6_addr32);
+ }
+ 
++static int tcp_v6_pre_connect(struct sock *sk, struct sockaddr *uaddr,
++			      int addr_len)
++{
++	/* This check is replicated from tcp_v6_connect() and intended to
++	 * prevent BPF program called below from accessing bytes that are out
++	 * of the bound specified by user in addr_len.
++	 */
++	if (addr_len < SIN6_LEN_RFC2133)
++		return -EINVAL;
++
++	sock_owned_by_me(sk);
++
++	return BPF_CGROUP_RUN_PROG_INET6_CONNECT(sk, uaddr);
++}
++
+ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
+ 			  int addr_len)
+ {
+@@ -1892,6 +1907,7 @@ struct proto tcpv6_prot = {
+ 	.name			= "TCPv6",
+ 	.owner			= THIS_MODULE,
+ 	.close			= tcp_close,
++	.pre_connect		= tcp_v6_pre_connect,
+ 	.connect		= tcp_v6_connect,
+ 	.disconnect		= tcp_disconnect,
+ 	.accept			= inet_csk_accept,
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -968,6 +968,25 @@ static void udp_v6_flush_pending_frames(
+ 	}
+ }
+ 
++static int udpv6_pre_connect(struct sock *sk, struct sockaddr *uaddr,
++			     int addr_len)
++{
++	/* The following checks are replicated from __ip6_datagram_connect()
++	 * and intended to prevent BPF program called below from accessing
++	 * bytes that are out of the bound specified by user in addr_len.
++	 */
++	if (uaddr->sa_family == AF_INET) {
++		if (__ipv6_only_sock(sk))
++			return -EAFNOSUPPORT;
++		return udp_pre_connect(sk, uaddr, addr_len);
++	}
++
++	if (addr_len < SIN6_LEN_RFC2133)
++		return -EINVAL;
++
++	return BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr);
++}
++
+ /**
+  *	udp6_hwcsum_outgoing  -  handle outgoing HW checksumming
+  *	@sk:	socket we are sending on
+@@ -1521,6 +1540,7 @@ struct proto udpv6_prot = {
+ 	.name		   = "UDPv6",
+ 	.owner		   = THIS_MODULE,
+ 	.close		   = udp_lib_close,
++	.pre_connect	   = udpv6_pre_connect,
+ 	.connect	   = ip6_datagram_connect,
+ 	.disconnect	   = udp_disconnect,
+ 	.ioctl		   = udp_ioctl,
