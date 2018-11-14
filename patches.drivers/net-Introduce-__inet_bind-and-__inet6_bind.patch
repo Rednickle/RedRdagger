@@ -1,0 +1,232 @@
+From: Andrey Ignatov <rdna@fb.com>
+Date: Fri, 30 Mar 2018 15:08:04 -0700
+Subject: net: Introduce __inet_bind() and __inet6_bind
+Patch-mainline: v4.17-rc1
+Git-commit: 3679d585bbc07a1ac4448d5b478b492cad3587ce
+References: bsc#1109837
+
+Refactor `bind()` code to make it ready to be called from BPF helper
+function `bpf_bind()` (will be added soon). Implementation of
+`inet_bind()` and `inet6_bind()` is separated into `__inet_bind()` and
+`__inet6_bind()` correspondingly. These function can be used from both
+`sk_prot->bind` and `bpf_bind()` contexts.
+
+New functions have two additional arguments.
+
+`force_bind_address_no_port` forces binding to IP only w/o checking
+`inet_sock.bind_address_no_port` field. It'll allow to bind local end of
+a connection to desired IP in `bpf_bind()` w/o changing
+`bind_address_no_port` field of a socket. It's useful since `bpf_bind()`
+can return an error and we'd need to restore original value of
+`bind_address_no_port` in that case if we changed this before calling to
+the helper.
+
+`with_lock` specifies whether to lock socket when working with `struct
+sk` or not. The argument is set to `true` for `sk_prot->bind`, i.e. old
+behavior is preserved. But it will be set to `false` for `bpf_bind()`
+use-case. The reason is all call-sites, where `bpf_bind()` will be
+called, already hold that socket lock.
+
+Signed-off-by: Andrey Ignatov <rdna@fb.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/inet_common.h |    2 ++
+ include/net/ipv6.h        |    2 ++
+ net/ipv4/af_inet.c        |   39 ++++++++++++++++++++++++---------------
+ net/ipv6/af_inet6.c       |   37 ++++++++++++++++++++++++-------------
+ 4 files changed, 52 insertions(+), 28 deletions(-)
+
+--- a/include/net/inet_common.h
++++ b/include/net/inet_common.h
+@@ -31,6 +31,8 @@ int inet_shutdown(struct socket *sock, i
+ int inet_listen(struct socket *sock, int backlog);
+ void inet_sock_destruct(struct sock *sk);
+ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len);
++int __inet_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
++		bool force_bind_address_no_port, bool with_lock);
+ int inet_getname(struct socket *sock, struct sockaddr *uaddr, int *uaddr_len,
+ 		 int peer);
+ int inet_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg);
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -995,6 +995,8 @@ void ipv6_local_error(struct sock *sk, i
+ void ipv6_local_rxpmtu(struct sock *sk, struct flowi6 *fl6, u32 mtu);
+ 
+ int inet6_release(struct socket *sock);
++int __inet6_bind(struct sock *sock, struct sockaddr *uaddr, int addr_len,
++		 bool force_bind_address_no_port, bool with_lock);
+ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len);
+ int inet6_getname(struct socket *sock, struct sockaddr *uaddr, int *uaddr_len,
+ 		  int peer);
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -430,30 +430,37 @@ EXPORT_SYMBOL(inet_release);
+ 
+ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ {
+-	struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
+ 	struct sock *sk = sock->sk;
+-	struct inet_sock *inet = inet_sk(sk);
+-	struct net *net = sock_net(sk);
+-	unsigned short snum;
+-	int chk_addr_ret;
+-	u32 tb_id = RT_TABLE_LOCAL;
+ 	int err;
+ 
+ 	/* If the socket has its own bind function then use it. (RAW) */
+ 	if (sk->sk_prot->bind) {
+-		err = sk->sk_prot->bind(sk, uaddr, addr_len);
+-		goto out;
++		return sk->sk_prot->bind(sk, uaddr, addr_len);
+ 	}
+-	err = -EINVAL;
+ 	if (addr_len < sizeof(struct sockaddr_in))
+-		goto out;
++		return -EINVAL;
+ 
+ 	/* BPF prog is run before any checks are done so that if the prog
+ 	 * changes context in a wrong way it will be caught.
+ 	 */
+ 	err = BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr);
+ 	if (err)
+-		goto out;
++		return err;
++
++	return __inet_bind(sk, uaddr, addr_len, false, true);
++}
++EXPORT_SYMBOL(inet_bind);
++
++int __inet_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
++		bool force_bind_address_no_port, bool with_lock)
++{
++	struct sockaddr_in *addr = (struct sockaddr_in *)uaddr;
++	struct inet_sock *inet = inet_sk(sk);
++	struct net *net = sock_net(sk);
++	unsigned short snum;
++	int chk_addr_ret;
++	u32 tb_id = RT_TABLE_LOCAL;
++	int err;
+ 
+ 	if (addr->sin_family != AF_INET) {
+ 		/* Compatibility games : accept AF_UNSPEC (mapped to AF_INET)
+@@ -497,7 +504,8 @@ int inet_bind(struct socket *sock, struc
+ 	 *      would be illegal to use them (multicast/broadcast) in
+ 	 *      which case the sending device address is used.
+ 	 */
+-	lock_sock(sk);
++	if (with_lock)
++		lock_sock(sk);
+ 
+ 	/* Check these errors (active socket, double bind). */
+ 	err = -EINVAL;
+@@ -509,7 +517,8 @@ int inet_bind(struct socket *sock, struc
+ 		inet->inet_saddr = 0;  /* Use device */
+ 
+ 	/* Make sure we are allowed to bind here. */
+-	if ((snum || !inet->bind_address_no_port) &&
++	if ((snum || !(inet->bind_address_no_port ||
++		       force_bind_address_no_port)) &&
+ 	    sk->sk_prot->get_port(sk, snum)) {
+ 		inet->inet_saddr = inet->inet_rcv_saddr = 0;
+ 		err = -EADDRINUSE;
+@@ -526,11 +535,11 @@ int inet_bind(struct socket *sock, struc
+ 	sk_dst_reset(sk);
+ 	err = 0;
+ out_release_sock:
+-	release_sock(sk);
++	if (with_lock)
++		release_sock(sk);
+ out:
+ 	return err;
+ }
+-EXPORT_SYMBOL(inet_bind);
+ 
+ int inet_dgram_connect(struct socket *sock, struct sockaddr *uaddr,
+ 		       int addr_len, int flags)
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -276,15 +276,7 @@ out_rcu_unlock:
+ /* bind for INET6 API */
+ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ {
+-	struct sockaddr_in6 *addr = (struct sockaddr_in6 *)uaddr;
+ 	struct sock *sk = sock->sk;
+-	struct inet_sock *inet = inet_sk(sk);
+-	struct ipv6_pinfo *np = inet6_sk(sk);
+-	struct net *net = sock_net(sk);
+-	__be32 v4addr = 0;
+-	unsigned short snum;
+-	bool saved_ipv6only;
+-	int addr_type = 0;
+ 	int err = 0;
+ 
+ 	/* If the socket has its own bind function then use it. */
+@@ -301,11 +293,28 @@ int inet6_bind(struct socket *sock, stru
+ 	if (err)
+ 		return err;
+ 
++	return __inet6_bind(sk, uaddr, addr_len, false, true);
++}
++EXPORT_SYMBOL(inet6_bind);
++
++int __inet6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len,
++		 bool force_bind_address_no_port, bool with_lock)
++{
++	struct sockaddr_in6 *addr = (struct sockaddr_in6 *)uaddr;
++	struct inet_sock *inet = inet_sk(sk);
++	struct ipv6_pinfo *np = inet6_sk(sk);
++	struct net *net = sock_net(sk);
++	__be32 v4addr = 0;
++	unsigned short snum;
++	bool saved_ipv6only;
++	int addr_type = 0;
++	int err = 0;
++
+ 	if (addr->sin6_family != AF_INET6)
+ 		return -EAFNOSUPPORT;
+ 
+ 	addr_type = ipv6_addr_type(&addr->sin6_addr);
+-	if ((addr_type & IPV6_ADDR_MULTICAST) && sock->type == SOCK_STREAM)
++	if ((addr_type & IPV6_ADDR_MULTICAST) && sk->sk_type == SOCK_STREAM)
+ 		return -EINVAL;
+ 
+ 	snum = ntohs(addr->sin6_port);
+@@ -313,7 +322,8 @@ int inet6_bind(struct socket *sock, stru
+ 	    !ns_capable(net->user_ns, CAP_NET_BIND_SERVICE))
+ 		return -EACCES;
+ 
+-	lock_sock(sk);
++	if (with_lock)
++		lock_sock(sk);
+ 
+ 	/* Check these errors (active socket, double bind). */
+ 	if (sk->sk_state != TCP_CLOSE || inet->inet_num) {
+@@ -401,7 +411,8 @@ int inet6_bind(struct socket *sock, stru
+ 		sk->sk_ipv6only = 1;
+ 
+ 	/* Make sure we are allowed to bind here. */
+-	if ((snum || !inet->bind_address_no_port) &&
++	if ((snum || !(inet->bind_address_no_port ||
++		       force_bind_address_no_port)) &&
+ 	    sk->sk_prot->get_port(sk, snum)) {
+ 		sk->sk_ipv6only = saved_ipv6only;
+ 		inet_reset_saddr(sk);
+@@ -417,13 +428,13 @@ int inet6_bind(struct socket *sock, stru
+ 	inet->inet_dport = 0;
+ 	inet->inet_daddr = 0;
+ out:
+-	release_sock(sk);
++	if (with_lock)
++		release_sock(sk);
+ 	return err;
+ out_unlock:
+ 	rcu_read_unlock();
+ 	goto out;
+ }
+-EXPORT_SYMBOL(inet6_bind);
+ 
+ int inet6_release(struct socket *sock)
+ {
