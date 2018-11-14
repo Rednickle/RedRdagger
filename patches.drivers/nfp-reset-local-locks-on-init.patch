@@ -1,0 +1,195 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Tue, 24 Apr 2018 21:17:01 -0700
+Subject: nfp: reset local locks on init
+Patch-mainline: v4.18-rc1
+Git-commit: 3e3e9fd8b6f0dd2d387d0dc666b770fe0dc36b33
+References: bsc#1109837
+
+NFP locks record the owner when held, for PCIe devices the owner
+ID will be the PCIe link number.  When driver loads it should scan
+known locks and if they indicate that they are held by local
+endpoint but the driver doesn't hold them - release them.
+
+Locks can be left taken for instance when kernel gets kexec-ed or
+after a crash.  Management FW tries to clean up stale locks too,
+but it currently depends on PCIe link going down which doesn't
+always happen.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/nfp_main.c             |    5 +
+ drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h          |    2 
+ drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h      |    2 
+ drivers/net/ethernet/netronome/nfp/nfpcore/nfp_mutex.c    |   45 ++++++++++
+ drivers/net/ethernet/netronome/nfp/nfpcore/nfp_resource.c |   59 ++++++++++++++
+ 5 files changed, 113 insertions(+)
+
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@ -486,6 +486,10 @@ static int nfp_pci_probe(struct pci_dev
+ 		goto err_disable_msix;
+ 	}
+ 
++	err = nfp_resource_table_init(pf->cpp);
++	if (err)
++		goto err_cpp_free;
++
+ 	pf->hwinfo = nfp_hwinfo_read(pf->cpp);
+ 
+ 	dev_info(&pdev->dev, "Assembly: %s%s%s-%s CPLD: %s\n",
+@@ -548,6 +552,7 @@ err_fw_unload:
+ 	vfree(pf->dumpspec);
+ err_hwinfo_free:
+ 	kfree(pf->hwinfo);
++err_cpp_free:
+ 	nfp_cpp_free(pf->cpp);
+ err_disable_msix:
+ 	destroy_workqueue(pf->wq);
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h
+@@ -94,6 +94,8 @@ int nfp_nsp_read_sensors(struct nfp_nsp
+ /* MAC Statistics Accumulator */
+ #define NFP_RESOURCE_MAC_STATISTICS	"mac.stat"
+ 
++int nfp_resource_table_init(struct nfp_cpp *cpp);
++
+ struct nfp_resource *
+ nfp_resource_acquire(struct nfp_cpp *cpp, const char *name);
+ 
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+@@ -295,6 +295,8 @@ void nfp_cpp_mutex_free(struct nfp_cpp_m
+ int nfp_cpp_mutex_lock(struct nfp_cpp_mutex *mutex);
+ int nfp_cpp_mutex_unlock(struct nfp_cpp_mutex *mutex);
+ int nfp_cpp_mutex_trylock(struct nfp_cpp_mutex *mutex);
++int nfp_cpp_mutex_reclaim(struct nfp_cpp *cpp, int target,
++			  unsigned long long address);
+ 
+ /**
+  * nfp_cppcore_pcie_unit() - Get PCI Unit of a CPP handle
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_mutex.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_mutex.c
+@@ -59,6 +59,11 @@ static u32 nfp_mutex_unlocked(u16 interf
+ 	return (u32)interface << 16 | 0x0000;
+ }
+ 
++static u32 nfp_mutex_owner(u32 val)
++{
++	return val >> 16;
++}
++
+ static bool nfp_mutex_is_locked(u32 val)
+ {
+ 	return (val & 0xffff) == 0x000f;
+@@ -351,3 +356,43 @@ int nfp_cpp_mutex_trylock(struct nfp_cpp
+ 
+ 	return nfp_mutex_is_locked(tmp) ? -EBUSY : -EINVAL;
+ }
++
++/**
++ * nfp_cpp_mutex_reclaim() - Unlock mutex if held by local endpoint
++ * @cpp:	NFP CPP handle
++ * @target:	NFP CPP target ID (ie NFP_CPP_TARGET_CLS or NFP_CPP_TARGET_MU)
++ * @address:	Offset into the address space of the NFP CPP target ID
++ *
++ * Release lock if held by local system.  Extreme care is advised, call only
++ * when no local lock users can exist.
++ *
++ * Return:      0 if the lock was OK, 1 if locked by us, -errno on invalid mutex
++ */
++int nfp_cpp_mutex_reclaim(struct nfp_cpp *cpp, int target,
++			  unsigned long long address)
++{
++	const u32 mur = NFP_CPP_ID(target, 3, 0);	/* atomic_read */
++	const u32 muw = NFP_CPP_ID(target, 4, 0);	/* atomic_write */
++	u16 interface = nfp_cpp_interface(cpp);
++	int err;
++	u32 tmp;
++
++	err = nfp_cpp_mutex_validate(interface, &target, address);
++	if (err)
++		return err;
++
++	/* Check lock */
++	err = nfp_cpp_readl(cpp, mur, address, &tmp);
++	if (err < 0)
++		return err;
++
++	if (nfp_mutex_is_unlocked(tmp) || nfp_mutex_owner(tmp) != interface)
++		return 0;
++
++	/* Bust the lock */
++	err = nfp_cpp_writel(cpp, muw, address, nfp_mutex_unlocked(interface));
++	if (err < 0)
++		return err;
++
++	return 1;
++}
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_resource.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_resource.c
+@@ -338,3 +338,62 @@ u64 nfp_resource_size(struct nfp_resourc
+ {
+ 	return res->size;
+ }
++
++/**
++ * nfp_resource_table_init() - Run initial checks on the resource table
++ * @cpp:	NFP CPP handle
++ *
++ * Start-of-day init procedure for resource table.  Must be called before
++ * any local resource table users may exist.
++ *
++ * Return: 0 on success, -errno on failure
++ */
++int nfp_resource_table_init(struct nfp_cpp *cpp)
++{
++	struct nfp_cpp_mutex *dev_mutex;
++	int i, err;
++
++	err = nfp_cpp_mutex_reclaim(cpp, NFP_RESOURCE_TBL_TARGET,
++				    NFP_RESOURCE_TBL_BASE);
++	if (err < 0) {
++		nfp_err(cpp, "Error: failed to reclaim resource table mutex\n");
++		return err;
++	}
++	if (err)
++		nfp_warn(cpp, "Warning: busted main resource table mutex\n");
++
++	dev_mutex = nfp_cpp_mutex_alloc(cpp, NFP_RESOURCE_TBL_TARGET,
++					NFP_RESOURCE_TBL_BASE,
++					NFP_RESOURCE_TBL_KEY);
++	if (!dev_mutex)
++		return -ENOMEM;
++
++	if (nfp_cpp_mutex_lock(dev_mutex)) {
++		nfp_err(cpp, "Error: failed to claim resource table mutex\n");
++		nfp_cpp_mutex_free(dev_mutex);
++		return -EINVAL;
++	}
++
++	/* Resource 0 is the dev_mutex, start from 1 */
++	for (i = 1; i < NFP_RESOURCE_TBL_ENTRIES; i++) {
++		u64 addr = NFP_RESOURCE_TBL_BASE +
++			sizeof(struct nfp_resource_entry) * i;
++
++		err = nfp_cpp_mutex_reclaim(cpp, NFP_RESOURCE_TBL_TARGET, addr);
++		if (err < 0) {
++			nfp_err(cpp,
++				"Error: failed to reclaim resource %d mutex\n",
++				i);
++			goto err_unlock;
++		}
++		if (err)
++			nfp_warn(cpp, "Warning: busted resource %d mutex\n", i);
++	}
++
++	err = 0;
++err_unlock:
++	nfp_cpp_mutex_unlock(dev_mutex);
++	nfp_cpp_mutex_free(dev_mutex);
++
++	return err;
++}
