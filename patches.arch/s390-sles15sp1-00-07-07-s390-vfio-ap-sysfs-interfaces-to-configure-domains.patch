@@ -1,0 +1,258 @@
+From: Farhan Ali <alifm@linux.ibm.com>
+Subject: s390: vfio-ap: sysfs interfaces to configure domains
+Patch-mainline: v4.20-rc1
+Git-commit: 3211da0c0b549f18d7b049abcffc73ca55ae51fd
+References: FATE#326370, LTC#169186, bsc#1113483
+
+Summary:     kernel: AP Crypto Passthrough 
+Description: This adds support for AP crypto passthrough for 
+             kvm guests.
+
+Upstream-Description:
+
+             s390: vfio-ap: sysfs interfaces to configure domains
+
+             Introduces two new sysfs attributes for the VFIO mediated
+             matrix device for assigning AP domains to and unassigning
+             AP domains from a mediated matrix device. The IDs of the
+             AP domains assigned to the mediated matrix device will be
+             stored in an AP queue mask (AQM).
+
+             The bits in the AQM, from most significant to least
+             significant bit, correspond to AP queue index (APQI) 0 to
+             255 (note that an APQI is synonymous with with a domain ID).
+             On some systems, the maximum allowable domain number may be
+             less than 255 - depending upon the host's AP configuration -
+             and assignment may be rejected if the input domain ID exceeds
+             the limit.
+
+             When a domain is assigned, the bit corresponding to the APQI
+             will be set in the AQM. Likewise, when a domain is unassigned,
+             the bit corresponding to the APQI will be cleared from the AQM.
+
+             In order to successfully assign a domain, the APQNs derived from
+             the domain ID being assigned and the adapter numbers of all
+             adapters previously assigned:
+
+             1. Must be bound to the vfio_ap device driver.
+
+             2. Must not be assigned to any other mediated matrix device.
+
+             If there are no adapters assigned to the mdev, then there must
+             be an AP queue bound to the vfio_ap device driver with an
+             APQN containing the domain ID (i.e., APQI), otherwise all
+             adapters subsequently assigned will fail because there will be no
+             AP queues bound with an APQN containing the APQI.
+
+             Assigning or un-assigning an AP domain will also be rejected if
+             a guest using the mediated matrix device is running.
+
+             The relevant sysfs structures are:
+
+             /sys/devices/vfio_ap/matrix/
+             ...... [mdev_supported_types]
+             ......... [vfio_ap-passthrough]
+             ............ [devices]
+             ...............[$uuid]
+             .................. assign_domain
+             .................. unassign_domain
+
+             To assign a domain to the $uuid mediated matrix device,
+             write the domain's ID to the assign_domain file. To
+             unassign a domain, write the domain's ID to the
+             unassign_domain file. The ID is specified using
+             conventional semantics: If it begins with 0x, the number
+             will be parsed as a hexadecimal (case insensitive) number;
+             if it begins with 0, it will be parsed as an octal number;
+             otherwise, it will be parsed as a decimal number.
+
+             For example, to assign domain 173 (0xad) to the mediated matrix
+             device $uuid:
+
+             	echo 173 > assign_domain
+
+             	or
+
+             	echo 0255 > assign_domain
+
+             	or
+
+             	echo 0xad > assign_domain
+
+             To unassign domain 173 (0xad):
+
+             	echo 173 > unassign_domain
+
+             	or
+
+             	echo 0255 > unassign_domain
+
+             	or
+
+             	echo 0xad > unassign_domain
+
+             Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+             Reviewed-by: Halil Pasic <pasic@linux.ibm.com>
+             Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+             Tested-by: Michael Mueller <mimu@linux.ibm.com>
+             Tested-by: Farhan Ali <alifm@linux.ibm.com>
+             Tested-by: Pierre Morel <pmorel@linux.ibm.com>
+             Message-Id: <20180925231641.4954-8-akrowiak@linux.vnet.ibm.com>
+             Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+
+Signed-off-by: Farhan Ali <alifm@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/s390/crypto/vfio_ap_ops.c |  138 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 137 insertions(+), 1 deletion(-)
+
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@ -382,10 +382,146 @@ static ssize_t unassign_adapter_store(st
+ }
+ DEVICE_ATTR_WO(unassign_adapter);
+ 
++static int
++vfio_ap_mdev_verify_queues_reserved_for_apqi(struct ap_matrix_mdev *matrix_mdev,
++					     unsigned long apqi)
++{
++	int ret;
++	unsigned long apid;
++	unsigned long nbits = matrix_mdev->matrix.apm_max + 1;
++
++	if (find_first_bit_inv(matrix_mdev->matrix.apm, nbits) >= nbits)
++		return vfio_ap_verify_queue_reserved(NULL, &apqi);
++
++	for_each_set_bit_inv(apid, matrix_mdev->matrix.apm, nbits) {
++		ret = vfio_ap_verify_queue_reserved(&apid, &apqi);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * assign_domain_store
++ *
++ * @dev:	the matrix device
++ * @attr:	the mediated matrix device's assign_domain attribute
++ * @buf:	a buffer containing the AP queue index (APQI) of the domain to
++ *		be assigned
++ * @count:	the number of bytes in @buf
++ *
++ * Parses the APQI from @buf and sets the corresponding bit in the mediated
++ * matrix device's AQM.
++ *
++ * Returns the number of bytes processed if the APQI is valid; otherwise returns
++ * one of the following errors:
++ *
++ *	1. -EINVAL
++ *	   The APQI is not a valid number
++ *
++ *	2. -ENODEV
++ *	   The APQI exceeds the maximum value configured for the system
++ *
++ *	3. -EADDRNOTAVAIL
++ *	   An APQN derived from the cross product of the APQI being assigned
++ *	   and the APIDs previously assigned is not bound to the vfio_ap device
++ *	   driver; or, if no APIDs have yet been assigned, the APQI is not
++ *	   contained in an APQN bound to the vfio_ap device driver.
++ *
++ *	4. -EADDRINUSE
++ *	   An APQN derived from the cross product of the APQI being assigned
++ *	   and the APIDs previously assigned is being used by another mediated
++ *	   matrix device
++ */
++static ssize_t assign_domain_store(struct device *dev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	int ret;
++	unsigned long apqi;
++	struct mdev_device *mdev = mdev_from_dev(dev);
++	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
++	unsigned long max_apqi = matrix_mdev->matrix.aqm_max;
++
++	ret = kstrtoul(buf, 0, &apqi);
++	if (ret)
++		return ret;
++	if (apqi > max_apqi)
++		return -ENODEV;
++
++	mutex_lock(&matrix_dev->lock);
++
++	ret = vfio_ap_mdev_verify_queues_reserved_for_apqi(matrix_mdev, apqi);
++	if (ret)
++		goto done;
++
++	set_bit_inv(apqi, matrix_mdev->matrix.aqm);
++
++	ret = vfio_ap_mdev_verify_no_sharing(matrix_mdev);
++	if (ret)
++		goto share_err;
++
++	ret = count;
++	goto done;
++
++share_err:
++	clear_bit_inv(apqi, matrix_mdev->matrix.aqm);
++done:
++	mutex_unlock(&matrix_dev->lock);
++
++	return ret;
++}
++DEVICE_ATTR_WO(assign_domain);
++
++
++/**
++ * unassign_domain_store
++ *
++ * @dev:	the matrix device
++ * @attr:	the mediated matrix device's unassign_domain attribute
++ * @buf:	a buffer containing the AP queue index (APQI) of the domain to
++ *		be unassigned
++ * @count:	the number of bytes in @buf
++ *
++ * Parses the APQI from @buf and clears the corresponding bit in the
++ * mediated matrix device's AQM.
++ *
++ * Returns the number of bytes processed if the APQI is valid; otherwise,
++ * returns one of the following errors:
++ *	-EINVAL if the APQI is not a number
++ *	-ENODEV if the APQI exceeds the maximum value configured for the system
++ */
++static ssize_t unassign_domain_store(struct device *dev,
++				     struct device_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int ret;
++	unsigned long apqi;
++	struct mdev_device *mdev = mdev_from_dev(dev);
++	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
++
++	ret = kstrtoul(buf, 0, &apqi);
++	if (ret)
++		return ret;
++
++	if (apqi > matrix_mdev->matrix.aqm_max)
++		return -ENODEV;
++
++	mutex_lock(&matrix_dev->lock);
++	clear_bit_inv((unsigned long)apqi, matrix_mdev->matrix.aqm);
++	mutex_unlock(&matrix_dev->lock);
++
++	return count;
++}
++DEVICE_ATTR_WO(unassign_domain);
++
+ static struct attribute *vfio_ap_mdev_attrs[] = {
+ 	&dev_attr_assign_adapter.attr,
+ 	&dev_attr_unassign_adapter.attr,
+-	NULL
++	&dev_attr_assign_domain.attr,
++	&dev_attr_unassign_domain.attr,
++	NULL,
+ };
+ 
+ static struct attribute_group vfio_ap_mdev_attr_group = {
