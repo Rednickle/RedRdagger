@@ -1,0 +1,231 @@
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 13 Nov 2017 14:28:30 +0100
+Subject: perf/core: Fix event schedule order
+Git-commit: 1cac7b1ae3579457200213303fc28ca13b75592f
+Patch-mainline: v4.17-rc1
+References: FATE#326324
+
+Scheduling in events with cpu=-1 before events with cpu=# changes
+semantics and is undesirable in that it would priorize these events.
+
+Given that groups->index is across all groups we actually have an
+inter-group ordering, meaning we can merge-sort two groups, which is
+just what we need to preserve semantics.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Alexey Budankov <alexey.budankov@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: David Carrillo-Cisneros <davidcc@google.com>
+Cc: Dmitri Prokhorov <Dmitry.Prohorov@intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Kan Liang <kan.liang@intel.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Valery Cherepennikov <valery.cherepennikov@intel.com>
+Cc: Vince Weaver <vincent.weaver@maine.edu>
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Tony Jones <tonyj@suse.de>
+---
+ kernel/events/core.c | 157 +++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 108 insertions(+), 49 deletions(-)
+
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 22165b009d73..2d8c0208ca4a 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -1608,6 +1608,21 @@ perf_event_groups_first(struct perf_event_groups *groups, int cpu)
+ 	return match;
+ }
+ 
++/*
++ * Like rb_entry_next_safe() for the @cpu subtree.
++ */
++static struct perf_event *
++perf_event_groups_next(struct perf_event *event)
++{
++	struct perf_event *next;
++
++	next = rb_entry_safe(rb_next(&event->group_node), typeof(*event), group_node);
++	if (next && next->cpu == event->cpu)
++		return next;
++
++	return NULL;
++}
++
+ /*
+  * Rotate the @cpu subtree.
+  *
+@@ -2354,22 +2369,6 @@ static int group_can_go_on(struct perf_event *event,
+ 	return can_add_hw;
+ }
+ 
+-static int
+-flexible_group_sched_in(struct perf_event *event,
+-			struct perf_event_context *ctx,
+-		        struct perf_cpu_context *cpuctx,
+-			int *can_add_hw)
+-{
+-	if (event->state <= PERF_EVENT_STATE_OFF || !event_filter_match(event))
+-		return 0;
+-
+-	if (group_can_go_on(event, cpuctx, *can_add_hw))
+-		if (group_sched_in(event, cpuctx, ctx))
+-			*can_add_hw = 0;
+-
+-	return 1;
+-}
+-
+ static void add_event_to_ctx(struct perf_event *event,
+ 			       struct perf_event_context *ctx)
+ {
+@@ -3185,52 +3184,112 @@ static void cpu_ctx_sched_out(struct perf_cpu_context *cpuctx,
+ 	ctx_sched_out(&cpuctx->ctx, cpuctx, event_type);
+ }
+ 
+-static void
+-ctx_pinned_sched_in(struct perf_event_context *ctx,
+-		    struct perf_cpu_context *cpuctx)
++static int visit_groups_merge(struct perf_event_groups *groups, int cpu,
++			      int (*func)(struct perf_event *, void *), void *data)
+ {
+-	int sw = -1, cpu = smp_processor_id();
+-	struct perf_event *event;
+-	int can_add_hw;
++	struct perf_event **evt, *evt1, *evt2;
++	int ret;
+ 
+-	perf_event_groups_for_each_cpu(event, sw,
+-			&ctx->pinned_groups, group_node) {
+-		can_add_hw = 1;
+-		if (flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw)) {
+-			if (event->state == PERF_EVENT_STATE_INACTIVE)
+-				perf_event_set_state(event,
+-						PERF_EVENT_STATE_ERROR);
++	evt1 = perf_event_groups_first(groups, -1);
++	evt2 = perf_event_groups_first(groups, cpu);
++
++	while (evt1 || evt2) {
++		if (evt1 && evt2) {
++			if (evt1->group_index < evt2->group_index)
++				evt = &evt1;
++			else
++				evt = &evt2;
++		} else if (evt1) {
++			evt = &evt1;
++		} else {
++			evt = &evt2;
+ 		}
++
++		ret = func(*evt, data);
++		if (ret)
++			return ret;
++
++		*evt = perf_event_groups_next(*evt);
+ 	}
+ 
+-	perf_event_groups_for_each_cpu(event, cpu,
+-			&ctx->pinned_groups, group_node) {
+-		can_add_hw = 1;
+-		if (flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw)) {
+-			if (event->state == PERF_EVENT_STATE_INACTIVE)
+-				perf_event_set_state(event,
+-						PERF_EVENT_STATE_ERROR);
+-		}
++	return 0;
++}
++
++struct sched_in_data {
++	struct perf_event_context *ctx;
++	struct perf_cpu_context *cpuctx;
++	int can_add_hw;
++};
++
++static int pinned_sched_in(struct perf_event *event, void *data)
++{
++	struct sched_in_data *sid = data;
++
++	if (event->state <= PERF_EVENT_STATE_OFF)
++		return 0;
++
++	if (!event_filter_match(event))
++		return 0;
++
++	if (group_can_go_on(event, sid->cpuctx, sid->can_add_hw))
++		group_sched_in(event, sid->cpuctx, sid->ctx);
++
++	/*
++	 * If this pinned group hasn't been scheduled,
++	 * put it in error state.
++	 */
++	if (event->state == PERF_EVENT_STATE_INACTIVE)
++		perf_event_set_state(event, PERF_EVENT_STATE_ERROR);
++
++	return 0;
++}
++
++static int flexible_sched_in(struct perf_event *event, void *data)
++{
++	struct sched_in_data *sid = data;
++
++	if (event->state <= PERF_EVENT_STATE_OFF)
++		return 0;
++
++	if (!event_filter_match(event))
++		return 0;
++
++	if (group_can_go_on(event, sid->cpuctx, sid->can_add_hw)) {
++		if (group_sched_in(event, sid->cpuctx, sid->ctx))
++			sid->can_add_hw = 0;
+ 	}
++
++	return 0;
+ }
+ 
+ static void
+-ctx_flexible_sched_in(struct perf_event_context *ctx,
+-		      struct perf_cpu_context *cpuctx)
++ctx_pinned_sched_in(struct perf_event_context *ctx,
++		    struct perf_cpu_context *cpuctx)
+ {
+-	int sw = -1, cpu = smp_processor_id();
+-	struct perf_event *event;
+-	int can_add_hw = 1;
++	struct sched_in_data sid = {
++		.ctx = ctx,
++		.cpuctx = cpuctx,
++		.can_add_hw = 1,
++	};
+ 
+-	perf_event_groups_for_each_cpu(event, sw,
+-			&ctx->flexible_groups, group_node)
+-		flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw);
++	visit_groups_merge(&ctx->pinned_groups,
++			   smp_processor_id(),
++			   pinned_sched_in, &sid);
++}
+ 
+-	can_add_hw = 1;
+-	perf_event_groups_for_each_cpu(event, cpu,
+-			&ctx->flexible_groups, group_node)
+-		flexible_group_sched_in(event, ctx, cpuctx, &can_add_hw);
++static void
++ctx_flexible_sched_in(struct perf_event_context *ctx,
++		      struct perf_cpu_context *cpuctx)
++{
++	struct sched_in_data sid = {
++		.ctx = ctx,
++		.cpuctx = cpuctx,
++		.can_add_hw = 1,
++	};
+ 
++	visit_groups_merge(&ctx->flexible_groups,
++			   smp_processor_id(),
++			   flexible_sched_in, &sid);
+ }
+ 
+ static void
+
