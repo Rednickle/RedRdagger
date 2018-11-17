@@ -1,0 +1,188 @@
+From: "bstroesser@ts.fujitsu.com" <bstroesser@ts.fujitsu.com>
+Date: Thu, 24 May 2018 18:49:41 +0200
+Subject: scsi: target: tcmu: add read length support
+Git-commit: 6c3796d130ed2860489885a934dcb7bb334d5eb0
+Patch-mainline: v4.18-rc3
+References: bsc#1097755
+
+Generally target core and TCMUser seem to work fine for tape devices and
+media changers.  But there is at least one situation where TCMUser is not
+able to support sequential access device emulation correctly.
+
+The situation is when an initiator sends a SCSI READ CDB with a length that
+is greater than the length of the tape block to read. We can distinguish
+two subcases:
+
+A) The initiator sent the READ CDB with the SILI bit being set.
+
+   In this case the sequential access device has to transfer the data from
+   the tape block (only the length of the tape block) and transmit a good
+   status.  The current interface between TCMUser and the userspace does
+   not support reduction of the read data size by the userspace program.
+
+   The patch below fixes this subcase by allowing the userspace program to
+   specify a reduced data size in read direction.
+
+B) The initiator sent the READ CDB with the SILI bit not being set.
+
+   In this case the sequential access device has to transfer the data from
+   the tape block as in A), but additionally has to transmit CHECK
+   CONDITION with the ILI bit set and NO SENSE in the sensebytes. The
+   information field in the sensebytes must contain the residual count.
+
+   With the below patch a user space program can specify the real read data
+   length and appropriate sensebytes.  TCMUser then uses the se_cmd flag
+   SCF_TREAT_READ_AS_NORMAL, to force target core to transmit the real data
+   size and the sensebytes.  Note: the flag SCF_TREAT_READ_AS_NORMAL is
+   introduced by Lee Duncan's patch "[PATCH v4] target: transport should
+   handle st FM/EOM/ILI reads" from Tue, 15 May 2018 18:25:24 -0700.
+
+Signed-off-by: Bodo Stroesser <bstroesser@ts.fujitsu.com>
+Acked-by: Mike Christie <mchristi@redhat.com>
+Reviewed-by: Lee Duncan <lduncan@suse.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/target/target_core_user.c     | 44 ++++++++++++++++++++++++++++-------
+ include/uapi/linux/target_core_user.h |  4 +++-
+ 2 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/target/target_core_user.c b/drivers/target/target_core_user.c
+index 7f96dfa32b9c..d8dc3d22051f 100644
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@ -656,7 +656,7 @@ static void scatter_data_area(struct tcmu_dev *udev,
+ }
+ 
+ static void gather_data_area(struct tcmu_dev *udev, struct tcmu_cmd *cmd,
+-			     bool bidi)
++			     bool bidi, uint32_t read_len)
+ {
+ 	struct se_cmd *se_cmd = cmd->se_cmd;
+ 	int i, dbi;
+@@ -689,7 +689,7 @@ static void gather_data_area(struct tcmu_dev *udev, struct tcmu_cmd *cmd,
+ 	for_each_sg(data_sg, sg, data_nents, i) {
+ 		int sg_remaining = sg->length;
+ 		to = kmap_atomic(sg_page(sg)) + sg->offset;
+-		while (sg_remaining > 0) {
++		while (sg_remaining > 0 && read_len > 0) {
+ 			if (block_remaining == 0) {
+ 				if (from)
+ 					kunmap_atomic(from);
+@@ -701,6 +701,8 @@ static void gather_data_area(struct tcmu_dev *udev, struct tcmu_cmd *cmd,
+ 			}
+ 			copy_bytes = min_t(size_t, sg_remaining,
+ 					block_remaining);
++			if (read_len < copy_bytes)
++				copy_bytes = read_len;
+ 			offset = DATA_BLOCK_SIZE - block_remaining;
+ 			tcmu_flush_dcache_range(from, copy_bytes);
+ 			memcpy(to + sg->length - sg_remaining, from + offset,
+@@ -708,8 +710,11 @@ static void gather_data_area(struct tcmu_dev *udev, struct tcmu_cmd *cmd,
+ 
+ 			sg_remaining -= copy_bytes;
+ 			block_remaining -= copy_bytes;
++			read_len -= copy_bytes;
+ 		}
+ 		kunmap_atomic(to - sg->offset);
++		if (read_len == 0)
++			break;
+ 	}
+ 	if (from)
+ 		kunmap_atomic(from);
+@@ -1042,6 +1047,8 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
+ {
+ 	struct se_cmd *se_cmd = cmd->se_cmd;
+ 	struct tcmu_dev *udev = cmd->tcmu_dev;
++	bool read_len_valid = false;
++	uint32_t read_len = se_cmd->data_length;
+ 
+ 	/*
+ 	 * cmd has been completed already from timeout, just reclaim
+@@ -1056,13 +1063,28 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
+ 		pr_warn("TCMU: Userspace set UNKNOWN_OP flag on se_cmd %p\n",
+ 			cmd->se_cmd);
+ 		entry->rsp.scsi_status = SAM_STAT_CHECK_CONDITION;
+-	} else if (entry->rsp.scsi_status == SAM_STAT_CHECK_CONDITION) {
++		goto done;
++	}
++
++	if (se_cmd->data_direction == DMA_FROM_DEVICE &&
++	    (entry->hdr.uflags & TCMU_UFLAG_READ_LEN) && entry->rsp.read_len) {
++		read_len_valid = true;
++		if (entry->rsp.read_len < read_len)
++			read_len = entry->rsp.read_len;
++	}
++
++	if (entry->rsp.scsi_status == SAM_STAT_CHECK_CONDITION) {
+ 		transport_copy_sense_to_cmd(se_cmd, entry->rsp.sense_buffer);
+-	} else if (se_cmd->se_cmd_flags & SCF_BIDI) {
++		if (!read_len_valid )
++			goto done;
++		else
++			se_cmd->se_cmd_flags |= SCF_TREAT_READ_AS_NORMAL;
++	}
++	if (se_cmd->se_cmd_flags & SCF_BIDI) {
+ 		/* Get Data-In buffer before clean up */
+-		gather_data_area(udev, cmd, true);
++		gather_data_area(udev, cmd, true, read_len);
+ 	} else if (se_cmd->data_direction == DMA_FROM_DEVICE) {
+-		gather_data_area(udev, cmd, false);
++		gather_data_area(udev, cmd, false, read_len);
+ 	} else if (se_cmd->data_direction == DMA_TO_DEVICE) {
+ 		/* TODO: */
+ 	} else if (se_cmd->data_direction != DMA_NONE) {
+@@ -1070,7 +1092,13 @@ static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *
+ 			se_cmd->data_direction);
+ 	}
+ 
+-	target_complete_cmd(cmd->se_cmd, entry->rsp.scsi_status);
++done:
++	if (read_len_valid) {
++		pr_debug("read_len = %d\n", read_len);
++		target_complete_cmd_with_length(cmd->se_cmd,
++					entry->rsp.scsi_status, read_len);
++	} else
++		target_complete_cmd(cmd->se_cmd, entry->rsp.scsi_status);
+ 
+ out:
+ 	cmd->se_cmd = NULL;
+@@ -1740,7 +1768,7 @@ static int tcmu_configure_device(struct se_device *dev)
+ 	/* Initialise the mailbox of the ring buffer */
+ 	mb = udev->mb_addr;
+ 	mb->version = TCMU_MAILBOX_VERSION;
+-	mb->flags = TCMU_MAILBOX_FLAG_CAP_OOOC;
++	mb->flags = TCMU_MAILBOX_FLAG_CAP_OOOC | TCMU_MAILBOX_FLAG_CAP_READ_LEN;
+ 	mb->cmdr_off = CMDR_OFF;
+ 	mb->cmdr_size = udev->cmdr_size;
+ 
+diff --git a/include/uapi/linux/target_core_user.h b/include/uapi/linux/target_core_user.h
+index 6e299349b158..b7b57967d90f 100644
+--- a/include/uapi/linux/target_core_user.h
++++ b/include/uapi/linux/target_core_user.h
+@@ -44,6 +44,7 @@
+ #define TCMU_MAILBOX_VERSION 2
+ #define ALIGN_SIZE 64 /* Should be enough for most CPUs */
+ #define TCMU_MAILBOX_FLAG_CAP_OOOC (1 << 0) /* Out-of-order completions */
++#define TCMU_MAILBOX_FLAG_CAP_READ_LEN (1 << 1) /* Read data length */
+ 
+ struct tcmu_mailbox {
+ 	__u16 version;
+@@ -71,6 +72,7 @@ struct tcmu_cmd_entry_hdr {
+ 	__u16 cmd_id;
+ 	__u8 kflags;
+ #define TCMU_UFLAG_UNKNOWN_OP 0x1
++#define TCMU_UFLAG_READ_LEN   0x2
+ 	__u8 uflags;
+ 
+ } __packed;
+@@ -119,7 +121,7 @@ struct tcmu_cmd_entry {
+ 			__u8 scsi_status;
+ 			__u8 __pad1;
+ 			__u16 __pad2;
+-			__u32 __pad3;
++			__u32 read_len;
+ 			char sense_buffer[TCMU_SENSE_BUFFERSIZE];
+ 		} rsp;
+ 	};
+
