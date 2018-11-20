@@ -1,0 +1,637 @@
+From: Andrey Ignatov <rdna@fb.com>
+Date: Fri, 30 Mar 2018 15:08:02 -0700
+Subject: bpf: Hooks for sys_bind
+Patch-mainline: v4.17-rc1
+Git-commit: 4fbac77d2d092b475dda9eea66da674369665427
+References: bsc#1109837
+
+== The problem ==
+
+There is a use-case when all processes inside a cgroup should use one
+single IP address on a host that has multiple IP configured.  Those
+processes should use the IP for both ingress and egress, for TCP and UDP
+traffic. So TCP/UDP servers should be bound to that IP to accept
+incoming connections on it, and TCP/UDP clients should make outgoing
+connections from that IP. It should not require changing application
+code since it's often not possible.
+
+Currently it's solved by intercepting glibc wrappers around syscalls
+such as `bind(2)` and `connect(2)`. It's done by a shared library that
+is preloaded for every process in a cgroup so that whenever TCP/UDP
+server calls `bind(2)`, the library replaces IP in sockaddr before
+passing arguments to syscall. When application calls `connect(2)` the
+library transparently binds the local end of connection to that IP
+(`bind(2)` with `IP_BIND_ADDRESS_NO_PORT` to avoid performance penalty).
+
+Shared library approach is fragile though, e.g.:
+* some applications clear env vars (incl. `LD_PRELOAD`);
+* `/etc/ld.so.preload` doesn't help since some applications are linked
+  with option `-z nodefaultlib`;
+* other applications don't use glibc and there is nothing to intercept.
+
+== The solution ==
+
+The patch provides much more reliable in-kernel solution for the 1st
+part of the problem: binding TCP/UDP servers on desired IP. It does not
+depend on application environment and implementation details (whether
+glibc is used or not).
+
+It adds new eBPF program type `BPF_PROG_TYPE_CGROUP_SOCK_ADDR` and
+attach types `BPF_CGROUP_INET4_BIND` and `BPF_CGROUP_INET6_BIND`
+(similar to already existing `BPF_CGROUP_INET_SOCK_CREATE`).
+
+The new program type is intended to be used with sockets (`struct sock`)
+in a cgroup and provided by user `struct sockaddr`. Pointers to both of
+them are parts of the context passed to programs of newly added types.
+
+The new attach types provides hooks in `bind(2)` system call for both
+IPv4 and IPv6 so that one can write a program to override IP addresses
+and ports user program tries to bind to and apply such a program for
+whole cgroup.
+
+== Implementation notes ==
+
+[1]
+Separate attach types for `AF_INET` and `AF_INET6` are added
+intentionally to prevent reading/writing to offsets that don't make
+sense for corresponding socket family. E.g. if user passes `sockaddr_in`
+it doesn't make sense to read from / write to `user_ip6[]` context
+fields.
+
+[2]
+The write access to `struct bpf_sock_addr_kern` is implemented using
+special field as an additional "register".
+
+There are just two registers in `sock_addr_convert_ctx_access`: `src`
+with value to write and `dst` with pointer to context that can't be
+changed not to break later instructions. But the fields, allowed to
+write to, are not available directly and to access them address of
+corresponding pointer has to be loaded first. To get additional register
+the 1st not used by `src` and `dst` one is taken, its content is saved
+to `bpf_sock_addr_kern.tmp_reg`, then the register is used to load
+address of pointer field, and finally the register's content is restored
+from the temporary field after writing `src` value.
+
+Signed-off-by: Andrey Ignatov <rdna@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf-cgroup.h |   21 ++++
+ include/linux/bpf_types.h  |    1 
+ include/linux/filter.h     |   10 +
+ include/uapi/linux/bpf.h   |   23 ++++
+ kernel/bpf/cgroup.c        |   36 ++++++
+ kernel/bpf/syscall.c       |   36 +++++-
+ kernel/bpf/verifier.c      |    1 
+ net/core/filter.c          |  232 +++++++++++++++++++++++++++++++++++++++++++++
+ net/ipv4/af_inet.c         |    7 +
+ net/ipv6/af_inet6.c        |    7 +
+ 10 files changed, 366 insertions(+), 8 deletions(-)
+
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -5,6 +5,7 @@
+ #include <uapi/linux/bpf.h>
+ 
+ struct sock;
++struct sockaddr;
+ struct cgroup;
+ struct sk_buff;
+ struct bpf_sock_ops_kern;
+@@ -62,6 +63,10 @@ int __cgroup_bpf_run_filter_skb(struct s
+ int __cgroup_bpf_run_filter_sk(struct sock *sk,
+ 			       enum bpf_attach_type type);
+ 
++int __cgroup_bpf_run_filter_sock_addr(struct sock *sk,
++				      struct sockaddr *uaddr,
++				      enum bpf_attach_type type);
++
+ int __cgroup_bpf_run_filter_sock_ops(struct sock *sk,
+ 				     struct bpf_sock_ops_kern *sock_ops,
+ 				     enum bpf_attach_type type);
+@@ -102,6 +107,20 @@ int __cgroup_bpf_check_dev_permission(sh
+ 	__ret;								       \
+ })
+ 
++#define BPF_CGROUP_RUN_SA_PROG(sk, uaddr, type)				       \
++({									       \
++	int __ret = 0;							       \
++	if (cgroup_bpf_enabled)						       \
++		__ret = __cgroup_bpf_run_filter_sock_addr(sk, uaddr, type);    \
++	__ret;								       \
++})
++
++#define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr)			       \
++	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET4_BIND)
++
++#define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr)			       \
++	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET6_BIND)
++
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops)				       \
+ ({									       \
+ 	int __ret = 0;							       \
+@@ -134,6 +153,8 @@ static inline int cgroup_bpf_inherit(str
+ #define BPF_CGROUP_RUN_PROG_INET_INGRESS(sk,skb) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_EGRESS(sk,skb) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_SOCK(sk) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type,major,minor,access) ({ 0; })
+ 
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -7,6 +7,7 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_ACT, t
+ BPF_PROG_TYPE(BPF_PROG_TYPE_XDP, xdp)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SKB, cg_skb)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCK, cg_sock)
++BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCK_ADDR, cg_sock_addr)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_IN, lwt_inout)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_OUT, lwt_inout)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_XMIT, lwt_xmit)
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1020,6 +1020,16 @@ static inline int bpf_tell_extensions(vo
+ 	return SKF_AD_MAX;
+ }
+ 
++struct bpf_sock_addr_kern {
++	struct sock *sk;
++	struct sockaddr *uaddr;
++	/* Temporary "register" to make indirect stores to nested structures
++	 * defined above. We need three registers to make such a store, but
++	 * only two (src and dst) are available at convert_ctx_access time
++	 */
++	u64 tmp_reg;
++};
++
+ struct bpf_sock_ops_kern {
+ 	struct	sock *sk;
+ 	u32	op;
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -135,6 +135,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_CGROUP_DEVICE,
+ 	BPF_PROG_TYPE_SK_MSG,
+ 	BPF_PROG_TYPE_RAW_TRACEPOINT,
++	BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+ };
+ 
+ enum bpf_attach_type {
+@@ -146,6 +147,8 @@ enum bpf_attach_type {
+ 	BPF_SK_SKB_STREAM_VERDICT,
+ 	BPF_CGROUP_DEVICE,
+ 	BPF_SK_MSG_VERDICT,
++	BPF_CGROUP_INET4_BIND,
++	BPF_CGROUP_INET6_BIND,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+@@ -1003,6 +1006,26 @@ struct bpf_map_info {
+ 	__u64 netns_ino;
+ } __attribute__((aligned(8)));
+ 
++/* User bpf_sock_addr struct to access socket fields and sockaddr struct passed
++ * by user and intended to be used by socket (e.g. to bind to, depends on
++ * attach attach type).
++ */
++struct bpf_sock_addr {
++	__u32 user_family;	/* Allows 4-byte read, but no write. */
++	__u32 user_ip4;		/* Allows 1,2,4-byte read and 4-byte write.
++				 * Stored in network byte order.
++				 */
++	__u32 user_ip6[4];	/* Allows 1,2,4-byte read an 4-byte write.
++				 * Stored in network byte order.
++				 */
++	__u32 user_port;	/* Allows 4-byte read and write.
++				 * Stored in network byte order
++				 */
++	__u32 family;		/* Allows 4-byte read, but no write */
++	__u32 type;		/* Allows 4-byte read, but no write */
++	__u32 protocol;		/* Allows 4-byte read, but no write */
++};
++
+ /* User bpf_sock_ops struct to access socket values and specify request ops
+  * and their replies.
+  * Some of this fields are in network (bigendian) byte order and may need
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -495,6 +495,42 @@ int __cgroup_bpf_run_filter_sk(struct so
+ EXPORT_SYMBOL(__cgroup_bpf_run_filter_sk);
+ 
+ /**
++ * __cgroup_bpf_run_filter_sock_addr() - Run a program on a sock and
++ *                                       provided by user sockaddr
++ * @sk: sock struct that will use sockaddr
++ * @uaddr: sockaddr struct provided by user
++ * @type: The type of program to be exectuted
++ *
++ * socket is expected to be of type INET or INET6.
++ *
++ * This function will return %-EPERM if an attached program is found and
++ * returned value != 1 during execution. In all other cases, 0 is returned.
++ */
++int __cgroup_bpf_run_filter_sock_addr(struct sock *sk,
++				      struct sockaddr *uaddr,
++				      enum bpf_attach_type type)
++{
++	struct bpf_sock_addr_kern ctx = {
++		.sk = sk,
++		.uaddr = uaddr,
++	};
++	struct cgroup *cgrp;
++	int ret;
++
++	/* Check socket family since not all sockets represent network
++	 * endpoint (e.g. AF_UNIX).
++	 */
++	if (sk->sk_family != AF_INET && sk->sk_family != AF_INET6)
++		return 0;
++
++	cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
++	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
++
++	return ret == 1 ? 0 : -EPERM;
++}
++EXPORT_SYMBOL(__cgroup_bpf_run_filter_sock_addr);
++
++/**
+  * __cgroup_bpf_run_filter_sock_ops() - Run a program on a sock
+  * @sk: socket to get cgroup from
+  * @sock_ops: bpf_sock_ops_kern struct to pass to program. Contains
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1155,19 +1155,29 @@ static int
+ bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
+ 				enum bpf_attach_type expected_attach_type)
+ {
+-	/* There are currently no prog types that require specifying
+-	 * attach_type at load time.
+-	 */
+-	return 0;
++	switch (prog_type) {
++	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
++		switch (expected_attach_type) {
++		case BPF_CGROUP_INET4_BIND:
++		case BPF_CGROUP_INET6_BIND:
++			return 0;
++		default:
++			return -EINVAL;
++		}
++	default:
++		return 0;
++	}
+ }
+ 
+ static int bpf_prog_attach_check_attach_type(const struct bpf_prog *prog,
+ 					     enum bpf_attach_type attach_type)
+ {
+-	/* There are currently no prog types that require specifying
+-	 * attach_type at load time.
+-	 */
+-	return 0;
++	switch (prog->type) {
++	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
++		return attach_type == prog->expected_attach_type ? 0 : -EINVAL;
++	default:
++		return 0;
++	}
+ }
+ 
+ /* last field in 'union bpf_attr' used by this command */
+@@ -1453,6 +1463,10 @@ static int bpf_prog_attach(const union b
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK;
+ 		break;
++	case BPF_CGROUP_INET4_BIND:
++	case BPF_CGROUP_INET6_BIND:
++		ptype = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
++		break;
+ 	case BPF_CGROUP_SOCK_OPS:
+ 		ptype = BPF_PROG_TYPE_SOCK_OPS;
+ 		break;
+@@ -1515,6 +1529,10 @@ static int bpf_prog_detach(const union b
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK;
+ 		break;
++	case BPF_CGROUP_INET4_BIND:
++	case BPF_CGROUP_INET6_BIND:
++		ptype = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
++		break;
+ 	case BPF_CGROUP_SOCK_OPS:
+ 		ptype = BPF_PROG_TYPE_SOCK_OPS;
+ 		break;
+@@ -1564,6 +1582,8 @@ static int bpf_prog_query(const union bp
+ 	case BPF_CGROUP_INET_INGRESS:
+ 	case BPF_CGROUP_INET_EGRESS:
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
++	case BPF_CGROUP_INET4_BIND:
++	case BPF_CGROUP_INET6_BIND:
+ 	case BPF_CGROUP_SOCK_OPS:
+ 	case BPF_CGROUP_DEVICE:
+ 		break;
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3887,6 +3887,7 @@ static int check_return_code(struct bpf_
+ 	switch (env->prog->type) {
+ 	case BPF_PROG_TYPE_CGROUP_SKB:
+ 	case BPF_PROG_TYPE_CGROUP_SOCK:
++	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 	case BPF_PROG_TYPE_CGROUP_DEVICE:
+ 		break;
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -3685,6 +3685,20 @@ sock_filter_func_proto(enum bpf_func_id
+ }
+ 
+ static const struct bpf_func_proto *
++sock_addr_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	switch (func_id) {
++	/* inet and inet6 sockets are created in a process
++	 * context so there is always a valid uid/gid
++	 */
++	case BPF_FUNC_get_current_uid_gid:
++		return &bpf_get_current_uid_gid_proto;
++	default:
++		return bpf_base_func_proto(func_id);
++	}
++}
++
++static const struct bpf_func_proto *
+ sk_filter_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+ 	switch (func_id) {
+@@ -4166,6 +4180,69 @@ void bpf_warn_invalid_xdp_action(u32 act
+ }
+ EXPORT_SYMBOL_GPL(bpf_warn_invalid_xdp_action);
+ 
++static bool sock_addr_is_valid_access(int off, int size,
++				      enum bpf_access_type type,
++				      const struct bpf_prog *prog,
++				      struct bpf_insn_access_aux *info)
++{
++	const int size_default = sizeof(__u32);
++
++	if (off < 0 || off >= sizeof(struct bpf_sock_addr))
++		return false;
++	if (off % size != 0)
++		return false;
++
++	/* Disallow access to IPv6 fields from IPv4 contex and vise
++	 * versa.
++	 */
++	switch (off) {
++	case bpf_ctx_range(struct bpf_sock_addr, user_ip4):
++		switch (prog->expected_attach_type) {
++		case BPF_CGROUP_INET4_BIND:
++			break;
++		default:
++			return false;
++		}
++		break;
++	case bpf_ctx_range_till(struct bpf_sock_addr, user_ip6[0], user_ip6[3]):
++		switch (prog->expected_attach_type) {
++		case BPF_CGROUP_INET6_BIND:
++			break;
++		default:
++			return false;
++		}
++		break;
++	}
++
++	switch (off) {
++	case bpf_ctx_range(struct bpf_sock_addr, user_ip4):
++	case bpf_ctx_range_till(struct bpf_sock_addr, user_ip6[0], user_ip6[3]):
++		/* Only narrow read access allowed for now. */
++		if (type == BPF_READ) {
++			bpf_ctx_record_field_size(info, size_default);
++			if (!bpf_ctx_narrow_access_ok(off, size, size_default))
++				return false;
++		} else {
++			if (size != size_default)
++				return false;
++		}
++		break;
++	case bpf_ctx_range(struct bpf_sock_addr, user_port):
++		if (size != size_default)
++			return false;
++		break;
++	default:
++		if (type == BPF_READ) {
++			if (size != size_default)
++				return false;
++		} else {
++			return false;
++		}
++	}
++
++	return true;
++}
++
+ static bool sock_ops_is_valid_access(int off, int size,
+ 				     enum bpf_access_type type,
+ 				     const struct bpf_prog *prog,
+@@ -4710,6 +4787,152 @@ static u32 xdp_convert_ctx_access(enum b
+ 	return insn - insn_buf;
+ }
+ 
++/* SOCK_ADDR_LOAD_NESTED_FIELD() loads Nested Field S.F.NF where S is type of
++ * context Structure, F is Field in context structure that contains a pointer
++ * to Nested Structure of type NS that has the field NF.
++ *
++ * SIZE encodes the load size (BPF_B, BPF_H, etc). It's up to caller to make
++ * sure that SIZE is not greater than actual size of S.F.NF.
++ *
++ * If offset OFF is provided, the load happens from that offset relative to
++ * offset of NF.
++ */
++#define SOCK_ADDR_LOAD_NESTED_FIELD_SIZE_OFF(S, NS, F, NF, SIZE, OFF)	       \
++	do {								       \
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(S, F), si->dst_reg,     \
++				      si->src_reg, offsetof(S, F));	       \
++		*insn++ = BPF_LDX_MEM(					       \
++			SIZE, si->dst_reg, si->dst_reg,			       \
++			bpf_target_off(NS, NF, FIELD_SIZEOF(NS, NF),	       \
++				       target_size)			       \
++				+ OFF);					       \
++	} while (0)
++
++#define SOCK_ADDR_LOAD_NESTED_FIELD(S, NS, F, NF)			       \
++	SOCK_ADDR_LOAD_NESTED_FIELD_SIZE_OFF(S, NS, F, NF,		       \
++					     BPF_FIELD_SIZEOF(NS, NF), 0)
++
++/* SOCK_ADDR_STORE_NESTED_FIELD_OFF() has semantic similar to
++ * SOCK_ADDR_LOAD_NESTED_FIELD_SIZE_OFF() but for store operation.
++ *
++ * It doesn't support SIZE argument though since narrow stores are not
++ * supported for now.
++ *
++ * In addition it uses Temporary Field TF (member of struct S) as the 3rd
++ * "register" since two registers available in convert_ctx_access are not
++ * enough: we can't override neither SRC, since it contains value to store, nor
++ * DST since it contains pointer to context that may be used by later
++ * instructions. But we need a temporary place to save pointer to nested
++ * structure whose field we want to store to.
++ */
++#define SOCK_ADDR_STORE_NESTED_FIELD_OFF(S, NS, F, NF, OFF, TF)		       \
++	do {								       \
++		int tmp_reg = BPF_REG_9;				       \
++		if (si->src_reg == tmp_reg || si->dst_reg == tmp_reg)	       \
++			--tmp_reg;					       \
++		if (si->src_reg == tmp_reg || si->dst_reg == tmp_reg)	       \
++			--tmp_reg;					       \
++		*insn++ = BPF_STX_MEM(BPF_DW, si->dst_reg, tmp_reg,	       \
++				      offsetof(S, TF));			       \
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(S, F), tmp_reg,	       \
++				      si->dst_reg, offsetof(S, F));	       \
++		*insn++ = BPF_STX_MEM(					       \
++			BPF_FIELD_SIZEOF(NS, NF), tmp_reg, si->src_reg,	       \
++			bpf_target_off(NS, NF, FIELD_SIZEOF(NS, NF),	       \
++				       target_size)			       \
++				+ OFF);					       \
++		*insn++ = BPF_LDX_MEM(BPF_DW, tmp_reg, si->dst_reg,	       \
++				      offsetof(S, TF));			       \
++	} while (0)
++
++#define SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD_SIZE_OFF(S, NS, F, NF, SIZE, OFF, \
++						      TF)		       \
++	do {								       \
++		if (type == BPF_WRITE) {				       \
++			SOCK_ADDR_STORE_NESTED_FIELD_OFF(S, NS, F, NF, OFF,    \
++							 TF);		       \
++		} else {						       \
++			SOCK_ADDR_LOAD_NESTED_FIELD_SIZE_OFF(		       \
++				S, NS, F, NF, SIZE, OFF);  \
++		}							       \
++	} while (0)
++
++#define SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD(S, NS, F, NF, TF)		       \
++	SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD_SIZE_OFF(			       \
++		S, NS, F, NF, BPF_FIELD_SIZEOF(NS, NF), 0, TF)
++
++static u32 sock_addr_convert_ctx_access(enum bpf_access_type type,
++					const struct bpf_insn *si,
++					struct bpf_insn *insn_buf,
++					struct bpf_prog *prog, u32 *target_size)
++{
++	struct bpf_insn *insn = insn_buf;
++	int off;
++
++	switch (si->off) {
++	case offsetof(struct bpf_sock_addr, user_family):
++		SOCK_ADDR_LOAD_NESTED_FIELD(struct bpf_sock_addr_kern,
++					    struct sockaddr, uaddr, sa_family);
++		break;
++
++	case offsetof(struct bpf_sock_addr, user_ip4):
++		SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD_SIZE_OFF(
++			struct bpf_sock_addr_kern, struct sockaddr_in, uaddr,
++			sin_addr, BPF_SIZE(si->code), 0, tmp_reg);
++		break;
++
++	case bpf_ctx_range_till(struct bpf_sock_addr, user_ip6[0], user_ip6[3]):
++		off = si->off;
++		off -= offsetof(struct bpf_sock_addr, user_ip6[0]);
++		SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD_SIZE_OFF(
++			struct bpf_sock_addr_kern, struct sockaddr_in6, uaddr,
++			sin6_addr.s6_addr32[0], BPF_SIZE(si->code), off,
++			tmp_reg);
++		break;
++
++	case offsetof(struct bpf_sock_addr, user_port):
++		/* To get port we need to know sa_family first and then treat
++		 * sockaddr as either sockaddr_in or sockaddr_in6.
++		 * Though we can simplify since port field has same offset and
++		 * size in both structures.
++		 * Here we check this invariant and use just one of the
++		 * structures if it's true.
++		 */
++		BUILD_BUG_ON(offsetof(struct sockaddr_in, sin_port) !=
++			     offsetof(struct sockaddr_in6, sin6_port));
++		BUILD_BUG_ON(FIELD_SIZEOF(struct sockaddr_in, sin_port) !=
++			     FIELD_SIZEOF(struct sockaddr_in6, sin6_port));
++		SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD(struct bpf_sock_addr_kern,
++						     struct sockaddr_in6, uaddr,
++						     sin6_port, tmp_reg);
++		break;
++
++	case offsetof(struct bpf_sock_addr, family):
++		SOCK_ADDR_LOAD_NESTED_FIELD(struct bpf_sock_addr_kern,
++					    struct sock, sk, sk_family);
++		break;
++
++	case offsetof(struct bpf_sock_addr, type):
++		SOCK_ADDR_LOAD_NESTED_FIELD_SIZE_OFF(
++			struct bpf_sock_addr_kern, struct sock, sk,
++			__sk_flags_offset, BPF_W, 0);
++		*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, SK_FL_TYPE_MASK);
++		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, SK_FL_TYPE_SHIFT);
++		break;
++
++	case offsetof(struct bpf_sock_addr, protocol):
++		SOCK_ADDR_LOAD_NESTED_FIELD_SIZE_OFF(
++			struct bpf_sock_addr_kern, struct sock, sk,
++			__sk_flags_offset, BPF_W, 0);
++		*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, SK_FL_PROTO_MASK);
++		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg,
++					SK_FL_PROTO_SHIFT);
++		break;
++	}
++
++	return insn - insn_buf;
++}
++
+ static u32 sock_ops_convert_ctx_access(enum bpf_access_type type,
+ 				       const struct bpf_insn *si,
+ 				       struct bpf_insn *insn_buf,
+@@ -5167,6 +5390,15 @@ const struct bpf_verifier_ops cg_sock_ve
+ const struct bpf_prog_ops cg_sock_prog_ops = {
+ };
+ 
++const struct bpf_verifier_ops cg_sock_addr_verifier_ops = {
++	.get_func_proto		= sock_addr_func_proto,
++	.is_valid_access	= sock_addr_is_valid_access,
++	.convert_ctx_access	= sock_addr_convert_ctx_access,
++};
++
++const struct bpf_prog_ops cg_sock_addr_prog_ops = {
++};
++
+ const struct bpf_verifier_ops sock_ops_verifier_ops = {
+ 	.get_func_proto		= sock_ops_func_proto,
+ 	.is_valid_access	= sock_ops_is_valid_access,
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -448,6 +448,13 @@ int inet_bind(struct socket *sock, struc
+ 	if (addr_len < sizeof(struct sockaddr_in))
+ 		goto out;
+ 
++	/* BPF prog is run before any checks are done so that if the prog
++	 * changes context in a wrong way it will be caught.
++	 */
++	err = BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr);
++	if (err)
++		goto out;
++
+ 	if (addr->sin_family != AF_INET) {
+ 		/* Compatibility games : accept AF_UNSPEC (mapped to AF_INET)
+ 		 * only if s_addr is INADDR_ANY.
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -294,6 +294,13 @@ int inet6_bind(struct socket *sock, stru
+ 	if (addr_len < SIN6_LEN_RFC2133)
+ 		return -EINVAL;
+ 
++	/* BPF prog is run before any checks are done so that if the prog
++	 * changes context in a wrong way it will be caught.
++	 */
++	err = BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr);
++	if (err)
++		return err;
++
+ 	if (addr->sin6_family != AF_INET6)
+ 		return -EAFNOSUPPORT;
+ 
