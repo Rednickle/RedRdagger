@@ -1,0 +1,205 @@
+From: Yonghong Song <yhs@fb.com>
+Date: Mon, 11 Dec 2017 11:39:02 -0800
+Subject: bpf/tracing: allow user space to query prog array on the same tp
+Patch-mainline: v4.16-rc1
+Git-commit: f371b304f12e31fe30207c41ca7754564e0ea4dc
+References: bsc#1109837
+
+Commit e87c6bc3852b ("bpf: permit multiple bpf attachments
+for a single perf event") added support to attach multiple
+bpf programs to a single perf event.
+Although this provides flexibility, users may want to know
+what other bpf programs attached to the same tp interface.
+Besides getting visibility for the underlying bpf system,
+such information may also help consolidate multiple bpf programs,
+understand potential performance issues due to a large array,
+and debug (e.g., one bpf program which overwrites return code
+may impact subsequent program results).
+
+Commit 2541517c32be ("tracing, perf: Implement BPF programs
+attached to kprobes") utilized the existing perf ioctl
+interface and added the command PERF_EVENT_IOC_SET_BPF
+to attach a bpf program to a tracepoint. This patch adds a new
+ioctl command, given a perf event fd, to query the bpf program
+array attached to the same perf tracepoint event.
+
+The new uapi ioctl command:
+  PERF_EVENT_IOC_QUERY_BPF
+
+The new uapi/linux/perf_event.h structure:
+  struct perf_event_query_bpf {
+       __u32	ids_len;
+       __u32	prog_cnt;
+       __u32	ids[0];
+  };
+
+User space provides buffer "ids" for kernel to copy to.
+When returning from the kernel, the number of available
+programs in the array is set in "prog_cnt".
+
+The usage:
+  struct perf_event_query_bpf *query =
+    malloc(sizeof(*query) + sizeof(u32) * ids_len);
+  query.ids_len = ids_len;
+  err = ioctl(pmu_efd, PERF_EVENT_IOC_QUERY_BPF, query);
+  if (err == 0) {
+    /* query.prog_cnt is the number of available progs,
+     * number of progs in ids: (ids_len == 0) ? 0 : query.prog_cnt
+     */
+  } else if (errno == ENOSPC) {
+    /* query.ids_len number of progs copied,
+     * query.prog_cnt is the number of available progs
+     */
+  } else {
+      /* other errors */
+  }
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf.h             |    4 ++++
+ include/uapi/linux/perf_event.h |   22 ++++++++++++++++++++++
+ kernel/bpf/core.c               |   21 +++++++++++++++++++++
+ kernel/events/core.c            |    3 +++
+ kernel/trace/bpf_trace.c        |   23 +++++++++++++++++++++++
+ 5 files changed, 73 insertions(+)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -261,6 +261,7 @@ typedef unsigned long (*bpf_ctx_copy_t)(
+ 
+ u64 bpf_event_output(struct bpf_map *map, u64 flags, void *meta, u64 meta_size,
+ 		     void *ctx, u64 ctx_size, bpf_ctx_copy_t ctx_copy);
++int bpf_event_query_prog_array(struct perf_event *event, void __user *info);
+ 
+ int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
+ 			  union bpf_attr __user *uattr);
+@@ -292,6 +293,9 @@ int bpf_prog_array_copy_to_user(struct b
+ 
+ void bpf_prog_array_delete_safe(struct bpf_prog_array __rcu *progs,
+ 				struct bpf_prog *old_prog);
++int bpf_prog_array_copy_info(struct bpf_prog_array __rcu *array,
++			     __u32 __user *prog_ids, u32 request_cnt,
++			     __u32 __user *prog_cnt);
+ int bpf_prog_array_copy(struct bpf_prog_array __rcu *old_array,
+ 			struct bpf_prog *exclude_prog,
+ 			struct bpf_prog *include_prog,
+--- a/include/uapi/linux/perf_event.h
++++ b/include/uapi/linux/perf_event.h
+@@ -393,6 +393,27 @@ struct perf_event_attr {
+ 	__u16	__reserved_2;	/* align to __u64 */
+ };
+ 
++/*
++ * Structure used by below PERF_EVENT_IOC_QUERY_BPF command
++ * to query bpf programs attached to the same perf tracepoint
++ * as the given perf event.
++ */
++struct perf_event_query_bpf {
++	/*
++	 * The below ids array length
++	 */
++	__u32	ids_len;
++	/*
++	 * Set by the kernel to indicate the number of
++	 * available programs
++	 */
++	__u32	prog_cnt;
++	/*
++	 * User provided buffer to store program ids
++	 */
++	__u32	ids[0];
++};
++
+ #define perf_flags(attr)	(*(&(attr)->read_format + 1))
+ 
+ /*
+@@ -408,6 +429,7 @@ struct perf_event_attr {
+ #define PERF_EVENT_IOC_ID		_IOR('$', 7, __u64 *)
+ #define PERF_EVENT_IOC_SET_BPF		_IOW('$', 8, __u32)
+ #define PERF_EVENT_IOC_PAUSE_OUTPUT	_IOW('$', 9, __u32)
++#define PERF_EVENT_IOC_QUERY_BPF	_IOWR('$', 10, struct perf_event_query_bpf *)
+ 
+ enum perf_event_ioc_flags {
+ 	PERF_IOC_FLAG_GROUP		= 1U << 0,
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1487,6 +1487,8 @@ int bpf_prog_array_copy_to_user(struct b
+ 	rcu_read_lock();
+ 	prog = rcu_dereference(progs)->progs;
+ 	for (; *prog; prog++) {
++		if (*prog == &dummy_bpf_prog.prog)
++			continue;
+ 		id = (*prog)->aux->id;
+ 		if (copy_to_user(prog_ids + i, &id, sizeof(id))) {
+ 			rcu_read_unlock();
+@@ -1570,6 +1572,25 @@ int bpf_prog_array_copy(struct bpf_prog_
+ 	return 0;
+ }
+ 
++int bpf_prog_array_copy_info(struct bpf_prog_array __rcu *array,
++			     __u32 __user *prog_ids, u32 request_cnt,
++			     __u32 __user *prog_cnt)
++{
++	u32 cnt = 0;
++
++	if (array)
++		cnt = bpf_prog_array_length(array);
++
++	if (copy_to_user(prog_cnt, &cnt, sizeof(cnt)))
++		return -EFAULT;
++
++	/* return early if user requested only program count or nothing to copy */
++	if (!request_cnt || !cnt)
++		return 0;
++
++	return bpf_prog_array_copy_to_user(array, prog_ids, request_cnt);
++}
++
+ static void bpf_prog_free_deferred(struct work_struct *work)
+ {
+ 	struct bpf_prog_aux *aux;
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -4769,6 +4769,9 @@ static long _perf_ioctl(struct perf_even
+ 		rcu_read_unlock();
+ 		return 0;
+ 	}
++
++	case PERF_EVENT_IOC_QUERY_BPF:
++		return bpf_event_query_prog_array(event, (void __user *)arg);
+ 	default:
+ 		return -ENOTTY;
+ 	}
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -825,3 +825,26 @@ void perf_event_detach_bpf_prog(struct p
+ unlock:
+ 	mutex_unlock(&bpf_event_mutex);
+ }
++
++int bpf_event_query_prog_array(struct perf_event *event, void __user *info)
++{
++	struct perf_event_query_bpf __user *uquery = info;
++	struct perf_event_query_bpf query = {};
++	int ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	if (event->attr.type != PERF_TYPE_TRACEPOINT)
++		return -EINVAL;
++	if (copy_from_user(&query, uquery, sizeof(query)))
++		return -EFAULT;
++
++	mutex_lock(&bpf_event_mutex);
++	ret = bpf_prog_array_copy_info(event->tp_event->prog_array,
++				       uquery->ids,
++				       query.ids_len,
++				       &uquery->prog_cnt);
++	mutex_unlock(&bpf_event_mutex);
++
++	return ret;
++}
