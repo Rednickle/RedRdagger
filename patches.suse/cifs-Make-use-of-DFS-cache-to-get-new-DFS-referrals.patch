@@ -1,0 +1,420 @@
+From: Aurelien Aptel <aaptel@suse.com>
+Date: Thu, 15 Nov 2018 19:45:10 +0100
+Subject: [PATCH] cifs: Make use of DFS cache to get new DFS referrals
+References: FATE#325270
+Patch-mainline: Submitted, linux-cifs 2018-11-15
+
+This patch will make use of DFS cache routines where appropriate and
+do not always request a new referral from server.
+
+Signed-off-by: Paulo Alcantara <palcantara@suse.de>
+Signed-off-by: Aurelien Aptel <aaptel@suse.com>
+Acked-by: Aurelien Aptel <aaptel@suse.com>
+---
+ fs/cifs/cifs_dfs_ref.c | 100 ++++++++++++++++++++++++++++++-------------------
+ fs/cifs/cifsfs.c       |  17 ++++++++-
+ fs/cifs/cifsglob.h     |   7 +++-
+ fs/cifs/cifsproto.h    |  20 +++++++---
+ fs/cifs/connect.c      |  49 +++++++-----------------
+ fs/cifs/smb1ops.c      |  15 ++++----
+ 6 files changed, 119 insertions(+), 89 deletions(-)
+
+diff --git a/fs/cifs/cifs_dfs_ref.c b/fs/cifs/cifs_dfs_ref.c
+index c90f611758bc..682065c1c844 100644
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@ -25,6 +25,7 @@
+ #include "dns_resolve.h"
+ #include "cifs_debug.h"
+ #include "cifs_unicode.h"
++#include "dfs_cache.h"
+ 
+ static LIST_HEAD(cifs_dfs_automount_list);
+ 
+@@ -285,16 +286,16 @@ static void dump_referral(const struct dfs_info3_param *ref)
+  */
+ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
+ {
+-	struct dfs_info3_param *referrals = NULL;
+-	unsigned int num_referrals = 0;
++	struct dfs_info3_param referral = {0};
+ 	struct cifs_sb_info *cifs_sb;
+ 	struct cifs_ses *ses;
+-	char *full_path;
++	struct cifs_tcon *tcon;
++	char *full_path, *root_path;
+ 	unsigned int xid;
+-	int i;
++	int len;
+ 	int rc;
+ 	struct vfsmount *mnt;
+-	struct tcon_link *tlink;
++	char sep;
+ 
+ 	cifs_dbg(FYI, "in %s\n", __func__);
+ 	BUG_ON(IS_ROOT(mntpt));
+@@ -307,54 +308,77 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
+ 	 */
+ 	mnt = ERR_PTR(-ENOMEM);
+ 
++	sep = CIFS_DIR_SEP(cifs_sb);
++
+ 	/* always use tree name prefix */
+ 	full_path = build_path_from_dentry_optional_prefix(mntpt, true);
+ 	if (full_path == NULL)
+ 		goto cdda_exit;
+ 
+ 	cifs_sb = CIFS_SB(mntpt->d_sb);
+-	tlink = cifs_sb_tlink(cifs_sb);
+-	if (IS_ERR(tlink)) {
+-		mnt = ERR_CAST(tlink);
++	cifs_dbg(FYI, "%s: full_path: %s\n", __func__, full_path);
++
++	if (!cifs_sb_master_tlink(cifs_sb)) {
++		cifs_dbg(FYI, "%s: master tlink is NULL\n", __func__);
++		goto free_full_path;
++	}
++
++	tcon = cifs_sb_master_tcon(cifs_sb);
++	if (!tcon) {
++		cifs_dbg(FYI, "%s: master tcon is NULL\n", __func__);
+ 		goto free_full_path;
+ 	}
+-	ses = tlink_tcon(tlink)->ses;
+ 
++	root_path = kstrdup(tcon->treeName, GFP_KERNEL);
++	if (!root_path) {
++		mnt = ERR_PTR(-ENOMEM);
++		goto free_full_path;
++	}
++	cifs_dbg(FYI, "%s: root path: %s\n", __func__, root_path);
++
++	ses = tcon->ses;
+ 	xid = get_xid();
+-	rc = get_dfs_path(xid, ses, full_path + 1, cifs_sb->local_nls,
+-		&num_referrals, &referrals,
+-		cifs_remap(cifs_sb));
+-	free_xid(xid);
+ 
+-	cifs_put_tlink(tlink);
+-
+-	mnt = ERR_PTR(-ENOENT);
+-	for (i = 0; i < num_referrals; i++) {
+-		int len;
+-		dump_referral(referrals + i);
+-		/* connect to a node */
+-		len = strlen(referrals[i].node_name);
+-		if (len < 2) {
+-			cifs_dbg(VFS, "%s: Net Address path too short: %s\n",
+-				 __func__, referrals[i].node_name);
+-			mnt = ERR_PTR(-EINVAL);
+-			break;
+-		}
+-		mnt = cifs_dfs_do_refmount(mntpt, cifs_sb,
+-				full_path, referrals + i);
+-		cifs_dbg(FYI, "%s: cifs_dfs_do_refmount:%s , mnt:%p\n",
+-			 __func__, referrals[i].node_name, mnt);
+-		if (!IS_ERR(mnt))
+-			goto success;
++	/*
++	 * If DFS root has been expired, then unconditionally fetch it again to
++	 * refresh DFS referral cache.
++	 */
++	rc = dfs_cache_find(xid, ses, cifs_sb->local_nls, cifs_remap(cifs_sb),
++			    root_path + 1, NULL, NULL);
++	if (!rc) {
++		rc = dfs_cache_find(xid, ses, cifs_sb->local_nls,
++				    cifs_remap(cifs_sb), full_path + 1,
++				    &referral, NULL);
+ 	}
+ 
+-	/* no valid submounts were found; return error from get_dfs_path() by
+-	 * preference */
+-	if (rc != 0)
++	free_xid(xid);
++
++	if (rc) {
+ 		mnt = ERR_PTR(rc);
++		goto free_root_path;
++	}
+ 
+-success:
+-	free_dfs_info_array(referrals, num_referrals);
++	dump_referral(&referral);
++
++	len = strlen(referral.node_name);
++	if (len < 2) {
++		cifs_dbg(VFS, "%s: Net Address path too short: %s\n",
++			 __func__, referral.node_name);
++		mnt = ERR_PTR(-EINVAL);
++		goto free_dfs_ref;
++	}
++	/*
++	 * cifs_mount() will retry every available node server in case
++	 * of failures.
++	 */
++	mnt = cifs_dfs_do_refmount(mntpt, cifs_sb, full_path, &referral);
++	cifs_dbg(FYI, "%s: cifs_dfs_do_refmount:%s , mnt:%p\n", __func__,
++		 referral.node_name, mnt);
++
++free_dfs_ref:
++	free_dfs_info_param(&referral);
++free_root_path:
++	kfree(root_path);
+ free_full_path:
+ 	kfree(full_path);
+ cdda_exit:
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index a1d0b7253c41..42d13b2036c5 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -52,6 +52,9 @@
+ #include "cifs_spnego.h"
+ #include "fscache.h"
+ #include "smb2pdu.h"
++#ifdef CONFIG_CIFS_DFS_UPCALL
++#include "dfs_cache.h"
++#endif
+ 
+ int cifsFYI = 0;
+ bool traceSMB;
+@@ -1396,10 +1399,15 @@ init_cifs(void)
+ 	if (rc)
+ 		goto out_destroy_mids;
+ 
++#ifdef CONFIG_CIFS_DFS_UPCALL
++	rc = dfs_cache_init();
++	if (rc)
++		goto out_destroy_request_bufs;
++#endif /* CONFIG_CIFS_DFS_UPCALL */
+ #ifdef CONFIG_CIFS_UPCALL
+ 	rc = init_cifs_spnego();
+ 	if (rc)
+-		goto out_destroy_request_bufs;
++		goto out_destroy_dfs_cache;
+ #endif /* CONFIG_CIFS_UPCALL */
+ 
+ #ifdef CONFIG_CIFS_ACL
+@@ -1421,6 +1429,10 @@ init_cifs(void)
+ #endif
+ #ifdef CONFIG_CIFS_UPCALL
+ 	exit_cifs_spnego();
++out_destroy_dfs_cache:
++#endif
++#ifdef CONFIG_CIFS_DFS_UPCALL
++	dfs_cache_destroy();
+ out_destroy_request_bufs:
+ #endif
+ 	cifs_destroy_request_bufs();
+@@ -1451,6 +1463,9 @@ exit_cifs(void)
+ #ifdef CONFIG_CIFS_UPCALL
+ 	exit_cifs_spnego();
+ #endif
++#ifdef CONFIG_CIFS_DFS_UPCALL
++	dfs_cache_destroy();
++#endif
+ 	cifs_destroy_request_bufs();
+ 	cifs_destroy_mids();
+ 	cifs_destroy_inodecache();
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index bb4dab284432..934b7f33ffa0 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -987,6 +987,12 @@ struct tcon_link {
+ 
+ extern struct tcon_link *cifs_sb_tlink(struct cifs_sb_info *cifs_sb);
+ 
++static inline struct tcon_link *
++cifs_sb_master_tlink(struct cifs_sb_info *cifs_sb)
++{
++	return cifs_sb->master_tlink;
++}
++
+ static inline struct cifs_tcon *
+ tlink_tcon(struct tcon_link *tlink)
+ {
+@@ -1478,7 +1484,6 @@ static inline void free_dfs_info_param(struct dfs_info3_param *param)
+ 	if (param) {
+ 		kfree(param->path_name);
+ 		kfree(param->node_name);
+-		kfree(param);
+ 	}
+ }
+ 
+diff --git a/fs/cifs/cifsproto.h b/fs/cifs/cifsproto.h
+index a753ccbd3b81..6d399d670dbc 100644
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -21,6 +21,9 @@
+ #ifndef _CIFSPROTO_H
+ #define _CIFSPROTO_H
+ #include <linux/nls.h>
++#ifdef CONFIG_CIFS_DFS_UPCALL
++#include "dfs_cache.h"
++#endif
+ 
+ struct statfs;
+ struct smb_vol;
+@@ -282,11 +285,6 @@ extern int CIFSGetDFSRefer(const unsigned int xid, struct cifs_ses *ses,
+ 			   unsigned int *num_of_nodes,
+ 			   const struct nls_table *nls_codepage, int remap);
+ 
+-extern int get_dfs_path(const unsigned int xid, struct cifs_ses *ses,
+-			const char *old_path,
+-			const struct nls_table *nls_codepage,
+-			unsigned int *num_referrals,
+-			struct dfs_info3_param **referrals, int remap);
+ extern int parse_dfs_referrals(struct get_dfs_referral_rsp *rsp, u32 rsp_size,
+ 			       unsigned int *num_of_nodes,
+ 			       struct dfs_info3_param **target_nodes,
+@@ -543,4 +541,16 @@ enum securityEnum cifs_select_sectype(struct TCP_Server_Info *,
+ struct cifs_aio_ctx *cifs_aio_ctx_alloc(void);
+ void cifs_aio_ctx_release(struct kref *refcount);
+ int setup_aio_ctx_iter(struct cifs_aio_ctx *ctx, struct iov_iter *iter, int rw);
++
++#ifdef CONFIG_CIFS_DFS_UPCALL
++static inline int get_dfs_path(const unsigned int xid, struct cifs_ses *ses,
++			       const char *old_path,
++			       const struct nls_table *nls_codepage,
++			       struct dfs_info3_param *referral, int remap)
++{
++	return dfs_cache_find(xid, ses, nls_codepage, remap, old_path,
++			      referral, NULL);
++}
++#endif
++
+ #endif			/* _CIFSPROTO_H */
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 4ded911a0776..0e314049b0f1 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -56,6 +56,10 @@
+ #include "rfc1002pdu.h"
+ #include "fscache.h"
+ #include "smb2proto.h"
++#include "dns_resolve.h"
++#ifdef CONFIG_CIFS_DFS_UPCALL
++#include "dfs_cache.h"
++#endif
+ 
+ #define CIFS_PORT 445
+ #define RFC1001_PORT 139
+@@ -2962,12 +2966,6 @@ cifs_put_tlink(struct tcon_link *tlink)
+ 	return;
+ }
+ 
+-static inline struct tcon_link *
+-cifs_sb_master_tlink(struct cifs_sb_info *cifs_sb)
+-{
+-	return cifs_sb->master_tlink;
+-}
+-
+ static int
+ compare_mount_options(struct super_block *sb, struct cifs_mnt_data *mnt_data)
+ {
+@@ -3063,25 +3061,6 @@ cifs_match_super(struct super_block *sb, void *data)
+ 	return rc;
+ }
+ 
+-int
+-get_dfs_path(const unsigned int xid, struct cifs_ses *ses, const char *old_path,
+-	     const struct nls_table *nls_codepage, unsigned int *num_referrals,
+-	     struct dfs_info3_param **referrals, int remap)
+-{
+-	int rc = 0;
+-
+-	if (!ses->server->ops->get_dfs_refer)
+-		return -ENOSYS;
+-
+-	*num_referrals = 0;
+-	*referrals = NULL;
+-
+-	rc = ses->server->ops->get_dfs_refer(xid, ses, old_path,
+-					     referrals, num_referrals,
+-					     nls_codepage, remap);
+-	return rc;
+-}
+-
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ static struct lock_class_key cifs_key[2];
+ static struct lock_class_key cifs_slock_key[2];
+@@ -3724,8 +3703,9 @@ build_unc_path_to_root(const struct smb_vol *vol,
+ 	return full_path;
+ }
+ 
+-/*
+- * Perform a dfs referral query for a share and (optionally) prefix
++/**
++ * expand_dfs_referral - Perform a dfs referral query and update the cifs_sb
++ *
+  *
+  * If a referral is found, cifs_sb->mountdata will be (re-)allocated
+  * to a string containing updated options for the submount.  Otherwise it
+@@ -3740,8 +3720,7 @@ expand_dfs_referral(const unsigned int xid, struct cifs_ses *ses,
+ 		    int check_prefix)
+ {
+ 	int rc;
+-	unsigned int num_referrals = 0;
+-	struct dfs_info3_param *referrals = NULL;
++	struct dfs_info3_param referral = {0};
+ 	char *full_path = NULL, *ref_path = NULL, *mdata = NULL;
+ 
+ 	full_path = build_unc_path_to_root(volume_info, cifs_sb);
+@@ -3751,17 +3730,15 @@ expand_dfs_referral(const unsigned int xid, struct cifs_ses *ses,
+ 	/* For DFS paths, skip the first '\' of the UNC */
+ 	ref_path = check_prefix ? full_path + 1 : volume_info->UNC + 1;
+ 
+-	rc = get_dfs_path(xid, ses, ref_path, cifs_sb->local_nls,
+-			  &num_referrals, &referrals, cifs_remap(cifs_sb));
+-
+-	if (!rc && num_referrals > 0) {
++	rc = dfs_cache_find(xid, ses, cifs_sb->local_nls, cifs_remap(cifs_sb),
++			    ref_path, &referral, NULL);
++	if (!rc) {
+ 		char *fake_devname = NULL;
+ 
+ 		mdata = cifs_compose_mount_options(cifs_sb->mountdata,
+-						   full_path + 1, referrals,
++						   full_path + 1, &referral,
+ 						   &fake_devname);
+-
+-		free_dfs_info_array(referrals, num_referrals);
++		free_dfs_info_param(&referral);
+ 
+ 		if (IS_ERR(mdata)) {
+ 			rc = PTR_ERR(mdata);
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index d8cd82001c1c..ca35feff3885 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -931,19 +931,18 @@ cifs_unix_dfs_readlink(const unsigned int xid, struct cifs_tcon *tcon,
+ {
+ #ifdef CONFIG_CIFS_DFS_UPCALL
+ 	int rc;
+-	unsigned int num_referrals = 0;
+-	struct dfs_info3_param *referrals = NULL;
++	struct dfs_info3_param referral = {0};
+ 
+-	rc = get_dfs_path(xid, tcon->ses, searchName, nls_codepage,
+-			  &num_referrals, &referrals, 0);
++	rc = get_dfs_path(xid, tcon->ses, searchName, nls_codepage, &referral,
++			  0);
+ 
+-	if (!rc && num_referrals > 0) {
+-		*symlinkinfo = kstrndup(referrals->node_name,
+-					strlen(referrals->node_name),
++	if (!rc) {
++		*symlinkinfo = kstrndup(referral.node_name,
++					strlen(referral.node_name),
+ 					GFP_KERNEL);
++		free_dfs_info_param(&referral);
+ 		if (!*symlinkinfo)
+ 			rc = -ENOMEM;
+-		free_dfs_info_array(referrals, num_referrals);
+ 	}
+ 	return rc;
+ #else /* No DFS support */
+-- 
+2.13.7
+
+
