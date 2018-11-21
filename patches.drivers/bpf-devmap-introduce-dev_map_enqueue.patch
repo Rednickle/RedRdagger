@@ -1,0 +1,192 @@
+From: Jesper Dangaard Brouer <brouer@redhat.com>
+Date: Thu, 24 May 2018 16:45:46 +0200
+Subject: bpf: devmap introduce dev_map_enqueue
+Patch-mainline: v4.18-rc1
+Git-commit: 67f29e07e131ffa13ea158c259a513f474c7df27
+References: bsc#1109837
+
+Functionality is the same, but the ndo_xdp_xmit call is now
+simply invoked from inside the devmap.c code.
+
+V2: Fix compile issue reported by kbuild test robot <lkp@intel.com>
+
+V5: Cleanups requested by Daniel
+ - Newlines before func definition
+ - Use BUILD_BUG_ON checks
+ - Remove unnecessary use return value store in dev_map_enqueue
+
+Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf.h        |   16 +++++++++++++---
+ include/trace/events/xdp.h |    9 ++++++++-
+ kernel/bpf/devmap.c        |   34 ++++++++++++++++++++++++++++------
+ net/core/filter.c          |   15 ++-------------
+ 4 files changed, 51 insertions(+), 23 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -458,14 +458,16 @@ int bpf_check(struct bpf_prog **fp, unio
+ void bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth);
+ 
+ /* Map specifics */
+-struct net_device  *__dev_map_lookup_elem(struct bpf_map *map, u32 key);
++struct xdp_buff;
++
++struct bpf_dtab_netdev *__dev_map_lookup_elem(struct bpf_map *map, u32 key);
+ void __dev_map_insert_ctx(struct bpf_map *map, u32 index);
+ void __dev_map_flush(struct bpf_map *map);
++int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp);
+ 
+ struct bpf_cpu_map_entry *__cpu_map_lookup_elem(struct bpf_map *map, u32 key);
+ void __cpu_map_insert_ctx(struct bpf_map *map, u32 index);
+ void __cpu_map_flush(struct bpf_map *map);
+-struct xdp_buff;
+ int cpu_map_enqueue(struct bpf_cpu_map_entry *rcpu, struct xdp_buff *xdp,
+ 		    struct net_device *dev_rx);
+ 
+@@ -544,6 +546,15 @@ static inline int bpf_obj_get_user(const
+ 	return -EOPNOTSUPP;
+ }
+ 
++struct xdp_buff;
++struct bpf_dtab_netdev;
++
++static inline
++int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp)
++{
++	return 0;
++}
++
+ static inline
+ struct bpf_cpu_map_entry *__cpu_map_lookup_elem(struct bpf_map *map, u32 key)
+ {
+@@ -558,7 +569,6 @@ static inline void __cpu_map_flush(struc
+ {
+ }
+ 
+-struct xdp_buff;
+ static inline int cpu_map_enqueue(struct bpf_cpu_map_entry *rcpu,
+ 				  struct xdp_buff *xdp,
+ 				  struct net_device *dev_rx)
+--- a/include/trace/events/xdp.h
++++ b/include/trace/events/xdp.h
+@@ -137,11 +137,18 @@ DEFINE_EVENT_PRINT(xdp_redirect_template
+ 		  __entry->map_id, __entry->map_index)
+ );
+ 
++#ifndef __DEVMAP_OBJ_TYPE
++#define __DEVMAP_OBJ_TYPE
++struct _bpf_dtab_netdev {
++	struct net_device *dev;
++};
++#endif /* __DEVMAP_OBJ_TYPE */
++
+ #define devmap_ifindex(fwd, map)				\
+ 	(!fwd ? 0 :						\
+ 	 (!map ? 0 :						\
+ 	  ((map->map_type == BPF_MAP_TYPE_DEVMAP) ?		\
+-	   ((struct net_device *)fwd)->ifindex : 0)))
++	   ((struct _bpf_dtab_netdev *)fwd)->dev->ifindex : 0)))
+ 
+ #define _trace_xdp_redirect_map(dev, xdp, fwd, map, idx)		\
+ 	 trace_xdp_redirect_map(dev, xdp, devmap_ifindex(fwd, map),	\
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -48,13 +48,15 @@
+  * calls will fail at this point.
+  */
+ #include <linux/bpf.h>
++#include <net/xdp.h>
+ #include <linux/filter.h>
++#include <trace/events/xdp.h>
+ 
+ #define DEV_CREATE_FLAG_MASK \
+ 	(BPF_F_NUMA_NODE | BPF_F_RDONLY | BPF_F_WRONLY)
+ 
+ struct bpf_dtab_netdev {
+-	struct net_device *dev;
++	struct net_device *dev; /* must be first member, due to tracepoint */
+ 	struct bpf_dtab *dtab;
+ 	unsigned int bit;
+ 	struct rcu_head rcu;
+@@ -240,21 +242,38 @@ void __dev_map_flush(struct bpf_map *map
+  * update happens in parallel here a dev_put wont happen until after reading the
+  * ifindex.
+  */
+-struct net_device  *__dev_map_lookup_elem(struct bpf_map *map, u32 key)
++struct bpf_dtab_netdev *__dev_map_lookup_elem(struct bpf_map *map, u32 key)
+ {
+ 	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
+-	struct bpf_dtab_netdev *dev;
++	struct bpf_dtab_netdev *obj;
+ 
+ 	if (key >= map->max_entries)
+ 		return NULL;
+ 
+-	dev = READ_ONCE(dtab->netdev_map[key]);
+-	return dev ? dev->dev : NULL;
++	obj = READ_ONCE(dtab->netdev_map[key]);
++	return obj;
++}
++
++int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp)
++{
++	struct net_device *dev = dst->dev;
++	struct xdp_frame *xdpf;
++
++	if (!dev->netdev_ops->ndo_xdp_xmit)
++		return -EOPNOTSUPP;
++
++	xdpf = convert_to_xdp_frame(xdp);
++	if (unlikely(!xdpf))
++		return -EOVERFLOW;
++
++	/* TODO: implement a bulking/enqueue step later */
++	return dev->netdev_ops->ndo_xdp_xmit(dev, xdpf);
+ }
+ 
+ static void *dev_map_lookup_elem(struct bpf_map *map, void *key)
+ {
+-	struct net_device *dev = __dev_map_lookup_elem(map, *(u32 *)key);
++	struct bpf_dtab_netdev *obj = __dev_map_lookup_elem(map, *(u32 *)key);
++	struct net_device *dev = dev = obj ? obj->dev : NULL;
+ 
+ 	return dev ? &dev->ifindex : NULL;
+ }
+@@ -405,6 +424,9 @@ static struct notifier_block dev_map_not
+ 
+ static int __init dev_map_init(void)
+ {
++	/* Assure tracepoint shadow struct _bpf_dtab_netdev is in sync */
++	BUILD_BUG_ON(offsetof(struct bpf_dtab_netdev, dev) !=
++		     offsetof(struct _bpf_dtab_netdev, dev));
+ 	register_netdevice_notifier(&dev_map_notifier);
+ 	return 0;
+ }
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -3051,20 +3051,9 @@ static int __bpf_tx_xdp_map(struct net_d
+ 
+ 	switch (map->map_type) {
+ 	case BPF_MAP_TYPE_DEVMAP: {
+-		struct net_device *dev = fwd;
+-		struct xdp_frame *xdpf;
++		struct bpf_dtab_netdev *dst = fwd;
+ 
+-		if (!dev->netdev_ops->ndo_xdp_xmit)
+-			return -EOPNOTSUPP;
+-
+-		xdpf = convert_to_xdp_frame(xdp);
+-		if (unlikely(!xdpf))
+-			return -EOVERFLOW;
+-
+-		/* TODO: move to inside map code instead, for bulk support
+-		 * err = dev_map_enqueue(dev, xdp);
+-		 */
+-		err = dev->netdev_ops->ndo_xdp_xmit(dev, xdpf);
++		err = dev_map_enqueue(dst, xdp);
+ 		if (err)
+ 			return err;
+ 		__dev_map_insert_ctx(map, index);
