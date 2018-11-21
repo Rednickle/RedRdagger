@@ -1,0 +1,367 @@
+From: John Hurley <john.hurley@netronome.com>
+Date: Wed, 23 May 2018 19:22:55 -0700
+Subject: nfp: flower: compute link aggregation action
+Patch-mainline: v4.18-rc1
+Git-commit: 7e24a59311ea4a92c38f76756496b06293c50afb
+References: bsc#1109837
+
+If the egress device of an offloaded rule is a LAG port, then encode the
+output port to the NFP with a LAG identifier and the offloaded group ID.
+
+A prelag action is also offloaded which must be the first action of the
+series (although may appear after other pre-actions - e.g. tunnels). This
+causes the FW to check that it has the necessary information to output to
+the requested LAG port. If it does not, the packet is sent to the kernel
+before any other actions are applied to it.
+
+Signed-off-by: John Hurley <john.hurley@netronome.com>
+Reviewed-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/flower/action.c   |  131 +++++++++++++++----
+ drivers/net/ethernet/netronome/nfp/flower/cmsg.h     |   13 +
+ drivers/net/ethernet/netronome/nfp/flower/lag_conf.c |   42 ++++++
+ drivers/net/ethernet/netronome/nfp/flower/main.h     |    9 +
+ drivers/net/ethernet/netronome/nfp/flower/offload.c  |    2 
+ 5 files changed, 169 insertions(+), 28 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/flower/action.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/action.c
+@@ -72,6 +72,42 @@ nfp_fl_push_vlan(struct nfp_fl_push_vlan
+ 	push_vlan->vlan_tci = cpu_to_be16(tmp_push_vlan_tci);
+ }
+ 
++static int
++nfp_fl_pre_lag(struct nfp_app *app, const struct tc_action *action,
++	       struct nfp_fl_payload *nfp_flow, int act_len)
++{
++	size_t act_size = sizeof(struct nfp_fl_pre_lag);
++	struct nfp_fl_pre_lag *pre_lag;
++	struct net_device *out_dev;
++	int err;
++
++	out_dev = tcf_mirred_dev(action);
++	if (!out_dev || !netif_is_lag_master(out_dev))
++		return 0;
++
++	if (act_len + act_size > NFP_FL_MAX_A_SIZ)
++		return -EOPNOTSUPP;
++
++	/* Pre_lag action must be first on action list.
++	 * If other actions already exist they need pushed forward.
++	 */
++	if (act_len)
++		memmove(nfp_flow->action_data + act_size,
++			nfp_flow->action_data, act_len);
++
++	pre_lag = (struct nfp_fl_pre_lag *)nfp_flow->action_data;
++	err = nfp_flower_lag_populate_pre_action(app, out_dev, pre_lag);
++	if (err)
++		return err;
++
++	pre_lag->head.jump_id = NFP_FL_ACTION_OPCODE_PRE_LAG;
++	pre_lag->head.len_lw = act_size >> NFP_FL_LW_SIZ;
++
++	nfp_flow->meta.shortcut = cpu_to_be32(NFP_FL_SC_ACT_NULL);
++
++	return act_size;
++}
++
+ static bool nfp_fl_netdev_is_tunnel_type(struct net_device *out_dev,
+ 					 enum nfp_flower_tun_type tun_type)
+ {
+@@ -88,12 +124,13 @@ static bool nfp_fl_netdev_is_tunnel_type
+ }
+ 
+ static int
+-nfp_fl_output(struct nfp_fl_output *output, const struct tc_action *action,
+-	      struct nfp_fl_payload *nfp_flow, bool last,
+-	      struct net_device *in_dev, enum nfp_flower_tun_type tun_type,
+-	      int *tun_out_cnt)
++nfp_fl_output(struct nfp_app *app, struct nfp_fl_output *output,
++	      const struct tc_action *action, struct nfp_fl_payload *nfp_flow,
++	      bool last, struct net_device *in_dev,
++	      enum nfp_flower_tun_type tun_type, int *tun_out_cnt)
+ {
+ 	size_t act_size = sizeof(struct nfp_fl_output);
++	struct nfp_flower_priv *priv = app->priv;
+ 	struct net_device *out_dev;
+ 	u16 tmp_flags;
+ 
+@@ -118,6 +155,15 @@ nfp_fl_output(struct nfp_fl_output *outp
+ 		output->flags = cpu_to_be16(tmp_flags |
+ 					    NFP_FL_OUT_FLAGS_USE_TUN);
+ 		output->port = cpu_to_be32(NFP_FL_PORT_TYPE_TUN | tun_type);
++	} else if (netif_is_lag_master(out_dev) &&
++		   priv->flower_ext_feats & NFP_FL_FEATS_LAG) {
++		int gid;
++
++		output->flags = cpu_to_be16(tmp_flags);
++		gid = nfp_flower_lag_get_output_id(app, out_dev);
++		if (gid < 0)
++			return gid;
++		output->port = cpu_to_be32(NFP_FL_LAG_OUT | gid);
+ 	} else {
+ 		/* Set action output parameters. */
+ 		output->flags = cpu_to_be16(tmp_flags);
+@@ -162,7 +208,7 @@ static struct nfp_fl_pre_tunnel *nfp_fl_
+ 	struct nfp_fl_pre_tunnel *pre_tun_act;
+ 
+ 	/* Pre_tunnel action must be first on action list.
+-	 * If other actions already exist they need pushed forward.
++	 * If other actions already exist they need to be pushed forward.
+ 	 */
+ 	if (act_len)
+ 		memmove(act_data + act_size, act_data, act_len);
+@@ -441,42 +487,73 @@ nfp_fl_pedit(const struct tc_action *act
+ }
+ 
+ static int
+-nfp_flower_loop_action(const struct tc_action *a,
++nfp_flower_output_action(struct nfp_app *app, const struct tc_action *a,
++			 struct nfp_fl_payload *nfp_fl, int *a_len,
++			 struct net_device *netdev, bool last,
++			 enum nfp_flower_tun_type *tun_type, int *tun_out_cnt,
++			 int *out_cnt)
++{
++	struct nfp_flower_priv *priv = app->priv;
++	struct nfp_fl_output *output;
++	int err, prelag_size;
++
++	if (*a_len + sizeof(struct nfp_fl_output) > NFP_FL_MAX_A_SIZ)
++		return -EOPNOTSUPP;
++
++	output = (struct nfp_fl_output *)&nfp_fl->action_data[*a_len];
++	err = nfp_fl_output(app, output, a, nfp_fl, last, netdev, *tun_type,
++			    tun_out_cnt);
++	if (err)
++		return err;
++
++	*a_len += sizeof(struct nfp_fl_output);
++
++	if (priv->flower_ext_feats & NFP_FL_FEATS_LAG) {
++		/* nfp_fl_pre_lag returns -err or size of prelag action added.
++		 * This will be 0 if it is not egressing to a lag dev.
++		 */
++		prelag_size = nfp_fl_pre_lag(app, a, nfp_fl, *a_len);
++		if (prelag_size < 0)
++			return prelag_size;
++		else if (prelag_size > 0 && (!last || *out_cnt))
++			return -EOPNOTSUPP;
++
++		*a_len += prelag_size;
++	}
++	(*out_cnt)++;
++
++	return 0;
++}
++
++static int
++nfp_flower_loop_action(struct nfp_app *app, const struct tc_action *a,
+ 		       struct nfp_fl_payload *nfp_fl, int *a_len,
+ 		       struct net_device *netdev,
+-		       enum nfp_flower_tun_type *tun_type, int *tun_out_cnt)
++		       enum nfp_flower_tun_type *tun_type, int *tun_out_cnt,
++		       int *out_cnt)
+ {
+ 	struct nfp_fl_set_ipv4_udp_tun *set_tun;
+ 	struct nfp_fl_pre_tunnel *pre_tun;
+ 	struct nfp_fl_push_vlan *psh_v;
+ 	struct nfp_fl_pop_vlan *pop_v;
+-	struct nfp_fl_output *output;
+ 	int err;
+ 
+ 	if (is_tcf_gact_shot(a)) {
+ 		nfp_fl->meta.shortcut = cpu_to_be32(NFP_FL_SC_ACT_DROP);
+ 	} else if (is_tcf_mirred_egress_redirect(a)) {
+-		if (*a_len + sizeof(struct nfp_fl_output) > NFP_FL_MAX_A_SIZ)
+-			return -EOPNOTSUPP;
+-
+-		output = (struct nfp_fl_output *)&nfp_fl->action_data[*a_len];
+-		err = nfp_fl_output(output, a, nfp_fl, true, netdev, *tun_type,
+-				    tun_out_cnt);
++		err = nfp_flower_output_action(app, a, nfp_fl, a_len, netdev,
++					       true, tun_type, tun_out_cnt,
++					       out_cnt);
+ 		if (err)
+ 			return err;
+ 
+-		*a_len += sizeof(struct nfp_fl_output);
+ 	} else if (is_tcf_mirred_egress_mirror(a)) {
+-		if (*a_len + sizeof(struct nfp_fl_output) > NFP_FL_MAX_A_SIZ)
+-			return -EOPNOTSUPP;
+-
+-		output = (struct nfp_fl_output *)&nfp_fl->action_data[*a_len];
+-		err = nfp_fl_output(output, a, nfp_fl, false, netdev, *tun_type,
+-				    tun_out_cnt);
++		err = nfp_flower_output_action(app, a, nfp_fl, a_len, netdev,
++					       false, tun_type, tun_out_cnt,
++					       out_cnt);
+ 		if (err)
+ 			return err;
+ 
+-		*a_len += sizeof(struct nfp_fl_output);
+ 	} else if (is_tcf_vlan(a) && tcf_vlan_action(a) == TCA_VLAN_ACT_POP) {
+ 		if (*a_len + sizeof(struct nfp_fl_pop_vlan) > NFP_FL_MAX_A_SIZ)
+ 			return -EOPNOTSUPP;
+@@ -533,11 +610,12 @@ nfp_flower_loop_action(const struct tc_a
+ 	return 0;
+ }
+ 
+-int nfp_flower_compile_action(struct tc_cls_flower_offload *flow,
++int nfp_flower_compile_action(struct nfp_app *app,
++			      struct tc_cls_flower_offload *flow,
+ 			      struct net_device *netdev,
+ 			      struct nfp_fl_payload *nfp_flow)
+ {
+-	int act_len, act_cnt, err, tun_out_cnt;
++	int act_len, act_cnt, err, tun_out_cnt, out_cnt;
+ 	enum nfp_flower_tun_type tun_type;
+ 	const struct tc_action *a;
+ 	LIST_HEAD(actions);
+@@ -548,11 +626,12 @@ int nfp_flower_compile_action(struct tc_
+ 	act_len = 0;
+ 	act_cnt = 0;
+ 	tun_out_cnt = 0;
++	out_cnt = 0;
+ 
+ 	tcf_exts_to_list(flow->exts, &actions);
+ 	list_for_each_entry(a, &actions, list) {
+-		err = nfp_flower_loop_action(a, nfp_flow, &act_len, netdev,
+-					     &tun_type, &tun_out_cnt);
++		err = nfp_flower_loop_action(app, a, nfp_flow, &act_len, netdev,
++					     &tun_type, &tun_out_cnt, &out_cnt);
+ 		if (err)
+ 			return err;
+ 		act_cnt++;
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -92,6 +92,7 @@
+ #define NFP_FL_ACTION_OPCODE_SET_IPV6_DST	12
+ #define NFP_FL_ACTION_OPCODE_SET_UDP		14
+ #define NFP_FL_ACTION_OPCODE_SET_TCP		15
++#define NFP_FL_ACTION_OPCODE_PRE_LAG		16
+ #define NFP_FL_ACTION_OPCODE_PRE_TUNNEL		17
+ #define NFP_FL_ACTION_OPCODE_NUM		32
+ 
+@@ -103,6 +104,9 @@
+ #define NFP_FL_PUSH_VLAN_CFI		BIT(12)
+ #define NFP_FL_PUSH_VLAN_VID		GENMASK(11, 0)
+ 
++/* LAG ports */
++#define NFP_FL_LAG_OUT			0xC0DE0000
++
+ /* Tunnel ports */
+ #define NFP_FL_PORT_TYPE_TUN		0x50000000
+ #define NFP_FL_IPV4_TUNNEL_TYPE		GENMASK(7, 4)
+@@ -177,6 +181,15 @@ struct nfp_fl_pop_vlan {
+ 	__be16 reserved;
+ };
+ 
++struct nfp_fl_pre_lag {
++	struct nfp_fl_act_head head;
++	__be16 group_id;
++	u8 lag_version[3];
++	u8 instance;
++};
++
++#define NFP_FL_PRE_LAG_VER_OFF	8
++
+ struct nfp_fl_pre_tunnel {
+ 	struct nfp_fl_act_head head;
+ 	__be16 reserved;
+--- a/drivers/net/ethernet/netronome/nfp/flower/lag_conf.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/lag_conf.c
+@@ -184,6 +184,48 @@ nfp_fl_lag_find_group_for_master_with_la
+ 	return NULL;
+ }
+ 
++int nfp_flower_lag_populate_pre_action(struct nfp_app *app,
++				       struct net_device *master,
++				       struct nfp_fl_pre_lag *pre_act)
++{
++	struct nfp_flower_priv *priv = app->priv;
++	struct nfp_fl_lag_group *group = NULL;
++	__be32 temp_vers;
++
++	mutex_lock(&priv->nfp_lag.lock);
++	group = nfp_fl_lag_find_group_for_master_with_lag(&priv->nfp_lag,
++							  master);
++	if (!group) {
++		mutex_unlock(&priv->nfp_lag.lock);
++		return -ENOENT;
++	}
++
++	pre_act->group_id = cpu_to_be16(group->group_id);
++	temp_vers = cpu_to_be32(priv->nfp_lag.batch_ver <<
++				NFP_FL_PRE_LAG_VER_OFF);
++	memcpy(pre_act->lag_version, &temp_vers, 3);
++	pre_act->instance = group->group_inst;
++	mutex_unlock(&priv->nfp_lag.lock);
++
++	return 0;
++}
++
++int nfp_flower_lag_get_output_id(struct nfp_app *app, struct net_device *master)
++{
++	struct nfp_flower_priv *priv = app->priv;
++	struct nfp_fl_lag_group *group = NULL;
++	int group_id = -ENOENT;
++
++	mutex_lock(&priv->nfp_lag.lock);
++	group = nfp_fl_lag_find_group_for_master_with_lag(&priv->nfp_lag,
++							  master);
++	if (group)
++		group_id = group->group_id;
++	mutex_unlock(&priv->nfp_lag.lock);
++
++	return group_id;
++}
++
+ static int
+ nfp_fl_lag_config_group(struct nfp_fl_lag *lag, struct nfp_fl_lag_group *group,
+ 			struct net_device **active_members,
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -45,6 +45,7 @@
+ #include <linux/workqueue.h>
+ #include <linux/idr.h>
+ 
++struct nfp_fl_pre_lag;
+ struct net_device;
+ struct nfp_app;
+ 
+@@ -253,7 +254,8 @@ int nfp_flower_compile_flow_match(struct
+ 				  struct net_device *netdev,
+ 				  struct nfp_fl_payload *nfp_flow,
+ 				  enum nfp_flower_tun_type tun_type);
+-int nfp_flower_compile_action(struct tc_cls_flower_offload *flow,
++int nfp_flower_compile_action(struct nfp_app *app,
++			      struct tc_cls_flower_offload *flow,
+ 			      struct net_device *netdev,
+ 			      struct nfp_fl_payload *nfp_flow);
+ int nfp_compile_flow_metadata(struct nfp_app *app,
+@@ -284,5 +286,10 @@ void nfp_flower_lag_init(struct nfp_fl_l
+ void nfp_flower_lag_cleanup(struct nfp_fl_lag *lag);
+ int nfp_flower_lag_reset(struct nfp_fl_lag *lag);
+ bool nfp_flower_lag_unprocessed_msg(struct nfp_app *app, struct sk_buff *skb);
++int nfp_flower_lag_populate_pre_action(struct nfp_app *app,
++				       struct net_device *master,
++				       struct nfp_fl_pre_lag *pre_act);
++int nfp_flower_lag_get_output_id(struct nfp_app *app,
++				 struct net_device *master);
+ 
+ #endif
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@ -440,7 +440,7 @@ nfp_flower_add_offload(struct nfp_app *a
+ 	if (err)
+ 		goto err_destroy_flow;
+ 
+-	err = nfp_flower_compile_action(flow, netdev, flow_pay);
++	err = nfp_flower_compile_action(app, flow, netdev, flow_pay);
+ 	if (err)
+ 		goto err_destroy_flow;
+ 
