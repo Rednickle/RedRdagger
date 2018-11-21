@@ -1,0 +1,491 @@
+From: Jiong Wang <jiong.wang@netronome.com>
+Date: Fri, 18 May 2018 12:12:09 -0700
+Subject: nfp: bpf: support logic indirect shifts (BPF_[L|R]SH | BPF_X)
+Patch-mainline: v4.18-rc1
+Git-commit: 991f5b3651f6bb1cb5034f422e43f489e65f2701
+References: bsc#1109837
+
+For indirect shifts, shift amount is not specified as constant, NFP needs
+to get the shift amount through the low 5 bits of source A operand in
+PREV_ALU, therefore extra instructions are needed compared with shifts by
+constants.
+
+Because NFP is 32-bit, so we are using register pair for 64-bit shifts and
+therefore would need different instruction sequences depending on whether
+shift amount is less than 32 or not.
+
+NFP branch-on-bit-test instruction emitter is added by this patch and is
+used for efficient runtime check on shift amount. We'd think the shift
+amount is less than 32 if bit 5 is clear and greater or equal than 32
+otherwise. Shift amount is greater than or equal to 64 will result in
+undefined behavior.
+
+This patch also use range info to avoid generating unnecessary runtime code
+if we are certain shift amount is less than 32 or not.
+
+Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/jit.c      |  297 +++++++++++++++++++---
+ drivers/net/ethernet/netronome/nfp/bpf/main.h     |   28 ++
+ drivers/net/ethernet/netronome/nfp/bpf/offload.c  |    2 
+ drivers/net/ethernet/netronome/nfp/bpf/verifier.c |    8 
+ drivers/net/ethernet/netronome/nfp/nfp_asm.h      |   17 +
+ 5 files changed, 321 insertions(+), 31 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -212,6 +212,60 @@ emit_br(struct nfp_prog *nfp_prog, enum
+ }
+ 
+ static void
++__emit_br_bit(struct nfp_prog *nfp_prog, u16 areg, u16 breg, u16 addr, u8 defer,
++	      bool set, bool src_lmextn)
++{
++	u16 addr_lo, addr_hi;
++	u64 insn;
++
++	addr_lo = addr & (OP_BR_BIT_ADDR_LO >> __bf_shf(OP_BR_BIT_ADDR_LO));
++	addr_hi = addr != addr_lo;
++
++	insn = OP_BR_BIT_BASE |
++		FIELD_PREP(OP_BR_BIT_A_SRC, areg) |
++		FIELD_PREP(OP_BR_BIT_B_SRC, breg) |
++		FIELD_PREP(OP_BR_BIT_BV, set) |
++		FIELD_PREP(OP_BR_BIT_DEFBR, defer) |
++		FIELD_PREP(OP_BR_BIT_ADDR_LO, addr_lo) |
++		FIELD_PREP(OP_BR_BIT_ADDR_HI, addr_hi) |
++		FIELD_PREP(OP_BR_BIT_SRC_LMEXTN, src_lmextn);
++
++	nfp_prog_push(nfp_prog, insn);
++}
++
++static void
++emit_br_bit_relo(struct nfp_prog *nfp_prog, swreg src, u8 bit, u16 addr,
++		 u8 defer, bool set, enum nfp_relo_type relo)
++{
++	struct nfp_insn_re_regs reg;
++	int err;
++
++	/* NOTE: The bit to test is specified as an rotation amount, such that
++	 *	 the bit to test will be placed on the MSB of the result when
++	 *	 doing a rotate right. For bit X, we need right rotate X + 1.
++	 */
++	bit += 1;
++
++	err = swreg_to_restricted(reg_none(), src, reg_imm(bit), &reg, false);
++	if (err) {
++		nfp_prog->error = err;
++		return;
++	}
++
++	__emit_br_bit(nfp_prog, reg.areg, reg.breg, addr, defer, set,
++		      reg.src_lmextn);
++
++	nfp_prog->prog[nfp_prog->prog_len - 1] |=
++		FIELD_PREP(OP_RELO_TYPE, relo);
++}
++
++static void
++emit_br_bset(struct nfp_prog *nfp_prog, swreg src, u8 bit, u16 addr, u8 defer)
++{
++	emit_br_bit_relo(nfp_prog, src, bit, addr, defer, true, RELO_BR_REL);
++}
++
++static void
+ __emit_immed(struct nfp_prog *nfp_prog, u16 areg, u16 breg, u16 imm_hi,
+ 	     enum immed_width width, bool invert,
+ 	     enum immed_shift shift, bool wr_both,
+@@ -310,6 +364,19 @@ emit_shf(struct nfp_prog *nfp_prog, swre
+ }
+ 
+ static void
++emit_shf_indir(struct nfp_prog *nfp_prog, swreg dst,
++	       swreg lreg, enum shf_op op, swreg rreg, enum shf_sc sc)
++{
++	if (sc == SHF_SC_R_ROT) {
++		pr_err("indirect shift is not allowed on rotation\n");
++		nfp_prog->error = -EFAULT;
++		return;
++	}
++
++	emit_shf(nfp_prog, dst, lreg, op, rreg, sc, 0);
++}
++
++static void
+ __emit_alu(struct nfp_prog *nfp_prog, u16 dst, enum alu_dst_ab dst_ab,
+ 	   u16 areg, enum alu_op op, u16 breg, bool swap, bool wr_both,
+ 	   bool dst_lmextn, bool src_lmextn)
+@@ -1629,56 +1696,226 @@ static int neg_reg64(struct nfp_prog *nf
+ 	return 0;
+ }
+ 
+-static int shl_imm64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++/* Pseudo code:
++ *   if shift_amt >= 32
++ *     dst_high = dst_low << shift_amt[4:0]
++ *     dst_low = 0;
++ *   else
++ *     dst_high = (dst_high, dst_low) >> (32 - shift_amt)
++ *     dst_low = dst_low << shift_amt
++ *
++ * The indirect shift will use the same logic at runtime.
++ */
++static int __shl_imm64(struct nfp_prog *nfp_prog, u8 dst, u8 shift_amt)
+ {
+-	const struct bpf_insn *insn = &meta->insn;
+-	u8 dst = insn->dst_reg * 2;
+-
+-	if (insn->imm < 32) {
+-		emit_shf(nfp_prog, reg_both(dst + 1),
+-			 reg_a(dst + 1), SHF_OP_NONE, reg_b(dst),
+-			 SHF_SC_R_DSHF, 32 - insn->imm);
+-		emit_shf(nfp_prog, reg_both(dst),
+-			 reg_none(), SHF_OP_NONE, reg_b(dst),
+-			 SHF_SC_L_SHF, insn->imm);
+-	} else if (insn->imm == 32) {
++	if (shift_amt < 32) {
++		emit_shf(nfp_prog, reg_both(dst + 1), reg_a(dst + 1),
++			 SHF_OP_NONE, reg_b(dst), SHF_SC_R_DSHF,
++			 32 - shift_amt);
++		emit_shf(nfp_prog, reg_both(dst), reg_none(), SHF_OP_NONE,
++			 reg_b(dst), SHF_SC_L_SHF, shift_amt);
++	} else if (shift_amt == 32) {
+ 		wrp_reg_mov(nfp_prog, dst + 1, dst);
+ 		wrp_immed(nfp_prog, reg_both(dst), 0);
+-	} else if (insn->imm > 32) {
+-		emit_shf(nfp_prog, reg_both(dst + 1),
+-			 reg_none(), SHF_OP_NONE, reg_b(dst),
+-			 SHF_SC_L_SHF, insn->imm - 32);
++	} else if (shift_amt > 32) {
++		emit_shf(nfp_prog, reg_both(dst + 1), reg_none(), SHF_OP_NONE,
++			 reg_b(dst), SHF_SC_L_SHF, shift_amt - 32);
+ 		wrp_immed(nfp_prog, reg_both(dst), 0);
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static int shr_imm64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++static int shl_imm64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+ 	const struct bpf_insn *insn = &meta->insn;
+ 	u8 dst = insn->dst_reg * 2;
+ 
+-	if (insn->imm < 32) {
+-		emit_shf(nfp_prog, reg_both(dst),
+-			 reg_a(dst + 1), SHF_OP_NONE, reg_b(dst),
+-			 SHF_SC_R_DSHF, insn->imm);
+-		emit_shf(nfp_prog, reg_both(dst + 1),
+-			 reg_none(), SHF_OP_NONE, reg_b(dst + 1),
+-			 SHF_SC_R_SHF, insn->imm);
+-	} else if (insn->imm == 32) {
++	return __shl_imm64(nfp_prog, dst, insn->imm);
++}
++
++static void shl_reg64_lt32_high(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	emit_alu(nfp_prog, imm_both(nfp_prog), reg_imm(32), ALU_OP_SUB,
++		 reg_b(src));
++	emit_alu(nfp_prog, reg_none(), imm_a(nfp_prog), ALU_OP_OR, reg_imm(0));
++	emit_shf_indir(nfp_prog, reg_both(dst + 1), reg_a(dst + 1), SHF_OP_NONE,
++		       reg_b(dst), SHF_SC_R_DSHF);
++}
++
++/* NOTE: for indirect left shift, HIGH part should be calculated first. */
++static void shl_reg64_lt32_low(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	emit_alu(nfp_prog, reg_none(), reg_a(src), ALU_OP_OR, reg_imm(0));
++	emit_shf_indir(nfp_prog, reg_both(dst), reg_none(), SHF_OP_NONE,
++		       reg_b(dst), SHF_SC_L_SHF);
++}
++
++static void shl_reg64_lt32(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	shl_reg64_lt32_high(nfp_prog, dst, src);
++	shl_reg64_lt32_low(nfp_prog, dst, src);
++}
++
++static void shl_reg64_ge32(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	emit_alu(nfp_prog, reg_none(), reg_a(src), ALU_OP_OR, reg_imm(0));
++	emit_shf_indir(nfp_prog, reg_both(dst + 1), reg_none(), SHF_OP_NONE,
++		       reg_b(dst), SHF_SC_L_SHF);
++	wrp_immed(nfp_prog, reg_both(dst), 0);
++}
++
++static int shl_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	const struct bpf_insn *insn = &meta->insn;
++	u64 umin, umax;
++	u8 dst, src;
++
++	dst = insn->dst_reg * 2;
++	umin = meta->umin;
++	umax = meta->umax;
++	if (umin == umax)
++		return __shl_imm64(nfp_prog, dst, umin);
++
++	src = insn->src_reg * 2;
++	if (umax < 32) {
++		shl_reg64_lt32(nfp_prog, dst, src);
++	} else if (umin >= 32) {
++		shl_reg64_ge32(nfp_prog, dst, src);
++	} else {
++		/* Generate different instruction sequences depending on runtime
++		 * value of shift amount.
++		 */
++		u16 label_ge32, label_end;
++
++		label_ge32 = nfp_prog_current_offset(nfp_prog) + 7;
++		emit_br_bset(nfp_prog, reg_a(src), 5, label_ge32, 0);
++
++		shl_reg64_lt32_high(nfp_prog, dst, src);
++		label_end = nfp_prog_current_offset(nfp_prog) + 6;
++		emit_br(nfp_prog, BR_UNC, label_end, 2);
++		/* shl_reg64_lt32_low packed in delay slot. */
++		shl_reg64_lt32_low(nfp_prog, dst, src);
++
++		if (!nfp_prog_confirm_current_offset(nfp_prog, label_ge32))
++			return -EINVAL;
++		shl_reg64_ge32(nfp_prog, dst, src);
++
++		if (!nfp_prog_confirm_current_offset(nfp_prog, label_end))
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++/* Pseudo code:
++ *   if shift_amt >= 32
++ *     dst_high = 0;
++ *     dst_low = dst_high >> shift_amt[4:0]
++ *   else
++ *     dst_high = dst_high >> shift_amt
++ *     dst_low = (dst_high, dst_low) >> shift_amt
++ *
++ * The indirect shift will use the same logic at runtime.
++ */
++static int __shr_imm64(struct nfp_prog *nfp_prog, u8 dst, u8 shift_amt)
++{
++	if (shift_amt < 32) {
++		emit_shf(nfp_prog, reg_both(dst), reg_a(dst + 1), SHF_OP_NONE,
++			 reg_b(dst), SHF_SC_R_DSHF, shift_amt);
++		emit_shf(nfp_prog, reg_both(dst + 1), reg_none(), SHF_OP_NONE,
++			 reg_b(dst + 1), SHF_SC_R_SHF, shift_amt);
++	} else if (shift_amt == 32) {
+ 		wrp_reg_mov(nfp_prog, dst, dst + 1);
+ 		wrp_immed(nfp_prog, reg_both(dst + 1), 0);
+-	} else if (insn->imm > 32) {
+-		emit_shf(nfp_prog, reg_both(dst),
+-			 reg_none(), SHF_OP_NONE, reg_b(dst + 1),
+-			 SHF_SC_R_SHF, insn->imm - 32);
++	} else if (shift_amt > 32) {
++		emit_shf(nfp_prog, reg_both(dst), reg_none(), SHF_OP_NONE,
++			 reg_b(dst + 1), SHF_SC_R_SHF, shift_amt - 32);
+ 		wrp_immed(nfp_prog, reg_both(dst + 1), 0);
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static int shr_imm64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	const struct bpf_insn *insn = &meta->insn;
++	u8 dst = insn->dst_reg * 2;
++
++	return __shr_imm64(nfp_prog, dst, insn->imm);
++}
++
++/* NOTE: for indirect right shift, LOW part should be calculated first. */
++static void shr_reg64_lt32_high(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	emit_alu(nfp_prog, reg_none(), reg_a(src), ALU_OP_OR, reg_imm(0));
++	emit_shf_indir(nfp_prog, reg_both(dst + 1), reg_none(), SHF_OP_NONE,
++		       reg_b(dst + 1), SHF_SC_R_SHF);
++}
++
++static void shr_reg64_lt32_low(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	emit_alu(nfp_prog, reg_none(), reg_a(src), ALU_OP_OR, reg_imm(0));
++	emit_shf_indir(nfp_prog, reg_both(dst), reg_a(dst + 1), SHF_OP_NONE,
++		       reg_b(dst), SHF_SC_R_DSHF);
++}
++
++static void shr_reg64_lt32(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	shr_reg64_lt32_low(nfp_prog, dst, src);
++	shr_reg64_lt32_high(nfp_prog, dst, src);
++}
++
++static void shr_reg64_ge32(struct nfp_prog *nfp_prog, u8 dst, u8 src)
++{
++	emit_alu(nfp_prog, reg_none(), reg_a(src), ALU_OP_OR, reg_imm(0));
++	emit_shf_indir(nfp_prog, reg_both(dst), reg_none(), SHF_OP_NONE,
++		       reg_b(dst + 1), SHF_SC_R_SHF);
++	wrp_immed(nfp_prog, reg_both(dst + 1), 0);
++}
++
++static int shr_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	const struct bpf_insn *insn = &meta->insn;
++	u64 umin, umax;
++	u8 dst, src;
++
++	dst = insn->dst_reg * 2;
++	umin = meta->umin;
++	umax = meta->umax;
++	if (umin == umax)
++		return __shr_imm64(nfp_prog, dst, umin);
++
++	src = insn->src_reg * 2;
++	if (umax < 32) {
++		shr_reg64_lt32(nfp_prog, dst, src);
++	} else if (umin >= 32) {
++		shr_reg64_ge32(nfp_prog, dst, src);
++	} else {
++		/* Generate different instruction sequences depending on runtime
++		 * value of shift amount.
++		 */
++		u16 label_ge32, label_end;
++
++		label_ge32 = nfp_prog_current_offset(nfp_prog) + 6;
++		emit_br_bset(nfp_prog, reg_a(src), 5, label_ge32, 0);
++		shr_reg64_lt32_low(nfp_prog, dst, src);
++		label_end = nfp_prog_current_offset(nfp_prog) + 6;
++		emit_br(nfp_prog, BR_UNC, label_end, 2);
++		/* shr_reg64_lt32_high packed in delay slot. */
++		shr_reg64_lt32_high(nfp_prog, dst, src);
++
++		if (!nfp_prog_confirm_current_offset(nfp_prog, label_ge32))
++			return -EINVAL;
++		shr_reg64_ge32(nfp_prog, dst, src);
++
++		if (!nfp_prog_confirm_current_offset(nfp_prog, label_end))
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int mov_reg(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+ 	const struct bpf_insn *insn = &meta->insn;
+@@ -2501,7 +2738,9 @@ static const instr_cb_t instr_cb[256] =
+ 	[BPF_ALU64 | BPF_SUB | BPF_X] =	sub_reg64,
+ 	[BPF_ALU64 | BPF_SUB | BPF_K] =	sub_imm64,
+ 	[BPF_ALU64 | BPF_NEG] =		neg_reg64,
++	[BPF_ALU64 | BPF_LSH | BPF_X] =	shl_reg64,
+ 	[BPF_ALU64 | BPF_LSH | BPF_K] =	shl_imm64,
++	[BPF_ALU64 | BPF_RSH | BPF_X] =	shr_reg64,
+ 	[BPF_ALU64 | BPF_RSH | BPF_K] =	shr_imm64,
+ 	[BPF_ALU | BPF_MOV | BPF_X] =	mov_reg,
+ 	[BPF_ALU | BPF_MOV | BPF_K] =	mov_imm,
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -263,6 +263,8 @@ struct nfp_bpf_reg_state {
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+  * @arg2: arg2 for call instructions
++ * @umin: copy of core verifier umin_value.
++ * @umax: copy of core verifier umax_value.
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
+@@ -298,6 +300,13 @@ struct nfp_insn_meta {
+ 			struct bpf_reg_state arg1;
+ 			struct nfp_bpf_reg_state arg2;
+ 		};
++		/* We are interested in range info for some operands,
++		 * for example, the shift amount.
++		 */
++		struct {
++			u64 umin;
++			u64 umax;
++		};
+ 	};
+ 	unsigned int off;
+ 	unsigned short n;
+@@ -375,6 +384,25 @@ static inline bool is_mbpf_xadd(const st
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_XADD);
+ }
+ 
++static inline bool is_mbpf_indir_shift(const struct nfp_insn_meta *meta)
++{
++	u8 code = meta->insn.code;
++	bool is_alu, is_shift;
++	u8 opclass, opcode;
++
++	opclass = BPF_CLASS(code);
++	is_alu = opclass == BPF_ALU64 || opclass == BPF_ALU;
++	if (!is_alu)
++		return false;
++
++	opcode = BPF_OP(code);
++	is_shift = opcode == BPF_LSH || opcode == BPF_RSH || opcode == BPF_ARSH;
++	if (!is_shift)
++		return false;
++
++	return BPF_SRC(code) == BPF_X;
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@ -190,6 +190,8 @@ nfp_prog_prepare(struct nfp_prog *nfp_pr
+ 
+ 		meta->insn = prog[i];
+ 		meta->n = i;
++		if (is_mbpf_indir_shift(meta))
++			meta->umin = U64_MAX;
+ 
+ 		list_add_tail(&meta->l, &nfp_prog->insns);
+ 	}
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -551,6 +551,14 @@ nfp_verify_insn(struct bpf_verifier_env
+ 	if (is_mbpf_xadd(meta))
+ 		return nfp_bpf_check_xadd(nfp_prog, meta, env);
+ 
++	if (is_mbpf_indir_shift(meta)) {
++		const struct bpf_reg_state *sreg =
++			cur_regs(env) + meta->insn.src_reg;
++
++		meta->umin = min(meta->umin, sreg->umin_value);
++		meta->umax = max(meta->umax, sreg->umax_value);
++	}
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/ethernet/netronome/nfp/nfp_asm.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_asm.h
+@@ -72,8 +72,21 @@
+ #define OP_BR_ADDR_LO		0x007ffc00000ULL
+ #define OP_BR_ADDR_HI		0x10000000000ULL
+ 
+-#define nfp_is_br(_insn)				\
+-	(((_insn) & OP_BR_BASE_MASK) == OP_BR_BASE)
++#define OP_BR_BIT_BASE		0x0d000000000ULL
++#define OP_BR_BIT_BASE_MASK	0x0f800080300ULL
++#define OP_BR_BIT_A_SRC		0x000000000ffULL
++#define OP_BR_BIT_B_SRC		0x0000003fc00ULL
++#define OP_BR_BIT_BV		0x00000040000ULL
++#define OP_BR_BIT_SRC_LMEXTN	0x40000000000ULL
++#define OP_BR_BIT_DEFBR		OP_BR_DEFBR
++#define OP_BR_BIT_ADDR_LO	OP_BR_ADDR_LO
++#define OP_BR_BIT_ADDR_HI	OP_BR_ADDR_HI
++
++static inline bool nfp_is_br(u64 insn)
++{
++	return (insn & OP_BR_BASE_MASK) == OP_BR_BASE ||
++	       (insn & OP_BR_BIT_BASE_MASK) == OP_BR_BIT_BASE;
++}
+ 
+ enum br_mask {
+ 	BR_BEQ = 0x00,
