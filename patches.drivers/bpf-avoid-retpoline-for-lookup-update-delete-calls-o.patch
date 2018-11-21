@@ -1,0 +1,223 @@
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Sat, 2 Jun 2018 23:06:35 +0200
+Subject: bpf: avoid retpoline for lookup/update/delete calls on maps
+Patch-mainline: v4.18-rc1
+Git-commit: 09772d92cd5ad998b0d5f6f46cd1658f8cb698cf
+References: bsc#1109837
+
+While some of the BPF map lookup helpers provide a ->map_gen_lookup()
+callback for inlining the map lookup altogether it is not available
+for every map, so the remaining ones have to call bpf_map_lookup_elem()
+helper which does a dispatch to map->ops->map_lookup_elem(). In
+times of retpolines, this will control and trap speculative execution
+rather than letting it do its work for the indirect call and will
+therefore cause a slowdown. Likewise, bpf_map_update_elem() and
+bpf_map_delete_elem() do not have an inlined version and need to call
+into their map->ops->map_update_elem() resp. map->ops->map_delete_elem()
+handlers.
+
+Before:
+
+  # bpftool prog dump xlated id 1
+    0: (bf) r2 = r10
+    1: (07) r2 += -8
+    2: (7a) *(u64 *)(r2 +0) = 0
+    3: (18) r1 = map[id:1]
+    5: (85) call __htab_map_lookup_elem#232656
+    6: (15) if r0 == 0x0 goto pc+4
+    7: (71) r1 = *(u8 *)(r0 +35)
+    8: (55) if r1 != 0x0 goto pc+1
+    9: (72) *(u8 *)(r0 +35) = 1
+   10: (07) r0 += 56
+   11: (15) if r0 == 0x0 goto pc+4
+   12: (bf) r2 = r0
+   13: (18) r1 = map[id:1]
+   15: (85) call bpf_map_delete_elem#215008  <-- indirect call via
+   16: (95) exit                                 helper
+
+After:
+
+  # bpftool prog dump xlated id 1
+    0: (bf) r2 = r10
+    1: (07) r2 += -8
+    2: (7a) *(u64 *)(r2 +0) = 0
+    3: (18) r1 = map[id:1]
+    5: (85) call __htab_map_lookup_elem#233328
+    6: (15) if r0 == 0x0 goto pc+4
+    7: (71) r1 = *(u8 *)(r0 +35)
+    8: (55) if r1 != 0x0 goto pc+1
+    9: (72) *(u8 *)(r0 +35) = 1
+   10: (07) r0 += 56
+   11: (15) if r0 == 0x0 goto pc+4
+   12: (bf) r2 = r0
+   13: (18) r1 = map[id:1]
+   15: (85) call htab_lru_map_delete_elem#238240  <-- direct call
+   16: (95) exit
+
+In all three lookup/update/delete cases however we can use the actual
+address of the map callback directly if we find that there's only a
+single path with a map pointer leading to the helper call, meaning
+when the map pointer has not been poisoned from verifier side.
+Example code can be seen above for the delete case.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/filter.h |    3 ++
+ kernel/bpf/hashtab.c   |   12 ++++++--
+ kernel/bpf/verifier.c  |   68 +++++++++++++++++++++++++++++++++++--------------
+ 3 files changed, 61 insertions(+), 22 deletions(-)
+
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -303,6 +303,9 @@ struct xdp_buff;
+ 
+ /* Function call */
+ 
++#define BPF_CAST_CALL(x)					\
++		((u64 (*)(u64, u64, u64, u64, u64))(x))
++
+ #define BPF_EMIT_CALL(FUNC)					\
+ 	((struct bpf_insn) {					\
+ 		.code  = BPF_JMP | BPF_CALL,			\
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -503,7 +503,9 @@ static u32 htab_map_gen_lookup(struct bp
+ 	struct bpf_insn *insn = insn_buf;
+ 	const int ret = BPF_REG_0;
+ 
+-	*insn++ = BPF_EMIT_CALL((u64 (*)(u64, u64, u64, u64, u64))__htab_map_lookup_elem);
++	BUILD_BUG_ON(!__same_type(&__htab_map_lookup_elem,
++		     (void *(*)(struct bpf_map *map, void *key))NULL));
++	*insn++ = BPF_EMIT_CALL(BPF_CAST_CALL(__htab_map_lookup_elem));
+ 	*insn++ = BPF_JMP_IMM(BPF_JEQ, ret, 0, 1);
+ 	*insn++ = BPF_ALU64_IMM(BPF_ADD, ret,
+ 				offsetof(struct htab_elem, key) +
+@@ -530,7 +532,9 @@ static u32 htab_lru_map_gen_lookup(struc
+ 	const int ret = BPF_REG_0;
+ 	const int ref_reg = BPF_REG_1;
+ 
+-	*insn++ = BPF_EMIT_CALL((u64 (*)(u64, u64, u64, u64, u64))__htab_map_lookup_elem);
++	BUILD_BUG_ON(!__same_type(&__htab_map_lookup_elem,
++		     (void *(*)(struct bpf_map *map, void *key))NULL));
++	*insn++ = BPF_EMIT_CALL(BPF_CAST_CALL(__htab_map_lookup_elem));
+ 	*insn++ = BPF_JMP_IMM(BPF_JEQ, ret, 0, 4);
+ 	*insn++ = BPF_LDX_MEM(BPF_B, ref_reg, ret,
+ 			      offsetof(struct htab_elem, lru_node) +
+@@ -1369,7 +1373,9 @@ static u32 htab_of_map_gen_lookup(struct
+ 	struct bpf_insn *insn = insn_buf;
+ 	const int ret = BPF_REG_0;
+ 
+-	*insn++ = BPF_EMIT_CALL((u64 (*)(u64, u64, u64, u64, u64))__htab_map_lookup_elem);
++	BUILD_BUG_ON(!__same_type(&__htab_map_lookup_elem,
++		     (void *(*)(struct bpf_map *map, void *key))NULL));
++	*insn++ = BPF_EMIT_CALL(BPF_CAST_CALL(__htab_map_lookup_elem));
+ 	*insn++ = BPF_JMP_IMM(BPF_JEQ, ret, 0, 2);
+ 	*insn++ = BPF_ALU64_IMM(BPF_ADD, ret,
+ 				offsetof(struct htab_elem, key) +
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -2394,8 +2394,11 @@ record_func_map(struct bpf_verifier_env
+ 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+ 
+ 	if (func_id != BPF_FUNC_tail_call &&
+-	    func_id != BPF_FUNC_map_lookup_elem)
++	    func_id != BPF_FUNC_map_lookup_elem &&
++	    func_id != BPF_FUNC_map_update_elem &&
++	    func_id != BPF_FUNC_map_delete_elem)
+ 		return 0;
++
+ 	if (meta->map_ptr == NULL) {
+ 		verbose(env, "kernel subsystem misconfigured verifier\n");
+ 		return -EINVAL;
+@@ -5540,6 +5543,7 @@ static int fixup_bpf_calls(struct bpf_ve
+ 	struct bpf_insn *insn = prog->insnsi;
+ 	const struct bpf_func_proto *fn;
+ 	const int insn_cnt = prog->len;
++	const struct bpf_map_ops *ops;
+ 	struct bpf_insn_aux_data *aux;
+ 	struct bpf_insn insn_buf[16];
+ 	struct bpf_prog *new_prog;
+@@ -5667,35 +5671,61 @@ static int fixup_bpf_calls(struct bpf_ve
+ 		}
+ 
+ 		/* BPF_EMIT_CALL() assumptions in some of the map_gen_lookup
+-		 * handlers are currently limited to 64 bit only.
++		 * and other inlining handlers are currently limited to 64 bit
++		 * only.
+ 		 */
+ 		if (prog->jit_requested && BITS_PER_LONG == 64 &&
+-		    insn->imm == BPF_FUNC_map_lookup_elem) {
++		    (insn->imm == BPF_FUNC_map_lookup_elem ||
++		     insn->imm == BPF_FUNC_map_update_elem ||
++		     insn->imm == BPF_FUNC_map_delete_elem)) {
+ 			aux = &env->insn_aux_data[i + delta];
+ 			if (bpf_map_ptr_poisoned(aux))
+ 				goto patch_call_imm;
+ 
+ 			map_ptr = BPF_MAP_PTR(aux->map_state);
+-			if (!map_ptr->ops->map_gen_lookup)
+-				goto patch_call_imm;
++			ops = map_ptr->ops;
++			if (insn->imm == BPF_FUNC_map_lookup_elem &&
++			    ops->map_gen_lookup) {
++				cnt = ops->map_gen_lookup(map_ptr, insn_buf);
++				if (cnt == 0 || cnt >= ARRAY_SIZE(insn_buf)) {
++					verbose(env, "bpf verifier is misconfigured\n");
++					return -EINVAL;
++				}
+ 
+-			cnt = map_ptr->ops->map_gen_lookup(map_ptr, insn_buf);
+-			if (cnt == 0 || cnt >= ARRAY_SIZE(insn_buf)) {
+-				verbose(env, "bpf verifier is misconfigured\n");
+-				return -EINVAL;
++				new_prog = bpf_patch_insn_data(env, i + delta,
++							       insn_buf, cnt);
++				if (!new_prog)
++					return -ENOMEM;
++
++				delta    += cnt - 1;
++				env->prog = prog = new_prog;
++				insn      = new_prog->insnsi + i + delta;
++				continue;
+ 			}
+ 
+-			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf,
+-						       cnt);
+-			if (!new_prog)
+-				return -ENOMEM;
+-
+-			delta += cnt - 1;
++			BUILD_BUG_ON(!__same_type(ops->map_lookup_elem,
++				     (void *(*)(struct bpf_map *map, void *key))NULL));
++			BUILD_BUG_ON(!__same_type(ops->map_delete_elem,
++				     (int (*)(struct bpf_map *map, void *key))NULL));
++			BUILD_BUG_ON(!__same_type(ops->map_update_elem,
++				     (int (*)(struct bpf_map *map, void *key, void *value,
++					      u64 flags))NULL));
++			switch (insn->imm) {
++			case BPF_FUNC_map_lookup_elem:
++				insn->imm = BPF_CAST_CALL(ops->map_lookup_elem) -
++					    __bpf_call_base;
++				continue;
++			case BPF_FUNC_map_update_elem:
++				insn->imm = BPF_CAST_CALL(ops->map_update_elem) -
++					    __bpf_call_base;
++				continue;
++			case BPF_FUNC_map_delete_elem:
++				insn->imm = BPF_CAST_CALL(ops->map_delete_elem) -
++					    __bpf_call_base;
++				continue;
++			}
+ 
+-			/* keep walking new program and skip insns we just inserted */
+-			env->prog = prog = new_prog;
+-			insn      = new_prog->insnsi + i + delta;
+-			continue;
++			goto patch_call_imm;
+ 		}
+ 
+ 		if (insn->imm == BPF_FUNC_redirect_map) {
