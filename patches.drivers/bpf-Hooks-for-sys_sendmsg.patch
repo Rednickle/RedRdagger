@@ -1,0 +1,388 @@
+From: Andrey Ignatov <rdna@fb.com>
+Date: Fri, 25 May 2018 08:55:23 -0700
+Subject: bpf: Hooks for sys_sendmsg
+Patch-mainline: v4.18-rc1
+Git-commit: 1cedee13d25ab118d325f95588c1a084e9317229
+References: bsc#1109837
+
+In addition to already existing BPF hooks for sys_bind and sys_connect,
+the patch provides new hooks for sys_sendmsg.
+
+It leverages existing BPF program type `BPF_PROG_TYPE_CGROUP_SOCK_ADDR`
+that provides access to socket itlself (properties like family, type,
+protocol) and user-passed `struct sockaddr *` so that BPF program can
+override destination IP and port for system calls such as sendto(2) or
+sendmsg(2) and/or assign source IP to the socket.
+
+The hooks are implemented as two new attach types:
+`BPF_CGROUP_UDP4_SENDMSG` and `BPF_CGROUP_UDP6_SENDMSG` for UDPv4 and
+UDPv6 correspondingly.
+
+UDPv4 and UDPv6 separate attach types for same reason as sys_bind and
+sys_connect hooks, i.e. to prevent reading from / writing to e.g.
+user_ip6 fields when user passes sockaddr_in since it'd be out-of-bound.
+
+The difference with already existing hooks is sys_sendmsg are
+implemented only for unconnected UDP.
+
+For TCP it doesn't make sense to change user-provided `struct sockaddr *`
+at sendto(2)/sendmsg(2) time since socket either was already connected
+and has source/destination set or wasn't connected and call to
+sendto(2)/sendmsg(2) would lead to ENOTCONN anyway.
+
+Connected UDP is already handled by sys_connect hooks that can override
+source/destination at connect time and use fast-path later, i.e. these
+hooks don't affect UDP fast-path.
+
+Rewriting source IP is implemented differently than that in sys_connect
+hooks. When sys_sendmsg is used with unconnected UDP it doesn't work to
+just bind socket to desired local IP address since source IP can be set
+on per-packet basis by using ancillary data (cmsg(3)). So no matter if
+socket is bound or not, source IP has to be rewritten on every call to
+sys_sendmsg.
+
+To do so two new fields are added to UAPI `struct bpf_sock_addr`;
+* `msg_src_ip4` to set source IPv4 for UDPv4;
+* `msg_src_ip6` to set source IPv6 for UDPv6.
+
+Signed-off-by: Andrey Ignatov <rdna@fb.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf-cgroup.h |   23 +++++++++++++++++------
+ include/linux/filter.h     |    1 +
+ include/uapi/linux/bpf.h   |    8 ++++++++
+ kernel/bpf/cgroup.c        |   11 ++++++++++-
+ kernel/bpf/syscall.c       |    8 ++++++++
+ net/core/filter.c          |   39 +++++++++++++++++++++++++++++++++++++++
+ net/ipv4/udp.c             |   20 ++++++++++++++++++--
+ net/ipv6/udp.c             |   24 ++++++++++++++++++++++++
+ 8 files changed, 125 insertions(+), 9 deletions(-)
+
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -65,7 +65,8 @@ int __cgroup_bpf_run_filter_sk(struct so
+ 
+ int __cgroup_bpf_run_filter_sock_addr(struct sock *sk,
+ 				      struct sockaddr *uaddr,
+-				      enum bpf_attach_type type);
++				      enum bpf_attach_type type,
++				      void *t_ctx);
+ 
+ int __cgroup_bpf_run_filter_sock_ops(struct sock *sk,
+ 				     struct bpf_sock_ops_kern *sock_ops,
+@@ -119,16 +120,18 @@ int __cgroup_bpf_check_dev_permission(sh
+ ({									       \
+ 	int __ret = 0;							       \
+ 	if (cgroup_bpf_enabled)						       \
+-		__ret = __cgroup_bpf_run_filter_sock_addr(sk, uaddr, type);    \
++		__ret = __cgroup_bpf_run_filter_sock_addr(sk, uaddr, type,     \
++							  NULL);	       \
+ 	__ret;								       \
+ })
+ 
+-#define BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, type)			       \
++#define BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, type, t_ctx)		       \
+ ({									       \
+ 	int __ret = 0;							       \
+ 	if (cgroup_bpf_enabled)	{					       \
+ 		lock_sock(sk);						       \
+-		__ret = __cgroup_bpf_run_filter_sock_addr(sk, uaddr, type);    \
++		__ret = __cgroup_bpf_run_filter_sock_addr(sk, uaddr, type,     \
++							  t_ctx);	       \
+ 		release_sock(sk);					       \
+ 	}								       \
+ 	__ret;								       \
+@@ -150,10 +153,16 @@ int __cgroup_bpf_check_dev_permission(sh
+ 	BPF_CGROUP_RUN_SA_PROG(sk, uaddr, BPF_CGROUP_INET6_CONNECT)
+ 
+ #define BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr)		       \
+-	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET4_CONNECT)
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET4_CONNECT, NULL)
+ 
+ #define BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr)		       \
+-	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET6_CONNECT)
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_INET6_CONNECT, NULL)
++
++#define BPF_CGROUP_RUN_PROG_UDP4_SENDMSG_LOCK(sk, uaddr, t_ctx)		       \
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_UDP4_SENDMSG, t_ctx)
++
++#define BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk, uaddr, t_ctx)		       \
++	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_UDP6_SENDMSG, t_ctx)
+ 
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops)				       \
+ ({									       \
+@@ -196,6 +205,8 @@ static inline int cgroup_bpf_inherit(str
+ #define BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET6_CONNECT(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_UDP4_SENDMSG_LOCK(sk, uaddr, t_ctx) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk, uaddr, t_ctx) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type,major,minor,access) ({ 0; })
+ 
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1009,6 +1009,7 @@ struct bpf_sock_addr_kern {
+ 	 * only two (src and dst) are available at convert_ctx_access time
+ 	 */
+ 	u64 tmp_reg;
++	void *t_ctx;	/* Attach type specific context. */
+ };
+ 
+ struct bpf_sock_ops_kern {
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -157,6 +157,8 @@ enum bpf_attach_type {
+ 	BPF_CGROUP_INET6_CONNECT,
+ 	BPF_CGROUP_INET4_POST_BIND,
+ 	BPF_CGROUP_INET6_POST_BIND,
++	BPF_CGROUP_UDP4_SENDMSG,
++	BPF_CGROUP_UDP6_SENDMSG,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+@@ -2221,6 +2223,12 @@ struct bpf_sock_addr {
+ 	__u32 family;		/* Allows 4-byte read, but no write */
+ 	__u32 type;		/* Allows 4-byte read, but no write */
+ 	__u32 protocol;		/* Allows 4-byte read, but no write */
++	__u32 msg_src_ip4;	/* Allows 1,2,4-byte read an 4-byte write.
++				 * Stored in network byte order.
++				 */
++	__u32 msg_src_ip6[4];	/* Allows 1,2,4-byte read an 4-byte write.
++				 * Stored in network byte order.
++				 */
+ };
+ 
+ /* User bpf_sock_ops struct to access socket values and specify request ops
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -500,6 +500,7 @@ EXPORT_SYMBOL(__cgroup_bpf_run_filter_sk
+  * @sk: sock struct that will use sockaddr
+  * @uaddr: sockaddr struct provided by user
+  * @type: The type of program to be exectuted
++ * @t_ctx: Pointer to attach type specific context
+  *
+  * socket is expected to be of type INET or INET6.
+  *
+@@ -508,12 +509,15 @@ EXPORT_SYMBOL(__cgroup_bpf_run_filter_sk
+  */
+ int __cgroup_bpf_run_filter_sock_addr(struct sock *sk,
+ 				      struct sockaddr *uaddr,
+-				      enum bpf_attach_type type)
++				      enum bpf_attach_type type,
++				      void *t_ctx)
+ {
+ 	struct bpf_sock_addr_kern ctx = {
+ 		.sk = sk,
+ 		.uaddr = uaddr,
++		.t_ctx = t_ctx,
+ 	};
++	struct sockaddr_storage unspec;
+ 	struct cgroup *cgrp;
+ 	int ret;
+ 
+@@ -523,6 +527,11 @@ int __cgroup_bpf_run_filter_sock_addr(st
+ 	if (sk->sk_family != AF_INET && sk->sk_family != AF_INET6)
+ 		return 0;
+ 
++	if (!ctx.uaddr) {
++		memset(&unspec, 0, sizeof(unspec));
++		ctx.uaddr = (struct sockaddr *)&unspec;
++	}
++
+ 	cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
+ 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
+ 
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1227,6 +1227,8 @@ bpf_prog_load_check_attach_type(enum bpf
+ 		case BPF_CGROUP_INET6_BIND:
+ 		case BPF_CGROUP_INET4_CONNECT:
+ 		case BPF_CGROUP_INET6_CONNECT:
++		case BPF_CGROUP_UDP4_SENDMSG:
++		case BPF_CGROUP_UDP6_SENDMSG:
+ 			return 0;
+ 		default:
+ 			return -EINVAL;
+@@ -1537,6 +1539,8 @@ static int bpf_prog_attach(const union b
+ 	case BPF_CGROUP_INET6_BIND:
+ 	case BPF_CGROUP_INET4_CONNECT:
+ 	case BPF_CGROUP_INET6_CONNECT:
++	case BPF_CGROUP_UDP4_SENDMSG:
++	case BPF_CGROUP_UDP6_SENDMSG:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
+ 		break;
+ 	case BPF_CGROUP_SOCK_OPS:
+@@ -1607,6 +1611,8 @@ static int bpf_prog_detach(const union b
+ 	case BPF_CGROUP_INET6_BIND:
+ 	case BPF_CGROUP_INET4_CONNECT:
+ 	case BPF_CGROUP_INET6_CONNECT:
++	case BPF_CGROUP_UDP4_SENDMSG:
++	case BPF_CGROUP_UDP6_SENDMSG:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
+ 		break;
+ 	case BPF_CGROUP_SOCK_OPS:
+@@ -1664,6 +1670,8 @@ static int bpf_prog_query(const union bp
+ 	case BPF_CGROUP_INET6_POST_BIND:
+ 	case BPF_CGROUP_INET4_CONNECT:
+ 	case BPF_CGROUP_INET6_CONNECT:
++	case BPF_CGROUP_UDP4_SENDMSG:
++	case BPF_CGROUP_UDP6_SENDMSG:
+ 	case BPF_CGROUP_SOCK_OPS:
+ 	case BPF_CGROUP_DEVICE:
+ 		break;
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -4725,6 +4725,7 @@ static bool sock_addr_is_valid_access(in
+ 		switch (prog->expected_attach_type) {
+ 		case BPF_CGROUP_INET4_BIND:
+ 		case BPF_CGROUP_INET4_CONNECT:
++		case BPF_CGROUP_UDP4_SENDMSG:
+ 			break;
+ 		default:
+ 			return false;
+@@ -4734,6 +4735,24 @@ static bool sock_addr_is_valid_access(in
+ 		switch (prog->expected_attach_type) {
+ 		case BPF_CGROUP_INET6_BIND:
+ 		case BPF_CGROUP_INET6_CONNECT:
++		case BPF_CGROUP_UDP6_SENDMSG:
++			break;
++		default:
++			return false;
++		}
++		break;
++	case bpf_ctx_range(struct bpf_sock_addr, msg_src_ip4):
++		switch (prog->expected_attach_type) {
++		case BPF_CGROUP_UDP4_SENDMSG:
++			break;
++		default:
++			return false;
++		}
++		break;
++	case bpf_ctx_range_till(struct bpf_sock_addr, msg_src_ip6[0],
++				msg_src_ip6[3]):
++		switch (prog->expected_attach_type) {
++		case BPF_CGROUP_UDP6_SENDMSG:
+ 			break;
+ 		default:
+ 			return false;
+@@ -4744,6 +4763,9 @@ static bool sock_addr_is_valid_access(in
+ 	switch (off) {
+ 	case bpf_ctx_range(struct bpf_sock_addr, user_ip4):
+ 	case bpf_ctx_range_till(struct bpf_sock_addr, user_ip6[0], user_ip6[3]):
++	case bpf_ctx_range(struct bpf_sock_addr, msg_src_ip4):
++	case bpf_ctx_range_till(struct bpf_sock_addr, msg_src_ip6[0],
++				msg_src_ip6[3]):
+ 		/* Only narrow read access allowed for now. */
+ 		if (type == BPF_READ) {
+ 			bpf_ctx_record_field_size(info, size_default);
+@@ -5498,6 +5520,23 @@ static u32 sock_addr_convert_ctx_access(
+ 		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg,
+ 					SK_FL_PROTO_SHIFT);
+ 		break;
++
++	case offsetof(struct bpf_sock_addr, msg_src_ip4):
++		/* Treat t_ctx as struct in_addr for msg_src_ip4. */
++		SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD_SIZE_OFF(
++			struct bpf_sock_addr_kern, struct in_addr, t_ctx,
++			s_addr, BPF_SIZE(si->code), 0, tmp_reg);
++		break;
++
++	case bpf_ctx_range_till(struct bpf_sock_addr, msg_src_ip6[0],
++				msg_src_ip6[3]):
++		off = si->off;
++		off -= offsetof(struct bpf_sock_addr, msg_src_ip6[0]);
++		/* Treat t_ctx as struct in6_addr for msg_src_ip6. */
++		SOCK_ADDR_LOAD_OR_STORE_NESTED_FIELD_SIZE_OFF(
++			struct bpf_sock_addr_kern, struct in6_addr, t_ctx,
++			s6_addr32[0], BPF_SIZE(si->code), off, tmp_reg);
++		break;
+ 	}
+ 
+ 	return insn - insn_buf;
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -860,6 +860,7 @@ int udp_sendmsg(struct sock *sk, struct
+ {
+ 	struct inet_sock *inet = inet_sk(sk);
+ 	struct udp_sock *up = udp_sk(sk);
++	DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
+ 	struct flowi4 fl4_stack;
+ 	struct flowi4 *fl4;
+ 	int ulen = len;
+@@ -914,8 +915,7 @@ int udp_sendmsg(struct sock *sk, struct
+ 	/*
+ 	 *	Get and verify the address.
+ 	 */
+-	if (msg->msg_name) {
+-		DECLARE_SOCKADDR(struct sockaddr_in *, usin, msg->msg_name);
++	if (usin) {
+ 		if (msg->msg_namelen < sizeof(*usin))
+ 			return -EINVAL;
+ 		if (usin->sin_family != AF_INET) {
+@@ -965,6 +965,22 @@ int udp_sendmsg(struct sock *sk, struct
+ 		rcu_read_unlock();
+ 	}
+ 
++	if (cgroup_bpf_enabled && !connected) {
++		err = BPF_CGROUP_RUN_PROG_UDP4_SENDMSG_LOCK(sk,
++					    (struct sockaddr *)usin, &ipc.addr);
++		if (err)
++			goto out_free;
++		if (usin) {
++			if (usin->sin_port == 0) {
++				/* BPF program set invalid port. Reject it. */
++				err = -EINVAL;
++				goto out_free;
++			}
++			daddr = usin->sin_addr.s_addr;
++			dport = usin->sin_port;
++		}
++	}
++
+ 	saddr = ipc.addr;
+ 	ipc.addr = faddr = daddr;
+ 
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -1302,6 +1302,29 @@ do_udp_sendmsg:
+ 		fl6.saddr = np->saddr;
+ 	fl6.fl6_sport = inet->inet_sport;
+ 
++	if (cgroup_bpf_enabled && !connected) {
++		err = BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk,
++					   (struct sockaddr *)sin6, &fl6.saddr);
++		if (err)
++			goto out_no_dst;
++		if (sin6) {
++			if (ipv6_addr_v4mapped(&sin6->sin6_addr)) {
++				/* BPF program rewrote IPv6-only by IPv4-mapped
++				 * IPv6. It's currently unsupported.
++				 */
++				err = -ENOTSUPP;
++				goto out_no_dst;
++			}
++			if (sin6->sin6_port == 0) {
++				/* BPF program set invalid port. Reject it. */
++				err = -EINVAL;
++				goto out_no_dst;
++			}
++			fl6.fl6_dport = sin6->sin6_port;
++			fl6.daddr = sin6->sin6_addr;
++		}
++	}
++
+ 	final_p = fl6_update_dst(&fl6, opt, &final);
+ 	if (final_p)
+ 		connected = 0;
+@@ -1397,6 +1420,7 @@ release_dst:
+ 
+ out:
+ 	dst_release(dst);
++out_no_dst:
+ 	fl6_sock_release(flowlabel);
+ 	txopt_put(opt_to_free);
+ 	if (!err)

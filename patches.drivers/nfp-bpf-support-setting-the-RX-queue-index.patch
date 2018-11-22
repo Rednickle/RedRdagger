@@ -1,0 +1,255 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Tue, 8 May 2018 19:37:07 -0700
+Subject: nfp: bpf: support setting the RX queue index
+Patch-mainline: v4.18-rc1
+Git-commit: d985888faae6588c8ce9e45ad1e4a3ab5f0376b4
+References: bsc#1109837
+
+BPF has access to all internal FW datapath structures.  Including
+the structure containing RX queue selection.  With little coordination
+with the datapath we can let the offloaded BPF select the RX queue.
+We just need a way to tell the datapath that queue selection has already
+been done and it shouldn't overwrite it.  Define a bit to tell datapath
+BPF already selected a queue (QSEL_SET), if the selected queue is not
+enabled (>= number of enabled queues) datapath will perform normal RSS.
+
+BPF queue selection on the NIC can be used to replace standard
+datapath RSS with fully programmable BPF/XDP RSS.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/fw.h       |    1 
+ drivers/net/ethernet/netronome/nfp/bpf/jit.c      |   47 ++++++++++++++++++++++
+ drivers/net/ethernet/netronome/nfp/bpf/main.c     |   11 +++++
+ drivers/net/ethernet/netronome/nfp/bpf/main.h     |    8 +++
+ drivers/net/ethernet/netronome/nfp/bpf/verifier.c |   28 ++++++++++++-
+ drivers/net/ethernet/netronome/nfp/nfp_asm.h      |   22 +++++-----
+ 6 files changed, 105 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/fw.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/fw.h
+@@ -50,6 +50,7 @@ enum bpf_cap_tlv_type {
+ 	NFP_BPF_CAP_TYPE_ADJUST_HEAD	= 2,
+ 	NFP_BPF_CAP_TYPE_MAPS		= 3,
+ 	NFP_BPF_CAP_TYPE_RANDOM		= 4,
++	NFP_BPF_CAP_TYPE_QUEUE_SELECT	= 5,
+ };
+ 
+ struct nfp_bpf_cap_tlv_func {
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -42,6 +42,7 @@
+ 
+ #include "main.h"
+ #include "../nfp_asm.h"
++#include "../nfp_net_ctrl.h"
+ 
+ /* --- NFP prog --- */
+ /* Foreach "multiple" entries macros provide pos and next<n> pointers.
+@@ -1470,6 +1471,38 @@ nfp_perf_event_output(struct nfp_prog *n
+ 	return 0;
+ }
+ 
++static int
++nfp_queue_select(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	u32 jmp_tgt;
++
++	jmp_tgt = nfp_prog_current_offset(nfp_prog) + 5;
++
++	/* Make sure the queue id fits into FW field */
++	emit_alu(nfp_prog, reg_none(), reg_a(meta->insn.src_reg * 2),
++		 ALU_OP_AND_NOT_B, reg_imm(0xff));
++	emit_br(nfp_prog, BR_BEQ, jmp_tgt, 2);
++
++	/* Set the 'queue selected' bit and the queue value */
++	emit_shf(nfp_prog, pv_qsel_set(nfp_prog),
++		 pv_qsel_set(nfp_prog), SHF_OP_OR, reg_imm(1),
++		 SHF_SC_L_SHF, PKT_VEL_QSEL_SET_BIT);
++	emit_ld_field(nfp_prog,
++		      pv_qsel_val(nfp_prog), 0x1, reg_b(meta->insn.src_reg * 2),
++		      SHF_SC_NONE, 0);
++	/* Delay slots end here, we will jump over next instruction if queue
++	 * value fits into the field.
++	 */
++	emit_ld_field(nfp_prog,
++		      pv_qsel_val(nfp_prog), 0x1, reg_imm(NFP_NET_RXR_MAX),
++		      SHF_SC_NONE, 0);
++
++	if (!nfp_prog_confirm_current_offset(nfp_prog, jmp_tgt))
++		return -EINVAL;
++
++	return 0;
++}
++
+ /* --- Callbacks --- */
+ static int mov_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+@@ -2160,6 +2193,17 @@ mem_stx_stack(struct nfp_prog *nfp_prog,
+ 			    false, wrp_lmem_store);
+ }
+ 
++static int mem_stx_xdp(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	switch (meta->insn.off) {
++	case offsetof(struct xdp_md, rx_queue_index):
++		return nfp_queue_select(nfp_prog, meta);
++	}
++
++	WARN_ON_ONCE(1); /* verifier should have rejected bad accesses */
++	return -EOPNOTSUPP;
++}
++
+ static int
+ mem_stx(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 	unsigned int size)
+@@ -2186,6 +2230,9 @@ static int mem_stx2(struct nfp_prog *nfp
+ 
+ static int mem_stx4(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
++	if (meta->ptr.type == PTR_TO_CTX)
++		if (nfp_prog->type == BPF_PROG_TYPE_XDP)
++			return mem_stx_xdp(nfp_prog, meta);
+ 	return mem_stx(nfp_prog, meta, 4);
+ }
+ 
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -334,6 +334,13 @@ nfp_bpf_parse_cap_random(struct nfp_app_
+ 	return 0;
+ }
+ 
++static int
++nfp_bpf_parse_cap_qsel(struct nfp_app_bpf *bpf, void __iomem *value, u32 length)
++{
++	bpf->queue_select = true;
++	return 0;
++}
++
+ static int nfp_bpf_parse_capabilities(struct nfp_app *app)
+ {
+ 	struct nfp_cpp *cpp = app->pf->cpp;
+@@ -376,6 +383,10 @@ static int nfp_bpf_parse_capabilities(st
+ 			if (nfp_bpf_parse_cap_random(app->priv, value, length))
+ 				goto err_release_free;
+ 			break;
++		case NFP_BPF_CAP_TYPE_QUEUE_SELECT:
++			if (nfp_bpf_parse_cap_qsel(app->priv, value, length))
++				goto err_release_free;
++			break;
+ 		default:
+ 			nfp_dbg(cpp, "unknown BPF capability: %d\n", type);
+ 			break;
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -82,10 +82,16 @@ enum static_regs {
+ enum pkt_vec {
+ 	PKT_VEC_PKT_LEN		= 0,
+ 	PKT_VEC_PKT_PTR		= 2,
++	PKT_VEC_QSEL_SET	= 4,
++	PKT_VEC_QSEL_VAL	= 6,
+ };
+ 
++#define PKT_VEL_QSEL_SET_BIT	4
++
+ #define pv_len(np)	reg_lm(1, PKT_VEC_PKT_LEN)
+ #define pv_ctm_ptr(np)	reg_lm(1, PKT_VEC_PKT_PTR)
++#define pv_qsel_set(np)	reg_lm(1, PKT_VEC_QSEL_SET)
++#define pv_qsel_val(np)	reg_lm(1, PKT_VEC_QSEL_VAL)
+ 
+ #define stack_reg(np)	reg_a(STATIC_REG_STACK)
+ #define stack_imm(np)	imm_b(np)
+@@ -139,6 +145,7 @@ enum pkt_vec {
+  * @helpers.perf_event_output:	output perf event to a ring buffer
+  *
+  * @pseudo_random:	FW initialized the pseudo-random machinery (CSRs)
++ * @queue_select:	BPF can set the RX queue ID in packet vector
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -181,6 +188,7 @@ struct nfp_app_bpf {
+ 	} helpers;
+ 
+ 	bool pseudo_random;
++	bool queue_select;
+ };
+ 
+ enum nfp_bpf_map_use {
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -468,6 +468,30 @@ nfp_bpf_check_ptr(struct nfp_prog *nfp_p
+ }
+ 
+ static int
++nfp_bpf_check_store(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
++		    struct bpf_verifier_env *env)
++{
++	const struct bpf_reg_state *reg = cur_regs(env) + meta->insn.dst_reg;
++
++	if (reg->type == PTR_TO_CTX) {
++		if (nfp_prog->type == BPF_PROG_TYPE_XDP) {
++			/* XDP ctx accesses must be 4B in size */
++			switch (meta->insn.off) {
++			case offsetof(struct xdp_md, rx_queue_index):
++				if (nfp_prog->bpf->queue_select)
++					goto exit_check_ptr;
++				pr_vlog(env, "queue selection not supported by FW\n");
++				return -EOPNOTSUPP;
++			}
++		}
++		pr_vlog(env, "unsupported store to context field\n");
++		return -EOPNOTSUPP;
++	}
++exit_check_ptr:
++	return nfp_bpf_check_ptr(nfp_prog, meta, env, meta->insn.dst_reg);
++}
++
++static int
+ nfp_bpf_check_xadd(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 		   struct bpf_verifier_env *env)
+ {
+@@ -522,8 +546,8 @@ nfp_verify_insn(struct bpf_verifier_env
+ 		return nfp_bpf_check_ptr(nfp_prog, meta, env,
+ 					 meta->insn.src_reg);
+ 	if (is_mbpf_store(meta))
+-		return nfp_bpf_check_ptr(nfp_prog, meta, env,
+-					 meta->insn.dst_reg);
++		return nfp_bpf_check_store(nfp_prog, meta, env);
++
+ 	if (is_mbpf_xadd(meta))
+ 		return nfp_bpf_check_xadd(nfp_prog, meta, env);
+ 
+--- a/drivers/net/ethernet/netronome/nfp/nfp_asm.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_asm.h
+@@ -183,16 +183,18 @@ enum shf_sc {
+ #define OP_ALU_DST_LMEXTN	0x80000000000ULL
+ 
+ enum alu_op {
+-	ALU_OP_NONE	= 0x00,
+-	ALU_OP_ADD	= 0x01,
+-	ALU_OP_NOT	= 0x04,
+-	ALU_OP_ADD_2B	= 0x05,
+-	ALU_OP_AND	= 0x08,
+-	ALU_OP_SUB_C	= 0x0d,
+-	ALU_OP_ADD_C	= 0x11,
+-	ALU_OP_OR	= 0x14,
+-	ALU_OP_SUB	= 0x15,
+-	ALU_OP_XOR	= 0x18,
++	ALU_OP_NONE		= 0x00,
++	ALU_OP_ADD		= 0x01,
++	ALU_OP_NOT		= 0x04,
++	ALU_OP_ADD_2B		= 0x05,
++	ALU_OP_AND		= 0x08,
++	ALU_OP_AND_NOT_A	= 0x0c,
++	ALU_OP_SUB_C		= 0x0d,
++	ALU_OP_AND_NOT_B	= 0x10,
++	ALU_OP_ADD_C		= 0x11,
++	ALU_OP_OR		= 0x14,
++	ALU_OP_SUB		= 0x15,
++	ALU_OP_XOR		= 0x18,
+ };
+ 
+ enum alu_dst_ab {

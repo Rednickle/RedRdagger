@@ -1,0 +1,137 @@
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Tue, 15 May 2018 10:50:31 +0200
+Subject: sched: manipulate __QDISC_STATE_RUNNING in qdisc_run_* helpers
+Patch-mainline: v4.18-rc1
+Git-commit: 32f7b44d0f5661044fcfa84e9ad402ed9d759107
+References: bsc#1109837
+
+Currently NOLOCK qdiscs pay a measurable overhead to atomically
+manipulate the __QDISC_STATE_RUNNING. Such bit is flipped twice per
+packet in the uncontended scenario with packet rate below the
+line rate: on packed dequeue and on the next, failing dequeue attempt.
+
+This changeset moves the bit manipulation into the qdisc_run_{begin,end}
+helpers, so that the bit is now flipped only once per packet, with
+measurable performance improvement in the uncontended scenario.
+
+This also allows simplifying the qdisc teardown code path - since
+qdisc_is_running() is now effective for each qdisc type - and avoid a
+possible race between qdisc_run() and dev_deactivate_many(), as now
+the some_qdisc_is_busy() can properly detect NOLOCK qdiscs being busy
+dequeuing packets.
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/sch_generic.h |   10 +++++++++-
+ net/core/dev.c            |    2 +-
+ net/sched/sch_generic.c   |   31 +++++++++----------------------
+ 3 files changed, 19 insertions(+), 24 deletions(-)
+
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -112,13 +112,19 @@ static inline void qdisc_refcount_inc(st
+ 
+ static inline bool qdisc_is_running(const struct Qdisc *qdisc)
+ {
++	if (qdisc->flags & TCQ_F_NOLOCK)
++		return test_bit(__QDISC_STATE_RUNNING, &qdisc->state);
+ 	return (raw_read_seqcount(&qdisc->running) & 1) ? true : false;
+ }
+ 
+ static inline bool qdisc_run_begin(struct Qdisc *qdisc)
+ {
+-	if (qdisc_is_running(qdisc))
++	if (qdisc->flags & TCQ_F_NOLOCK) {
++		if (test_and_set_bit(__QDISC_STATE_RUNNING, &qdisc->state))
++			return false;
++	} else if (qdisc_is_running(qdisc)) {
+ 		return false;
++	}
+ 	/* Variant of write_seqcount_begin() telling lockdep a trylock
+ 	 * was attempted.
+ 	 */
+@@ -130,6 +136,8 @@ static inline bool qdisc_run_begin(struc
+ static inline void qdisc_run_end(struct Qdisc *qdisc)
+ {
+ 	write_seqcount_end(&qdisc->running);
++	if (qdisc->flags & TCQ_F_NOLOCK)
++		clear_bit(__QDISC_STATE_RUNNING, &qdisc->state);
+ }
+ 
+ static inline bool qdisc_may_bulk(const struct Qdisc *qdisc)
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3203,7 +3203,7 @@ static inline int __dev_xmit_skb(struct
+ 			rc = NET_XMIT_DROP;
+ 		} else {
+ 			rc = q->enqueue(skb, q, &to_free) & NET_XMIT_MASK;
+-			__qdisc_run(q);
++			qdisc_run(q);
+ 		}
+ 
+ 		if (unlikely(to_free))
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -370,33 +370,24 @@ bool sch_direct_xmit(struct sk_buff *skb
+  */
+ static inline bool qdisc_restart(struct Qdisc *q, int *packets)
+ {
+-	bool more, validate, nolock = q->flags & TCQ_F_NOLOCK;
+ 	spinlock_t *root_lock = NULL;
+ 	struct netdev_queue *txq;
+ 	struct net_device *dev;
+ 	struct sk_buff *skb;
++	bool validate;
+ 
+ 	/* Dequeue packet */
+-	if (nolock && test_and_set_bit(__QDISC_STATE_RUNNING, &q->state))
+-		return false;
+-
+ 	skb = dequeue_skb(q, &validate, packets);
+-	if (unlikely(!skb)) {
+-		if (nolock)
+-			clear_bit(__QDISC_STATE_RUNNING, &q->state);
++	if (unlikely(!skb))
+ 		return false;
+-	}
+ 
+-	if (!nolock)
++	if (!(q->flags & TCQ_F_NOLOCK))
+ 		root_lock = qdisc_lock(q);
+ 
+ 	dev = qdisc_dev(q);
+ 	txq = skb_get_tx_queue(dev, skb);
+ 
+-	more = sch_direct_xmit(skb, q, dev, txq, root_lock, validate);
+-	if (nolock)
+-		clear_bit(__QDISC_STATE_RUNNING, &q->state);
+-	return more;
++	return sch_direct_xmit(skb, q, dev, txq, root_lock, validate);
+ }
+ 
+ void __qdisc_run(struct Qdisc *q)
+@@ -1141,17 +1132,13 @@ static bool some_qdisc_is_busy(struct ne
+ 		dev_queue = netdev_get_tx_queue(dev, i);
+ 		q = dev_queue->qdisc_sleeping;
+ 
+-		if (q->flags & TCQ_F_NOLOCK) {
+-			val = test_bit(__QDISC_STATE_SCHED, &q->state);
+-		} else {
+-			root_lock = qdisc_lock(q);
+-			spin_lock_bh(root_lock);
++		root_lock = qdisc_lock(q);
++		spin_lock_bh(root_lock);
+ 
+-			val = (qdisc_is_running(q) ||
+-			       test_bit(__QDISC_STATE_SCHED, &q->state));
++		val = (qdisc_is_running(q) ||
++		       test_bit(__QDISC_STATE_SCHED, &q->state));
+ 
+-			spin_unlock_bh(root_lock);
+-		}
++		spin_unlock_bh(root_lock);
+ 
+ 		if (val)
+ 			return true;

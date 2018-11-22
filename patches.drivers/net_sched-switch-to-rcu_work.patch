@@ -1,0 +1,830 @@
+From: Cong Wang <xiyou.wangcong@gmail.com>
+Date: Wed, 23 May 2018 15:26:53 -0700
+Subject: net_sched: switch to rcu_work
+Patch-mainline: v4.18-rc1
+Git-commit: aaa908ffbee18a65529b716efb346a626e81559a
+References: bsc#1109837
+
+Commit 05f0fe6b74db ("RCU, workqueue: Implement rcu_work") introduces
+new API's for dispatching work in a RCU callback. Now we can just
+switch to the new API's for tc filters. This could get rid of a lot
+of code.
+
+Cc: Tejun Heo <tj@kernel.org>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/pkt_cls.h    |    3 +--
+ net/sched/cls_api.c      |    5 +++--
+ net/sched/cls_basic.c    |   24 +++++++-----------------
+ net/sched/cls_bpf.c      |   22 ++++++----------------
+ net/sched/cls_cgroup.c   |   23 +++++------------------
+ net/sched/cls_flow.c     |   24 +++++++-----------------
+ net/sched/cls_flower.c   |   41 +++++++++++------------------------------
+ net/sched/cls_fw.c       |   24 +++++++-----------------
+ net/sched/cls_matchall.c |   21 +++++----------------
+ net/sched/cls_route.c    |   23 +++++++++--------------
+ net/sched/cls_rsvp.h     |   20 +++++---------------
+ net/sched/cls_tcindex.c  |   41 ++++++++++-------------------------------
+ net/sched/cls_u32.c      |   37 ++++++++++---------------------------
+ 13 files changed, 86 insertions(+), 222 deletions(-)
+
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -18,8 +18,6 @@ struct tcf_walker {
+ int register_tcf_proto_ops(struct tcf_proto_ops *ops);
+ int unregister_tcf_proto_ops(struct tcf_proto_ops *ops);
+ 
+-bool tcf_queue_work(struct work_struct *work);
+-
+ enum tcf_block_binder_type {
+ 	TCF_BLOCK_BINDER_TYPE_UNSPEC,
+ 	TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
+@@ -34,6 +32,7 @@ struct tcf_block_ext_info {
+ };
+ 
+ struct tcf_block_cb;
++bool tcf_queue_work(struct rcu_work *rwork, work_func_t func);
+ 
+ #ifdef CONFIG_NET_CLS
+ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -104,9 +104,10 @@ int unregister_tcf_proto_ops(struct tcf_
+ }
+ EXPORT_SYMBOL(unregister_tcf_proto_ops);
+ 
+-bool tcf_queue_work(struct work_struct *work)
++bool tcf_queue_work(struct rcu_work *rwork, work_func_t func)
+ {
+-	return queue_work(tc_filter_wq, work);
++	INIT_RCU_WORK(rwork, func);
++	return queue_rcu_work(tc_filter_wq, rwork);
+ }
+ EXPORT_SYMBOL(tcf_queue_work);
+ 
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -35,10 +35,7 @@ struct basic_filter {
+ 	struct tcf_result	res;
+ 	struct tcf_proto	*tp;
+ 	struct list_head	link;
+-	union {
+-		struct work_struct	work;
+-		struct rcu_head		rcu;
+-	};
++	struct rcu_work		rwork;
+ };
+ 
+ static int basic_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+@@ -97,21 +94,14 @@ static void __basic_delete_filter(struct
+ 
+ static void basic_delete_filter_work(struct work_struct *work)
+ {
+-	struct basic_filter *f = container_of(work, struct basic_filter, work);
+-
++	struct basic_filter *f = container_of(to_rcu_work(work),
++					      struct basic_filter,
++					      rwork);
+ 	rtnl_lock();
+ 	__basic_delete_filter(f);
+ 	rtnl_unlock();
+ }
+ 
+-static void basic_delete_filter(struct rcu_head *head)
+-{
+-	struct basic_filter *f = container_of(head, struct basic_filter, rcu);
+-
+-	INIT_WORK(&f->work, basic_delete_filter_work);
+-	tcf_queue_work(&f->work);
+-}
+-
+ static void basic_destroy(struct tcf_proto *tp, struct netlink_ext_ack *extack)
+ {
+ 	struct basic_head *head = rtnl_dereference(tp->root);
+@@ -122,7 +112,7 @@ static void basic_destroy(struct tcf_pro
+ 		tcf_unbind_filter(tp, &f->res);
+ 		idr_remove(&head->handle_idr, f->handle);
+ 		if (tcf_exts_get_net(&f->exts))
+-			call_rcu(&f->rcu, basic_delete_filter);
++			tcf_queue_work(&f->rwork, basic_delete_filter_work);
+ 		else
+ 			__basic_delete_filter(f);
+ 	}
+@@ -140,7 +130,7 @@ static int basic_delete(struct tcf_proto
+ 	tcf_unbind_filter(tp, &f->res);
+ 	idr_remove(&head->handle_idr, f->handle);
+ 	tcf_exts_get_net(&f->exts);
+-	call_rcu(&f->rcu, basic_delete_filter);
++	tcf_queue_work(&f->rwork, basic_delete_filter_work);
+ 	*last = list_empty(&head->flist);
+ 	return 0;
+ }
+@@ -234,7 +224,7 @@ static int basic_change(struct net *net,
+ 		list_replace_rcu(&fold->link, &fnew->link);
+ 		tcf_unbind_filter(tp, &fold->res);
+ 		tcf_exts_get_net(&fold->exts);
+-		call_rcu(&fold->rcu, basic_delete_filter);
++		tcf_queue_work(&fold->rwork, basic_delete_filter_work);
+ 	} else {
+ 		list_add_rcu(&fnew->link, &head->flist);
+ 	}
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -49,10 +49,7 @@ struct cls_bpf_prog {
+ 	struct sock_filter *bpf_ops;
+ 	const char *bpf_name;
+ 	struct tcf_proto *tp;
+-	union {
+-		struct work_struct work;
+-		struct rcu_head rcu;
+-	};
++	struct rcu_work rwork;
+ };
+ 
+ static const struct nla_policy bpf_policy[TCA_BPF_MAX + 1] = {
+@@ -275,21 +272,14 @@ static void __cls_bpf_delete_prog(struct
+ 
+ static void cls_bpf_delete_prog_work(struct work_struct *work)
+ {
+-	struct cls_bpf_prog *prog = container_of(work, struct cls_bpf_prog, work);
+-
++	struct cls_bpf_prog *prog = container_of(to_rcu_work(work),
++						 struct cls_bpf_prog,
++						 rwork);
+ 	rtnl_lock();
+ 	__cls_bpf_delete_prog(prog);
+ 	rtnl_unlock();
+ }
+ 
+-static void cls_bpf_delete_prog_rcu(struct rcu_head *rcu)
+-{
+-	struct cls_bpf_prog *prog = container_of(rcu, struct cls_bpf_prog, rcu);
+-
+-	INIT_WORK(&prog->work, cls_bpf_delete_prog_work);
+-	tcf_queue_work(&prog->work);
+-}
+-
+ static void __cls_bpf_delete(struct tcf_proto *tp, struct cls_bpf_prog *prog,
+ 			     struct netlink_ext_ack *extack)
+ {
+@@ -300,7 +290,7 @@ static void __cls_bpf_delete(struct tcf_
+ 	list_del_rcu(&prog->link);
+ 	tcf_unbind_filter(tp, &prog->res);
+ 	if (tcf_exts_get_net(&prog->exts))
+-		call_rcu(&prog->rcu, cls_bpf_delete_prog_rcu);
++		tcf_queue_work(&prog->rwork, cls_bpf_delete_prog_work);
+ 	else
+ 		__cls_bpf_delete_prog(prog);
+ }
+@@ -526,7 +516,7 @@ static int cls_bpf_change(struct net *ne
+ 		list_replace_rcu(&oldprog->link, &prog->link);
+ 		tcf_unbind_filter(tp, &oldprog->res);
+ 		tcf_exts_get_net(&oldprog->exts);
+-		call_rcu(&oldprog->rcu, cls_bpf_delete_prog_rcu);
++		tcf_queue_work(&oldprog->rwork, cls_bpf_delete_prog_work);
+ 	} else {
+ 		list_add_rcu(&prog->link, &head->plist);
+ 	}
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -23,10 +23,7 @@ struct cls_cgroup_head {
+ 	struct tcf_exts		exts;
+ 	struct tcf_ematch_tree	ematches;
+ 	struct tcf_proto	*tp;
+-	union {
+-		struct work_struct	work;
+-		struct rcu_head		rcu;
+-	};
++	struct rcu_work		rwork;
+ };
+ 
+ static int cls_cgroup_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+@@ -70,24 +67,14 @@ static void __cls_cgroup_destroy(struct
+ 
+ static void cls_cgroup_destroy_work(struct work_struct *work)
+ {
+-	struct cls_cgroup_head *head = container_of(work,
++	struct cls_cgroup_head *head = container_of(to_rcu_work(work),
+ 						    struct cls_cgroup_head,
+-						    work);
++						    rwork);
+ 	rtnl_lock();
+ 	__cls_cgroup_destroy(head);
+ 	rtnl_unlock();
+ }
+ 
+-static void cls_cgroup_destroy_rcu(struct rcu_head *root)
+-{
+-	struct cls_cgroup_head *head = container_of(root,
+-						    struct cls_cgroup_head,
+-						    rcu);
+-
+-	INIT_WORK(&head->work, cls_cgroup_destroy_work);
+-	tcf_queue_work(&head->work);
+-}
+-
+ static int cls_cgroup_change(struct net *net, struct sk_buff *in_skb,
+ 			     struct tcf_proto *tp, unsigned long base,
+ 			     u32 handle, struct nlattr **tca,
+@@ -134,7 +121,7 @@ static int cls_cgroup_change(struct net
+ 	rcu_assign_pointer(tp->root, new);
+ 	if (head) {
+ 		tcf_exts_get_net(&head->exts);
+-		call_rcu(&head->rcu, cls_cgroup_destroy_rcu);
++		tcf_queue_work(&head->rwork, cls_cgroup_destroy_work);
+ 	}
+ 	return 0;
+ errout:
+@@ -151,7 +138,7 @@ static void cls_cgroup_destroy(struct tc
+ 	/* Head can still be NULL due to cls_cgroup_init(). */
+ 	if (head) {
+ 		if (tcf_exts_get_net(&head->exts))
+-			call_rcu(&head->rcu, cls_cgroup_destroy_rcu);
++			tcf_queue_work(&head->rwork, cls_cgroup_destroy_work);
+ 		else
+ 			__cls_cgroup_destroy(head);
+ 	}
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -57,10 +57,7 @@ struct flow_filter {
+ 	u32			divisor;
+ 	u32			baseclass;
+ 	u32			hashrnd;
+-	union {
+-		struct work_struct	work;
+-		struct rcu_head		rcu;
+-	};
++	struct rcu_work		rwork;
+ };
+ 
+ static inline u32 addr_fold(void *addr)
+@@ -383,21 +380,14 @@ static void __flow_destroy_filter(struct
+ 
+ static void flow_destroy_filter_work(struct work_struct *work)
+ {
+-	struct flow_filter *f = container_of(work, struct flow_filter, work);
+-
++	struct flow_filter *f = container_of(to_rcu_work(work),
++					     struct flow_filter,
++					     rwork);
+ 	rtnl_lock();
+ 	__flow_destroy_filter(f);
+ 	rtnl_unlock();
+ }
+ 
+-static void flow_destroy_filter(struct rcu_head *head)
+-{
+-	struct flow_filter *f = container_of(head, struct flow_filter, rcu);
+-
+-	INIT_WORK(&f->work, flow_destroy_filter_work);
+-	tcf_queue_work(&f->work);
+-}
+-
+ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 		       struct tcf_proto *tp, unsigned long base,
+ 		       u32 handle, struct nlattr **tca,
+@@ -564,7 +554,7 @@ static int flow_change(struct net *net,
+ 
+ 	if (fold) {
+ 		tcf_exts_get_net(&fold->exts);
+-		call_rcu(&fold->rcu, flow_destroy_filter);
++		tcf_queue_work(&fold->rwork, flow_destroy_filter_work);
+ 	}
+ 	return 0;
+ 
+@@ -584,7 +574,7 @@ static int flow_delete(struct tcf_proto
+ 
+ 	list_del_rcu(&f->list);
+ 	tcf_exts_get_net(&f->exts);
+-	call_rcu(&f->rcu, flow_destroy_filter);
++	tcf_queue_work(&f->rwork, flow_destroy_filter_work);
+ 	*last = list_empty(&head->filters);
+ 	return 0;
+ }
+@@ -609,7 +599,7 @@ static void flow_destroy(struct tcf_prot
+ 	list_for_each_entry_safe(f, next, &head->filters, list) {
+ 		list_del_rcu(&f->list);
+ 		if (tcf_exts_get_net(&f->exts))
+-			call_rcu(&f->rcu, flow_destroy_filter);
++			tcf_queue_work(&f->rwork, flow_destroy_filter_work);
+ 		else
+ 			__flow_destroy_filter(f);
+ 	}
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -73,10 +73,7 @@ struct fl_flow_mask {
+ struct cls_fl_head {
+ 	struct rhashtable ht;
+ 	struct list_head masks;
+-	union {
+-		struct work_struct work;
+-		struct rcu_head	rcu;
+-	};
++	struct rcu_work rwork;
+ 	struct idr handle_idr;
+ };
+ 
+@@ -90,10 +87,8 @@ struct cls_fl_filter {
+ 	struct list_head list;
+ 	u32 handle;
+ 	u32 flags;
+-	union {
+-		struct work_struct work;
+-		struct rcu_head	rcu;
+-	};
++	struct rcu_work rwork;
++	struct net_device *hw_dev;
+ };
+ 
+ static const struct rhashtable_params mask_ht_params = {
+@@ -234,21 +229,14 @@ static void __fl_destroy_filter(struct c
+ 
+ static void fl_destroy_filter_work(struct work_struct *work)
+ {
+-	struct cls_fl_filter *f = container_of(work, struct cls_fl_filter, work);
++	struct cls_fl_filter *f = container_of(to_rcu_work(work),
++					struct cls_fl_filter, rwork);
+ 
+ 	rtnl_lock();
+ 	__fl_destroy_filter(f);
+ 	rtnl_unlock();
+ }
+ 
+-static void fl_destroy_filter(struct rcu_head *head)
+-{
+-	struct cls_fl_filter *f = container_of(head, struct cls_fl_filter, rcu);
+-
+-	INIT_WORK(&f->work, fl_destroy_filter_work);
+-	tcf_queue_work(&f->work);
+-}
+-
+ static void fl_hw_destroy_filter(struct tcf_proto *tp, struct cls_fl_filter *f,
+ 				 struct netlink_ext_ack *extack)
+ {
+@@ -326,7 +314,7 @@ static bool __fl_delete(struct tcf_proto
+ 		fl_hw_destroy_filter(tp, f, extack);
+ 	tcf_unbind_filter(tp, &f->res);
+ 	if (async)
+-		call_rcu(&f->rcu, fl_destroy_filter);
++		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
+ 	else
+ 		__fl_destroy_filter(f);
+ 
+@@ -335,20 +323,13 @@ static bool __fl_delete(struct tcf_proto
+ 
+ static void fl_destroy_sleepable(struct work_struct *work)
+ {
+-	struct cls_fl_head *head = container_of(work, struct cls_fl_head,
+-						work);
++	struct cls_fl_head *head = container_of(to_rcu_work(work),
++						struct cls_fl_head,
++						rwork);
+ 	kfree(head);
+ 	module_put(THIS_MODULE);
+ }
+ 
+-static void fl_destroy_rcu(struct rcu_head *rcu)
+-{
+-	struct cls_fl_head *head = container_of(rcu, struct cls_fl_head, rcu);
+-
+-	INIT_WORK(&head->work, fl_destroy_sleepable);
+-	schedule_work(&head->work);
+-}
+-
+ static void fl_destroy(struct tcf_proto *tp, struct netlink_ext_ack *extack)
+ {
+ 	struct cls_fl_head *head = rtnl_dereference(tp->root);
+@@ -364,7 +345,7 @@ static void fl_destroy(struct tcf_proto
+ 	idr_destroy(&head->handle_idr);
+ 
+ 	__module_get(THIS_MODULE);
+-	call_rcu(&head->rcu, fl_destroy_rcu);
++	tcf_queue_work(&head->rwork, fl_destroy_sleepable);
+ }
+ 
+ static void *fl_get(struct tcf_proto *tp, u32 handle)
+@@ -1035,7 +1016,7 @@ static int fl_change(struct net *net, st
+ 		list_replace_rcu(&fold->list, &fnew->list);
+ 		tcf_unbind_filter(tp, &fold->res);
+ 		tcf_exts_get_net(&fold->exts);
+-		call_rcu(&fold->rcu, fl_destroy_filter);
++		tcf_queue_work(&fold->rwork, fl_destroy_filter_work);
+ 	} else {
+ 		list_add_tail_rcu(&fnew->list, &fnew->mask->filters);
+ 	}
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@ -47,10 +47,7 @@ struct fw_filter {
+ #endif /* CONFIG_NET_CLS_IND */
+ 	struct tcf_exts		exts;
+ 	struct tcf_proto	*tp;
+-	union {
+-		struct work_struct	work;
+-		struct rcu_head		rcu;
+-	};
++	struct rcu_work		rwork;
+ };
+ 
+ static u32 fw_hash(u32 handle)
+@@ -134,21 +131,14 @@ static void __fw_delete_filter(struct fw
+ 
+ static void fw_delete_filter_work(struct work_struct *work)
+ {
+-	struct fw_filter *f = container_of(work, struct fw_filter, work);
+-
++	struct fw_filter *f = container_of(to_rcu_work(work),
++					   struct fw_filter,
++					   rwork);
+ 	rtnl_lock();
+ 	__fw_delete_filter(f);
+ 	rtnl_unlock();
+ }
+ 
+-static void fw_delete_filter(struct rcu_head *head)
+-{
+-	struct fw_filter *f = container_of(head, struct fw_filter, rcu);
+-
+-	INIT_WORK(&f->work, fw_delete_filter_work);
+-	tcf_queue_work(&f->work);
+-}
+-
+ static void fw_destroy(struct tcf_proto *tp, struct netlink_ext_ack *extack)
+ {
+ 	struct fw_head *head = rtnl_dereference(tp->root);
+@@ -164,7 +154,7 @@ static void fw_destroy(struct tcf_proto
+ 					 rtnl_dereference(f->next));
+ 			tcf_unbind_filter(tp, &f->res);
+ 			if (tcf_exts_get_net(&f->exts))
+-				call_rcu(&f->rcu, fw_delete_filter);
++				tcf_queue_work(&f->rwork, fw_delete_filter_work);
+ 			else
+ 				__fw_delete_filter(f);
+ 		}
+@@ -193,7 +183,7 @@ static int fw_delete(struct tcf_proto *t
+ 			RCU_INIT_POINTER(*fp, rtnl_dereference(f->next));
+ 			tcf_unbind_filter(tp, &f->res);
+ 			tcf_exts_get_net(&f->exts);
+-			call_rcu(&f->rcu, fw_delete_filter);
++			tcf_queue_work(&f->rwork, fw_delete_filter_work);
+ 			ret = 0;
+ 			break;
+ 		}
+@@ -316,7 +306,7 @@ static int fw_change(struct net *net, st
+ 		rcu_assign_pointer(*fp, fnew);
+ 		tcf_unbind_filter(tp, &f->res);
+ 		tcf_exts_get_net(&f->exts);
+-		call_rcu(&f->rcu, fw_delete_filter);
++		tcf_queue_work(&f->rwork, fw_delete_filter_work);
+ 
+ 		*arg = fnew;
+ 		return err;
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -21,10 +21,7 @@ struct cls_mall_head {
+ 	struct tcf_result res;
+ 	u32 handle;
+ 	u32 flags;
+-	union {
+-		struct work_struct work;
+-		struct rcu_head	rcu;
+-	};
++	struct rcu_work rwork;
+ };
+ 
+ static int mall_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+@@ -53,22 +50,14 @@ static void __mall_destroy(struct cls_ma
+ 
+ static void mall_destroy_work(struct work_struct *work)
+ {
+-	struct cls_mall_head *head = container_of(work, struct cls_mall_head,
+-						  work);
++	struct cls_mall_head *head = container_of(to_rcu_work(work),
++						  struct cls_mall_head,
++						  rwork);
+ 	rtnl_lock();
+ 	__mall_destroy(head);
+ 	rtnl_unlock();
+ }
+ 
+-static void mall_destroy_rcu(struct rcu_head *rcu)
+-{
+-	struct cls_mall_head *head = container_of(rcu, struct cls_mall_head,
+-						  rcu);
+-
+-	INIT_WORK(&head->work, mall_destroy_work);
+-	tcf_queue_work(&head->work);
+-}
+-
+ static void mall_destroy_hw_filter(struct tcf_proto *tp,
+ 				   struct cls_mall_head *head,
+ 				   unsigned long cookie,
+@@ -126,7 +115,7 @@ static void mall_destroy(struct tcf_prot
+ 		mall_destroy_hw_filter(tp, head, (unsigned long) head, extack);
+ 
+ 	if (tcf_exts_get_net(&head->exts))
+-		call_rcu(&head->rcu, mall_destroy_rcu);
++		tcf_queue_work(&head->rwork, mall_destroy_work);
+ 	else
+ 		__mall_destroy(head);
+ }
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -57,10 +57,7 @@ struct route4_filter {
+ 	u32			handle;
+ 	struct route4_bucket	*bkt;
+ 	struct tcf_proto	*tp;
+-	union {
+-		struct work_struct	work;
+-		struct rcu_head		rcu;
+-	};
++	struct rcu_work		rwork;
+ };
+ 
+ #define ROUTE4_FAILURE ((struct route4_filter *)(-1L))
+@@ -266,19 +263,17 @@ static void __route4_delete_filter(struc
+ 
+ static void route4_delete_filter_work(struct work_struct *work)
+ {
+-	struct route4_filter *f = container_of(work, struct route4_filter, work);
+-
++	struct route4_filter *f = container_of(to_rcu_work(work),
++					       struct route4_filter,
++					       rwork);
+ 	rtnl_lock();
+ 	__route4_delete_filter(f);
+ 	rtnl_unlock();
+ }
+ 
+-static void route4_delete_filter(struct rcu_head *head)
++static void route4_queue_work(struct route4_filter *f)
+ {
+-	struct route4_filter *f = container_of(head, struct route4_filter, rcu);
+-
+-	INIT_WORK(&f->work, route4_delete_filter_work);
+-	tcf_queue_work(&f->work);
++	tcf_queue_work(&f->rwork, route4_delete_filter_work);
+ }
+ 
+ static void route4_destroy(struct tcf_proto *tp, struct netlink_ext_ack *extack)
+@@ -304,7 +299,7 @@ static void route4_destroy(struct tcf_pr
+ 					RCU_INIT_POINTER(b->ht[h2], next);
+ 					tcf_unbind_filter(tp, &f->res);
+ 					if (tcf_exts_get_net(&f->exts))
+-						call_rcu(&f->rcu, route4_delete_filter);
++						route4_queue_work(f);
+ 					else
+ 						__route4_delete_filter(f);
+ 				}
+@@ -349,7 +344,7 @@ static int route4_delete(struct tcf_prot
+ 			/* Delete it */
+ 			tcf_unbind_filter(tp, &f->res);
+ 			tcf_exts_get_net(&f->exts);
+-			call_rcu(&f->rcu, route4_delete_filter);
++			tcf_queue_work(&f->rwork, route4_delete_filter_work);
+ 
+ 			/* Strip RTNL protected tree */
+ 			for (i = 0; i <= 32; i++) {
+@@ -554,7 +549,7 @@ static int route4_change(struct net *net
+ 	if (fold) {
+ 		tcf_unbind_filter(tp, &fold->res);
+ 		tcf_exts_get_net(&fold->exts);
+-		call_rcu(&fold->rcu, route4_delete_filter);
++		tcf_queue_work(&fold->rwork, route4_delete_filter_work);
+ 	}
+ 	return 0;
+ 
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@ -97,10 +97,7 @@ struct rsvp_filter {
+ 
+ 	u32				handle;
+ 	struct rsvp_session		*sess;
+-	union {
+-		struct work_struct		work;
+-		struct rcu_head			rcu;
+-	};
++	struct rcu_work			rwork;
+ };
+ 
+ static inline unsigned int hash_dst(__be32 *dst, u8 protocol, u8 tunnelid)
+@@ -294,21 +291,14 @@ static void __rsvp_delete_filter(struct
+ 
+ static void rsvp_delete_filter_work(struct work_struct *work)
+ {
+-	struct rsvp_filter *f = container_of(work, struct rsvp_filter, work);
+-
++	struct rsvp_filter *f = container_of(to_rcu_work(work),
++					     struct rsvp_filter,
++					     rwork);
+ 	rtnl_lock();
+ 	__rsvp_delete_filter(f);
+ 	rtnl_unlock();
+ }
+ 
+-static void rsvp_delete_filter_rcu(struct rcu_head *head)
+-{
+-	struct rsvp_filter *f = container_of(head, struct rsvp_filter, rcu);
+-
+-	INIT_WORK(&f->work, rsvp_delete_filter_work);
+-	tcf_queue_work(&f->work);
+-}
+-
+ static void rsvp_delete_filter(struct tcf_proto *tp, struct rsvp_filter *f)
+ {
+ 	tcf_unbind_filter(tp, &f->res);
+@@ -317,7 +307,7 @@ static void rsvp_delete_filter(struct tc
+ 	 * in cleanup() callback
+ 	 */
+ 	if (tcf_exts_get_net(&f->exts))
+-		call_rcu(&f->rcu, rsvp_delete_filter_rcu);
++		tcf_queue_work(&f->rwork, rsvp_delete_filter_work);
+ 	else
+ 		__rsvp_delete_filter(f);
+ }
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@ -28,20 +28,14 @@
+ struct tcindex_filter_result {
+ 	struct tcf_exts		exts;
+ 	struct tcf_result	res;
+-	union {
+-		struct work_struct	work;
+-		struct rcu_head		rcu;
+-	};
++	struct rcu_work		rwork;
+ };
+ 
+ struct tcindex_filter {
+ 	u16 key;
+ 	struct tcindex_filter_result result;
+ 	struct tcindex_filter __rcu *next;
+-	union {
+-		struct work_struct work;
+-		struct rcu_head rcu;
+-	};
++	struct rcu_work rwork;
+ };
+ 
+ 
+@@ -152,21 +146,14 @@ static void tcindex_destroy_rexts_work(s
+ {
+ 	struct tcindex_filter_result *r;
+ 
+-	r = container_of(work, struct tcindex_filter_result, work);
++	r = container_of(to_rcu_work(work),
++			 struct tcindex_filter_result,
++			 rwork);
+ 	rtnl_lock();
+ 	__tcindex_destroy_rexts(r);
+ 	rtnl_unlock();
+ }
+ 
+-static void tcindex_destroy_rexts(struct rcu_head *head)
+-{
+-	struct tcindex_filter_result *r;
+-
+-	r = container_of(head, struct tcindex_filter_result, rcu);
+-	INIT_WORK(&r->work, tcindex_destroy_rexts_work);
+-	tcf_queue_work(&r->work);
+-}
+-
+ static void __tcindex_destroy_fexts(struct tcindex_filter *f)
+ {
+ 	tcf_exts_destroy(&f->result.exts);
+@@ -176,23 +163,15 @@ static void __tcindex_destroy_fexts(stru
+ 
+ static void tcindex_destroy_fexts_work(struct work_struct *work)
+ {
+-	struct tcindex_filter *f = container_of(work, struct tcindex_filter,
+-						work);
++	struct tcindex_filter *f = container_of(to_rcu_work(work),
++						struct tcindex_filter,
++						rwork);
+ 
+ 	rtnl_lock();
+ 	__tcindex_destroy_fexts(f);
+ 	rtnl_unlock();
+ }
+ 
+-static void tcindex_destroy_fexts(struct rcu_head *head)
+-{
+-	struct tcindex_filter *f = container_of(head, struct tcindex_filter,
+-						rcu);
+-
+-	INIT_WORK(&f->work, tcindex_destroy_fexts_work);
+-	tcf_queue_work(&f->work);
+-}
+-
+ static int tcindex_delete(struct tcf_proto *tp, void *arg, bool *last,
+ 			  struct netlink_ext_ack *extack)
+ {
+@@ -228,12 +207,12 @@ found:
+ 	 */
+ 	if (f) {
+ 		if (tcf_exts_get_net(&f->result.exts))
+-			call_rcu(&f->rcu, tcindex_destroy_fexts);
++			tcf_queue_work(&f->rwork, tcindex_destroy_fexts_work);
+ 		else
+ 			__tcindex_destroy_fexts(f);
+ 	} else {
+ 		if (tcf_exts_get_net(&r->exts))
+-			call_rcu(&r->rcu, tcindex_destroy_rexts);
++			tcf_queue_work(&r->rwork, tcindex_destroy_rexts_work);
+ 		else
+ 			__tcindex_destroy_rexts(r);
+ 	}
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -69,10 +69,7 @@ struct tc_u_knode {
+ 	u32 __percpu		*pcpu_success;
+ #endif
+ 	struct tcf_proto	*tp;
+-	union {
+-		struct work_struct	work;
+-		struct rcu_head		rcu;
+-	};
++	struct rcu_work		rwork;
+ 	/* The 'sel' field MUST be the last field in structure to allow for
+ 	 * tc_u32_keys allocated at end of structure.
+ 	 */
+@@ -437,21 +434,14 @@ static int u32_destroy_key(struct tcf_pr
+  */
+ static void u32_delete_key_work(struct work_struct *work)
+ {
+-	struct tc_u_knode *key = container_of(work, struct tc_u_knode, work);
+-
++	struct tc_u_knode *key = container_of(to_rcu_work(work),
++					      struct tc_u_knode,
++					      rwork);
+ 	rtnl_lock();
+ 	u32_destroy_key(key->tp, key, false);
+ 	rtnl_unlock();
+ }
+ 
+-static void u32_delete_key_rcu(struct rcu_head *rcu)
+-{
+-	struct tc_u_knode *key = container_of(rcu, struct tc_u_knode, rcu);
+-
+-	INIT_WORK(&key->work, u32_delete_key_work);
+-	tcf_queue_work(&key->work);
+-}
+-
+ /* u32_delete_key_freepf_rcu is the rcu callback variant
+  * that free's the entire structure including the statistics
+  * percpu variables. Only use this if the key is not a copy
+@@ -461,21 +451,14 @@ static void u32_delete_key_rcu(struct rc
+  */
+ static void u32_delete_key_freepf_work(struct work_struct *work)
+ {
+-	struct tc_u_knode *key = container_of(work, struct tc_u_knode, work);
+-
++	struct tc_u_knode *key = container_of(to_rcu_work(work),
++					      struct tc_u_knode,
++					      rwork);
+ 	rtnl_lock();
+ 	u32_destroy_key(key->tp, key, true);
+ 	rtnl_unlock();
+ }
+ 
+-static void u32_delete_key_freepf_rcu(struct rcu_head *rcu)
+-{
+-	struct tc_u_knode *key = container_of(rcu, struct tc_u_knode, rcu);
+-
+-	INIT_WORK(&key->work, u32_delete_key_freepf_work);
+-	tcf_queue_work(&key->work);
+-}
+-
+ static int u32_delete_key(struct tcf_proto *tp, struct tc_u_knode *key)
+ {
+ 	struct tc_u_knode __rcu **kp;
+@@ -492,7 +475,7 @@ static int u32_delete_key(struct tcf_pro
+ 				tcf_unbind_filter(tp, &key->res);
+ 				idr_remove(&ht->handle_idr, key->handle);
+ 				tcf_exts_get_net(&key->exts);
+-				call_rcu(&key->rcu, u32_delete_key_freepf_rcu);
++				tcf_queue_work(&key->rwork, u32_delete_key_freepf_work);
+ 				return 0;
+ 			}
+ 		}
+@@ -612,7 +595,7 @@ static void u32_clear_hnode(struct tcf_p
+ 			u32_remove_hw_knode(tp, n, extack);
+ 			idr_remove(&ht->handle_idr, n->handle);
+ 			if (tcf_exts_get_net(&n->exts))
+-				call_rcu(&n->rcu, u32_delete_key_freepf_rcu);
++				tcf_queue_work(&n->rwork, u32_delete_key_freepf_work);
+ 			else
+ 				u32_destroy_key(n->tp, n, true);
+ 		}
+@@ -996,7 +979,7 @@ static int u32_change(struct net *net, s
+ 		u32_replace_knode(tp, tp_c, new);
+ 		tcf_unbind_filter(tp, &n->res);
+ 		tcf_exts_get_net(&n->exts);
+-		call_rcu(&n->rcu, u32_delete_key_rcu);
++		tcf_queue_work(&n->rwork, u32_delete_key_work);
+ 		return 0;
+ 	}
+ 

@@ -1,0 +1,421 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Thu, 10 May 2018 10:24:40 -0700
+Subject: tools: bpf: move the event reading loop to libbpf
+Patch-mainline: v4.18-rc1
+Git-commit: d0cabbb021bee5c4b831a0235af9534ad07f8d3d
+References: bsc#1109837
+
+There are two copies of event reading loop - in bpftool and
+trace_helpers "library".  Consolidate them and move the code
+to libbpf.  Return codes from trace_helpers are kept, but
+renamed to include LIBBPF prefix.
+
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ samples/bpf/Makefile                        |    8 ++
+ samples/bpf/trace_output_user.c             |    6 -
+ tools/bpf/bpftool/map_perf_ring.c           |   64 ++++----------------
+ tools/lib/bpf/Makefile                      |    2 
+ tools/lib/bpf/libbpf.c                      |   61 +++++++++++++++++++
+ tools/lib/bpf/libbpf.h                      |   13 ++++
+ tools/testing/selftests/bpf/Makefile        |    2 
+ tools/testing/selftests/bpf/trace_helpers.c |   87 +++++++++-------------------
+ tools/testing/selftests/bpf/trace_helpers.h |   11 +--
+ 9 files changed, 135 insertions(+), 119 deletions(-)
+
+--- a/samples/bpf/Makefile
++++ b/samples/bpf/Makefile
+@@ -163,6 +163,14 @@ HOSTCFLAGS += -I$(srctree)/tools/lib/ -I
+ HOSTCFLAGS += -I$(srctree)/tools/perf
+ 
+ HOSTCFLAGS_bpf_load.o += -I$(objtree)/usr/include -Wno-unused-variable
++HOSTCFLAGS_trace_helpers.o += -I$(srctree)/tools/lib/bpf/
++
++HOSTCFLAGS_trace_output_user.o += -I$(srctree)/tools/lib/bpf/
++HOSTCFLAGS_offwaketime_user.o += -I$(srctree)/tools/lib/bpf/
++HOSTCFLAGS_spintest_user.o += -I$(srctree)/tools/lib/bpf/
++HOSTCFLAGS_trace_event_user.o += -I$(srctree)/tools/lib/bpf/
++HOSTCFLAGS_sampleip_user.o += -I$(srctree)/tools/lib/bpf/
++
+ HOSTLOADLIBES_test_lru_dist += -lelf
+ HOSTLOADLIBES_sock_example += -lelf
+ HOSTLOADLIBES_fds_example += -lelf
+--- a/samples/bpf/trace_output_user.c
++++ b/samples/bpf/trace_output_user.c
+@@ -48,7 +48,7 @@ static int print_bpf_output(void *data,
+ 	if (e->cookie != 0x12345678) {
+ 		printf("BUG pid %llx cookie %llx sized %d\n",
+ 		       e->pid, e->cookie, size);
+-		return PERF_EVENT_ERROR;
++		return LIBBPF_PERF_EVENT_ERROR;
+ 	}
+ 
+ 	cnt++;
+@@ -56,10 +56,10 @@ static int print_bpf_output(void *data,
+ 	if (cnt == MAX_CNT) {
+ 		printf("recv %lld events per sec\n",
+ 		       MAX_CNT * 1000000000ll / (time_get_ns() - start_time));
+-		return PERF_EVENT_DONE;
++		return LIBBPF_PERF_EVENT_DONE;
+ 	}
+ 
+-	return PERF_EVENT_CONT;
++	return LIBBPF_PERF_EVENT_CONT;
+ }
+ 
+ static void test_bpf_perf_event(void)
+--- a/tools/bpf/bpftool/map_perf_ring.c
++++ b/tools/bpf/bpftool/map_perf_ring.c
+@@ -50,14 +50,15 @@ static void int_exit(int signo)
+ 	stop = true;
+ }
+ 
+-static void
+-print_bpf_output(struct event_ring_info *ring, struct perf_event_sample *e)
++static enum bpf_perf_event_ret print_bpf_output(void *event, void *priv)
+ {
++	struct event_ring_info *ring = priv;
++	struct perf_event_sample *e = event;
+ 	struct {
+ 		struct perf_event_header header;
+ 		__u64 id;
+ 		__u64 lost;
+-	} *lost = (void *)e;
++	} *lost = event;
+ 
+ 	if (json_output) {
+ 		jsonw_start_object(json_wtr);
+@@ -96,60 +97,23 @@ print_bpf_output(struct event_ring_info
+ 			       e->header.type, e->header.size);
+ 		}
+ 	}
++
++	return LIBBPF_PERF_EVENT_CONT;
+ }
+ 
+ static void
+ perf_event_read(struct event_ring_info *ring, void **buf, size_t *buf_len)
+ {
+-	volatile struct perf_event_mmap_page *header = ring->mem;
+-	__u64 buffer_size = MMAP_PAGE_CNT * get_page_size();
+-	__u64 data_tail = header->data_tail;
+-	__u64 data_head = header->data_head;
+-	void *base, *begin, *end;
+-
+-	asm volatile("" ::: "memory"); /* in real code it should be smp_rmb() */
+-	if (data_head == data_tail)
+-		return;
+-
+-	base = ((char *)header) + get_page_size();
+-
+-	begin = base + data_tail % buffer_size;
+-	end = base + data_head % buffer_size;
+-
+-	while (begin != end) {
+-		struct perf_event_sample *e;
+-
+-		e = begin;
+-		if (begin + e->header.size > base + buffer_size) {
+-			long len = base + buffer_size - begin;
+-
+-			if (*buf_len < e->header.size) {
+-				free(*buf);
+-				*buf = malloc(e->header.size);
+-				if (!*buf) {
+-					fprintf(stderr,
+-						"can't allocate memory");
+-					stop = true;
+-					return;
+-				}
+-				*buf_len = e->header.size;
+-			}
+-
+-			memcpy(*buf, begin, len);
+-			memcpy(*buf + len, base, e->header.size - len);
+-			e = (void *)*buf;
+-			begin = base + e->header.size - len;
+-		} else if (begin + e->header.size == base + buffer_size) {
+-			begin = base;
+-		} else {
+-			begin += e->header.size;
+-		}
++	enum bpf_perf_event_ret ret;
+ 
+-		print_bpf_output(ring, e);
++	ret = bpf_perf_event_read_simple(ring->mem,
++					 MMAP_PAGE_CNT * get_page_size(),
++					 get_page_size(), buf, buf_len,
++					 print_bpf_output, ring);
++	if (ret != LIBBPF_PERF_EVENT_CONT) {
++		fprintf(stderr, "perf read loop failed with %d\n", ret);
++		stop = true;
+ 	}
+-
+-	__sync_synchronize(); /* smp_mb() */
+-	header->data_tail = data_head;
+ }
+ 
+ static int perf_mmap_size(void)
+--- a/tools/lib/bpf/Makefile
++++ b/tools/lib/bpf/Makefile
+@@ -68,7 +68,7 @@ FEATURE_USER = .libbpf
+ FEATURE_TESTS = libelf libelf-getphdrnum libelf-mmap bpf
+ FEATURE_DISPLAY = libelf bpf
+ 
+-INCLUDES = -I. -I$(srctree)/tools/include -I$(srctree)/tools/arch/$(ARCH)/include/uapi -I$(srctree)/tools/include/uapi
++INCLUDES = -I. -I$(srctree)/tools/include -I$(srctree)/tools/arch/$(ARCH)/include/uapi -I$(srctree)/tools/include/uapi -I$(srctree)/tools/perf
+ FEATURE_CHECK_CFLAGS-bpf = $(INCLUDES)
+ 
+ check_feat := 1
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -31,6 +31,7 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <errno.h>
++#include <perf-sys.h>
+ #include <asm/unistd.h>
+ #include <linux/err.h>
+ #include <linux/kernel.h>
+@@ -2196,3 +2197,63 @@ int bpf_prog_load_xattr(const struct bpf
+ 	*prog_fd = bpf_program__fd(first_prog);
+ 	return 0;
+ }
++
++enum bpf_perf_event_ret
++bpf_perf_event_read_simple(void *mem, unsigned long size,
++			   unsigned long page_size, void **buf, size_t *buf_len,
++			   bpf_perf_event_print_t fn, void *priv)
++{
++	volatile struct perf_event_mmap_page *header = mem;
++	__u64 data_tail = header->data_tail;
++	__u64 data_head = header->data_head;
++	void *base, *begin, *end;
++	int ret;
++
++	asm volatile("" ::: "memory"); /* in real code it should be smp_rmb() */
++	if (data_head == data_tail)
++		return LIBBPF_PERF_EVENT_CONT;
++
++	base = ((char *)header) + page_size;
++
++	begin = base + data_tail % size;
++	end = base + data_head % size;
++
++	while (begin != end) {
++		struct perf_event_header *ehdr;
++
++		ehdr = begin;
++		if (begin + ehdr->size > base + size) {
++			long len = base + size - begin;
++
++			if (*buf_len < ehdr->size) {
++				free(*buf);
++				*buf = malloc(ehdr->size);
++				if (!*buf) {
++					ret = LIBBPF_PERF_EVENT_ERROR;
++					break;
++				}
++				*buf_len = ehdr->size;
++			}
++
++			memcpy(*buf, begin, len);
++			memcpy(*buf + len, base, ehdr->size - len);
++			ehdr = (void *)*buf;
++			begin = base + ehdr->size - len;
++		} else if (begin + ehdr->size == base + size) {
++			begin = base;
++		} else {
++			begin += ehdr->size;
++		}
++
++		ret = fn(ehdr, priv);
++		if (ret != LIBBPF_PERF_EVENT_CONT)
++			break;
++
++		data_tail += ehdr->size;
++	}
++
++	__sync_synchronize(); /* smp_mb() */
++	header->data_tail = data_tail;
++
++	return ret;
++}
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -267,4 +267,17 @@ int bpf_prog_load(const char *file, enum
+ 		  struct bpf_object **pobj, int *prog_fd);
+ 
+ int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags);
++
++enum bpf_perf_event_ret {
++	LIBBPF_PERF_EVENT_DONE	= 0,
++	LIBBPF_PERF_EVENT_ERROR	= -1,
++	LIBBPF_PERF_EVENT_CONT	= -2,
++};
++
++typedef enum bpf_perf_event_ret (*bpf_perf_event_print_t)(void *event,
++							  void *priv);
++int bpf_perf_event_read_simple(void *mem, unsigned long size,
++			       unsigned long page_size,
++			       void **buf, size_t *buf_len,
++			       bpf_perf_event_print_t fn, void *priv);
+ #endif
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -10,7 +10,7 @@ ifneq ($(wildcard $(GENHDR)),)
+   GENFLAGS := -DHAVE_GENHDR
+ endif
+ 
+-CFLAGS += -Wall -O2 -I$(APIDIR) -I$(LIBDIR) -I$(GENDIR) $(GENFLAGS) -I../../../include
++CFLAGS += -Wall -O2 -I$(APIDIR) -I$(LIBDIR) -I$(BPFDIR) -I$(GENDIR) $(GENFLAGS) -I../../../include
+ LDLIBS += -lcap -lelf -lrt -lpthread
+ 
+ TEST_CUSTOM_PROGS = $(OUTPUT)/urandom_read
+--- a/tools/testing/selftests/bpf/trace_helpers.c
++++ b/tools/testing/selftests/bpf/trace_helpers.c
+@@ -74,7 +74,7 @@ struct ksym *ksym_search(long key)
+ 
+ static int page_size;
+ static int page_cnt = 8;
+-static volatile struct perf_event_mmap_page *header;
++static struct perf_event_mmap_page *header;
+ 
+ int perf_event_mmap(int fd)
+ {
+@@ -107,74 +107,47 @@ struct perf_event_sample {
+ 	char data[];
+ };
+ 
+-static int perf_event_read(perf_event_print_fn fn)
++static enum bpf_perf_event_ret bpf_perf_event_print(void *event, void *priv)
+ {
+-	__u64 data_tail = header->data_tail;
+-	__u64 data_head = header->data_head;
+-	__u64 buffer_size = page_cnt * page_size;
+-	void *base, *begin, *end;
+-	char buf[256];
++	struct perf_event_sample *e = event;
++	perf_event_print_fn fn = priv;
+ 	int ret;
+ 
+-	asm volatile("" ::: "memory"); /* in real code it should be smp_rmb() */
+-	if (data_head == data_tail)
+-		return PERF_EVENT_CONT;
+-
+-	base = ((char *)header) + page_size;
+-
+-	begin = base + data_tail % buffer_size;
+-	end = base + data_head % buffer_size;
+-
+-	while (begin != end) {
+-		struct perf_event_sample *e;
+-
+-		e = begin;
+-		if (begin + e->header.size > base + buffer_size) {
+-			long len = base + buffer_size - begin;
+-
+-			assert(len < e->header.size);
+-			memcpy(buf, begin, len);
+-			memcpy(buf + len, base, e->header.size - len);
+-			e = (void *) buf;
+-			begin = base + e->header.size - len;
+-		} else if (begin + e->header.size == base + buffer_size) {
+-			begin = base;
+-		} else {
+-			begin += e->header.size;
+-		}
+-
+-		if (e->header.type == PERF_RECORD_SAMPLE) {
+-			ret = fn(e->data, e->size);
+-			if (ret != PERF_EVENT_CONT)
+-				return ret;
+-		} else if (e->header.type == PERF_RECORD_LOST) {
+-			struct {
+-				struct perf_event_header header;
+-				__u64 id;
+-				__u64 lost;
+-			} *lost = (void *) e;
+-			printf("lost %lld events\n", lost->lost);
+-		} else {
+-			printf("unknown event type=%d size=%d\n",
+-			       e->header.type, e->header.size);
+-		}
++	if (e->header.type == PERF_RECORD_SAMPLE) {
++		ret = fn(e->data, e->size);
++		if (ret != LIBBPF_PERF_EVENT_CONT)
++			return ret;
++	} else if (e->header.type == PERF_RECORD_LOST) {
++		struct {
++			struct perf_event_header header;
++			__u64 id;
++			__u64 lost;
++		} *lost = (void *) e;
++		printf("lost %lld events\n", lost->lost);
++	} else {
++		printf("unknown event type=%d size=%d\n",
++		       e->header.type, e->header.size);
+ 	}
+ 
+-	__sync_synchronize(); /* smp_mb() */
+-	header->data_tail = data_head;
+-	return PERF_EVENT_CONT;
++	return LIBBPF_PERF_EVENT_CONT;
+ }
+ 
+ int perf_event_poller(int fd, perf_event_print_fn output_fn)
+ {
+-	int ret;
++	enum bpf_perf_event_ret ret;
++	void *buf = NULL;
++	size_t len = 0;
+ 
+ 	for (;;) {
+ 		perf_event_poll(fd);
+-		ret = perf_event_read(output_fn);
+-		if (ret != PERF_EVENT_CONT)
+-			return ret;
++		ret = bpf_perf_event_read_simple(header, page_cnt * page_size,
++						 page_size, &buf, &len,
++						 bpf_perf_event_print,
++						 output_fn);
++		if (ret != LIBBPF_PERF_EVENT_CONT)
++			break;
+ 	}
++	free(buf);
+ 
+-	return PERF_EVENT_DONE;
++	return ret;
+ }
+--- a/tools/testing/selftests/bpf/trace_helpers.h
++++ b/tools/testing/selftests/bpf/trace_helpers.h
+@@ -2,6 +2,8 @@
+ #ifndef __TRACE_HELPER_H
+ #define __TRACE_HELPER_H
+ 
++#include <libbpf.h>
++
+ struct ksym {
+ 	long addr;
+ 	char *name;
+@@ -10,14 +12,9 @@ struct ksym {
+ int load_kallsyms(void);
+ struct ksym *ksym_search(long key);
+ 
+-typedef int (*perf_event_print_fn)(void *data, int size);
+-
+-/* return code for perf_event_print_fn */
+-#define PERF_EVENT_DONE		0
+-#define PERF_EVENT_ERROR	-1
+-#define PERF_EVENT_CONT		-2
++typedef enum bpf_perf_event_ret (*perf_event_print_fn)(void *data, int size);
+ 
+ int perf_event_mmap(int fd);
+-/* return PERF_EVENT_DONE or PERF_EVENT_ERROR */
++/* return LIBBPF_PERF_EVENT_DONE or LIBBPF_PERF_EVENT_ERROR */
+ int perf_event_poller(int fd, perf_event_print_fn output_fn);
+ #endif

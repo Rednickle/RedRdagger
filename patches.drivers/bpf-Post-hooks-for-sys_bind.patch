@@ -1,0 +1,415 @@
+From: Andrey Ignatov <rdna@fb.com>
+Date: Fri, 30 Mar 2018 15:08:07 -0700
+Subject: bpf: Post-hooks for sys_bind
+Patch-mainline: v4.17-rc1
+Git-commit: aac3fc320d9404f2665a8b1249dc3170d5fa3caf
+References: bsc#1109837
+
+"Post-hooks" are hooks that are called right before returning from
+sys_bind. At this time IP and port are already allocated and no further
+changes to `struct sock` can happen before returning from sys_bind but
+BPF program has a chance to inspect the socket and change sys_bind
+result.
+
+Specifically it can e.g. inspect what port was allocated and if it
+doesn't satisfy some policy, BPF program can force sys_bind to fail and
+return EPERM to user.
+
+Another example of usage is recording the IP:port pair to some map to
+use it in later calls to sys_connect. E.g. if some TCP server inside
+cgroup was bound to some IP:port_n, it can be recorded to a map. And
+later when some TCP client inside same cgroup is trying to connect to
+127.0.0.1:port_n, BPF hook for sys_connect can override the destination
+and connect application to IP:port_n instead of 127.0.0.1:port_n. That
+helps forcing all applications inside a cgroup to use desired IP and not
+break those applications if they e.g. use localhost to communicate
+between each other.
+
+== Implementation details ==
+
+Post-hooks are implemented as two new attach types
+`BPF_CGROUP_INET4_POST_BIND` and `BPF_CGROUP_INET6_POST_BIND` for
+existing prog type `BPF_PROG_TYPE_CGROUP_SOCK`.
+
+Separate attach types for IPv4 and IPv6 are introduced to avoid access
+to IPv6 field in `struct sock` from `inet_bind()` and to IPv4 field from
+`inet6_bind()` since those fields might not make sense in such cases.
+
+Signed-off-by: Andrey Ignatov <rdna@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf-cgroup.h |   18 +++++-
+ include/uapi/linux/bpf.h   |   11 ++++
+ kernel/bpf/syscall.c       |   43 ++++++++++++++++
+ net/core/filter.c          |  116 +++++++++++++++++++++++++++++++++++++++------
+ net/ipv4/af_inet.c         |   18 ++++--
+ net/ipv6/af_inet6.c        |   21 +++++---
+ 6 files changed, 196 insertions(+), 31 deletions(-)
+
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -97,16 +97,24 @@ int __cgroup_bpf_check_dev_permission(sh
+ 	__ret;								       \
+ })
+ 
+-#define BPF_CGROUP_RUN_PROG_INET_SOCK(sk)				       \
++#define BPF_CGROUP_RUN_SK_PROG(sk, type)				       \
+ ({									       \
+ 	int __ret = 0;							       \
+-	if (cgroup_bpf_enabled && sk) {					       \
+-		__ret = __cgroup_bpf_run_filter_sk(sk,			       \
+-						 BPF_CGROUP_INET_SOCK_CREATE); \
++	if (cgroup_bpf_enabled) {					       \
++		__ret = __cgroup_bpf_run_filter_sk(sk, type);		       \
+ 	}								       \
+ 	__ret;								       \
+ })
+ 
++#define BPF_CGROUP_RUN_PROG_INET_SOCK(sk)				       \
++	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET_SOCK_CREATE)
++
++#define BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk)				       \
++	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET4_POST_BIND)
++
++#define BPF_CGROUP_RUN_PROG_INET6_POST_BIND(sk)				       \
++	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET6_POST_BIND)
++
+ #define BPF_CGROUP_RUN_SA_PROG(sk, uaddr, type)				       \
+ ({									       \
+ 	int __ret = 0;							       \
+@@ -182,6 +190,8 @@ static inline int cgroup_bpf_inherit(str
+ #define BPF_CGROUP_RUN_PROG_INET_SOCK(sk) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET6_POST_BIND(sk) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_CONNECT(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_CONNECT_LOCK(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET6_CONNECT(sk, uaddr) ({ 0; })
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -149,6 +149,8 @@ enum bpf_attach_type {
+ 	BPF_CGROUP_INET6_BIND,
+ 	BPF_CGROUP_INET4_CONNECT,
+ 	BPF_CGROUP_INET6_CONNECT,
++	BPF_CGROUP_INET4_POST_BIND,
++	BPF_CGROUP_INET6_POST_BIND,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+@@ -934,6 +936,15 @@ struct bpf_sock {
+ 	__u32 protocol;
+ 	__u32 mark;
+ 	__u32 priority;
++	__u32 src_ip4;		/* Allows 1,2,4-byte read.
++				 * Stored in network byte order.
++				 */
++	__u32 src_ip6[4];	/* Allows 1,2,4-byte read.
++				 * Stored in network byte order.
++				 */
++	__u32 src_port;		/* Allows 4-byte read.
++				 * Stored in host byte order
++				 */
+ };
+ 
+ #define XDP_PACKET_HEADROOM 256
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1151,11 +1151,46 @@ struct bpf_prog *bpf_prog_get_type_dev(u
+ }
+ EXPORT_SYMBOL_GPL(bpf_prog_get_type_dev);
+ 
++/* Initially all BPF programs could be loaded w/o specifying
++ * expected_attach_type. Later for some of them specifying expected_attach_type
++ * at load time became required so that program could be validated properly.
++ * Programs of types that are allowed to be loaded both w/ and w/o (for
++ * backward compatibility) expected_attach_type, should have the default attach
++ * type assigned to expected_attach_type for the latter case, so that it can be
++ * validated later at attach time.
++ *
++ * bpf_prog_load_fixup_attach_type() sets expected_attach_type in @attr if
++ * prog type requires it but has some attach types that have to be backward
++ * compatible.
++ */
++static void bpf_prog_load_fixup_attach_type(union bpf_attr *attr)
++{
++	switch (attr->prog_type) {
++	case BPF_PROG_TYPE_CGROUP_SOCK:
++		/* Unfortunately BPF_ATTACH_TYPE_UNSPEC enumeration doesn't
++		 * exist so checking for non-zero is the way to go here.
++		 */
++		if (!attr->expected_attach_type)
++			attr->expected_attach_type =
++				BPF_CGROUP_INET_SOCK_CREATE;
++		break;
++	}
++}
++
+ static int
+ bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
+ 				enum bpf_attach_type expected_attach_type)
+ {
+ 	switch (prog_type) {
++	case BPF_PROG_TYPE_CGROUP_SOCK:
++		switch (expected_attach_type) {
++		case BPF_CGROUP_INET_SOCK_CREATE:
++		case BPF_CGROUP_INET4_POST_BIND:
++		case BPF_CGROUP_INET6_POST_BIND:
++			return 0;
++		default:
++			return -EINVAL;
++		}
+ 	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+ 		switch (expected_attach_type) {
+ 		case BPF_CGROUP_INET4_BIND:
+@@ -1175,6 +1210,7 @@ static int bpf_prog_attach_check_attach_
+ 					     enum bpf_attach_type attach_type)
+ {
+ 	switch (prog->type) {
++	case BPF_PROG_TYPE_CGROUP_SOCK:
+ 	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+ 		return attach_type == prog->expected_attach_type ? 0 : -EINVAL;
+ 	default:
+@@ -1220,6 +1256,7 @@ static int bpf_prog_load(union bpf_attr
+ 	    !capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
++	bpf_prog_load_fixup_attach_type(attr);
+ 	if (bpf_prog_load_check_attach_type(type, attr->expected_attach_type))
+ 		return -EINVAL;
+ 
+@@ -1388,6 +1425,8 @@ static int bpf_prog_attach(const union b
+ 		ptype = BPF_PROG_TYPE_CGROUP_SKB;
+ 		break;
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
++	case BPF_CGROUP_INET4_POST_BIND:
++	case BPF_CGROUP_INET6_POST_BIND:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK;
+ 		break;
+ 	case BPF_CGROUP_INET4_BIND:
+@@ -1456,6 +1495,8 @@ static int bpf_prog_detach(const union b
+ 		ptype = BPF_PROG_TYPE_CGROUP_SKB;
+ 		break;
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
++	case BPF_CGROUP_INET4_POST_BIND:
++	case BPF_CGROUP_INET6_POST_BIND:
+ 		ptype = BPF_PROG_TYPE_CGROUP_SOCK;
+ 		break;
+ 	case BPF_CGROUP_INET4_BIND:
+@@ -1515,6 +1556,8 @@ static int bpf_prog_query(const union bp
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
+ 	case BPF_CGROUP_INET4_BIND:
+ 	case BPF_CGROUP_INET6_BIND:
++	case BPF_CGROUP_INET4_POST_BIND:
++	case BPF_CGROUP_INET6_POST_BIND:
+ 	case BPF_CGROUP_INET4_CONNECT:
+ 	case BPF_CGROUP_INET6_CONNECT:
+ 	case BPF_CGROUP_SOCK_OPS:
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -4083,30 +4083,80 @@ static bool lwt_is_valid_access(int off,
+ 	return bpf_skb_is_valid_access(off, size, type, prog, info);
+ }
+ 
+-static bool sock_filter_is_valid_access(int off, int size,
+-					enum bpf_access_type type,
+-					const struct bpf_prog *prog,
+-					struct bpf_insn_access_aux *info)
++
++/* Attach type specific accesses */
++static bool __sock_filter_check_attach_type(int off,
++					    enum bpf_access_type access_type,
++					    enum bpf_attach_type attach_type)
+ {
+-	if (type == BPF_WRITE) {
+-		switch (off) {
+-		case offsetof(struct bpf_sock, bound_dev_if):
+-		case offsetof(struct bpf_sock, mark):
+-		case offsetof(struct bpf_sock, priority):
+-			break;
++	switch (off) {
++	case offsetof(struct bpf_sock, bound_dev_if):
++	case offsetof(struct bpf_sock, mark):
++	case offsetof(struct bpf_sock, priority):
++		switch (attach_type) {
++		case BPF_CGROUP_INET_SOCK_CREATE:
++			goto full_access;
++		default:
++			return false;
++		}
++	case bpf_ctx_range(struct bpf_sock, src_ip4):
++		switch (attach_type) {
++		case BPF_CGROUP_INET4_POST_BIND:
++			goto read_only;
++		default:
++			return false;
++		}
++	case bpf_ctx_range_till(struct bpf_sock, src_ip6[0], src_ip6[3]):
++		switch (attach_type) {
++		case BPF_CGROUP_INET6_POST_BIND:
++			goto read_only;
++		default:
++			return false;
++		}
++	case bpf_ctx_range(struct bpf_sock, src_port):
++		switch (attach_type) {
++		case BPF_CGROUP_INET4_POST_BIND:
++		case BPF_CGROUP_INET6_POST_BIND:
++			goto read_only;
+ 		default:
+ 			return false;
+ 		}
+ 	}
++read_only:
++	return access_type == BPF_READ;
++full_access:
++	return true;
++}
++
++static bool __sock_filter_check_size(int off, int size,
++				     struct bpf_insn_access_aux *info)
++{
++	const int size_default = sizeof(__u32);
+ 
+-	if (off < 0 || off + size > sizeof(struct bpf_sock))
++	switch (off) {
++	case bpf_ctx_range(struct bpf_sock, src_ip4):
++	case bpf_ctx_range_till(struct bpf_sock, src_ip6[0], src_ip6[3]):
++		bpf_ctx_record_field_size(info, size_default);
++		return bpf_ctx_narrow_access_ok(off, size, size_default);
++	}
++
++	return size == size_default;
++}
++
++static bool sock_filter_is_valid_access(int off, int size,
++					enum bpf_access_type type,
++					const struct bpf_prog *prog,
++					struct bpf_insn_access_aux *info)
++{
++	if (off < 0 || off >= sizeof(struct bpf_sock))
+ 		return false;
+-	/* The verifier guarantees that size > 0. */
+ 	if (off % size != 0)
+ 		return false;
+-	if (size != sizeof(__u32))
++	if (!__sock_filter_check_attach_type(off, type,
++					     prog->expected_attach_type))
++		return false;
++	if (!__sock_filter_check_size(off, size, info))
+ 		return false;
+-
+ 	return true;
+ }
+ 
+@@ -4714,6 +4764,7 @@ static u32 sock_filter_convert_ctx_acces
+ 					  struct bpf_prog *prog, u32 *target_size)
+ {
+ 	struct bpf_insn *insn = insn_buf;
++	int off;
+ 
+ 	switch (si->off) {
+ 	case offsetof(struct bpf_sock, bound_dev_if):
+@@ -4769,6 +4820,43 @@ static u32 sock_filter_convert_ctx_acces
+ 		*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, SK_FL_PROTO_MASK);
+ 		*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, SK_FL_PROTO_SHIFT);
+ 		break;
++
++	case offsetof(struct bpf_sock, src_ip4):
++		*insn++ = BPF_LDX_MEM(
++			BPF_SIZE(si->code), si->dst_reg, si->src_reg,
++			bpf_target_off(struct sock_common, skc_rcv_saddr,
++				       FIELD_SIZEOF(struct sock_common,
++						    skc_rcv_saddr),
++				       target_size));
++		break;
++
++	case bpf_ctx_range_till(struct bpf_sock, src_ip6[0], src_ip6[3]):
++#if IS_ENABLED(CONFIG_IPV6)
++		off = si->off;
++		off -= offsetof(struct bpf_sock, src_ip6[0]);
++		*insn++ = BPF_LDX_MEM(
++			BPF_SIZE(si->code), si->dst_reg, si->src_reg,
++			bpf_target_off(
++				struct sock_common,
++				skc_v6_rcv_saddr.s6_addr32[0],
++				FIELD_SIZEOF(struct sock_common,
++					     skc_v6_rcv_saddr.s6_addr32[0]),
++				target_size) + off);
++#else
++		(void)off;
++		*insn++ = BPF_MOV32_IMM(si->dst_reg, 0);
++#endif
++		break;
++
++	case offsetof(struct bpf_sock, src_port):
++		*insn++ = BPF_LDX_MEM(
++			BPF_FIELD_SIZEOF(struct sock_common, skc_num),
++			si->dst_reg, si->src_reg,
++			bpf_target_off(struct sock_common, skc_num,
++				       FIELD_SIZEOF(struct sock_common,
++						    skc_num),
++				       target_size));
++		break;
+ 	}
+ 
+ 	return insn - insn_buf;
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -517,12 +517,18 @@ int __inet_bind(struct sock *sk, struct
+ 		inet->inet_saddr = 0;  /* Use device */
+ 
+ 	/* Make sure we are allowed to bind here. */
+-	if ((snum || !(inet->bind_address_no_port ||
+-		       force_bind_address_no_port)) &&
+-	    sk->sk_prot->get_port(sk, snum)) {
+-		inet->inet_saddr = inet->inet_rcv_saddr = 0;
+-		err = -EADDRINUSE;
+-		goto out_release_sock;
++	if (snum || !(inet->bind_address_no_port ||
++		      force_bind_address_no_port)) {
++		if (sk->sk_prot->get_port(sk, snum)) {
++			inet->inet_saddr = inet->inet_rcv_saddr = 0;
++			err = -EADDRINUSE;
++			goto out_release_sock;
++		}
++		err = BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk);
++		if (err) {
++			inet->inet_saddr = inet->inet_rcv_saddr = 0;
++			goto out_release_sock;
++		}
+ 	}
+ 
+ 	if (inet->inet_rcv_saddr)
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -411,13 +411,20 @@ int __inet6_bind(struct sock *sk, struct
+ 		sk->sk_ipv6only = 1;
+ 
+ 	/* Make sure we are allowed to bind here. */
+-	if ((snum || !(inet->bind_address_no_port ||
+-		       force_bind_address_no_port)) &&
+-	    sk->sk_prot->get_port(sk, snum)) {
+-		sk->sk_ipv6only = saved_ipv6only;
+-		inet_reset_saddr(sk);
+-		err = -EADDRINUSE;
+-		goto out;
++	if (snum || !(inet->bind_address_no_port ||
++		      force_bind_address_no_port)) {
++		if (sk->sk_prot->get_port(sk, snum)) {
++			sk->sk_ipv6only = saved_ipv6only;
++			inet_reset_saddr(sk);
++			err = -EADDRINUSE;
++			goto out;
++		}
++		err = BPF_CGROUP_RUN_PROG_INET6_POST_BIND(sk);
++		if (err) {
++			sk->sk_ipv6only = saved_ipv6only;
++			inet_reset_saddr(sk);
++			goto out;
++		}
+ 	}
+ 
+ 	if (addr_type != IPV6_ADDR_ANY)

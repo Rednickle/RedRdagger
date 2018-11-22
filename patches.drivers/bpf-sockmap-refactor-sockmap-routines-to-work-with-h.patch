@@ -1,0 +1,401 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Mon, 14 May 2018 10:00:16 -0700
+Subject: bpf: sockmap, refactor sockmap routines to work with hashmap
+Patch-mainline: v4.18-rc1
+Git-commit: e5cd3abcb31a48d4ea91bd32f0618802ca5f3592
+References: bsc#1109837
+
+This patch only refactors the existing sockmap code. This will allow
+much of the psock initialization code path and bpf helper codes to
+work for both sockmap bpf map types that are backed by an array, the
+currently supported type, and the new hash backed bpf map type
+sockhash.
+
+Most the fallout comes from three changes,
+
+  - Pushing bpf programs into an independent structure so we
+    can use it from the htab struct in the next patch.
+  - Generalizing helpers to use void *key instead of the hardcoded
+    u32.
+  - Instead of passing map/key through the metadata we now do
+    the lookup inline. This avoids storing the key in the metadata
+    which will be useful when keys can be longer than 4 bytes. We
+    rename the sk pointers to sk_redir at this point as well to
+    avoid any confusion between the current sk pointer and the
+    redirect pointer sk_redir.
+
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Acked-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/filter.h |    3 -
+ include/net/tcp.h      |    3 -
+ kernel/bpf/sockmap.c   |  142 +++++++++++++++++++++++++++++--------------------
+ net/core/filter.c      |   31 ++--------
+ 4 files changed, 95 insertions(+), 84 deletions(-)
+
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -516,9 +516,8 @@ struct sk_msg_buff {
+ 	int sg_end;
+ 	struct scatterlist sg_data[MAX_SKB_FRAGS];
+ 	bool sg_copy[MAX_SKB_FRAGS];
+-	__u32 key;
+ 	__u32 flags;
+-	struct bpf_map *map;
++	struct sock *sk_redir;
+ 	struct sk_buff *skb;
+ 	struct list_head list;
+ };
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -835,9 +835,8 @@ struct tcp_skb_cb {
+ #endif
+ 		} header;	/* For incoming skbs */
+ 		struct {
+-			__u32 key;
+ 			__u32 flags;
+-			struct bpf_map *map;
++			struct sock *sk_redir;
+ 			void *data_end;
+ 		} bpf;
+ 	};
+--- a/kernel/bpf/sockmap.c
++++ b/kernel/bpf/sockmap.c
+@@ -48,14 +48,18 @@
+ #define SOCK_CREATE_FLAG_MASK \
+ 	(BPF_F_NUMA_NODE | BPF_F_RDONLY | BPF_F_WRONLY)
+ 
+-struct bpf_stab {
+-	struct bpf_map map;
+-	struct sock **sock_map;
++struct bpf_sock_progs {
+ 	struct bpf_prog *bpf_tx_msg;
+ 	struct bpf_prog *bpf_parse;
+ 	struct bpf_prog *bpf_verdict;
+ };
+ 
++struct bpf_stab {
++	struct bpf_map map;
++	struct sock **sock_map;
++	struct bpf_sock_progs progs;
++};
++
+ enum smap_psock_state {
+ 	SMAP_TX_RUNNING,
+ };
+@@ -461,7 +465,7 @@ static int free_curr_sg(struct sock *sk,
+ static int bpf_map_msg_verdict(int _rc, struct sk_msg_buff *md)
+ {
+ 	return ((_rc == SK_PASS) ?
+-	       (md->map ? __SK_REDIRECT : __SK_PASS) :
++	       (md->sk_redir ? __SK_REDIRECT : __SK_PASS) :
+ 	       __SK_DROP);
+ }
+ 
+@@ -1092,7 +1096,7 @@ static int smap_verdict_func(struct smap
+ 	 * when we orphan the skb so that we don't have the possibility
+ 	 * to reference a stale map.
+ 	 */
+-	TCP_SKB_CB(skb)->bpf.map = NULL;
++	TCP_SKB_CB(skb)->bpf.sk_redir = NULL;
+ 	skb->sk = psock->sock;
+ 	bpf_compute_data_end_sk_skb(skb);
+ 	preempt_disable();
+@@ -1102,7 +1106,7 @@ static int smap_verdict_func(struct smap
+ 
+ 	/* Moving return codes from UAPI namespace into internal namespace */
+ 	return rc == SK_PASS ?
+-		(TCP_SKB_CB(skb)->bpf.map ? __SK_REDIRECT : __SK_PASS) :
++		(TCP_SKB_CB(skb)->bpf.sk_redir ? __SK_REDIRECT : __SK_PASS) :
+ 		__SK_DROP;
+ }
+ 
+@@ -1372,7 +1376,6 @@ static int smap_init_sock(struct smap_ps
+ }
+ 
+ static void smap_init_progs(struct smap_psock *psock,
+-			    struct bpf_stab *stab,
+ 			    struct bpf_prog *verdict,
+ 			    struct bpf_prog *parse)
+ {
+@@ -1450,14 +1453,13 @@ static void smap_gc_work(struct work_str
+ 	kfree(psock);
+ }
+ 
+-static struct smap_psock *smap_init_psock(struct sock *sock,
+-					  struct bpf_stab *stab)
++static struct smap_psock *smap_init_psock(struct sock *sock, int node)
+ {
+ 	struct smap_psock *psock;
+ 
+ 	psock = kzalloc_node(sizeof(struct smap_psock),
+ 			     GFP_ATOMIC | __GFP_NOWARN,
+-			     stab->map.numa_node);
++			     node);
+ 	if (!psock)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -1662,40 +1664,26 @@ out:
+  *  - sock_map must use READ_ONCE and (cmp)xchg operations
+  *  - BPF verdict/parse programs must use READ_ONCE and xchg operations
+  */
+-static int sock_map_ctx_update_elem(struct bpf_sock_ops_kern *skops,
+-				    struct bpf_map *map,
+-				    void *key, u64 flags)
++
++static int __sock_map_ctx_update_elem(struct bpf_map *map,
++				      struct bpf_sock_progs *progs,
++				      struct sock *sock,
++				      struct sock **map_link,
++				      void *key)
+ {
+-	struct bpf_stab *stab = container_of(map, struct bpf_stab, map);
+-	struct smap_psock_map_entry *e = NULL;
+ 	struct bpf_prog *verdict, *parse, *tx_msg;
+-	struct sock *osock, *sock;
++	struct smap_psock_map_entry *e = NULL;
+ 	struct smap_psock *psock;
+-	u32 i = *(u32 *)key;
+ 	bool new = false;
+ 	int err;
+ 
+-	if (unlikely(flags > BPF_EXIST))
+-		return -EINVAL;
+-
+-	if (unlikely(i >= stab->map.max_entries))
+-		return -E2BIG;
+-
+-	sock = READ_ONCE(stab->sock_map[i]);
+-	if (flags == BPF_EXIST && !sock)
+-		return -ENOENT;
+-	else if (flags == BPF_NOEXIST && sock)
+-		return -EEXIST;
+-
+-	sock = skops->sk;
+-
+ 	/* 1. If sock map has BPF programs those will be inherited by the
+ 	 * sock being added. If the sock is already attached to BPF programs
+ 	 * this results in an error.
+ 	 */
+-	verdict = READ_ONCE(stab->bpf_verdict);
+-	parse = READ_ONCE(stab->bpf_parse);
+-	tx_msg = READ_ONCE(stab->bpf_tx_msg);
++	verdict = READ_ONCE(progs->bpf_verdict);
++	parse = READ_ONCE(progs->bpf_parse);
++	tx_msg = READ_ONCE(progs->bpf_tx_msg);
+ 
+ 	if (parse && verdict) {
+ 		/* bpf prog refcnt may be zero if a concurrent attach operation
+@@ -1748,7 +1736,7 @@ static int sock_map_ctx_update_elem(stru
+ 			goto out_progs;
+ 		}
+ 	} else {
+-		psock = smap_init_psock(sock, stab);
++		psock = smap_init_psock(sock, map->numa_node);
+ 		if (IS_ERR(psock)) {
+ 			err = PTR_ERR(psock);
+ 			goto out_progs;
+@@ -1763,7 +1751,6 @@ static int sock_map_ctx_update_elem(stru
+ 		err = -ENOMEM;
+ 		goto out_progs;
+ 	}
+-	e->entry = &stab->sock_map[i];
+ 
+ 	/* 3. At this point we have a reference to a valid psock that is
+ 	 * running. Attach any BPF programs needed.
+@@ -1780,7 +1767,7 @@ static int sock_map_ctx_update_elem(stru
+ 		err = smap_init_sock(psock, sock);
+ 		if (err)
+ 			goto out_free;
+-		smap_init_progs(psock, stab, verdict, parse);
++		smap_init_progs(psock, verdict, parse);
+ 		smap_start_sock(psock, sock);
+ 	}
+ 
+@@ -1789,19 +1776,12 @@ static int sock_map_ctx_update_elem(stru
+ 	 * it with. Because we can only have a single set of programs if
+ 	 * old_sock has a strp we can stop it.
+ 	 */
+-	list_add_tail(&e->list, &psock->maps);
+-	write_unlock_bh(&sock->sk_callback_lock);
+-
+-	osock = xchg(&stab->sock_map[i], sock);
+-	if (osock) {
+-		struct smap_psock *opsock = smap_psock_sk(osock);
+-
+-		write_lock_bh(&osock->sk_callback_lock);
+-		smap_list_remove(opsock, &stab->sock_map[i]);
+-		smap_release_sock(opsock, osock);
+-		write_unlock_bh(&osock->sk_callback_lock);
++	if (map_link) {
++		e->entry = map_link;
++		list_add_tail(&e->list, &psock->maps);
+ 	}
+-	return 0;
++	write_unlock_bh(&sock->sk_callback_lock);
++	return err;
+ out_free:
+ 	smap_release_sock(psock, sock);
+ out_progs:
+@@ -1816,23 +1796,69 @@ out_progs:
+ 	return err;
+ }
+ 
+-int sock_map_prog(struct bpf_map *map, struct bpf_prog *prog, u32 type)
++static int sock_map_ctx_update_elem(struct bpf_sock_ops_kern *skops,
++				    struct bpf_map *map,
++				    void *key, u64 flags)
+ {
+ 	struct bpf_stab *stab = container_of(map, struct bpf_stab, map);
++	struct bpf_sock_progs *progs = &stab->progs;
++	struct sock *osock, *sock;
++	u32 i = *(u32 *)key;
++	int err;
++
++	if (unlikely(flags > BPF_EXIST))
++		return -EINVAL;
++
++	if (unlikely(i >= stab->map.max_entries))
++		return -E2BIG;
++
++	sock = READ_ONCE(stab->sock_map[i]);
++	if (flags == BPF_EXIST && !sock)
++		return -ENOENT;
++	else if (flags == BPF_NOEXIST && sock)
++		return -EEXIST;
++
++	sock = skops->sk;
++	err = __sock_map_ctx_update_elem(map, progs, sock, &stab->sock_map[i],
++					 key);
++	if (err)
++		goto out;
++
++	osock = xchg(&stab->sock_map[i], sock);
++	if (osock) {
++		struct smap_psock *opsock = smap_psock_sk(osock);
++
++		write_lock_bh(&osock->sk_callback_lock);
++		smap_list_remove(opsock, &stab->sock_map[i]);
++		smap_release_sock(opsock, osock);
++		write_unlock_bh(&osock->sk_callback_lock);
++	}
++out:
++	return 0;
++}
++
++int sock_map_prog(struct bpf_map *map, struct bpf_prog *prog, u32 type)
++{
++	struct bpf_sock_progs *progs;
+ 	struct bpf_prog *orig;
+ 
+-	if (unlikely(map->map_type != BPF_MAP_TYPE_SOCKMAP))
++	if (map->map_type == BPF_MAP_TYPE_SOCKMAP) {
++		struct bpf_stab *stab = container_of(map, struct bpf_stab, map);
++
++		progs = &stab->progs;
++	} else {
+ 		return -EINVAL;
++	}
+ 
+ 	switch (type) {
+ 	case BPF_SK_MSG_VERDICT:
+-		orig = xchg(&stab->bpf_tx_msg, prog);
++		orig = xchg(&progs->bpf_tx_msg, prog);
+ 		break;
+ 	case BPF_SK_SKB_STREAM_PARSER:
+-		orig = xchg(&stab->bpf_parse, prog);
++		orig = xchg(&progs->bpf_parse, prog);
+ 		break;
+ 	case BPF_SK_SKB_STREAM_VERDICT:
+-		orig = xchg(&stab->bpf_verdict, prog);
++		orig = xchg(&progs->bpf_verdict, prog);
+ 		break;
+ 	default:
+ 		return -EOPNOTSUPP;
+@@ -1881,16 +1907,18 @@ static int sock_map_update_elem(struct b
+ static void sock_map_release(struct bpf_map *map)
+ {
+ 	struct bpf_stab *stab = container_of(map, struct bpf_stab, map);
++	struct bpf_sock_progs *progs;
+ 	struct bpf_prog *orig;
+ 
+-	orig = xchg(&stab->bpf_parse, NULL);
++	progs = &stab->progs;
++	orig = xchg(&progs->bpf_parse, NULL);
+ 	if (orig)
+ 		bpf_prog_put(orig);
+-	orig = xchg(&stab->bpf_verdict, NULL);
++	orig = xchg(&progs->bpf_verdict, NULL);
+ 	if (orig)
+ 		bpf_prog_put(orig);
+ 
+-	orig = xchg(&stab->bpf_tx_msg, NULL);
++	orig = xchg(&progs->bpf_tx_msg, NULL);
+ 	if (orig)
+ 		bpf_prog_put(orig);
+ }
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -2085,9 +2085,10 @@ BPF_CALL_4(bpf_sk_redirect_map, struct s
+ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
+ 		return SK_DROP;
+ 
+-	tcb->bpf.key = key;
+ 	tcb->bpf.flags = flags;
+-	tcb->bpf.map = map;
++	tcb->bpf.sk_redir = __sock_map_lookup_elem(map, key);
++	if (!tcb->bpf.sk_redir)
++		return SK_DROP;
+ 
+ 	return SK_PASS;
+ }
+@@ -2095,16 +2096,8 @@ BPF_CALL_4(bpf_sk_redirect_map, struct s
+ struct sock *do_sk_redirect_map(struct sk_buff *skb)
+ {
+ 	struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+-	struct sock *sk = NULL;
+-
+-	if (tcb->bpf.map) {
+-		sk = __sock_map_lookup_elem(tcb->bpf.map, tcb->bpf.key);
+ 
+-		tcb->bpf.key = 0;
+-		tcb->bpf.map = NULL;
+-	}
+-
+-	return sk;
++	return tcb->bpf.sk_redir;
+ }
+ 
+ static const struct bpf_func_proto bpf_sk_redirect_map_proto = {
+@@ -2124,25 +2117,17 @@ BPF_CALL_4(bpf_msg_redirect_map, struct
+ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
+ 		return SK_DROP;
+ 
+-	msg->key = key;
+ 	msg->flags = flags;
+-	msg->map = map;
++	msg->sk_redir = __sock_map_lookup_elem(map, key);
++	if (!msg->sk_redir)
++		return SK_DROP;
+ 
+ 	return SK_PASS;
+ }
+ 
+ struct sock *do_msg_redirect_map(struct sk_msg_buff *msg)
+ {
+-	struct sock *sk = NULL;
+-
+-	if (msg->map) {
+-		sk = __sock_map_lookup_elem(msg->map, msg->key);
+-
+-		msg->key = 0;
+-		msg->map = NULL;
+-	}
+-
+-	return sk;
++	return msg->sk_redir;
+ }
+ 
+ static const struct bpf_func_proto bpf_msg_redirect_map_proto = {

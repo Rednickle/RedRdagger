@@ -1,0 +1,133 @@
+From: Yonghong Song <yhs@fb.com>
+Date: Sat, 28 Apr 2018 22:28:09 -0700
+Subject: bpf/verifier: refine retval R0 state for bpf_get_stack helper
+Patch-mainline: v4.18-rc1
+Git-commit: 849fa50662fbc8b476d652f8a4e6bdda17b37859
+References: bsc#1109837
+
+The special property of return values for helpers bpf_get_stack
+and bpf_probe_read_str are captured in verifier.
+Both helpers return a negative error code or
+a length, which is equal to or smaller than the buffer
+size argument. This additional information in the
+verifier can avoid the condition such as "retval > bufsize"
+in the bpf program. For example, for the code blow,
+    usize = bpf_get_stack(ctx, raw_data, max_len, BPF_F_USER_STACK);
+    if (usize < 0 || usize > max_len)
+        return 0;
+The verifier may have the following errors:
+    52: (85) call bpf_get_stack#65
+     R0=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R1_w=ctx(id=0,off=0,imm=0)
+     R2_w=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R3_w=inv800 R4_w=inv256
+     R6=ctx(id=0,off=0,imm=0) R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R9_w=inv800 R10=fp0,call_-1
+    53: (bf) r8 = r0
+    54: (bf) r1 = r8
+    55: (67) r1 <<= 32
+    56: (bf) r2 = r1
+    57: (77) r2 >>= 32
+    58: (25) if r2 > 0x31f goto pc+33
+     R0=inv(id=0) R1=inv(id=0,smax_value=9223372032559808512,
+                         umax_value=18446744069414584320,
+                         var_off=(0x0; 0xffffffff00000000))
+     R2=inv(id=0,umax_value=799,var_off=(0x0; 0x3ff))
+     R6=ctx(id=0,off=0,imm=0) R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R8=inv(id=0) R9=inv800 R10=fp0,call_-1
+    59: (1f) r9 -= r8
+    60: (c7) r1 s>>= 32
+    61: (bf) r2 = r7
+    62: (0f) r2 += r1
+    math between map_value pointer and register with unbounded
+    min value is not allowed
+The failure is due to llvm compiler optimization where register "r2",
+which is a copy of "r1", is tested for condition while later on "r1"
+is used for map_ptr operation. The verifier is not able to track such
+inst sequence effectively.
+
+Without the "usize > max_len" condition, there is no llvm optimization
+and the below generated code passed verifier:
+    52: (85) call bpf_get_stack#65
+     R0=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R1_w=ctx(id=0,off=0,imm=0)
+     R2_w=map_value(id=0,off=0,ks=4,vs=1600,imm=0) R3_w=inv800 R4_w=inv256
+     R6=ctx(id=0,off=0,imm=0) R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R9_w=inv800 R10=fp0,call_-1
+    53: (b7) r1 = 0
+    54: (bf) r8 = r0
+    55: (67) r8 <<= 32
+    56: (c7) r8 s>>= 32
+    57: (6d) if r1 s> r8 goto pc+24
+     R0=inv(id=0,umax_value=800,var_off=(0x0; 0x3ff))
+     R1=inv0 R6=ctx(id=0,off=0,imm=0)
+     R7=map_value(id=0,off=0,ks=4,vs=1600,imm=0)
+     R8=inv(id=0,umax_value=800,var_off=(0x0; 0x3ff)) R9=inv800
+     R10=fp0,call_-1
+    58: (bf) r2 = r7
+    59: (0f) r2 += r8
+    60: (1f) r9 -= r8
+    61: (bf) r1 = r6
+
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ kernel/bpf/verifier.c |   27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -187,6 +187,8 @@ struct bpf_call_arg_meta {
+ 	bool pkt_access;
+ 	int regno;
+ 	int access_size;
++	s64 msize_smax_value;
++	u64 msize_umax_value;
+ };
+ 
+ static DEFINE_MUTEX(bpf_verifier_lock);
+@@ -2032,6 +2034,12 @@ static int check_func_arg(struct bpf_ver
+ 	} else if (arg_type_is_mem_size(arg_type)) {
+ 		bool zero_size_allowed = (arg_type == ARG_CONST_SIZE_OR_ZERO);
+ 
++		/* remember the mem_size which may be used later
++		 * to refine return values.
++		 */
++		meta->msize_smax_value = reg->smax_value;
++		meta->msize_umax_value = reg->umax_value;
++
+ 		/* The register is SCALAR_VALUE; the access check
+ 		 * happens using its boundaries.
+ 		 */
+@@ -2394,6 +2402,23 @@ record_func_map(struct bpf_verifier_env
+ 	return 0;
+ }
+ 
++static void do_refine_retval_range(struct bpf_reg_state *regs, int ret_type,
++				   int func_id,
++				   struct bpf_call_arg_meta *meta)
++{
++	struct bpf_reg_state *ret_reg = &regs[BPF_REG_0];
++
++	if (ret_type != RET_INTEGER ||
++	    (func_id != BPF_FUNC_get_stack &&
++	     func_id != BPF_FUNC_probe_read_str))
++		return;
++
++	ret_reg->smax_value = meta->msize_smax_value;
++	ret_reg->umax_value = meta->msize_umax_value;
++	__reg_deduce_bounds(ret_reg);
++	__reg_bound_offset(ret_reg);
++}
++
+ static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn_idx)
+ {
+ 	const struct bpf_func_proto *fn = NULL;
+@@ -2507,6 +2532,8 @@ static int check_helper_call(struct bpf_
+ 		return -EINVAL;
+ 	}
+ 
++	do_refine_retval_range(regs, fn->ret_type, func_id, &meta);
++
+ 	err = check_map_func_compatibility(env, meta.map_ptr, func_id);
+ 	if (err)
+ 		return err;

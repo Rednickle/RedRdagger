@@ -1,0 +1,199 @@
+From: Willem de Bruijn <willemb@google.com>
+Date: Thu, 26 Apr 2018 13:42:16 -0400
+Subject: udp: add udp gso
+Patch-mainline: v4.18-rc1
+Git-commit: ee80d1ebe5ba7f4bd74959c873119175a4fc08d3
+References: bsc#1109837
+
+Implement generic segmentation offload support for udp datagrams. A
+follow-up patch adds support to the protocol stack to generate such
+packets.
+
+UDP GSO is not UFO. UFO fragments a single large datagram. GSO splits
+a large payload into a number of discrete UDP datagrams.
+
+The implementation adds a GSO type SKB_UDP_GSO_L4 to differentiate it
+from UFO (SKB_UDP_GSO).
+
+IPPROTO_UDPLITE is excluded, as that protocol has no gso handler
+registered.
+
+[ Export __udp_gso_segment for ipv6. -DaveM ]
+
+Signed-off-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/skbuff.h |    2 +
+ include/net/udp.h      |    4 +++
+ net/core/skbuff.c      |    2 +
+ net/ipv4/udp_offload.c |   53 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ net/ipv6/ip6_offload.c |    6 +++--
+ net/ipv6/udp_offload.c |   19 ++++++++++++++++-
+ 6 files changed, 82 insertions(+), 4 deletions(-)
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -497,6 +497,8 @@ enum {
+ 	SKB_GSO_ESP = 1 << 15,
+ 
+ 	SKB_GSO_UDP = 1 << 16,
++
++	SKB_GSO_UDP_L4 = 1 << 17,
+ };
+ 
+ #if BITS_PER_LONG > 32
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -174,6 +174,10 @@ struct sk_buff **udp_gro_receive(struct
+ 				 struct udphdr *uh, udp_lookup_t lookup);
+ int udp_gro_complete(struct sk_buff *skb, int nhoff, udp_lookup_t lookup);
+ 
++struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
++				  netdev_features_t features,
++				  unsigned int mss, __sum16 check);
++
+ static inline struct udphdr *udp_gro_udphdr(struct sk_buff *skb)
+ {
+ 	struct udphdr *uh;
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -4596,6 +4596,8 @@ unsigned int skb_gso_transport_seglen(co
+ 		thlen = tcp_hdrlen(skb);
+ 	} else if (unlikely(shinfo->gso_type & SKB_GSO_SCTP)) {
+ 		thlen = sizeof(struct sctphdr);
++	} else if (shinfo->gso_type & SKB_GSO_UDP_L4) {
++		thlen = sizeof(struct udphdr);
+ 	}
+ 	/* UFO sets gso_size to the size of the fragmentation
+ 	 * payload, i.e. the size of the L4 (UDP) header is already
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -187,6 +187,54 @@ out_unlock:
+ }
+ EXPORT_SYMBOL(skb_udp_tunnel_segment);
+ 
++struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
++				  netdev_features_t features,
++				  unsigned int mss, __sum16 check)
++{
++	struct sk_buff *segs, *seg;
++	unsigned int hdrlen;
++	struct udphdr *uh;
++
++	if (gso_skb->len <= sizeof(*uh) + mss)
++		return ERR_PTR(-EINVAL);
++
++	hdrlen = gso_skb->data - skb_mac_header(gso_skb);
++	skb_pull(gso_skb, sizeof(*uh));
++
++	segs = skb_segment(gso_skb, features);
++	if (unlikely(IS_ERR_OR_NULL(segs)))
++		return segs;
++
++	for (seg = segs; seg; seg = seg->next) {
++		uh = udp_hdr(seg);
++		uh->len = htons(seg->len - hdrlen);
++		uh->check = check;
++
++		/* last packet can be partial gso_size */
++		if (!seg->next)
++			csum_replace2(&uh->check, htons(mss),
++				      htons(seg->len - hdrlen - sizeof(*uh)));
++	}
++
++	return segs;
++}
++EXPORT_SYMBOL_GPL(__udp_gso_segment);
++
++static struct sk_buff *__udp4_gso_segment(struct sk_buff *gso_skb,
++					  netdev_features_t features)
++{
++	const struct iphdr *iph = ip_hdr(gso_skb);
++	unsigned int mss = skb_shinfo(gso_skb)->gso_size;
++
++	if (!can_checksum_protocol(features, htons(ETH_P_IP)))
++		return ERR_PTR(-EIO);
++
++	return __udp_gso_segment(gso_skb, features, mss,
++				 udp_v4_check(sizeof(struct udphdr) + mss,
++					      iph->saddr, iph->daddr, 0));
++}
++EXPORT_SYMBOL_GPL(__udp4_gso_segment);
++
+ static struct sk_buff *udp4_ufo_fragment(struct sk_buff *skb,
+ 					 netdev_features_t features)
+ {
+@@ -203,12 +251,15 @@ static struct sk_buff *udp4_ufo_fragment
+ 		goto out;
+ 	}
+ 
+-	if (!(skb_shinfo(skb)->gso_type & SKB_GSO_UDP))
++	if (!(skb_shinfo(skb)->gso_type & (SKB_GSO_UDP | SKB_GSO_UDP_L4)))
+ 		goto out;
+ 
+ 	if (!pskb_may_pull(skb, sizeof(struct udphdr)))
+ 		goto out;
+ 
++	if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4)
++		return __udp4_gso_segment(skb, features);
++
+ 	mss = skb_shinfo(skb)->gso_size;
+ 	if (unlikely(skb->len <= mss))
+ 		goto out;
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -88,9 +88,11 @@ static struct sk_buff *ipv6_gso_segment(
+ 
+ 	if (skb->encapsulation &&
+ 	    skb_shinfo(skb)->gso_type & (SKB_GSO_IPXIP4 | SKB_GSO_IPXIP6))
+-		udpfrag = proto == IPPROTO_UDP && encap;
++		udpfrag = proto == IPPROTO_UDP && encap &&
++			  (skb_shinfo(skb)->gso_type & SKB_GSO_UDP);
+ 	else
+-		udpfrag = proto == IPPROTO_UDP && !skb->encapsulation;
++		udpfrag = proto == IPPROTO_UDP && !skb->encapsulation &&
++			  (skb_shinfo(skb)->gso_type & SKB_GSO_UDP);
+ 
+ 	ops = rcu_dereference(inet6_offloads[proto]);
+ 	if (likely(ops && ops->callbacks.gso_segment)) {
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@ -17,6 +17,20 @@
+ #include <net/ip6_checksum.h>
+ #include "ip6_offload.h"
+ 
++static struct sk_buff *__udp6_gso_segment(struct sk_buff *gso_skb,
++					  netdev_features_t features)
++{
++	const struct ipv6hdr *ip6h = ipv6_hdr(gso_skb);
++	unsigned int mss = skb_shinfo(gso_skb)->gso_size;
++
++	if (!can_checksum_protocol(features, htons(ETH_P_IPV6)))
++		return ERR_PTR(-EIO);
++
++	return __udp_gso_segment(gso_skb, features, mss,
++				 udp_v6_check(sizeof(struct udphdr) + mss,
++					      &ip6h->saddr, &ip6h->daddr, 0));
++}
++
+ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
+ 					 netdev_features_t features)
+ {
+@@ -42,12 +56,15 @@ static struct sk_buff *udp6_ufo_fragment
+ 		const struct ipv6hdr *ipv6h;
+ 		struct udphdr *uh;
+ 
+-		if (!(skb_shinfo(skb)->gso_type & SKB_GSO_UDP))
++		if (!(skb_shinfo(skb)->gso_type & (SKB_GSO_UDP | SKB_GSO_UDP_L4)))
+ 			goto out;
+ 
+ 		if (!pskb_may_pull(skb, sizeof(struct udphdr)))
+ 			goto out;
+ 
++		if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4)
++			return __udp6_gso_segment(skb, features);
++
+ 		/* Do software UFO. Complete and fill in the UDP checksum as HW cannot
+ 		 * do checksum of UDP packets sent as multiple IP fragments.
+ 		 */

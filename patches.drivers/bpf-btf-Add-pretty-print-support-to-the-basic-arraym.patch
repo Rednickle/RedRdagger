@@ -1,0 +1,460 @@
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Wed, 18 Apr 2018 15:56:03 -0700
+Subject: bpf: btf: Add pretty print support to the basic arraymap
+Patch-mainline: v4.18-rc1
+Git-commit: a26ca7c982cb576749cbdd01e8ecde4bf010d60a
+References: bsc#1109837
+
+This patch adds pretty print support to the basic arraymap.
+Support for other bpf maps can be added later.
+
+This patch adds new attrs to the BPF_MAP_CREATE command to allow
+specifying the btf_fd, btf_key_id and btf_value_id.  The
+BPF_MAP_CREATE can then associate the btf to the map if
+the creating map supports BTF.
+
+A BTF supported map needs to implement two new map ops,
+map_seq_show_elem() and map_check_btf().  This patch has
+implemented these new map ops for the basic arraymap.
+
+It also adds file_operations, bpffs_map_fops, to the pinned
+map such that the pinned map can be opened and read.
+After that, the user has an intuitive way to do
+"cat bpffs/pathto/a-pinned-map" instead of getting
+an error.
+
+bpffs_map_fops should not be extended further to support
+other operations.  Other operations (e.g. write/key-lookup...)
+should be realized by the userspace tools (e.g. bpftool) through
+the BPF_OBJ_GET_INFO_BY_FD, map's lookup/update interface...etc.
+Follow up patches will allow the userspace to obtain
+the BTF from a map-fd.
+
+Here is a sample output when reading a pinned arraymap
+with the following map's value:
+
+struct map_value {
+	int count_a;
+	int count_b;
+};
+
+cat /sys/fs/bpf/pinned_array_map:
+
+0: {1,2}
+1: {3,4}
+2: {5,6}
+...
+
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Acked-by: Alexei Starovoitov <ast@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf.h      |   20 +++++-
+ include/uapi/linux/bpf.h |    3 
+ kernel/bpf/arraymap.c    |   50 +++++++++++++++
+ kernel/bpf/inode.c       |  155 ++++++++++++++++++++++++++++++++++++++++++++++-
+ kernel/bpf/syscall.c     |   32 +++++++++
+ 5 files changed, 253 insertions(+), 7 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -22,6 +22,8 @@ struct perf_event;
+ struct bpf_prog;
+ struct bpf_map;
+ struct sock;
++struct seq_file;
++struct btf;
+ 
+ /* map is generic key/value storage optionally accesible by eBPF programs */
+ struct bpf_map_ops {
+@@ -44,10 +46,14 @@ struct bpf_map_ops {
+ 	void (*map_fd_put_ptr)(void *ptr);
+ 	u32 (*map_gen_lookup)(struct bpf_map *map, struct bpf_insn *insn_buf);
+ 	u32 (*map_fd_sys_lookup_elem)(void *ptr);
++	void (*map_seq_show_elem)(struct bpf_map *map, void *key,
++				  struct seq_file *m);
++	int (*map_check_btf)(const struct bpf_map *map, const struct btf *btf,
++			     u32 key_type_id, u32 value_type_id);
+ };
+ 
+ struct bpf_map {
+-	/* 1st cacheline with read-mostly members of which some
++	/* The first two cachelines with read-mostly members of which some
+ 	 * are also accessed in fast-path (e.g. ops, max_entries).
+ 	 */
+ 	const struct bpf_map_ops *ops ____cacheline_aligned;
+@@ -63,10 +69,13 @@ struct bpf_map {
+ 	u32 pages;
+ 	u32 id;
+ 	int numa_node;
++	u32 btf_key_id;
++	u32 btf_value_id;
++	struct btf *btf;
+ 	bool unpriv_array;
+-	/* 7 bytes hole */
++	/* 55 bytes hole */
+ 
+-	/* 2nd cacheline with misc members to avoid false sharing
++	/* The 3rd and 4th cacheline with misc members to avoid false sharing
+ 	 * particularly with refcounting.
+ 	 */
+ 	struct user_struct *user ____cacheline_aligned;
+@@ -101,6 +110,11 @@ static inline struct bpf_offloaded_map *
+ 	return container_of(map, struct bpf_offloaded_map, map);
+ }
+ 
++static inline bool bpf_map_support_seq_show(const struct bpf_map *map)
++{
++	return map->ops->map_seq_show_elem && map->ops->map_check_btf;
++}
++
+ extern const struct bpf_map_ops bpf_map_offload_ops;
+ 
+ /* function argument constraints */
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -268,6 +268,9 @@ union bpf_attr {
+ 					 */
+ 		char	map_name[BPF_OBJ_NAME_LEN];
+ 		__u32	map_ifindex;	/* ifindex of netdev to create on */
++		__u32	btf_fd;		/* fd pointing to a BTF type data */
++		__u32	btf_key_id;	/* BTF type_id of the key */
++		__u32	btf_value_id;	/* BTF type_id of the value */
+ 	};
+ 
+ 	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -11,11 +11,13 @@
+  * General Public License for more details.
+  */
+ #include <linux/bpf.h>
++#include <linux/btf.h>
+ #include <linux/err.h>
+ #include <linux/slab.h>
+ #include <linux/mm.h>
+ #include <linux/filter.h>
+ #include <linux/perf_event.h>
++#include <uapi/linux/btf.h>
+ 
+ #include "map_in_map.h"
+ 
+@@ -336,6 +338,52 @@ static void array_map_free(struct bpf_ma
+ 	bpf_map_area_free(array);
+ }
+ 
++static void array_map_seq_show_elem(struct bpf_map *map, void *key,
++				    struct seq_file *m)
++{
++	void *value;
++
++	rcu_read_lock();
++
++	value = array_map_lookup_elem(map, key);
++	if (!value) {
++		rcu_read_unlock();
++		return;
++	}
++
++	seq_printf(m, "%u: ", *(u32 *)key);
++	btf_type_seq_show(map->btf, map->btf_value_id, value, m);
++	seq_puts(m, "\n");
++
++	rcu_read_unlock();
++}
++
++static int array_map_check_btf(const struct bpf_map *map, const struct btf *btf,
++			       u32 btf_key_id, u32 btf_value_id)
++{
++	const struct btf_type *key_type, *value_type;
++	u32 key_size, value_size;
++	u32 int_data;
++
++	key_type = btf_type_id_size(btf, &btf_key_id, &key_size);
++	if (!key_type || BTF_INFO_KIND(key_type->info) != BTF_KIND_INT)
++		return -EINVAL;
++
++	int_data = *(u32 *)(key_type + 1);
++	/* bpf array can only take a u32 key.  This check makes
++	 * sure that the btf matches the attr used during map_create.
++	 */
++	if (BTF_INT_BITS(int_data) != 32 || key_size != 4 ||
++	    BTF_INT_OFFSET(int_data))
++		return -EINVAL;
++
++	value_type = btf_type_id_size(btf, &btf_value_id, &value_size);
++	if (!value_type || value_size > map->value_size)
++		return -EINVAL;
++
++	return 0;
++}
++
+ const struct bpf_map_ops array_map_ops = {
+ 	.map_alloc_check = array_map_alloc_check,
+ 	.map_alloc = array_map_alloc,
+@@ -345,6 +393,8 @@ const struct bpf_map_ops array_map_ops =
+ 	.map_update_elem = array_map_update_elem,
+ 	.map_delete_elem = array_map_delete_elem,
+ 	.map_gen_lookup = array_map_gen_lookup,
++	.map_seq_show_elem = array_map_seq_show_elem,
++	.map_check_btf = array_map_check_btf,
+ };
+ 
+ const struct bpf_map_ops percpu_array_map_ops = {
+--- a/kernel/bpf/inode.c
++++ b/kernel/bpf/inode.c
+@@ -150,8 +150,154 @@ static int bpf_mkdir(struct inode *dir,
+ 	return 0;
+ }
+ 
++struct map_iter {
++	void *key;
++	bool done;
++};
++
++static struct map_iter *map_iter(struct seq_file *m)
++{
++	return m->private;
++}
++
++static struct bpf_map *seq_file_to_map(struct seq_file *m)
++{
++	return file_inode(m->file)->i_private;
++}
++
++static void map_iter_free(struct map_iter *iter)
++{
++	if (iter) {
++		kfree(iter->key);
++		kfree(iter);
++	}
++}
++
++static struct map_iter *map_iter_alloc(struct bpf_map *map)
++{
++	struct map_iter *iter;
++
++	iter = kzalloc(sizeof(*iter), GFP_KERNEL | __GFP_NOWARN);
++	if (!iter)
++		goto error;
++
++	iter->key = kzalloc(map->key_size, GFP_KERNEL | __GFP_NOWARN);
++	if (!iter->key)
++		goto error;
++
++	return iter;
++
++error:
++	map_iter_free(iter);
++	return NULL;
++}
++
++static void *map_seq_next(struct seq_file *m, void *v, loff_t *pos)
++{
++	struct bpf_map *map = seq_file_to_map(m);
++	void *key = map_iter(m)->key;
++
++	if (map_iter(m)->done)
++		return NULL;
++
++	if (unlikely(v == SEQ_START_TOKEN))
++		goto done;
++
++	if (map->ops->map_get_next_key(map, key, key)) {
++		map_iter(m)->done = true;
++		return NULL;
++	}
++
++done:
++	++(*pos);
++	return key;
++}
++
++static void *map_seq_start(struct seq_file *m, loff_t *pos)
++{
++	if (map_iter(m)->done)
++		return NULL;
++
++	return *pos ? map_iter(m)->key : SEQ_START_TOKEN;
++}
++
++static void map_seq_stop(struct seq_file *m, void *v)
++{
++}
++
++static int map_seq_show(struct seq_file *m, void *v)
++{
++	struct bpf_map *map = seq_file_to_map(m);
++	void *key = map_iter(m)->key;
++
++	if (unlikely(v == SEQ_START_TOKEN)) {
++		seq_puts(m, "# WARNING!! The output is for debug purpose only\n");
++		seq_puts(m, "# WARNING!! The output format will change\n");
++	} else {
++		map->ops->map_seq_show_elem(map, key, m);
++	}
++
++	return 0;
++}
++
++static const struct seq_operations bpffs_map_seq_ops = {
++	.start	= map_seq_start,
++	.next	= map_seq_next,
++	.show	= map_seq_show,
++	.stop	= map_seq_stop,
++};
++
++static int bpffs_map_open(struct inode *inode, struct file *file)
++{
++	struct bpf_map *map = inode->i_private;
++	struct map_iter *iter;
++	struct seq_file *m;
++	int err;
++
++	iter = map_iter_alloc(map);
++	if (!iter)
++		return -ENOMEM;
++
++	err = seq_open(file, &bpffs_map_seq_ops);
++	if (err) {
++		map_iter_free(iter);
++		return err;
++	}
++
++	m = file->private_data;
++	m->private = iter;
++
++	return 0;
++}
++
++static int bpffs_map_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *m = file->private_data;
++
++	map_iter_free(map_iter(m));
++
++	return seq_release(inode, file);
++}
++
++/* bpffs_map_fops should only implement the basic
++ * read operation for a BPF map.  The purpose is to
++ * provide a simple user intuitive way to do
++ * "cat bpffs/pathto/a-pinned-map".
++ *
++ * Other operations (e.g. write, lookup...) should be realized by
++ * the userspace tools (e.g. bpftool) through the
++ * BPF_OBJ_GET_INFO_BY_FD and the map's lookup/update
++ * interface.
++ */
++static const struct file_operations bpffs_map_fops = {
++	.open		= bpffs_map_open,
++	.read		= seq_read,
++	.release	= bpffs_map_release,
++};
++
+ static int bpf_mkobj_ops(struct inode *dir, struct dentry *dentry,
+-			 umode_t mode, const struct inode_operations *iops)
++			 umode_t mode, const struct inode_operations *iops,
++			 const struct file_operations *fops)
+ {
+ 	struct inode *inode;
+ 
+@@ -160,6 +306,7 @@ static int bpf_mkobj_ops(struct inode *d
+ 		return PTR_ERR(inode);
+ 
+ 	inode->i_op = iops;
++	inode->i_fop = fops;
+ 	inode->i_private = dentry->d_fsdata;
+ 
+ 	bpf_dentry_finalize(dentry, inode, dir);
+@@ -170,6 +317,7 @@ static int bpf_mkobj(struct inode *dir,
+ 		     dev_t devt)
+ {
+ 	enum bpf_type type = MINOR(devt);
++	struct bpf_map *map = dentry->d_fsdata;
+ 
+ 	if (MAJOR(devt) != UNNAMED_MAJOR || !S_ISREG(mode) ||
+ 	    dentry->d_fsdata == NULL)
+@@ -177,9 +325,10 @@ static int bpf_mkobj(struct inode *dir,
+ 
+ 	switch (type) {
+ 	case BPF_TYPE_PROG:
+-		return bpf_mkobj_ops(dir, dentry, mode, &bpf_prog_iops);
++		return bpf_mkobj_ops(dir, dentry, mode, &bpf_prog_iops, NULL);
+ 	case BPF_TYPE_MAP:
+-		return bpf_mkobj_ops(dir, dentry, mode, &bpf_map_iops);
++		return bpf_mkobj_ops(dir, dentry, mode, &bpf_map_iops,
++				     map->btf ? &bpffs_map_fops : NULL);
+ 	default:
+ 		return -EPERM;
+ 	}
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -28,6 +28,7 @@
+ #include <linux/timekeeping.h>
+ #include <linux/ctype.h>
+ #include <linux/nospec.h>
++#include <linux/btf.h>
+ 
+ #define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PROG_ARRAY || \
+ 			   (map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+@@ -253,6 +254,7 @@ static void bpf_map_free_deferred(struct
+ 	struct bpf_map *map = container_of(work, struct bpf_map, work);
+ 
+ 	bpf_map_uncharge_memlock(map);
++	btf_put(map->btf);
+ 	/* implementation dependent freeing */
+ 	map->ops->map_free(map);
+ }
+@@ -412,7 +414,7 @@ static int bpf_obj_name_cpy(char *dst, c
+ 	return 0;
+ }
+ 
+-#define BPF_MAP_CREATE_LAST_FIELD map_ifindex
++#define BPF_MAP_CREATE_LAST_FIELD btf_value_id
+ /* called via syscall */
+ static int map_create(union bpf_attr *attr)
+ {
+@@ -446,6 +448,33 @@ static int map_create(union bpf_attr *at
+ 	atomic_set(&map->refcnt, 1);
+ 	atomic_set(&map->usercnt, 1);
+ 
++	if (bpf_map_support_seq_show(map) &&
++	    (attr->btf_key_id || attr->btf_value_id)) {
++		struct btf *btf;
++
++		if (!attr->btf_key_id || !attr->btf_value_id) {
++			err = -EINVAL;
++			goto free_map_nouncharge;
++		}
++
++		btf = btf_get_by_fd(attr->btf_fd);
++		if (IS_ERR(btf)) {
++			err = PTR_ERR(btf);
++			goto free_map_nouncharge;
++		}
++
++		err = map->ops->map_check_btf(map, btf, attr->btf_key_id,
++					      attr->btf_value_id);
++		if (err) {
++			btf_put(btf);
++			goto free_map_nouncharge;
++		}
++
++		map->btf = btf;
++		map->btf_key_id = attr->btf_key_id;
++		map->btf_value_id = attr->btf_value_id;
++	}
++
+ 	err = bpf_map_charge_memlock(map);
+ 	if (err)
+ 		goto free_map_nouncharge;
+@@ -472,6 +501,7 @@ static int map_create(union bpf_attr *at
+ free_map:
+ 	bpf_map_uncharge_memlock(map);
+ free_map_nouncharge:
++	btf_put(map->btf);
+ 	map->ops->map_free(map);
+ 	return err;
+ }
