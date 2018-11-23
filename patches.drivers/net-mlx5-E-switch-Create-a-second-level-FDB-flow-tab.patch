@@ -1,0 +1,124 @@
+From: Chris Mi <chrism@mellanox.com>
+Date: Wed, 16 May 2018 17:42:52 +0900
+Subject: net/mlx5: E-switch, Create a second level FDB flow table
+Patch-mainline: v4.18-rc1
+Git-commit: a842dd04cf85fbc6e21e65a344b957f4a1dc0413
+References: bsc#1103990 FATE#326006
+
+If firmware supports the forward action with a destination list
+that includes a flow table, create a second level FDB flow table.
+
+This is going to be used for flow based mirroring under the switchdev
+offloads mode.
+
+Signed-off-by: Chris Mi <chrism@mellanox.com>
+Reviewed-by: Paul Blakey <paulb@mellanox.com>
+Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.h          |    4 +
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c |   31 +++++++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c          |    2 
+ 3 files changed, 32 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -55,6 +55,9 @@
+ #define MLX5_RATE_TO_BW_SHARE(rate, divider, limit) \
+ 	min_t(u32, max_t(u32, (rate) / (divider), MLX5_MIN_BW_SHARE), limit)
+ 
++#define mlx5_esw_has_fwd_fdb(dev) \
++	MLX5_CAP_ESW_FLOWTABLE(dev, fdb_multi_path_to_table)
++
+ struct vport_ingress {
+ 	struct mlx5_flow_table *acl;
+ 	struct mlx5_flow_group *allow_untagged_spoofchk_grp;
+@@ -127,6 +130,7 @@ struct mlx5_eswitch_fdb {
+ 
+ 		struct offloads_fdb {
+ 			struct mlx5_flow_table *fast_fdb;
++			struct mlx5_flow_table *fwd_fdb;
+ 			struct mlx5_flow_table *slow_fdb;
+ 			struct mlx5_flow_group *send_to_vport_grp;
+ 			struct mlx5_flow_group *miss_grp;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -454,7 +454,7 @@ static int esw_create_offloads_fast_fdb_
+ 	if (!root_ns) {
+ 		esw_warn(dev, "Failed to get FDB flow namespace\n");
+ 		err = -EOPNOTSUPP;
+-		goto out;
++		goto out_namespace;
+ 	}
+ 
+ 	esw_debug(dev, "Create offloads FDB table, min (max esw size(2^%d), max counters(%d)*groups(%d))\n",
+@@ -464,6 +464,9 @@ static int esw_create_offloads_fast_fdb_
+ 	esw_size = min_t(int, max_flow_counter * ESW_OFFLOADS_NUM_GROUPS,
+ 			 1 << MLX5_CAP_ESW_FLOWTABLE_FDB(dev, log_max_ft_size));
+ 
++	if (mlx5_esw_has_fwd_fdb(dev))
++		esw_size >>= 1;
++
+ 	if (esw->offloads.encap != DEVLINK_ESWITCH_ENCAP_MODE_NONE)
+ 		flags |= MLX5_FLOW_TABLE_TUNNEL_EN;
+ 
+@@ -474,16 +477,36 @@ static int esw_create_offloads_fast_fdb_
+ 	if (IS_ERR(fdb)) {
+ 		err = PTR_ERR(fdb);
+ 		esw_warn(dev, "Failed to create Fast path FDB Table err %d\n", err);
+-		goto out;
++		goto out_namespace;
+ 	}
+ 	esw->fdb_table.offloads.fast_fdb = fdb;
+ 
+-out:
++	if (!mlx5_esw_has_fwd_fdb(dev))
++		goto out_namespace;
++
++	fdb = mlx5_create_auto_grouped_flow_table(root_ns, FDB_FAST_PATH,
++						  esw_size,
++						  ESW_OFFLOADS_NUM_GROUPS, 1,
++						  flags);
++	if (IS_ERR(fdb)) {
++		err = PTR_ERR(fdb);
++		esw_warn(dev, "Failed to create fwd table err %d\n", err);
++		goto out_ft;
++	}
++	esw->fdb_table.offloads.fwd_fdb = fdb;
++
++	return err;
++
++out_ft:
++	mlx5_destroy_flow_table(esw->fdb_table.offloads.fast_fdb);
++out_namespace:
+ 	return err;
+ }
+ 
+ static void esw_destroy_offloads_fast_fdb_table(struct mlx5_eswitch *esw)
+ {
++	if (mlx5_esw_has_fwd_fdb(esw->dev))
++		mlx5_destroy_flow_table(esw->fdb_table.offloads.fwd_fdb);
+ 	mlx5_destroy_flow_table(esw->fdb_table.offloads.fast_fdb);
+ }
+ 
+@@ -588,7 +611,7 @@ miss_err:
+ send_vport_err:
+ 	mlx5_destroy_flow_table(esw->fdb_table.offloads.slow_fdb);
+ slow_fdb_err:
+-	mlx5_destroy_flow_table(esw->fdb_table.offloads.fast_fdb);
++	esw_destroy_offloads_fast_fdb_table(esw);
+ fast_fdb_err:
+ ns_err:
+ 	kvfree(flow_group_in);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -2495,7 +2495,7 @@ static int init_fdb_root_ns(struct mlx5_
+ 	if (!steering->fdb_root_ns)
+ 		return -ENOMEM;
+ 
+-	prio = fs_create_prio(&steering->fdb_root_ns->ns, 0, 1);
++	prio = fs_create_prio(&steering->fdb_root_ns->ns, 0, 2);
+ 	if (IS_ERR(prio))
+ 		goto out_err;
+ 
