@@ -1,0 +1,276 @@
+From: Andy Gospodarek <gospo@broadcom.com>
+Date: Tue, 9 Jan 2018 16:06:20 -0500
+Subject: bnxt_en: add support for software dynamic interrupt moderation
+Patch-mainline: v4.16-rc1
+Git-commit: 6a8788f25625eab31ffa624da2db758ecae6151d
+References: bsc#1104745 FATE#325918
+
+This implements the changes needed for the bnxt_en driver to add support
+for dynamic interrupt moderation per ring.
+
+This does add additional counters in the receive path, but testing shows
+that any additional instructions are offset by throughput gain when the
+default configuration is for low latency.
+
+Signed-off-by: Andy Gospodarek <gospo@broadcom.com>
+Acked-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/Makefile       |    2 
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c         |   50 ++++++++++++++++++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h         |   34 ++++++++++----
+ drivers/net/ethernet/broadcom/bnxt/bnxt_dim.c     |   32 ++++++++++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c |   12 +++++
+ 5 files changed, 118 insertions(+), 12 deletions(-)
+ create mode 100644 drivers/net/ethernet/broadcom/bnxt/bnxt_dim.c
+
+--- a/drivers/net/ethernet/broadcom/bnxt/Makefile
++++ b/drivers/net/ethernet/broadcom/bnxt/Makefile
+@@ -1,4 +1,4 @@
+ obj-$(CONFIG_BNXT) += bnxt_en.o
+ 
+-bnxt_en-y := bnxt.o bnxt_sriov.o bnxt_ethtool.o bnxt_dcb.o bnxt_ulp.o bnxt_xdp.o bnxt_vfr.o bnxt_devlink.o
++bnxt_en-y := bnxt.o bnxt_sriov.o bnxt_ethtool.o bnxt_dcb.o bnxt_ulp.o bnxt_xdp.o bnxt_vfr.o bnxt_devlink.o bnxt_dim.o
+ bnxt_en-$(CONFIG_BNXT_FLOWER_OFFLOAD) += bnxt_tc.o
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -1645,6 +1645,8 @@ next_rx:
+ 	rxr->rx_next_cons = NEXT_RX(cons);
+ 
+ next_rx_no_prod:
++	cpr->rx_packets += 1;
++	cpr->rx_bytes += len;
+ 	*raw_cons = tmp_raw_cons;
+ 
+ 	return rc;
+@@ -1802,6 +1804,7 @@ static irqreturn_t bnxt_msix(int irq, vo
+ 	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
+ 	u32 cons = RING_CMP(cpr->cp_raw_cons);
+ 
++	cpr->event_ctr++;
+ 	prefetch(&cpr->cp_desc_ring[CP_RING(cons)][CP_IDX(cons)]);
+ 	napi_schedule(&bnapi->napi);
+ 	return IRQ_HANDLED;
+@@ -2025,6 +2028,15 @@ static int bnxt_poll(struct napi_struct
+ 			break;
+ 		}
+ 	}
++	if (bp->flags & BNXT_FLAG_DIM) {
++		struct net_dim_sample dim_sample;
++
++		net_dim_sample(cpr->event_ctr,
++			       cpr->rx_packets,
++			       cpr->rx_bytes,
++			       &dim_sample);
++		net_dim(&cpr->dim, dim_sample);
++	}
+ 	mmiowb();
+ 	return work_done;
+ }
+@@ -2617,6 +2629,8 @@ static void bnxt_init_cp_rings(struct bn
+ 		struct bnxt_ring_struct *ring = &cpr->cp_ring_struct;
+ 
+ 		ring->fw_ring_id = INVALID_HW_RING_ID;
++		cpr->rx_ring_coal.coal_ticks = bp->rx_coal.coal_ticks;
++		cpr->rx_ring_coal.coal_bufs = bp->rx_coal.coal_bufs;
+ 	}
+ }
+ 
+@@ -4593,6 +4607,36 @@ static void bnxt_hwrm_set_coal_params(st
+ 	req->flags = cpu_to_le16(flags);
+ }
+ 
++int bnxt_hwrm_set_ring_coal(struct bnxt *bp, struct bnxt_napi *bnapi)
++{
++	struct hwrm_ring_cmpl_ring_cfg_aggint_params_input req_rx = {0};
++	struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
++	struct bnxt_coal coal;
++	unsigned int grp_idx;
++
++	/* Tick values in micro seconds.
++	 * 1 coal_buf x bufs_per_record = 1 completion record.
++	 */
++	memcpy(&coal, &bp->rx_coal, sizeof(struct bnxt_coal));
++
++	coal.coal_ticks = cpr->rx_ring_coal.coal_ticks;
++	coal.coal_bufs = cpr->rx_ring_coal.coal_bufs;
++
++	if (!bnapi->rx_ring)
++		return -ENODEV;
++
++	bnxt_hwrm_cmd_hdr_init(bp, &req_rx,
++			       HWRM_RING_CMPL_RING_CFG_AGGINT_PARAMS, -1, -1);
++
++	bnxt_hwrm_set_coal_params(&coal, &req_rx);
++
++	grp_idx = bnapi->index;
++	req_rx.ring_id = cpu_to_le16(bp->grp_info[grp_idx].cp_fw_ring_id);
++
++	return hwrm_send_message(bp, &req_rx, sizeof(req_rx),
++				 HWRM_CMD_TIMEOUT);
++}
++
+ int bnxt_hwrm_set_coal(struct bnxt *bp)
+ {
+ 	int i, rc = 0;
+@@ -5715,7 +5759,13 @@ static void bnxt_enable_napi(struct bnxt
+ 	int i;
+ 
+ 	for (i = 0; i < bp->cp_nr_rings; i++) {
++		struct bnxt_cp_ring_info *cpr = &bp->bnapi[i]->cp_ring;
+ 		bp->bnapi[i]->in_reset = false;
++
++		if (bp->bnapi[i]->rx_ring) {
++			INIT_WORK(&cpr->dim.work, bnxt_dim_work);
++			cpr->dim.mode = NET_DIM_CQ_PERIOD_MODE_START_FROM_EQE;
++		}
+ 		napi_enable(&bp->bnapi[i]->napi);
+ 	}
+ }
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -24,6 +24,7 @@
+ #include <net/dst_metadata.h>
+ #include <net/switchdev.h>
+ #include <net/xdp.h>
++#include <linux/net_dim.h>
+ 
+ struct tx_bd {
+ 	__le32 tx_bd_len_flags_type;
+@@ -608,6 +609,17 @@ struct bnxt_tx_ring_info {
+ 	struct bnxt_ring_struct	tx_ring_struct;
+ };
+ 
++struct bnxt_coal {
++	u16			coal_ticks;
++	u16			coal_ticks_irq;
++	u16			coal_bufs;
++	u16			coal_bufs_irq;
++			/* RING_IDLE enabled when coal ticks < idle_thresh  */
++	u16			idle_thresh;
++	u8			bufs_per_record;
++	u8			budget;
++};
++
+ struct bnxt_tpa_info {
+ 	void			*data;
+ 	u8			*data_ptr;
+@@ -672,6 +684,13 @@ struct bnxt_cp_ring_info {
+ 	u32			cp_raw_cons;
+ 	void __iomem		*cp_doorbell;
+ 
++	struct bnxt_coal	rx_ring_coal;
++	u64			rx_packets;
++	u64			rx_bytes;
++	u64			event_ctr;
++
++	struct net_dim		dim;
++
+ 	struct tx_cmp		*cp_desc_ring[MAX_CP_PAGES];
+ 
+ 	dma_addr_t		cp_desc_mapping[MAX_CP_PAGES];
+@@ -946,17 +965,6 @@ struct bnxt_test_info {
+ #define BNXT_CAG_REG_LEGACY_INT_STATUS	0x4014
+ #define BNXT_CAG_REG_BASE		0x300000
+ 
+-struct bnxt_coal {
+-	u16			coal_ticks;
+-	u16			coal_ticks_irq;
+-	u16			coal_bufs;
+-	u16			coal_bufs_irq;
+-			/* RING_IDLE enabled when coal ticks < idle_thresh  */
+-	u16			idle_thresh;
+-	u8			bufs_per_record;
+-	u8			budget;
+-};
+-
+ struct bnxt_tc_flow_stats {
+ 	u64		packets;
+ 	u64		bytes;
+@@ -1128,6 +1136,7 @@ struct bnxt {
+ 	#define BNXT_FLAG_DOUBLE_DB	0x400000
+ 	#define BNXT_FLAG_FW_DCBX_AGENT	0x800000
+ 	#define BNXT_FLAG_CHIP_NITRO_A0	0x1000000
++	#define BNXT_FLAG_DIM		0x2000000
+ 
+ 	#define BNXT_FLAG_ALL_CONFIG_FEATS (BNXT_FLAG_TPA |		\
+ 					    BNXT_FLAG_RFS |		\
+@@ -1425,4 +1434,7 @@ int bnxt_setup_mq_tc(struct net_device *
+ int bnxt_get_max_rings(struct bnxt *, int *, int *, bool);
+ void bnxt_restore_pf_fw_resources(struct bnxt *bp);
+ int bnxt_port_attr_get(struct bnxt *bp, struct switchdev_attr *attr);
++void bnxt_dim_work(struct work_struct *work);
++int bnxt_hwrm_set_ring_coal(struct bnxt *bp, struct bnxt_napi *bnapi);
++
+ #endif
+--- /dev/null
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_dim.c
+@@ -0,0 +1,32 @@
++/* Broadcom NetXtreme-C/E network driver.
++ *
++ * Copyright (c) 2017-2018 Broadcom Limited
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation.
++ */
++
++#include <linux/net_dim.h>
++#include "bnxt_hsi.h"
++#include "bnxt.h"
++
++void bnxt_dim_work(struct work_struct *work)
++{
++	struct net_dim *dim = container_of(work, struct net_dim,
++					   work);
++	struct bnxt_cp_ring_info *cpr = container_of(dim,
++						     struct bnxt_cp_ring_info,
++						     dim);
++	struct bnxt_napi *bnapi = container_of(cpr,
++					       struct bnxt_napi,
++					       cp_ring);
++	struct net_dim_cq_moder cur_profile = net_dim_get_profile(dim->mode,
++								  dim->profile_ix);
++
++	cpr->rx_ring_coal.coal_ticks = cur_profile.usec;
++	cpr->rx_ring_coal.coal_bufs = cur_profile.pkts;
++
++	bnxt_hwrm_set_ring_coal(bnapi->bp, bnapi);
++	dim->state = NET_DIM_START_MEASURE;
++}
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -49,6 +49,8 @@ static int bnxt_get_coalesce(struct net_
+ 
+ 	memset(coal, 0, sizeof(*coal));
+ 
++	coal->use_adaptive_rx_coalesce = bp->flags & BNXT_FLAG_DIM;
++
+ 	hw_coal = &bp->rx_coal;
+ 	mult = hw_coal->bufs_per_record;
+ 	coal->rx_coalesce_usecs = hw_coal->coal_ticks;
+@@ -77,6 +79,15 @@ static int bnxt_set_coalesce(struct net_
+ 	int rc = 0;
+ 	u16 mult;
+ 
++	if (coal->use_adaptive_rx_coalesce) {
++		bp->flags |= BNXT_FLAG_DIM;
++	} else {
++		if (bp->flags & BNXT_FLAG_DIM) {
++			bp->flags &= ~(BNXT_FLAG_DIM);
++			goto reset_coalesce;
++		}
++	}
++
+ 	hw_coal = &bp->rx_coal;
+ 	mult = hw_coal->bufs_per_record;
+ 	hw_coal->coal_ticks = coal->rx_coalesce_usecs;
+@@ -104,6 +115,7 @@ static int bnxt_set_coalesce(struct net_
+ 		update_stats = true;
+ 	}
+ 
++reset_coalesce:
+ 	if (netif_running(dev)) {
+ 		if (update_stats) {
+ 			rc = bnxt_close_nic(bp, true, false);
