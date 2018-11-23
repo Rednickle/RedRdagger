@@ -1,0 +1,352 @@
+From: Don Hiatt <don.hiatt@intel.com>
+Date: Tue, 15 May 2018 18:28:15 -0700
+Subject: IB/hfi1: Add support for 16B Management Packets
+Patch-mainline: v4.18-rc1
+Git-commit: 81cd3891f021b88319f7243715c30945aaabe9ea
+References: bsc#1114685 FATE#325854
+
+16B Management Packets (L4=0x08) replace the BTH and DETH
+of normal MAD packet packets with a header containing the
+the source and destination queue pair numbers; fields that
+were originally retrieved from the BTH/DETH are now populated
+from this header as well as from the 16B LRH (e.g. pkey).
+
+16B Management Packets are used as an optimized management
+format on 16B fabrics.
+
+These management packets have an opcode of IB_OPCODE_UD_SEND_ONLY,
+a fixed 3Byte pad, and a header length of 24Bytes.
+
+The decision as to when we send a management packet is based
+upon either the source or destination queue pair number being
+0 or 1.
+
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Signed-off-by: Don Hiatt <don.hiatt@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hfi1/driver.c |   33 +++++++++++++-------
+ drivers/infiniband/hw/hfi1/hfi.h    |   28 +++++++++++++++++
+ drivers/infiniband/hw/hfi1/ud.c     |   57 ++++++++++++++++++++++++++----------
+ drivers/infiniband/hw/hfi1/verbs.c  |   25 +++++++++++----
+ 4 files changed, 110 insertions(+), 33 deletions(-)
+
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@ -1484,38 +1484,51 @@ static int hfi1_setup_bypass_packet(stru
+ 	struct hfi1_pportdata *ppd = rcd->ppd;
+ 	struct hfi1_ibport *ibp = &ppd->ibport_data;
+ 	u8 l4;
+-	u8 grh_len;
+ 
+ 	packet->hdr = (struct hfi1_16b_header *)
+ 			hfi1_get_16B_header(packet->rcd->dd,
+ 					    packet->rhf_addr);
+-	packet->hlen = (u8 *)packet->rhf_addr - (u8 *)packet->hdr;
+-
+ 	l4 = hfi1_16B_get_l4(packet->hdr);
+ 	if (l4 == OPA_16B_L4_IB_LOCAL) {
+-		grh_len = 0;
+ 		packet->ohdr = packet->ebuf;
+ 		packet->grh = NULL;
++		packet->opcode = ib_bth_get_opcode(packet->ohdr);
++		packet->pad = hfi1_16B_bth_get_pad(packet->ohdr);
++		/* hdr_len_by_opcode already has an IB LRH factored in */
++		packet->hlen = hdr_len_by_opcode[packet->opcode] +
++			(LRH_16B_BYTES - LRH_9B_BYTES);
++		packet->migrated = opa_bth_is_migration(packet->ohdr);
+ 	} else if (l4 == OPA_16B_L4_IB_GLOBAL) {
+ 		u32 vtf;
++		u8 grh_len = sizeof(struct ib_grh);
+ 
+-		grh_len = sizeof(struct ib_grh);
+ 		packet->ohdr = packet->ebuf + grh_len;
+ 		packet->grh = packet->ebuf;
++		packet->opcode = ib_bth_get_opcode(packet->ohdr);
++		packet->pad = hfi1_16B_bth_get_pad(packet->ohdr);
++		/* hdr_len_by_opcode already has an IB LRH factored in */
++		packet->hlen = hdr_len_by_opcode[packet->opcode] +
++			(LRH_16B_BYTES - LRH_9B_BYTES) + grh_len;
++		packet->migrated = opa_bth_is_migration(packet->ohdr);
++
+ 		if (packet->grh->next_hdr != IB_GRH_NEXT_HDR)
+ 			goto drop;
+ 		vtf = be32_to_cpu(packet->grh->version_tclass_flow);
+ 		if ((vtf >> IB_GRH_VERSION_SHIFT) != IB_GRH_VERSION)
+ 			goto drop;
++	} else if (l4 == OPA_16B_L4_FM) {
++		packet->mgmt = packet->ebuf;
++		packet->ohdr = NULL;
++		packet->grh = NULL;
++		packet->opcode = IB_OPCODE_UD_SEND_ONLY;
++		packet->pad = OPA_16B_L4_FM_PAD;
++		packet->hlen = OPA_16B_L4_FM_HLEN;
++		packet->migrated = false;
+ 	} else {
+ 		goto drop;
+ 	}
+ 
+ 	/* Query commonly used fields from packet header */
+-	packet->opcode = ib_bth_get_opcode(packet->ohdr);
+-	/* hdr_len_by_opcode already has an IB LRH factored in */
+-	packet->hlen = hdr_len_by_opcode[packet->opcode] +
+-		(LRH_16B_BYTES - LRH_9B_BYTES) + grh_len;
+ 	packet->payload = packet->ebuf + packet->hlen - LRH_16B_BYTES;
+ 	packet->slid = hfi1_16B_get_slid(packet->hdr);
+ 	packet->dlid = hfi1_16B_get_dlid(packet->hdr);
+@@ -1525,10 +1538,8 @@ static int hfi1_setup_bypass_packet(stru
+ 					    16B);
+ 	packet->sc = hfi1_16B_get_sc(packet->hdr);
+ 	packet->sl = ibp->sc_to_sl[packet->sc];
+-	packet->pad = hfi1_16B_bth_get_pad(packet->ohdr);
+ 	packet->extra_byte = SIZE_OF_LT;
+ 	packet->pkey = hfi1_16B_get_pkey(packet->hdr);
+-	packet->migrated = opa_bth_is_migration(packet->ohdr);
+ 
+ 	if (hfi1_bypass_ingress_pkt_check(packet))
+ 		goto drop;
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -333,6 +333,7 @@ struct hfi1_packet {
+ 	struct rvt_qp *qp;
+ 	struct ib_other_headers *ohdr;
+ 	struct ib_grh *grh;
++	struct opa_16b_mgmt *mgmt;
+ 	u64 rhf;
+ 	u32 maxcnt;
+ 	u32 rhqoff;
+@@ -397,6 +398,12 @@ struct hfi1_packet {
+ #define OPA_16B_L4_IB_GLOBAL	0x0A
+ #define OPA_16B_L4_ETHR		OPA_VNIC_L4_ETHR
+ 
++/*
++ * OPA 16B Management
++ */
++#define OPA_16B_L4_FM_PAD	3  /* fixed 3B pad */
++#define OPA_16B_L4_FM_HLEN	24 /* 16B(16) + L4_FM(8) */
++
+ static inline u8 hfi1_16B_get_l4(struct hfi1_16b_header *hdr)
+ {
+ 	return (u8)(hdr->lrh[2] & OPA_16B_L4_MASK);
+@@ -473,6 +480,27 @@ static inline u8 hfi1_16B_bth_get_pad(st
+ 		   OPA_16B_BTH_PAD_MASK);
+ }
+ 
++/*
++ * 16B Management
++ */
++#define OPA_16B_MGMT_QPN_MASK	0xFFFFFF
++static inline u32 hfi1_16B_get_dest_qpn(struct opa_16b_mgmt *mgmt)
++{
++	return be32_to_cpu(mgmt->dest_qpn) & OPA_16B_MGMT_QPN_MASK;
++}
++
++static inline u32 hfi1_16B_get_src_qpn(struct opa_16b_mgmt *mgmt)
++{
++	return be32_to_cpu(mgmt->src_qpn) & OPA_16B_MGMT_QPN_MASK;
++}
++
++static inline void hfi1_16B_set_qpn(struct opa_16b_mgmt *mgmt,
++				    u32 dest_qp, u32 src_qp)
++{
++	mgmt->dest_qpn = cpu_to_be32(dest_qp & OPA_16B_MGMT_QPN_MASK);
++	mgmt->src_qpn = cpu_to_be32(src_qp & OPA_16B_MGMT_QPN_MASK);
++}
++
+ struct rvt_sge_state;
+ 
+ /*
+--- a/drivers/infiniband/hw/hfi1/ud.c
++++ b/drivers/infiniband/hw/hfi1/ud.c
+@@ -399,16 +399,30 @@ void hfi1_make_ud_req_16B(struct rvt_qp
+ 	struct hfi1_pportdata *ppd;
+ 	struct hfi1_ibport *ibp;
+ 	u32 dlid, slid, nwords, extra_bytes;
++	u32 dest_qp = wqe->ud_wr.remote_qpn;
++	u32 src_qp = qp->ibqp.qp_num;
+ 	u16 len, pkey;
+ 	u8 l4, sc5;
++	bool is_mgmt = false;
+ 
+ 	ibp = to_iport(qp->ibqp.device, qp->port_num);
+ 	ppd = ppd_from_ibp(ibp);
+ 	ah_attr = &ibah_to_rvtah(wqe->ud_wr.ah)->attr;
+-	/* header size in dwords 16B LRH+BTH+DETH = (16+12+8)/4. */
+-	ps->s_txreq->hdr_dwords = 9;
+-	if (wqe->wr.opcode == IB_WR_SEND_WITH_IMM)
+-		ps->s_txreq->hdr_dwords++;
++
++	/*
++	 * Build 16B Management Packet if either the destination
++	 * or source queue pair number is 0 or 1.
++	 */
++	if (dest_qp == 0 || src_qp == 0 || dest_qp == 1 || src_qp == 1) {
++		/* header size in dwords 16B LRH+L4_FM = (16+8)/4. */
++		ps->s_txreq->hdr_dwords = 6;
++		is_mgmt = true;
++	} else {
++		/* header size in dwords 16B LRH+BTH+DETH = (16+12+8)/4. */
++		ps->s_txreq->hdr_dwords = 9;
++		if (wqe->wr.opcode == IB_WR_SEND_WITH_IMM)
++			ps->s_txreq->hdr_dwords++;
++	}
+ 
+ 	/* SW provides space for CRC and LT for bypass packets. */
+ 	extra_bytes = hfi1_get_16b_padding((ps->s_txreq->hdr_dwords << 2),
+@@ -453,7 +467,14 @@ void hfi1_make_ud_req_16B(struct rvt_qp
+ 		slid = ppd->lid | (rdma_ah_get_path_bits(ah_attr) &
+ 			   ((1 << ppd->lmc) - 1));
+ 
+-	hfi1_make_bth_deth(qp, wqe, ohdr, &pkey, extra_bytes, true);
++	if (is_mgmt) {
++		l4 = OPA_16B_L4_FM;
++		pkey = hfi1_get_pkey(ibp, wqe->ud_wr.pkey_index);
++		hfi1_16B_set_qpn(&ps->s_txreq->phdr.hdr.opah.u.mgmt,
++				 dest_qp, src_qp);
++	} else {
++		hfi1_make_bth_deth(qp, wqe, ohdr, &pkey, extra_bytes, true);
++	}
+ 	/* Convert dwords to flits */
+ 	len = (ps->s_txreq->hdr_dwords + nwords) >> 1;
+ 
+@@ -845,10 +866,8 @@ static int opa_smp_check(struct hfi1_ibp
+  */
+ void hfi1_ud_rcv(struct hfi1_packet *packet)
+ {
+-	struct ib_other_headers *ohdr = packet->ohdr;
+ 	u32 hdrsize = packet->hlen;
+ 	struct ib_wc wc;
+-	u32 qkey;
+ 	u32 src_qp;
+ 	u16 pkey;
+ 	int mgmt_pkey_idx = -1;
+@@ -864,27 +883,35 @@ void hfi1_ud_rcv(struct hfi1_packet *pac
+ 	u32 dlid = packet->dlid;
+ 	u32 slid = packet->slid;
+ 	u8 extra_bytes;
++	u8 l4 = 0;
+ 	bool dlid_is_permissive;
+ 	bool slid_is_permissive;
++	bool solicited = false;
+ 
+ 	extra_bytes = packet->pad + packet->extra_byte + (SIZE_OF_CRC << 2);
+-	qkey = ib_get_qkey(ohdr);
+-	src_qp = ib_get_sqpn(ohdr);
+ 
+ 	if (packet->etype == RHF_RCV_TYPE_BYPASS) {
+ 		u32 permissive_lid =
+ 			opa_get_lid(be32_to_cpu(OPA_LID_PERMISSIVE), 16B);
+ 
++		l4 = hfi1_16B_get_l4(packet->hdr);
+ 		pkey = hfi1_16B_get_pkey(packet->hdr);
+ 		dlid_is_permissive = (dlid == permissive_lid);
+ 		slid_is_permissive = (slid == permissive_lid);
+ 	} else {
+-		pkey = ib_bth_get_pkey(ohdr);
++		pkey = ib_bth_get_pkey(packet->ohdr);
+ 		dlid_is_permissive = (dlid == be16_to_cpu(IB_LID_PERMISSIVE));
+ 		slid_is_permissive = (slid == be16_to_cpu(IB_LID_PERMISSIVE));
+ 	}
+ 	sl_from_sc = ibp->sc_to_sl[sc5];
+ 
++	if (likely(l4 != OPA_16B_L4_FM)) {
++		src_qp = ib_get_sqpn(packet->ohdr);
++		solicited = ib_bth_is_solicited(packet->ohdr);
++	} else {
++		src_qp = hfi1_16B_get_src_qpn(packet->mgmt);
++	}
++
+ 	process_ecn(qp, packet, (opcode != IB_OPCODE_CNP));
+ 	/*
+ 	 * Get the number of bytes the message was padded by
+@@ -922,8 +949,9 @@ void hfi1_ud_rcv(struct hfi1_packet *pac
+ 			if (mgmt_pkey_idx < 0)
+ 				goto drop;
+ 		}
+-		if (unlikely(qkey != qp->qkey)) /* Silent drop */
+-			return;
++		if (unlikely(l4 != OPA_16B_L4_FM &&
++			     ib_get_qkey(packet->ohdr) != qp->qkey))
++			return; /* Silent drop */
+ 
+ 		/* Drop invalid MAD packets (see 13.5.3.1). */
+ 		if (unlikely(qp->ibqp.qp_num == 1 &&
+@@ -950,7 +978,7 @@ void hfi1_ud_rcv(struct hfi1_packet *pac
+ 
+ 	if (qp->ibqp.qp_num > 1 &&
+ 	    opcode == IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE) {
+-		wc.ex.imm_data = ohdr->u.ud.imm_data;
++		wc.ex.imm_data = packet->ohdr->u.ud.imm_data;
+ 		wc.wc_flags = IB_WC_WITH_IMM;
+ 		tlen -= sizeof(u32);
+ 	} else if (opcode == IB_OPCODE_UD_SEND_ONLY) {
+@@ -1047,8 +1075,7 @@ void hfi1_ud_rcv(struct hfi1_packet *pac
+ 		dlid & ((1 << ppd_from_ibp(ibp)->lmc) - 1);
+ 	wc.port_num = qp->port_num;
+ 	/* Signal completion event if the solicited bit is set. */
+-	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-		     ib_bth_is_solicited(ohdr));
++	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc, solicited);
+ 	return;
+ 
+ drop:
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -617,7 +617,12 @@ static inline void hfi1_handle_packet(st
+ 			wake_up(&mcast->wait);
+ 	} else {
+ 		/* Get the destination QP number. */
+-		qp_num = ib_bth_get_qpn(packet->ohdr);
++		if (packet->etype == RHF_RCV_TYPE_BYPASS &&
++		    hfi1_16B_get_l4(packet->hdr) == OPA_16B_L4_FM)
++			qp_num = hfi1_16B_get_dest_qpn(packet->mgmt);
++		else
++			qp_num = ib_bth_get_qpn(packet->ohdr);
++
+ 		rcu_read_lock();
+ 		packet->qp = rvt_lookup_qpn(rdi, &ibp->rvp, qp_num);
+ 		if (!packet->qp)
+@@ -1308,21 +1313,23 @@ int hfi1_verbs_send(struct rvt_qp *qp, s
+ {
+ 	struct hfi1_devdata *dd = dd_from_ibdev(qp->ibqp.device);
+ 	struct hfi1_qp_priv *priv = qp->priv;
+-	struct ib_other_headers *ohdr;
++	struct ib_other_headers *ohdr = NULL;
+ 	send_routine sr;
+ 	int ret;
+ 	u16 pkey;
+ 	u32 slid;
++	u8 l4 = 0;
+ 
+ 	/* locate the pkey within the headers */
+ 	if (ps->s_txreq->phdr.hdr.hdr_type) {
+ 		struct hfi1_16b_header *hdr = &ps->s_txreq->phdr.hdr.opah;
+-		u8 l4 = hfi1_16B_get_l4(hdr);
+ 
+-		if (l4 == OPA_16B_L4_IB_GLOBAL)
+-			ohdr = &hdr->u.l.oth;
+-		else
++		l4 = hfi1_16B_get_l4(hdr);
++		if (l4 == OPA_16B_L4_IB_LOCAL)
+ 			ohdr = &hdr->u.oth;
++		else if (l4 == OPA_16B_L4_IB_GLOBAL)
++			ohdr = &hdr->u.l.oth;
++
+ 		slid = hfi1_16B_get_slid(hdr);
+ 		pkey = hfi1_16B_get_pkey(hdr);
+ 	} else {
+@@ -1337,7 +1344,11 @@ int hfi1_verbs_send(struct rvt_qp *qp, s
+ 		pkey = ib_bth_get_pkey(ohdr);
+ 	}
+ 
+-	ps->opcode = ib_bth_get_opcode(ohdr);
++	if (likely(l4 != OPA_16B_L4_FM))
++		ps->opcode = ib_bth_get_opcode(ohdr);
++	else
++		ps->opcode = IB_OPCODE_UD_SEND_ONLY;
++
+ 	sr = get_send_routine(qp, ps);
+ 	ret = egress_pkey_check(dd->pport, slid, pkey,
+ 				priv->s_sc, qp->s_pkey_index);
