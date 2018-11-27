@@ -1,0 +1,275 @@
+From: Roman Kagan <rkagan@virtuozzo.com>
+Date: Thu, 1 Feb 2018 16:48:32 +0300
+Patch-mainline: v4.17-rc1
+Subject: kvm: x86: hyperv: guest->host event signaling via eventfd
+Git-commit: faeb7833eee0d6afe0ecb6bdfa6042556c2c352e
+References: bsc#1107207
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In Hyper-V, the fast guest->host notification mechanism is the
+SIGNAL_EVENT hypercall, with a single parameter of the connection ID to
+signal.
+
+Currently this hypercall incurs a user exit and requires the userspace
+to decode the parameters and trigger the notification of the potentially
+different I/O context.
+
+To avoid the costly user exit, process this hypercall and signal the
+corresponding eventfd in KVM, similar to ioeventfd.  The association
+between the connection id and the eventfd is established via the newly
+introduced KVM_HYPERV_EVENTFD ioctl, and maintained in an
+(srcu-protected) IDR.
+
+Signed-off-by: Roman Kagan <rkagan@virtuozzo.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+[asm/hyperv.h changes approved by KY Srinivasan. - Radim]
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ Documentation/virtual/kvm/api.txt  |  32 ++++++++++++
+ arch/x86/include/asm/kvm_host.h    |   2 +
+ arch/x86/include/uapi/asm/hyperv.h |   2 +
+ arch/x86/kvm/hyperv.c              | 103 ++++++++++++++++++++++++++++++++++++-
+ arch/x86/kvm/hyperv.h              |   1 +
+ arch/x86/kvm/x86.c                 |  10 ++++
+ include/uapi/linux/kvm.h           |  15 ++++++
+ 7 files changed, 164 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -754,6 +754,8 @@ struct kvm_hv {
+ 	u64 hv_crash_ctl;
+ 
+ 	HV_REFERENCE_TSC_PAGE tsc_ref;
++
++	struct idr conn_to_evt;
+ };
+ 
+ enum kvm_irqchip_mode {
+diff --git a/arch/x86/include/uapi/asm/hyperv.h b/arch/x86/include/uapi/asm/hyperv.h
+--- a/arch/x86/include/uapi/asm/hyperv.h
++++ b/arch/x86/include/uapi/asm/hyperv.h
+@@ -303,7 +303,9 @@ enum HV_GENERIC_SET_FORMAT {
+ #define HV_STATUS_INVALID_HYPERCALL_CODE	2
+ #define HV_STATUS_INVALID_HYPERCALL_INPUT	3
+ #define HV_STATUS_INVALID_ALIGNMENT		4
++#define HV_STATUS_INVALID_PARAMETER		5
+ #define HV_STATUS_INSUFFICIENT_MEMORY		11
++#define HV_STATUS_INVALID_PORT_ID		17
+ #define HV_STATUS_INVALID_CONNECTION_ID		18
+ #define HV_STATUS_INSUFFICIENT_BUFFERS		19
+ 
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -29,6 +29,7 @@
+ #include <linux/kvm_host.h>
+ #include <linux/highmem.h>
+ #include <linux/sched/cputime.h>
++#include <linux/eventfd.h>
+ 
+ #include <asm/apicdef.h>
+ #include <trace/events/kvm.h>
+@@ -1226,6 +1227,43 @@ static int kvm_hv_hypercall_complete_userspace(struct kvm_vcpu *vcpu)
+ 	return 1;
+ }
+ 
++static u16 kvm_hvcall_signal_event(struct kvm_vcpu *vcpu, bool fast, u64 param)
++{
++	struct eventfd_ctx *eventfd;
++
++	if (unlikely(!fast)) {
++		int ret;
++		gpa_t gpa = param;
++
++		if ((gpa & (__alignof__(param) - 1)) ||
++		    offset_in_page(gpa) + sizeof(param) > PAGE_SIZE)
++			return HV_STATUS_INVALID_ALIGNMENT;
++
++		ret = kvm_vcpu_read_guest(vcpu, gpa, &param, sizeof(param));
++		if (ret < 0)
++			return HV_STATUS_INVALID_ALIGNMENT;
++	}
++
++	/*
++	 * Per spec, bits 32-47 contain the extra "flag number".  However, we
++	 * have no use for it, and in all known usecases it is zero, so just
++	 * report lookup failure if it isn't.
++	 */
++	if (param & 0xffff00000000ULL)
++		return HV_STATUS_INVALID_PORT_ID;
++	/* remaining bits are reserved-zero */
++	if (param & ~KVM_HYPERV_CONN_ID_MASK)
++		return HV_STATUS_INVALID_HYPERCALL_INPUT;
++
++	/* conn_to_evt is protected by vcpu->kvm->srcu */
++	eventfd = idr_find(&vcpu->kvm->arch.hyperv.conn_to_evt, param);
++	if (!eventfd)
++		return HV_STATUS_INVALID_PORT_ID;
++
++	eventfd_signal(eventfd, 1);
++	return HV_STATUS_SUCCESS;
++}
++
+ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+ {
+ 	u64 param, ingpa, outgpa, ret;
+@@ -1276,8 +1314,12 @@ int kvm_hv_hypercall(struct kvm_vcpu *vcpu)
+ 	case HVCALL_NOTIFY_LONG_SPIN_WAIT:
+ 		kvm_vcpu_on_spin(vcpu, true);
+ 		break;
+-	case HVCALL_POST_MESSAGE:
+ 	case HVCALL_SIGNAL_EVENT:
++		res = kvm_hvcall_signal_event(vcpu, fast, ingpa);
++		if (res != HV_STATUS_INVALID_PORT_ID)
++			break;
++		/* maybe userspace knows this conn_id: fall through */
++	case HVCALL_POST_MESSAGE:
+ 		/* don't bother userspace if it has no way to handle it */
+ 		if (!vcpu_to_synic(vcpu)->active) {
+ 			res = HV_STATUS_INVALID_HYPERCALL_CODE;
+@@ -1305,8 +1347,67 @@ set_result:
+ void kvm_hv_init_vm(struct kvm *kvm)
+ {
+ 	mutex_init(&kvm->arch.hyperv.hv_lock);
++	idr_init(&kvm->arch.hyperv.conn_to_evt);
+ }
+ 
+ void kvm_hv_destroy_vm(struct kvm *kvm)
+ {
++	struct eventfd_ctx *eventfd;
++	int i;
++
++	idr_for_each_entry(&kvm->arch.hyperv.conn_to_evt, eventfd, i)
++		eventfd_ctx_put(eventfd);
++	idr_destroy(&kvm->arch.hyperv.conn_to_evt);
++}
++
++static int kvm_hv_eventfd_assign(struct kvm *kvm, u32 conn_id, int fd)
++{
++	struct kvm_hv *hv = &kvm->arch.hyperv;
++	struct eventfd_ctx *eventfd;
++	int ret;
++
++	eventfd = eventfd_ctx_fdget(fd);
++	if (IS_ERR(eventfd))
++		return PTR_ERR(eventfd);
++
++	mutex_lock(&hv->hv_lock);
++	ret = idr_alloc(&hv->conn_to_evt, eventfd, conn_id, conn_id + 1,
++			GFP_KERNEL);
++	mutex_unlock(&hv->hv_lock);
++
++	if (ret >= 0)
++		return 0;
++
++	if (ret == -ENOSPC)
++		ret = -EEXIST;
++	eventfd_ctx_put(eventfd);
++	return ret;
++}
++
++static int kvm_hv_eventfd_deassign(struct kvm *kvm, u32 conn_id)
++{
++	struct kvm_hv *hv = &kvm->arch.hyperv;
++	struct eventfd_ctx *eventfd;
++
++	mutex_lock(&hv->hv_lock);
++	eventfd = idr_remove(&hv->conn_to_evt, conn_id);
++	mutex_unlock(&hv->hv_lock);
++
++	if (!eventfd)
++		return -ENOENT;
++
++	synchronize_srcu(&kvm->srcu);
++	eventfd_ctx_put(eventfd);
++	return 0;
++}
++
++int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args)
++{
++	if ((args->flags & ~KVM_HYPERV_EVENTFD_DEASSIGN) ||
++	    (args->conn_id & ~KVM_HYPERV_CONN_ID_MASK))
++		return -EINVAL;
++
++	if (args->flags == KVM_HYPERV_EVENTFD_DEASSIGN)
++		return kvm_hv_eventfd_deassign(kvm, args->conn_id);
++	return kvm_hv_eventfd_assign(kvm, args->conn_id, args->fd);
+ }
+diff --git a/arch/x86/kvm/hyperv.h b/arch/x86/kvm/hyperv.h
+--- a/arch/x86/kvm/hyperv.h
++++ b/arch/x86/kvm/hyperv.h
+@@ -90,5 +90,6 @@ void kvm_hv_setup_tsc_page(struct kvm *kvm,
+ 
+ void kvm_hv_init_vm(struct kvm *kvm);
+ void kvm_hv_destroy_vm(struct kvm *kvm);
++int kvm_vm_ioctl_hv_eventfd(struct kvm *kvm, struct kvm_hyperv_eventfd *args);
+ 
+ #endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2809,6 +2809,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_HYPERV_SYNIC:
+ 	case KVM_CAP_HYPERV_SYNIC2:
+ 	case KVM_CAP_HYPERV_VP_INDEX:
++	case KVM_CAP_HYPERV_EVENTFD:
+ 	case KVM_CAP_PCI_SEGMENT:
+ 	case KVM_CAP_DEBUGREGS:
+ 	case KVM_CAP_X86_ROBUST_SINGLESTEP:
+@@ -4482,6 +4483,15 @@ set_identity_unlock:
+ 			r = kvm_x86_ops->mem_enc_unreg_region(kvm, &region);
+ 		break;
+ 	}
++	case KVM_HYPERV_EVENTFD: {
++		struct kvm_hyperv_eventfd hvevfd;
++
++		r = -EFAULT;
++		if (copy_from_user(&hvevfd, argp, sizeof(hvevfd)))
++			goto out;
++		r = kvm_vm_ioctl_hv_eventfd(kvm, &hvevfd);
++		break;
++	}
+ 	default:
+ 		r = -ENOTTY;
+ 	}
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -936,6 +936,7 @@ struct kvm_ppc_resize_hpt {
+ #define KVM_CAP_PPC_GET_CPU_CHAR 151
+ #define KVM_CAP_S390_BPB 152
+ #define KVM_CAP_GET_MSR_FEATURES 153
++#define KVM_CAP_HYPERV_EVENTFD 154
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
+@@ -1375,6 +1376,10 @@ struct kvm_enc_region {
+ #define KVM_MEMORY_ENCRYPT_REG_REGION    _IOR(KVMIO, 0xbb, struct kvm_enc_region)
+ #define KVM_MEMORY_ENCRYPT_UNREG_REGION  _IOR(KVMIO, 0xbc, struct kvm_enc_region)
+ 
++/* Available with KVM_CAP_HYPERV_EVENTFD */
++#define KVM_HYPERV_EVENTFD        _IOW(KVMIO,  0xbd, struct kvm_hyperv_eventfd)
++
++
+ /* Secure Encrypted Virtualization command */
+ enum sev_cmd_id {
+ 	/* Guest initialization commands */
+@@ -1515,4 +1520,14 @@ struct kvm_assigned_msix_entry {
+ #define KVM_ARM_DEV_EL1_PTIMER		(1 << 1)
+ #define KVM_ARM_DEV_PMU			(1 << 2)
+ 
++struct kvm_hyperv_eventfd {
++	__u32 conn_id;
++	__s32 fd;
++	__u32 flags;
++	__u32 padding[3];
++};
++
++#define KVM_HYPERV_CONN_ID_MASK		0x00ffffff
++#define KVM_HYPERV_EVENTFD_DEASSIGN	(1 << 0)
++
+ #endif /* __LINUX_KVM_H */
