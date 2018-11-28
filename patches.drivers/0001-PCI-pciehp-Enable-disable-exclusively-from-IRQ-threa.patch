@@ -1,0 +1,379 @@
+From 32a8cef274feacd00b748a4f13b84d60aa6d82ff Mon Sep 17 00:00:00 2001
+From: Lukas Wunner <lukas@wunner.de>
+Date: Thu, 19 Jul 2018 17:27:46 -0500
+Subject: [PATCH] PCI: pciehp: Enable/disable exclusively from IRQ thread
+Git-commit: 32a8cef274feacd00b748a4f13b84d60aa6d82ff
+Patch-mainline: v4.19
+References: FATE#326303
+
+Besides the IRQ thread, there are several other places in the driver
+which enable or disable the slot:
+
+- pciehp_probe() enables the slot if it's occupied and the pciehp_force
+  module parameter is used.
+
+- pciehp_resume() enables or disables the slot after system sleep.
+
+- pciehp_queue_pushbutton_work() enables or disables the slot after the
+  5 second delay following an Attention Button press.
+
+- pciehp_sysfs_enable_slot() and pciehp_sysfs_disable_slot() enable or
+  disable the slot on sysfs write.
+
+This requires locking and complicates pciehp's state machine.
+
+A simplification can be achieved by enabling and disabling the slot
+exclusively from the IRQ thread.
+
+Amend the functions listed above to request slot enable/disablement from
+the IRQ thread by either synthesizing a Presence Detect Changed event or,
+in the case of a disable user request (via sysfs or an Attention Button
+press), submitting a newly introduced force disable request.  The latter
+is needed because the slot shall be forced off despite being occupied.
+For this force disable request, avoid colliding with Slot Status register
+bits by using a bit number greater than 16.
+
+For synchronous execution of requests (on sysfs write), wait for the
+request to finish and retrieve the result.  There can only ever be one
+sysfs write in flight due to the locking in kernfs_fop_write(), hence
+there is no risk of returning the result of a different sysfs request to
+user space.
+
+The POWERON_STATE and POWEROFF_STATE is now no longer entered by the
+above-listed functions, but solely by the IRQ thread when it begins a
+power transition.  Afterwards, it moves to STATIC_STATE.  The same
+applies to canceling the Attention Button work, it likewise becomes an
+IRQ thread only operation.
+
+An immediate consequence is that the POWERON_STATE and POWEROFF_STATE is
+never observed by the IRQ thread itself, only by functions called in a
+different context, such as pciehp_sysfs_enable_slot().  So remove
+handling of these states from pciehp_handle_button_press() and
+pciehp_handle_link_change() which are exclusively called from the IRQ
+thread.
+
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/pci/hotplug/pciehp.h      |   15 +++++
+ drivers/pci/hotplug/pciehp_core.c |   29 ++++++----
+ drivers/pci/hotplug/pciehp_ctrl.c |  108 ++++++++++++++++----------------------
+ drivers/pci/hotplug/pciehp_hpc.c  |   14 +++-
+ 4 files changed, 92 insertions(+), 74 deletions(-)
+
+--- a/drivers/pci/hotplug/pciehp.h
++++ b/drivers/pci/hotplug/pciehp.h
+@@ -95,6 +95,8 @@ struct controller {
+ 	unsigned int notification_enabled:1;
+ 	unsigned int power_fault_detected;
+ 	atomic_t pending_events;
++	int request_result;
++	wait_queue_head_t requester;
+ };
+ 
+ /**
+@@ -116,6 +118,17 @@ struct controller {
+ #define POWEROFF_STATE			4
+ #define ON_STATE			5
+ 
++/**
++ * DOC: Flags to request an action from the IRQ thread
++ *
++ * These are stored together with events read from the Slot Status register,
++ * hence must be greater than its 16-bit width.
++ *
++ * %DISABLE_SLOT: Disable the slot in response to a user request via sysfs or
++ *	an Attention Button press after the 5 second delay
++ */
++#define DISABLE_SLOT		(1 << 16)
++
+ #define ATTN_BUTTN(ctrl)	((ctrl)->slot_cap & PCI_EXP_SLTCAP_ABP)
+ #define POWER_CTRL(ctrl)	((ctrl)->slot_cap & PCI_EXP_SLTCAP_PCP)
+ #define MRL_SENS(ctrl)		((ctrl)->slot_cap & PCI_EXP_SLTCAP_MRLSP)
+@@ -128,7 +141,9 @@ struct controller {
+ 
+ int pciehp_sysfs_enable_slot(struct slot *slot);
+ int pciehp_sysfs_disable_slot(struct slot *slot);
++void pciehp_request(struct controller *ctrl, int action);
+ void pciehp_handle_button_press(struct slot *slot);
++void pciehp_handle_disable_request(struct slot *slot);
+ void pciehp_handle_link_change(struct slot *slot);
+ void pciehp_handle_presence_change(struct slot *slot);
+ int pciehp_configure_device(struct slot *p_slot);
+--- a/drivers/pci/hotplug/pciehp_core.c
++++ b/drivers/pci/hotplug/pciehp_core.c
+@@ -254,16 +254,20 @@ static int pciehp_probe(struct pcie_devi
+ 	}
+ 
+ 	/* Check if slot is occupied */
++	mutex_lock(&slot->lock);
+ 	pciehp_get_adapter_status(slot, &occupied);
+ 	pciehp_get_power_status(slot, &poweron);
+-	if (occupied && pciehp_force) {
+-		mutex_lock(&slot->hotplug_lock);
+-		pciehp_enable_slot(slot);
+-		mutex_unlock(&slot->hotplug_lock);
+-	}
++	if (pciehp_force &&
++	    ((occupied && (slot->state == OFF_STATE ||
++			   slot->state == BLINKINGON_STATE)) ||
++	      (!occupied && (slot->state == ON_STATE ||
++			     slot->state == BLINKINGOFF_STATE))))
++		pciehp_request(ctrl, PCI_EXP_SLTSTA_PDC);
++
+ 	/* If empty slot's power status is on, turn power off */
+ 	if (!occupied && poweron && POWER_CTRL(ctrl))
+ 		pciehp_power_off_slot(slot);
++	mutex_unlock(&slot->lock);
+ 
+ 	return 0;
+ 
+@@ -307,12 +311,15 @@ static int pciehp_resume(struct pcie_dev
+ 
+ 	/* Check if slot is occupied */
+ 	pciehp_get_adapter_status(slot, &status);
+-	mutex_lock(&slot->hotplug_lock);
+-	if (status)
+-		pciehp_enable_slot(slot);
+-	else
+-		pciehp_disable_slot(slot);
+-	mutex_unlock(&slot->hotplug_lock);
++
++	mutex_lock(&slot->lock);
++	if ((status && (slot->state == OFF_STATE ||
++			slot->state == BLINKINGON_STATE)) ||
++	    (!status && (slot->state == ON_STATE ||
++		slot->state == BLINKINGOFF_STATE)))
++		pciehp_request(ctrl, PCI_EXP_SLTSTA_PDC);
++	mutex_unlock(&slot->lock);
++
+ 	return 0;
+ }
+ #endif /* PM */
+--- a/drivers/pci/hotplug/pciehp_ctrl.c
++++ b/drivers/pci/hotplug/pciehp_ctrl.c
+@@ -140,22 +140,26 @@ static int remove_board(struct slot *p_s
+ 	return 0;
+ }
+ 
++void pciehp_request(struct controller *ctrl, int action)
++{
++	atomic_or(action, &ctrl->pending_events);
++	if (!pciehp_poll_mode)
++		irq_wake_thread(ctrl->pcie->irq, ctrl);
++}
++
+ void pciehp_queue_pushbutton_work(struct work_struct *work)
+ {
+ 	struct slot *p_slot = container_of(work, struct slot, work.work);
++	struct controller *ctrl = p_slot->ctrl;
+ 
+ 	mutex_lock(&p_slot->lock);
+ 	switch (p_slot->state) {
+ 	case BLINKINGOFF_STATE:
+-		p_slot->state = POWEROFF_STATE;
+-		mutex_unlock(&p_slot->lock);
+-		pciehp_disable_slot(p_slot);
+-		return;
++		pciehp_request(ctrl, DISABLE_SLOT);
++		break;
+ 	case BLINKINGON_STATE:
+-		p_slot->state = POWERON_STATE;
+-		mutex_unlock(&p_slot->lock);
+-		pciehp_enable_slot(p_slot);
+-		return;
++		pciehp_request(ctrl, PCI_EXP_SLTSTA_PDC);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -206,16 +210,6 @@ void pciehp_handle_button_press(struct s
+ 		ctrl_info(ctrl, "Slot(%s): Action canceled due to button press\n",
+ 			  slot_name(p_slot));
+ 		break;
+-	case POWEROFF_STATE:
+-	case POWERON_STATE:
+-		/*
+-		 * Ignore if the slot is on power-on or power-off state;
+-		 * this means that the previous attention button action
+-		 * to hot-add or hot-remove is undergoing
+-		 */
+-		ctrl_info(ctrl, "Slot(%s): Button ignored\n",
+-			  slot_name(p_slot));
+-		break;
+ 	default:
+ 		ctrl_err(ctrl, "Slot(%s): Ignoring invalid state %#x\n",
+ 			 slot_name(p_slot), p_slot->state);
+@@ -224,6 +218,22 @@ void pciehp_handle_button_press(struct s
+ 	mutex_unlock(&p_slot->lock);
+ }
+ 
++void pciehp_handle_disable_request(struct slot *slot)
++{
++	struct controller *ctrl = slot->ctrl;
++
++	mutex_lock(&slot->lock);
++	switch (slot->state) {
++	case BLINKINGON_STATE:
++	case BLINKINGOFF_STATE:
++		cancel_delayed_work(&slot->work);
++	}
++	slot->state = POWEROFF_STATE;
++	mutex_unlock(&slot->lock);
++
++	ctrl->request_result = pciehp_disable_slot(slot);
++}
++
+ void pciehp_handle_link_change(struct slot *p_slot)
+ {
+ 	struct controller *ctrl = p_slot->ctrl;
+@@ -252,32 +262,6 @@ void pciehp_handle_link_change(struct sl
+ 		}
+ 		return;
+ 		break;
+-	case POWERON_STATE:
+-		if (link_active) {
+-			ctrl_info(ctrl, "Slot(%s): Link Up event ignored; already powering on\n",
+-				  slot_name(p_slot));
+-		} else {
+-			p_slot->state = POWEROFF_STATE;
+-			mutex_unlock(&p_slot->lock);
+-			ctrl_info(ctrl, "Slot(%s): Link Down event queued; currently getting powered on\n",
+-				  slot_name(p_slot));
+-			pciehp_disable_slot(p_slot);
+-			return;
+-		}
+-		break;
+-	case POWEROFF_STATE:
+-		if (link_active) {
+-			p_slot->state = POWERON_STATE;
+-			mutex_unlock(&p_slot->lock);
+-			ctrl_info(ctrl, "Slot(%s): Link Up event queued; currently getting powered off\n",
+-				  slot_name(p_slot));
+-			pciehp_enable_slot(p_slot);
+-			return;
+-		} else {
+-			ctrl_info(ctrl, "Slot(%s): Link Down event ignored; already powering off\n",
+-				  slot_name(p_slot));
+-		}
+-		break;
+ 	default:
+ 		ctrl_err(ctrl, "Slot(%s): Ignoring invalid state %#x\n",
+ 			 slot_name(p_slot), p_slot->state);
+@@ -292,6 +276,12 @@ void pciehp_handle_presence_change(struc
+ 	u8 present;
+ 
+ 	mutex_lock(&slot->lock);
++	switch (slot->state) {
++	case BLINKINGON_STATE:
++	case BLINKINGOFF_STATE:
++		cancel_delayed_work(&slot->work);
++	}
++
+ 	pciehp_get_adapter_status(slot, &present);
+ 	ctrl_info(ctrl, "Slot(%s): Card %spresent\n", slot_name(slot),
+ 		  present ? "" : "not ");
+@@ -299,7 +289,7 @@ void pciehp_handle_presence_change(struc
+ 	if (present) {
+ 		slot->state = POWERON_STATE;
+ 		mutex_unlock(&slot->lock);
+-		pciehp_enable_slot(slot);
++		ctrl->request_result = pciehp_enable_slot(slot);
+ 	} else {
+ 		slot->state = POWEROFF_STATE;
+ 		mutex_unlock(&slot->lock);
+@@ -372,16 +362,17 @@ int pciehp_sysfs_enable_slot(struct slot
+ 	mutex_lock(&p_slot->lock);
+ 	switch (p_slot->state) {
+ 	case BLINKINGON_STATE:
+-		cancel_delayed_work(&p_slot->work);
+ 	case OFF_STATE:
+-		p_slot->state = POWERON_STATE;
+ 		mutex_unlock(&p_slot->lock);
+-		mutex_lock(&p_slot->hotplug_lock);
+-		retval = pciehp_enable_slot(p_slot);
+-		mutex_unlock(&p_slot->hotplug_lock);
+-		mutex_lock(&p_slot->lock);
+-		p_slot->state = retval ? OFF_STATE : ON_STATE;
+-		break;
++		/*
++		 * The IRQ thread becomes a no-op if the user pulls out the
++		 * card before the thread wakes up, so initialize to -ENODEV.
++		 */
++		ctrl->request_result = -ENODEV;
++		pciehp_request(ctrl, PCI_EXP_SLTSTA_PDC);
++		wait_event(ctrl->requester,
++			   !atomic_read(&ctrl->pending_events));
++		return ctrl->request_result;
+ 	case POWERON_STATE:
+ 		ctrl_info(ctrl, "Slot(%s): Already in powering on state\n",
+ 			  slot_name(p_slot));
+@@ -410,15 +401,12 @@ int pciehp_sysfs_disable_slot(struct slo
+ 	mutex_lock(&p_slot->lock);
+ 	switch (p_slot->state) {
+ 	case BLINKINGOFF_STATE:
+-		cancel_delayed_work(&p_slot->work);
+ 	case ON_STATE:
+-		p_slot->state = POWEROFF_STATE;
+ 		mutex_unlock(&p_slot->lock);
+-		mutex_lock(&p_slot->hotplug_lock);
+-		retval = pciehp_disable_slot(p_slot);
+-		mutex_unlock(&p_slot->hotplug_lock);
+-		mutex_lock(&p_slot->lock);
+-		p_slot->state = OFF_STATE;
++		pciehp_request(ctrl, DISABLE_SLOT);
++		wait_event(ctrl->requester,
++				!atomic_read(&ctrl->pending_events));
++		return ctrl->request_result;
+ 		break;
+ 	case POWEROFF_STATE:
+ 		ctrl_info(ctrl, "Slot(%s): Already in powering off state\n",
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@ -610,11 +610,16 @@ static irqreturn_t pciehp_ist(int irq, v
+ 	}
+ 
+ 	/*
++	 * Disable requests have higher priority than Presence Detect Changed
++	 * or Data Link Layer State Changed events.
++	 *
+ 	 * Check Link Status Changed at higher precedence than Presence
+ 	 * Detect Changed.  The PDS value may be set to "card present" from
+ 	 * out-of-band detection, which may be in conflict with a Link Down.
+ 	 */
+-	if (events & PCI_EXP_SLTSTA_DLLSC)
++	if (events & DISABLE_SLOT)
++		pciehp_handle_disable_request(slot);
++	else if (events & PCI_EXP_SLTSTA_DLLSC)
+ 		pciehp_handle_link_change(slot);
+ 	else if (events & PCI_EXP_SLTSTA_PDC)
+ 		pciehp_handle_presence_change(slot);
+@@ -627,6 +632,7 @@ static irqreturn_t pciehp_ist(int irq, v
+ 		pciehp_green_led_off(slot);
+ 	}
+ 
++	wake_up(&ctrl->requester);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -640,8 +646,9 @@ static int pciehp_poll(void *data)
+ 		if (kthread_should_park())
+ 			kthread_parkme();
+ 
+-		/* poll for interrupt events */
+-		while (pciehp_isr(IRQ_NOTCONNECTED, ctrl) == IRQ_WAKE_THREAD)
++		/* poll for interrupt events or user requests */
++		while (pciehp_isr(IRQ_NOTCONNECTED, ctrl) == IRQ_WAKE_THREAD ||
++		       atomic_read(&ctrl->pending_events))
+ 			pciehp_ist(IRQ_NOTCONNECTED, ctrl);
+ 
+ 		if (pciehp_poll_time <= 0 || pciehp_poll_time > 60)
+@@ -853,6 +860,7 @@ struct controller *pcie_init(struct pcie
+ 
+ 	ctrl->slot_cap = slot_cap;
+ 	mutex_init(&ctrl->ctrl_lock);
++	init_waitqueue_head(&ctrl->requester);
+ 	init_waitqueue_head(&ctrl->queue);
+ 	dbg_ctrl(ctrl);
+ 
