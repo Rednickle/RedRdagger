@@ -1,0 +1,155 @@
+From ec07a4473072ff0607e3126ce26c31dbf81f9a15 Mon Sep 17 00:00:00 2001
+From: Lukas Wunner <lukas@wunner.de>
+Date: Thu, 19 Jul 2018 17:27:39 -0500
+Subject: [PATCH] PCI: pciehp: Convert to threaded polling
+Git-commit: ec07a4473072ff0607e3126ce26c31dbf81f9a15
+Patch-mainline: v4.19
+References: FATE#326303
+
+We've just converted pciehp to threaded IRQ handling, but still cannot
+sleep in pciehp_ist() because the function is also called in poll mode,
+which runs in softirq context (from a timer).
+
+Convert poll mode to a kthread so that pciehp_ist() always runs in task
+context.
+
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/pci/hotplug/pciehp.h     |    2 -
+ drivers/pci/hotplug/pciehp_hpc.c |   69 ++++++++++++++++++---------------------
+ 2 files changed, 33 insertions(+), 38 deletions(-)
+
+--- a/drivers/pci/hotplug/pciehp.h
++++ b/drivers/pci/hotplug/pciehp.h
+@@ -94,7 +94,7 @@ struct controller {
+ 	wait_queue_head_t queue;	/* sleep & wake process */
+ 	u32 slot_cap;
+ 	u16 slot_ctrl;
+-	struct timer_list poll_timer;
++	struct task_struct *poll_thread;
+ 	unsigned long cmd_started;	/* jiffies */
+ 	unsigned int cmd_busy:1;
+ 	unsigned int link_active_reporting:1;
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@ -31,7 +31,7 @@
+ #include <linux/types.h>
+ #include <linux/signal.h>
+ #include <linux/jiffies.h>
+-#include <linux/timer.h>
++#include <linux/kthread.h>
+ #include <linux/pci.h>
+ #include <linux/interrupt.h>
+ #include <linux/time.h>
+@@ -47,36 +47,7 @@ static inline struct pci_dev *ctrl_dev(s
+ 
+ static irqreturn_t pciehp_isr(int irq, void *dev_id);
+ static irqreturn_t pciehp_ist(int irq, void *dev_id);
+-static void start_int_poll_timer(struct controller *ctrl, int sec);
+-
+-/* This is the interrupt polling timeout function. */
+-static void int_poll_timeout(unsigned long data)
+-{
+-	struct controller *ctrl = (struct controller *)data;
+-
+-	/* Poll for interrupt events.  regs == NULL => polling */
+-	while (pciehp_isr(IRQ_NOTCONNECTED, ctrl) == IRQ_WAKE_THREAD)
+-		pciehp_ist(IRQ_NOTCONNECTED, ctrl);
+-
+-	init_timer(&ctrl->poll_timer);
+-	if (!pciehp_poll_time)
+-		pciehp_poll_time = 2; /* default polling interval is 2 sec */
+-
+-	start_int_poll_timer(ctrl, pciehp_poll_time);
+-}
+-
+-/* This function starts the interrupt polling timer. */
+-static void start_int_poll_timer(struct controller *ctrl, int sec)
+-{
+-	/* Clamp to sane value */
+-	if ((sec <= 0) || (sec > 60))
+-		sec = 2;
+-
+-	ctrl->poll_timer.function = &int_poll_timeout;
+-	ctrl->poll_timer.data = (unsigned long)ctrl;
+-	ctrl->poll_timer.expires = jiffies + sec * HZ;
+-	add_timer(&ctrl->poll_timer);
+-}
++static int pciehp_poll(void *data);
+ 
+ static inline int pciehp_request_irq(struct controller *ctrl)
+ {
+@@ -84,9 +55,10 @@ static inline int pciehp_request_irq(str
+ 
+ 	/* Install interrupt polling timer. Start with 10 sec delay */
+ 	if (pciehp_poll_mode) {
+-		init_timer(&ctrl->poll_timer);
+-		start_int_poll_timer(ctrl, 10);
+-		return 0;
++		ctrl->poll_thread = kthread_run(&pciehp_poll, ctrl,
++						"pciehp_poll-%s",
++						slot_name(ctrl->slot));
++		return PTR_ERR_OR_ZERO(ctrl->poll_thread);
+ 	}
+ 
+ 	/* Installs the interrupt handler */
+@@ -101,7 +73,7 @@ static inline int pciehp_request_irq(str
+ static inline void pciehp_free_irq(struct controller *ctrl)
+ {
+ 	if (pciehp_poll_mode)
+-		del_timer_sync(&ctrl->poll_timer);
++		kthread_stop(ctrl->poll_thread);
+ 	else
+ 		free_irq(ctrl->pcie->irq, ctrl);
+ }
+@@ -669,6 +641,29 @@ static irqreturn_t pciehp_ist(int irq, v
+ 	return IRQ_HANDLED;
+ }
+ 
++static int pciehp_poll(void *data)
++{
++	struct controller *ctrl = data;
++
++	schedule_timeout_idle(10 * HZ); /* start with 10 sec delay */
++
++	while (!kthread_should_stop()) {
++		if (kthread_should_park())
++			kthread_parkme();
++
++		/* poll for interrupt events */
++		while (pciehp_isr(IRQ_NOTCONNECTED, ctrl) == IRQ_WAKE_THREAD)
++			pciehp_ist(IRQ_NOTCONNECTED, ctrl);
++
++		if (pciehp_poll_time <= 0 || pciehp_poll_time > 60)
++			pciehp_poll_time = 2; /* clamp to sane value */
++
++		schedule_timeout_idle(pciehp_poll_time * HZ);
++	}
++
++	return 0;
++}
++
+ static void pcie_enable_notification(struct controller *ctrl)
+ {
+ 	u16 cmd, mask;
+@@ -759,7 +754,7 @@ int pciehp_reset_slot(struct slot *slot,
+ 	ctrl_dbg(ctrl, "%s: SLOTCTRL %x write cmd %x\n", __func__,
+ 		 pci_pcie_cap(ctrl->pcie->port) + PCI_EXP_SLTCTL, 0);
+ 	if (pciehp_poll_mode)
+-		del_timer_sync(&ctrl->poll_timer);
++		kthread_park(ctrl->poll_thread);
+ 
+ 	pci_reset_bridge_secondary_bus(ctrl->pcie->port);
+ 
+@@ -768,7 +763,7 @@ int pciehp_reset_slot(struct slot *slot,
+ 	ctrl_dbg(ctrl, "%s: SLOTCTRL %x write cmd %x\n", __func__,
+ 		 pci_pcie_cap(ctrl->pcie->port) + PCI_EXP_SLTCTL, ctrl_mask);
+ 	if (pciehp_poll_mode)
+-		int_poll_timeout(ctrl->poll_timer.data);
++		kthread_unpark(ctrl->poll_thread);
+ 
+ 	return 0;
+ }
