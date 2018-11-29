@@ -1,0 +1,247 @@
+From: Andy Gospodarek <gospo@broadcom.com>
+Date: Thu, 26 Apr 2018 17:44:40 -0400
+Subject: bnxt_en: add debugfs support for DIM
+Patch-mainline: v4.18-rc1
+Git-commit: cabfb09d87bd7980cb4e39bd2ce679a788eb7e7a
+References: bsc#1104745 FATE#325918
+
+This adds debugfs support for bnxt_en with the purpose of allowing users
+to examine the current DIM profile in use for each receive queue.  This
+was instrumental in debugging issues found with DIM and ensuring that
+the profiles we expect to use are the profiles being used.
+
+Signed-off-by: Andy Gospodarek <gospo@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/Makefile       |    1 
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c         |    6 +
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h         |    2 
+ drivers/net/ethernet/broadcom/bnxt/bnxt_debugfs.c |  124 ++++++++++++++++++++++
+ drivers/net/ethernet/broadcom/bnxt/bnxt_debugfs.h |   23 ++++
+ 5 files changed, 156 insertions(+)
+ create mode 100644 drivers/net/ethernet/broadcom/bnxt/bnxt_debugfs.c
+ create mode 100644 drivers/net/ethernet/broadcom/bnxt/bnxt_debugfs.h
+
+--- a/drivers/net/ethernet/broadcom/bnxt/Makefile
++++ b/drivers/net/ethernet/broadcom/bnxt/Makefile
+@@ -2,3 +2,4 @@ obj-$(CONFIG_BNXT) += bnxt_en.o
+ 
+ bnxt_en-y := bnxt.o bnxt_sriov.o bnxt_ethtool.o bnxt_dcb.o bnxt_ulp.o bnxt_xdp.o bnxt_vfr.o bnxt_devlink.o bnxt_dim.o
+ bnxt_en-$(CONFIG_BNXT_FLOWER_OFFLOAD) += bnxt_tc.o
++bnxt_en-$(CONFIG_DEBUG_FS) += bnxt_debugfs.o
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -62,6 +62,7 @@
+ #include "bnxt_vfr.h"
+ #include "bnxt_tc.h"
+ #include "bnxt_devlink.h"
++#include "bnxt_debugfs.h"
+ 
+ #define BNXT_TX_TIMEOUT		(5 * HZ)
+ 
+@@ -6870,6 +6871,7 @@ static int __bnxt_open_nic(struct bnxt *
+ 	}
+ 
+ 	bnxt_enable_napi(bp);
++	bnxt_debug_dev_init(bp);
+ 
+ 	rc = bnxt_init_nic(bp, irq_re_init);
+ 	if (rc) {
+@@ -6902,6 +6904,7 @@ static int __bnxt_open_nic(struct bnxt *
+ 	return 0;
+ 
+ open_err:
++	bnxt_debug_dev_exit(bp);
+ 	bnxt_disable_napi(bp);
+ 	bnxt_del_napi(bp);
+ 
+@@ -6995,6 +6998,7 @@ static void __bnxt_close_nic(struct bnxt
+ 
+ 	/* TODO CHIMP_FW: Link/PHY related cleanup if (link_re_init) */
+ 
++	bnxt_debug_dev_exit(bp);
+ 	bnxt_disable_napi(bp);
+ 	del_timer_sync(&bp->timer);
+ 	bnxt_free_skbs(bp);
+@@ -9071,6 +9075,7 @@ static struct pci_driver bnxt_pci_driver
+ 
+ static int __init bnxt_init(void)
+ {
++	bnxt_debug_init();
+ 	return pci_register_driver(&bnxt_pci_driver);
+ }
+ 
+@@ -9079,6 +9084,7 @@ static void __exit bnxt_exit(void)
+ 	pci_unregister_driver(&bnxt_pci_driver);
+ 	if (bnxt_pf_wq)
+ 		destroy_workqueue(bnxt_pf_wq);
++	bnxt_debug_exit();
+ }
+ 
+ module_init(bnxt_init);
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1391,6 +1391,8 @@ struct bnxt {
+ 	u16			*cfa_code_map; /* cfa_code -> vf_idx map */
+ 	u8			switch_id[8];
+ 	struct bnxt_tc_info	*tc_info;
++	struct dentry		*debugfs_pdev;
++	struct dentry		*debugfs_dim;
+ };
+ 
+ #define BNXT_RX_STATS_OFFSET(counter)			\
+--- /dev/null
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_debugfs.c
+@@ -0,0 +1,124 @@
++/* Broadcom NetXtreme-C/E network driver.
++ *
++ * Copyright (c) 2017-2018 Broadcom Limited
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation.
++ */
++
++#include <linux/debugfs.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include "bnxt_hsi.h"
++#include <linux/net_dim.h>
++#include "bnxt.h"
++#include "bnxt_debugfs.h"
++
++static struct dentry *bnxt_debug_mnt;
++
++static ssize_t debugfs_dim_read(struct file *filep,
++				char __user *buffer,
++				size_t count, loff_t *ppos)
++{
++	struct net_dim *dim = filep->private_data;
++	int len;
++	char *buf;
++
++	if (*ppos)
++		return 0;
++	if (!dim)
++		return -ENODEV;
++	buf = kasprintf(GFP_KERNEL,
++			"state = %d\n" \
++			"profile_ix = %d\n" \
++			"mode = %d\n" \
++			"tune_state = %d\n" \
++			"steps_right = %d\n" \
++			"steps_left = %d\n" \
++			"tired = %d\n",
++			dim->state,
++			dim->profile_ix,
++			dim->mode,
++			dim->tune_state,
++			dim->steps_right,
++			dim->steps_left,
++			dim->tired);
++	if (!buf)
++		return -ENOMEM;
++	if (count < strlen(buf)) {
++		kfree(buf);
++		return -ENOSPC;
++	}
++	len = simple_read_from_buffer(buffer, count, ppos, buf, strlen(buf));
++	kfree(buf);
++	return len;
++}
++
++static const struct file_operations debugfs_dim_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.read = debugfs_dim_read,
++};
++
++static struct dentry *debugfs_dim_ring_init(struct net_dim *dim, int ring_idx,
++					    struct dentry *dd)
++{
++	static char qname[16];
++
++	snprintf(qname, 10, "%d", ring_idx);
++	return debugfs_create_file(qname, 0600, dd,
++				   dim, &debugfs_dim_fops);
++}
++
++void bnxt_debug_dev_init(struct bnxt *bp)
++{
++	const char *pname = pci_name(bp->pdev);
++	struct dentry *pdevf;
++	int i;
++
++	bp->debugfs_pdev = debugfs_create_dir(pname, bnxt_debug_mnt);
++	if (bp->debugfs_pdev) {
++		pdevf = debugfs_create_dir("dim", bp->debugfs_pdev);
++		if (!pdevf) {
++			pr_err("failed to create debugfs entry %s/dim\n",
++			       pname);
++			return;
++		}
++		bp->debugfs_dim = pdevf;
++		/* create files for each rx ring */
++		for (i = 0; i < bp->cp_nr_rings; i++) {
++			struct bnxt_cp_ring_info *cpr = &bp->bnapi[i]->cp_ring;
++
++			if (cpr && bp->bnapi[i]->rx_ring) {
++				pdevf = debugfs_dim_ring_init(&cpr->dim, i,
++							      bp->debugfs_dim);
++				if (!pdevf)
++					pr_err("failed to create debugfs entry %s/dim/%d\n",
++					       pname, i);
++			}
++		}
++	} else {
++		pr_err("failed to create debugfs entry %s\n", pname);
++	}
++}
++
++void bnxt_debug_dev_exit(struct bnxt *bp)
++{
++	if (bp) {
++		debugfs_remove_recursive(bp->debugfs_pdev);
++		bp->debugfs_pdev = NULL;
++	}
++}
++
++void bnxt_debug_init(void)
++{
++	bnxt_debug_mnt = debugfs_create_dir("bnxt_en", NULL);
++	if (!bnxt_debug_mnt)
++		pr_err("failed to init bnxt_en debugfs\n");
++}
++
++void bnxt_debug_exit(void)
++{
++	debugfs_remove_recursive(bnxt_debug_mnt);
++}
+--- /dev/null
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_debugfs.h
+@@ -0,0 +1,23 @@
++/* Broadcom NetXtreme-C/E network driver.
++ *
++ * Copyright (c) 2017-2018 Broadcom Limited
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation.
++ */
++
++#include "bnxt_hsi.h"
++#include "bnxt.h"
++
++#ifdef CONFIG_DEBUG_FS
++void bnxt_debug_init(void);
++void bnxt_debug_exit(void);
++void bnxt_debug_dev_init(struct bnxt *bp);
++void bnxt_debug_dev_exit(struct bnxt *bp);
++#else
++static inline void bnxt_debug_init(void) {}
++static inline void bnxt_debug_exit(void) {}
++static inline void bnxt_debug_dev_init(struct bnxt *bp) {}
++static inline void bnxt_debug_dev_exit(struct bnxt *bp) {}
++#endif

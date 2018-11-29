@@ -1,0 +1,231 @@
+From: Shiraz Saleem <shiraz.saleem@intel.com>
+Date: Sat, 12 May 2018 07:50:30 -0500
+Subject: i40iw: Extend port reuse support for listeners
+Patch-mainline: v4.18-rc1
+Git-commit: f43c00c04bbf01be0822ef9f0281cc69b56c4e40
+References: bsc#1114687 FATE#326314
+
+If two listeners are created with different IP's but
+same port, the second rdma_listen fails due to a
+duplicate port entry being added from the CQP add
+APBVT OP. commit f16dc0aa5ea2 ("i40iw: Add support
+for port reuse on active side connections") does not
+account for listener side port reuse.
+
+Check for duplicate port before invoking the CQP command
+to add APBVT entry and delete the entry only if the port
+is not in use. Additionally, consolidate all port-reuse
+logic into i40iw_manage_apbvt.
+
+Fixes: f16dc0aa5ea2 ("i40iw: Add support for port reuse on active side connections")
+Signed-off-by: Shiraz Saleem <shiraz.saleem@intel.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/i40iw/i40iw_cm.c |   63 +++++++++++++--------------------
+ drivers/infiniband/hw/i40iw/i40iw_cm.h |    4 +-
+ drivers/infiniband/hw/i40iw/i40iw_hw.c |   34 ++++++++++++++++-
+ 3 files changed, 59 insertions(+), 42 deletions(-)
+
+--- a/drivers/infiniband/hw/i40iw/i40iw_cm.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_cm.c
+@@ -1519,18 +1519,13 @@ static void i40iw_add_hte_node(struct i4
+ 
+ /**
+  * i40iw_find_port - find port that matches reference port
+- * @port: port number
++ * @hte: ptr to accelerated or non-accelerated list
+  * @accelerated_list: flag for accelerated vs non-accelerated list
+  */
+-static bool i40iw_find_port(struct i40iw_cm_core *cm_core, u16 port,
+-			    bool accelerated_list)
++static bool i40iw_find_port(struct list_head *hte, u16 port)
+ {
+-	struct list_head *hte;
+ 	struct i40iw_cm_node *cm_node;
+ 
+-	hte = accelerated_list ?
+-	      &cm_core->accelerated_list : &cm_core->non_accelerated_list;
+-
+ 	list_for_each_entry(cm_node, hte, list) {
+ 		if (cm_node->loc_port == port)
+ 			return true;
+@@ -1540,35 +1535,32 @@ static bool i40iw_find_port(struct i40iw
+ 
+ /**
+  * i40iw_port_in_use - determine if port is in use
++ * @cm_core: cm's core
+  * @port: port number
+- * @active_side: flag for listener side vs active side
+  */
+-static bool i40iw_port_in_use(struct i40iw_cm_core *cm_core, u16 port, bool active_side)
++bool i40iw_port_in_use(struct i40iw_cm_core *cm_core, u16 port)
+ {
+ 	struct i40iw_cm_listener *listen_node;
+ 	unsigned long flags;
+-	bool ret = false;
+ 
+-	if (active_side) {
+-		spin_lock_irqsave(&cm_core->ht_lock, flags);
+-		ret = i40iw_find_port(cm_core, port, true);
+-		if (!ret)
+-			ret = i40iw_find_port(cm_core, port, false);
+-		if (!ret)
+-			clear_bit(port, cm_core->active_side_ports);
++	spin_lock_irqsave(&cm_core->ht_lock, flags);
++	if (i40iw_find_port(&cm_core->accelerated_list, port) ||
++	    i40iw_find_port(&cm_core->non_accelerated_list, port)) {
+ 		spin_unlock_irqrestore(&cm_core->ht_lock, flags);
+-	} else {
+-		spin_lock_irqsave(&cm_core->listen_list_lock, flags);
+-		list_for_each_entry(listen_node, &cm_core->listen_nodes, list) {
+-			if (listen_node->loc_port == port) {
+-				ret = true;
+-				break;
+-			}
++		return true;
++	}
++	spin_unlock_irqrestore(&cm_core->ht_lock, flags);
++
++	spin_lock_irqsave(&cm_core->listen_list_lock, flags);
++	list_for_each_entry(listen_node, &cm_core->listen_nodes, list) {
++		if (listen_node->loc_port == port) {
++			spin_unlock_irqrestore(&cm_core->listen_list_lock, flags);
++			return true;
+ 		}
+-		spin_unlock_irqrestore(&cm_core->listen_list_lock, flags);
+ 	}
++	spin_unlock_irqrestore(&cm_core->listen_list_lock, flags);
+ 
+-	return ret;
++	return false;
+ }
+ 
+ /**
+@@ -1917,7 +1909,7 @@ static int i40iw_dec_refcnt_listen(struc
+ 		spin_unlock_irqrestore(&cm_core->listen_list_lock, flags);
+ 
+ 		if (listener->iwdev) {
+-			if (apbvt_del && !i40iw_port_in_use(cm_core, listener->loc_port, false))
++			if (apbvt_del)
+ 				i40iw_manage_apbvt(listener->iwdev,
+ 						   listener->loc_port,
+ 						   I40IW_MANAGE_APBVT_DEL);
+@@ -2298,7 +2290,7 @@ static void i40iw_rem_ref_cm_node(struct
+ 	if (cm_node->listener) {
+ 		i40iw_dec_refcnt_listen(cm_core, cm_node->listener, 0, true);
+ 	} else {
+-		if (!i40iw_port_in_use(cm_core, cm_node->loc_port, true) && cm_node->apbvt_set) {
++		if (cm_node->apbvt_set) {
+ 			i40iw_manage_apbvt(cm_node->iwdev,
+ 					   cm_node->loc_port,
+ 					   I40IW_MANAGE_APBVT_DEL);
+@@ -3245,6 +3237,7 @@ void i40iw_setup_cm_core(struct i40iw_de
+ 
+ 	spin_lock_init(&cm_core->ht_lock);
+ 	spin_lock_init(&cm_core->listen_list_lock);
++	spin_lock_init(&cm_core->apbvt_lock);
+ 
+ 	cm_core->event_wq = alloc_ordered_workqueue("iwewq",
+ 						    WQ_MEM_RECLAIM);
+@@ -3812,7 +3805,6 @@ int i40iw_connect(struct iw_cm_id *cm_id
+ 	struct sockaddr_in6 *laddr6;
+ 	struct sockaddr_in6 *raddr6;
+ 	int ret = 0;
+-	unsigned long flags;
+ 
+ 	ibqp = i40iw_get_qp(cm_id->device, conn_param->qpn);
+ 	if (!ibqp)
+@@ -3883,15 +3875,10 @@ int i40iw_connect(struct iw_cm_id *cm_id
+ 		cm_node->qhash_set = true;
+ 	}
+ 
+-	spin_lock_irqsave(&iwdev->cm_core.ht_lock, flags);
+-	if (!test_and_set_bit(cm_info.loc_port, iwdev->cm_core.active_side_ports)) {
+-		spin_unlock_irqrestore(&iwdev->cm_core.ht_lock, flags);
+-		if (i40iw_manage_apbvt(iwdev, cm_info.loc_port, I40IW_MANAGE_APBVT_ADD)) {
+-			ret =  -EINVAL;
+-			goto err;
+-		}
+-	} else {
+-		spin_unlock_irqrestore(&iwdev->cm_core.ht_lock, flags);
++	if (i40iw_manage_apbvt(iwdev, cm_info.loc_port,
++			       I40IW_MANAGE_APBVT_ADD)) {
++		ret =  -EINVAL;
++		goto err;
+ 	}
+ 
+ 	cm_node->apbvt_set = true;
+--- a/drivers/infiniband/hw/i40iw/i40iw_cm.h
++++ b/drivers/infiniband/hw/i40iw/i40iw_cm.h
+@@ -413,8 +413,9 @@ struct i40iw_cm_core {
+ 
+ 	spinlock_t ht_lock; /* manage hash table */
+ 	spinlock_t listen_list_lock; /* listen list */
++	spinlock_t apbvt_lock; /*manage apbvt entries*/
+ 
+-	unsigned long active_side_ports[BITS_TO_LONGS(MAX_PORTS)];
++	unsigned long ports_in_use[BITS_TO_LONGS(MAX_PORTS)];
+ 
+ 	u64	stats_nodes_created;
+ 	u64	stats_nodes_destroyed;
+@@ -457,4 +458,5 @@ void i40iw_if_notify(struct i40iw_device
+ void i40iw_cm_teardown_connections(struct i40iw_device *iwdev, u32 *ipaddr,
+ 				   struct i40iw_cm_info *nfo,
+ 				   bool disconnect_all);
++bool i40iw_port_in_use(struct i40iw_cm_core *cm_core, u16 port);
+ #endif /* I40IW_CM_H */
+--- a/drivers/infiniband/hw/i40iw/i40iw_hw.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_hw.c
+@@ -443,13 +443,37 @@ void i40iw_process_aeq(struct i40iw_devi
+ int i40iw_manage_apbvt(struct i40iw_device *iwdev, u16 accel_local_port, bool add_port)
+ {
+ 	struct i40iw_apbvt_info *info;
+-	enum i40iw_status_code status;
+ 	struct i40iw_cqp_request *cqp_request;
+ 	struct cqp_commands_info *cqp_info;
++	unsigned long flags;
++	struct i40iw_cm_core *cm_core = &iwdev->cm_core;
++	enum i40iw_status_code status = 0;
++	bool in_use;
++
++	/* apbvt_lock is held across CQP delete APBVT OP (non-waiting) to
++	 * protect against race where add APBVT CQP can race ahead of the delete
++	 * APBVT for same port.
++	 */
++	spin_lock_irqsave(&cm_core->apbvt_lock, flags);
++
++	if (!add_port) {
++		in_use = i40iw_port_in_use(cm_core, accel_local_port);
++		if (in_use)
++			goto exit;
++		clear_bit(accel_local_port, cm_core->ports_in_use);
++	} else {
++		in_use = test_and_set_bit(accel_local_port,
++					  cm_core->ports_in_use);
++		spin_unlock_irqrestore(&cm_core->apbvt_lock, flags);
++		if (in_use)
++			return 0;
++	}
+ 
+ 	cqp_request = i40iw_get_cqp_request(&iwdev->cqp, add_port);
+-	if (!cqp_request)
+-		return -ENOMEM;
++	if (!cqp_request) {
++		status = -ENOMEM;
++		goto exit;
++	}
+ 
+ 	cqp_info = &cqp_request->info;
+ 	info = &cqp_info->in.u.manage_apbvt_entry.info;
+@@ -465,6 +489,10 @@ int i40iw_manage_apbvt(struct i40iw_devi
+ 	status = i40iw_handle_cqp_op(iwdev, cqp_request);
+ 	if (status)
+ 		i40iw_pr_err("CQP-OP Manage APBVT entry fail");
++exit:
++	if (!add_port)
++		spin_unlock_irqrestore(&cm_core->apbvt_lock, flags);
++
+ 	return status;
+ }
+ 
