@@ -1,0 +1,532 @@
+From: Feras Daoud <ferasda@mellanox.com>
+Date: Wed, 7 Feb 2018 11:08:56 +0200
+Subject: net/mlx5: FW tracer, events handling
+Patch-mainline: v4.19-rc1
+Git-commit: c71ad41ccb0c29fce95149b74786574b354c9dda
+References: bsc#1103990 FATE#326006
+
+The tracer has one event, event 0x26, with two subtypes:
+- Subtype 0: Ownership change
+- Subtype 1: Traces available
+
+An ownership change occurs in the following cases:
+1- Owner releases his ownership, in this case, an event will be
+sent to inform others to reattempt acquire ownership.
+2- Ownership was taken by a higher priority tool, in this case
+the owner should understand that it lost ownership, and go through
+tear down flow.
+
+The second subtype indicates that there are traces in the trace buffer,
+in this case, the driver polls the tracer buffer for new traces, parse
+them and prepares the messages for printing.
+
+The HW starts tracing from the first address in the tracer buffer.
+Driver receives an event notifying that new trace block exists.
+HW posts a timestamp event at the last 8B of every 256B block.
+Comparing the timestamp to the last handled timestamp would indicate
+that this is a new trace block. Once the new timestamp is detected,
+the entire block is considered valid.
+
+Block validation and parsing, should be done after copying the current
+block to a different location, in order to avoid block overwritten
+during processing.
+
+Signed-off-by: Feras Daoud <ferasda@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.c |  268 ++++++++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.h |   71 +++
+ drivers/net/ethernet/mellanox/mlx5/core/eq.c             |   11 
+ include/linux/mlx5/device.h                              |    7 
+ 4 files changed, 347 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.c
+@@ -318,25 +318,244 @@ out:
+ 	return;
+ }
+ 
+-static void mlx5_fw_tracer_ownership_change(struct work_struct *work)
++static void mlx5_fw_tracer_arm(struct mlx5_core_dev *dev)
+ {
+-	struct mlx5_fw_tracer *tracer = container_of(work, struct mlx5_fw_tracer,
+-						     ownership_change_work);
+-	struct mlx5_core_dev *dev = tracer->dev;
++	u32 out[MLX5_ST_SZ_DW(mtrc_ctrl)] = {0};
++	u32 in[MLX5_ST_SZ_DW(mtrc_ctrl)] = {0};
+ 	int err;
+ 
+-	if (tracer->owner) {
+-		mlx5_fw_tracer_ownership_release(tracer);
++	MLX5_SET(mtrc_ctrl, in, arm_event, 1);
++
++	err = mlx5_core_access_reg(dev, in, sizeof(in), out, sizeof(out),
++				   MLX5_REG_MTRC_CTRL, 0, 1);
++	if (err)
++		mlx5_core_warn(dev, "FWTracer: Failed to arm tracer event %d\n", err);
++}
++
++static void poll_trace(struct mlx5_fw_tracer *tracer,
++		       struct tracer_event *tracer_event, u64 *trace)
++{
++	u32 timestamp_low, timestamp_mid, timestamp_high, urts;
++
++	tracer_event->event_id = MLX5_GET(tracer_event, trace, event_id);
++	tracer_event->lost_event = MLX5_GET(tracer_event, trace, lost);
++
++	switch (tracer_event->event_id) {
++	case TRACER_EVENT_TYPE_TIMESTAMP:
++		tracer_event->type = TRACER_EVENT_TYPE_TIMESTAMP;
++		urts = MLX5_GET(tracer_timestamp_event, trace, urts);
++		if (tracer->trc_ver == 0)
++			tracer_event->timestamp_event.unreliable = !!(urts >> 2);
++		else
++			tracer_event->timestamp_event.unreliable = !!(urts & 1);
++
++		timestamp_low = MLX5_GET(tracer_timestamp_event,
++					 trace, timestamp7_0);
++		timestamp_mid = MLX5_GET(tracer_timestamp_event,
++					 trace, timestamp39_8);
++		timestamp_high = MLX5_GET(tracer_timestamp_event,
++					  trace, timestamp52_40);
++
++		tracer_event->timestamp_event.timestamp =
++				((u64)timestamp_high << 40) |
++				((u64)timestamp_mid << 8) |
++				(u64)timestamp_low;
++		break;
++	default:
++		if (tracer_event->event_id >= tracer->str_db.first_string_trace ||
++		    tracer_event->event_id <= tracer->str_db.first_string_trace +
++					      tracer->str_db.num_string_trace) {
++			tracer_event->type = TRACER_EVENT_TYPE_STRING;
++			tracer_event->string_event.timestamp =
++				MLX5_GET(tracer_string_event, trace, timestamp);
++			tracer_event->string_event.string_param =
++				MLX5_GET(tracer_string_event, trace, string_param);
++			tracer_event->string_event.tmsn =
++				MLX5_GET(tracer_string_event, trace, tmsn);
++			tracer_event->string_event.tdsn =
++				MLX5_GET(tracer_string_event, trace, tdsn);
++		} else {
++			tracer_event->type = TRACER_EVENT_TYPE_UNRECOGNIZED;
++		}
++		break;
++	}
++}
++
++static u64 get_block_timestamp(struct mlx5_fw_tracer *tracer, u64 *ts_event)
++{
++	struct tracer_event tracer_event;
++	u8 event_id;
++
++	event_id = MLX5_GET(tracer_event, ts_event, event_id);
++
++	if (event_id == TRACER_EVENT_TYPE_TIMESTAMP)
++		poll_trace(tracer, &tracer_event, ts_event);
++	else
++		tracer_event.timestamp_event.timestamp = 0;
++
++	return tracer_event.timestamp_event.timestamp;
++}
++
++static void mlx5_fw_tracer_handle_traces(struct work_struct *work)
++{
++	struct mlx5_fw_tracer *tracer =
++			container_of(work, struct mlx5_fw_tracer, handle_traces_work);
++	u64 block_timestamp, last_block_timestamp, tmp_trace_block[TRACES_PER_BLOCK];
++	u32 block_count, start_offset, prev_start_offset, prev_consumer_index;
++	u32 trace_event_size = MLX5_ST_SZ_BYTES(tracer_event);
++	struct tracer_event tracer_event;
++	struct mlx5_core_dev *dev;
++	int i;
++
++	if (!tracer->owner)
+ 		return;
++
++	dev = tracer->dev;
++	block_count = tracer->buff.size / TRACER_BLOCK_SIZE_BYTE;
++	start_offset = tracer->buff.consumer_index * TRACER_BLOCK_SIZE_BYTE;
++
++	/* Copy the block to local buffer to avoid HW override while being processed*/
++	memcpy(tmp_trace_block, tracer->buff.log_buf + start_offset,
++	       TRACER_BLOCK_SIZE_BYTE);
++
++	block_timestamp =
++		get_block_timestamp(tracer, &tmp_trace_block[TRACES_PER_BLOCK - 1]);
++
++	while (block_timestamp > tracer->last_timestamp) {
++		/* Check block override if its not the first block */
++		if (!tracer->last_timestamp) {
++			u64 *ts_event;
++			/* To avoid block override be the HW in case of buffer
++			 * wraparound, the time stamp of the previous block
++			 * should be compared to the last timestamp handled
++			 * by the driver.
++			 */
++			prev_consumer_index =
++				(tracer->buff.consumer_index - 1) & (block_count - 1);
++			prev_start_offset = prev_consumer_index * TRACER_BLOCK_SIZE_BYTE;
++
++			ts_event = tracer->buff.log_buf + prev_start_offset +
++				   (TRACES_PER_BLOCK - 1) * trace_event_size;
++			last_block_timestamp = get_block_timestamp(tracer, ts_event);
++			/* If previous timestamp different from last stored
++			 * timestamp then there is a good chance that the
++			 * current buffer is overwritten and therefore should
++			 * not be parsed.
++			 */
++			if (tracer->last_timestamp != last_block_timestamp) {
++				mlx5_core_warn(dev, "FWTracer: Events were lost\n");
++				tracer->last_timestamp = block_timestamp;
++				tracer->buff.consumer_index =
++					(tracer->buff.consumer_index + 1) & (block_count - 1);
++				break;
++			}
++		}
++
++		/* Parse events */
++		for (i = 0; i < TRACES_PER_BLOCK ; i++)
++			poll_trace(tracer, &tracer_event, &tmp_trace_block[i]);
++
++		tracer->buff.consumer_index =
++			(tracer->buff.consumer_index + 1) & (block_count - 1);
++
++		tracer->last_timestamp = block_timestamp;
++		start_offset = tracer->buff.consumer_index * TRACER_BLOCK_SIZE_BYTE;
++		memcpy(tmp_trace_block, tracer->buff.log_buf + start_offset,
++		       TRACER_BLOCK_SIZE_BYTE);
++		block_timestamp = get_block_timestamp(tracer,
++						      &tmp_trace_block[TRACES_PER_BLOCK - 1]);
+ 	}
+ 
++	mlx5_fw_tracer_arm(dev);
++}
++
++static int mlx5_fw_tracer_set_mtrc_conf(struct mlx5_fw_tracer *tracer)
++{
++	struct mlx5_core_dev *dev = tracer->dev;
++	u32 out[MLX5_ST_SZ_DW(mtrc_conf)] = {0};
++	u32 in[MLX5_ST_SZ_DW(mtrc_conf)] = {0};
++	int err;
++
++	MLX5_SET(mtrc_conf, in, trace_mode, TRACE_TO_MEMORY);
++	MLX5_SET(mtrc_conf, in, log_trace_buffer_size,
++		 ilog2(TRACER_BUFFER_PAGE_NUM));
++	MLX5_SET(mtrc_conf, in, trace_mkey, tracer->buff.mkey.key);
++
++	err = mlx5_core_access_reg(dev, in, sizeof(in), out, sizeof(out),
++				   MLX5_REG_MTRC_CONF, 0, 1);
++	if (err)
++		mlx5_core_warn(dev, "FWTracer: Failed to set tracer configurations %d\n", err);
++
++	return err;
++}
++
++static int mlx5_fw_tracer_set_mtrc_ctrl(struct mlx5_fw_tracer *tracer, u8 status, u8 arm)
++{
++	struct mlx5_core_dev *dev = tracer->dev;
++	u32 out[MLX5_ST_SZ_DW(mtrc_ctrl)] = {0};
++	u32 in[MLX5_ST_SZ_DW(mtrc_ctrl)] = {0};
++	int err;
++
++	MLX5_SET(mtrc_ctrl, in, modify_field_select, TRACE_STATUS);
++	MLX5_SET(mtrc_ctrl, in, trace_status, status);
++	MLX5_SET(mtrc_ctrl, in, arm_event, arm);
++
++	err = mlx5_core_access_reg(dev, in, sizeof(in), out, sizeof(out),
++				   MLX5_REG_MTRC_CTRL, 0, 1);
++
++	if (!err && status)
++		tracer->last_timestamp = 0;
++
++	return err;
++}
++
++static int mlx5_fw_tracer_start(struct mlx5_fw_tracer *tracer)
++{
++	struct mlx5_core_dev *dev = tracer->dev;
++	int err;
++
+ 	err = mlx5_fw_tracer_ownership_acquire(tracer);
+ 	if (err) {
+ 		mlx5_core_dbg(dev, "FWTracer: Ownership was not granted %d\n", err);
++		/* Don't fail since ownership can be acquired on a later FW event */
++		return 0;
++	}
++
++	err = mlx5_fw_tracer_set_mtrc_conf(tracer);
++	if (err) {
++		mlx5_core_warn(dev, "FWTracer: Failed to set tracer configuration %d\n", err);
++		goto release_ownership;
++	}
++
++	/* enable tracer & trace events */
++	err = mlx5_fw_tracer_set_mtrc_ctrl(tracer, 1, 1);
++	if (err) {
++		mlx5_core_warn(dev, "FWTracer: Failed to enable tracer %d\n", err);
++		goto release_ownership;
++	}
++
++	return 0;
++
++release_ownership:
++	mlx5_fw_tracer_ownership_release(tracer);
++	return err;
++}
++
++static void mlx5_fw_tracer_ownership_change(struct work_struct *work)
++{
++	struct mlx5_fw_tracer *tracer =
++		container_of(work, struct mlx5_fw_tracer, ownership_change_work);
++
++	if (tracer->owner) {
++		tracer->owner = false;
++		tracer->buff.consumer_index = 0;
+ 		return;
+ 	}
++
++	mlx5_fw_tracer_start(tracer);
+ }
+ 
++/* Create software resources (Buffers, etc ..) */
+ struct mlx5_fw_tracer *mlx5_fw_tracer_create(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_fw_tracer *tracer = NULL;
+@@ -361,6 +580,8 @@ struct mlx5_fw_tracer *mlx5_fw_tracer_cr
+ 
+ 	INIT_WORK(&tracer->ownership_change_work, mlx5_fw_tracer_ownership_change);
+ 	INIT_WORK(&tracer->read_fw_strings_work, mlx5_tracer_read_strings_db);
++	INIT_WORK(&tracer->handle_traces_work, mlx5_fw_tracer_handle_traces);
++
+ 
+ 	err = mlx5_query_mtrc_caps(tracer);
+ 	if (err) {
+@@ -392,6 +613,9 @@ free_tracer:
+ 	return ERR_PTR(err);
+ }
+ 
++/* Create HW resources + start tracer
++ * must be called before Async EQ is created
++ */
+ int mlx5_fw_tracer_init(struct mlx5_fw_tracer *tracer)
+ {
+ 	struct mlx5_core_dev *dev;
+@@ -417,22 +641,25 @@ int mlx5_fw_tracer_init(struct mlx5_fw_t
+ 		goto err_dealloc_pd;
+ 	}
+ 
+-	err = mlx5_fw_tracer_ownership_acquire(tracer);
+-	if (err) /* Don't fail since ownership can be acquired on a later FW event */
+-		mlx5_core_dbg(dev, "FWTracer: Ownership was not granted %d\n", err);
++	mlx5_fw_tracer_start(tracer);
+ 
+ 	return 0;
++
+ err_dealloc_pd:
+ 	mlx5_core_dealloc_pd(dev, tracer->buff.pdn);
+ 	return err;
+ }
+ 
++/* Stop tracer + Cleanup HW resources
++ * must be called after Async EQ is destroyed
++ */
+ void mlx5_fw_tracer_cleanup(struct mlx5_fw_tracer *tracer)
+ {
+ 	if (IS_ERR_OR_NULL(tracer))
+ 		return;
+ 
+ 	cancel_work_sync(&tracer->ownership_change_work);
++	cancel_work_sync(&tracer->handle_traces_work);
+ 
+ 	if (tracer->owner)
+ 		mlx5_fw_tracer_ownership_release(tracer);
+@@ -441,6 +668,7 @@ void mlx5_fw_tracer_cleanup(struct mlx5_
+ 	mlx5_core_dealloc_pd(tracer->dev, tracer->buff.pdn);
+ }
+ 
++/* Free software resources (Buffers, etc ..) */
+ void mlx5_fw_tracer_destroy(struct mlx5_fw_tracer *tracer)
+ {
+ 	if (IS_ERR_OR_NULL(tracer))
+@@ -454,4 +682,26 @@ void mlx5_fw_tracer_destroy(struct mlx5_
+ 	kfree(tracer);
+ }
+ 
++void mlx5_fw_tracer_event(struct mlx5_core_dev *dev, struct mlx5_eqe *eqe)
++{
++	struct mlx5_fw_tracer *tracer = dev->tracer;
++
++	if (!tracer)
++		return;
++
++	switch (eqe->sub_type) {
++	case MLX5_TRACER_SUBTYPE_OWNERSHIP_CHANGE:
++		if (test_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state))
++			queue_work(tracer->work_queue, &tracer->ownership_change_work);
++		break;
++	case MLX5_TRACER_SUBTYPE_TRACES_AVAILABLE:
++		if (likely(tracer->str_db.loaded))
++			queue_work(tracer->work_queue, &tracer->handle_traces_work);
++		break;
++	default:
++		mlx5_core_dbg(dev, "FWTracer: Event with unrecognized subtype: sub_type %d\n",
++			      eqe->sub_type);
++	}
++}
++
+ EXPORT_TRACEPOINT_SYMBOL(mlx5_fw);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.h
+@@ -43,6 +43,9 @@
+ #define TRACER_BUFFER_CHUNK 4096
+ #define TRACE_BUFFER_SIZE_BYTE (TRACER_BUFFER_PAGE_NUM * TRACER_BUFFER_CHUNK)
+ 
++#define TRACER_BLOCK_SIZE_BYTE 256
++#define TRACES_PER_BLOCK 32
++
+ struct mlx5_fw_tracer {
+ 	struct mlx5_core_dev *dev;
+ 	bool owner;
+@@ -69,8 +72,11 @@ struct mlx5_fw_tracer {
+ 		dma_addr_t dma;
+ 		u32 size;
+ 		struct mlx5_core_mkey mkey;
+-
++		u32 consumer_index;
+ 	} buff;
++
++	u64 last_timestamp;
++	struct work_struct handle_traces_work;
+ };
+ 
+ enum mlx5_fw_tracer_ownership_state {
+@@ -78,7 +84,70 @@ enum mlx5_fw_tracer_ownership_state {
+ 	MLX5_FW_TRACER_ACQUIRE_OWNERSHIP,
+ };
+ 
++enum tracer_ctrl_fields_select {
++	TRACE_STATUS = 1 << 0,
++};
++
++enum tracer_event_type {
++	TRACER_EVENT_TYPE_STRING,
++	TRACER_EVENT_TYPE_TIMESTAMP = 0xFF,
++	TRACER_EVENT_TYPE_UNRECOGNIZED,
++};
++
++enum tracing_mode {
++	TRACE_TO_MEMORY = 1 << 0,
++};
++
++struct tracer_timestamp_event {
++	u64        timestamp;
++	u8         unreliable;
++};
++
++struct tracer_string_event {
++	u32        timestamp;
++	u32        tmsn;
++	u32        tdsn;
++	u32        string_param;
++};
++
++struct tracer_event {
++	bool      lost_event;
++	u32       type;
++	u8        event_id;
++	union {
++		struct tracer_string_event string_event;
++		struct tracer_timestamp_event timestamp_event;
++	};
++};
++
++struct mlx5_ifc_tracer_event_bits {
++	u8         lost[0x1];
++	u8         timestamp[0x7];
++	u8         event_id[0x8];
++	u8         event_data[0x30];
++};
++
++struct mlx5_ifc_tracer_string_event_bits {
++	u8         lost[0x1];
++	u8         timestamp[0x7];
++	u8         event_id[0x8];
++	u8         tmsn[0xd];
++	u8         tdsn[0x3];
++	u8         string_param[0x20];
++};
++
++struct mlx5_ifc_tracer_timestamp_event_bits {
++	u8         timestamp7_0[0x8];
++	u8         event_id[0x8];
++	u8         urts[0x3];
++	u8         timestamp52_40[0xd];
++	u8         timestamp39_8[0x20];
++};
++
+ struct mlx5_fw_tracer *mlx5_fw_tracer_create(struct mlx5_core_dev *dev);
++int mlx5_fw_tracer_init(struct mlx5_fw_tracer *tracer);
++void mlx5_fw_tracer_cleanup(struct mlx5_fw_tracer *tracer);
+ void mlx5_fw_tracer_destroy(struct mlx5_fw_tracer *tracer);
++void mlx5_fw_tracer_event(struct mlx5_core_dev *dev, struct mlx5_eqe *eqe) { return; }
+ 
+ #endif
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@ -40,6 +40,7 @@
+ #include "mlx5_core.h"
+ #include "fpga/core.h"
+ #include "eswitch.h"
++#include "diag/fw_tracer.h"
+ 
+ enum {
+ 	MLX5_EQE_SIZE		= sizeof(struct mlx5_eqe),
+@@ -168,6 +169,8 @@ static const char *eqe_type_str(u8 type)
+ 		return "MLX5_EVENT_TYPE_FPGA_QP_ERROR";
+ 	case MLX5_EVENT_TYPE_GENERAL_EVENT:
+ 		return "MLX5_EVENT_TYPE_GENERAL_EVENT";
++	case MLX5_EVENT_TYPE_DEVICE_TRACER:
++		return "MLX5_EVENT_TYPE_DEVICE_TRACER";
+ 	default:
+ 		return "Unrecognized event";
+ 	}
+@@ -576,6 +579,11 @@ static irqreturn_t mlx5_eq_int(int irq,
+ 		case MLX5_EVENT_TYPE_GENERAL_EVENT:
+ 			general_event_handler(dev, eqe);
+ 			break;
++
++		case MLX5_EVENT_TYPE_DEVICE_TRACER:
++			mlx5_fw_tracer_event(dev, eqe);
++			break;
++
+ 		default:
+ 			mlx5_core_warn(dev, "Unhandled event 0x%x on EQ 0x%x\n",
+ 				       eqe->type, eq->eqn);
+@@ -853,6 +861,9 @@ int mlx5_start_eqs(struct mlx5_core_dev
+ 	if (MLX5_CAP_GEN(dev, temp_warn_event))
+ 		async_event_mask |= (1ull << MLX5_EVENT_TYPE_TEMP_WARN_EVENT);
+ 
++	if (MLX5_CAP_MCAM_REG(dev, tracer_registers))
++		async_event_mask |= (1ull << MLX5_EVENT_TYPE_DEVICE_TRACER);
++
+ 	err = mlx5_create_map_eq(dev, &table->cmd_eq, MLX5_EQ_VEC_CMD,
+ 				 MLX5_NUM_CMD_EQE, 1ull << MLX5_EVENT_TYPE_CMD,
+ 				 "mlx5_cmd_eq", MLX5_EQ_TYPE_ASYNC);
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@ -332,6 +332,13 @@ enum mlx5_event {
+ 
+ 	MLX5_EVENT_TYPE_FPGA_ERROR         = 0x20,
+ 	MLX5_EVENT_TYPE_FPGA_QP_ERROR      = 0x21,
++
++	MLX5_EVENT_TYPE_DEVICE_TRACER      = 0x26,
++};
++
++enum {
++	MLX5_TRACER_SUBTYPE_OWNERSHIP_CHANGE = 0x0,
++	MLX5_TRACER_SUBTYPE_TRACES_AVAILABLE = 0x1,
+ };
+ 
+ enum {
