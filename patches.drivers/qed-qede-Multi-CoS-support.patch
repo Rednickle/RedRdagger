@@ -1,0 +1,578 @@
+From: Manish Chopra <manish.chopra@cavium.com>
+Date: Thu, 9 Aug 2018 11:13:49 -0700
+Subject: qed/qede: Multi CoS support.
+Patch-mainline: v4.19-rc1
+Git-commit: 5e7baf0fcb2a3aef7329f3c7543d4695a46bd321
+References: bsc#1104393 FATE#325891 bsc#1104389 FATE#325890
+
+This patch adds support for tc mqprio offload,
+using this different traffic classes on the adapter
+can be utilized based on configured priority to tc map.
+
+For example -
+
+tc qdisc add dev eth0 root mqprio num_tc 4 map 0 1 2 3
+
+This will cause SKBs with priority 0,1,2,3 to transmit
+over tc 0,1,2,3 hardware queues respectively.
+
+Signed-off-by: Manish Chopra <manish.chopra@cavium.com>
+Signed-off-by: Ariel Elior <ariel.elior@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qed/qed_l2.c        |    9 +
+ drivers/net/ethernet/qlogic/qed/qed_main.c      |    5 
+ drivers/net/ethernet/qlogic/qede/qede.h         |   13 ++
+ drivers/net/ethernet/qlogic/qede/qede_ethtool.c |   48 ++++++--
+ drivers/net/ethernet/qlogic/qede/qede_fp.c      |   29 +++--
+ drivers/net/ethernet/qlogic/qede/qede_main.c    |  139 +++++++++++++++++++-----
+ include/linux/qed/qed_eth_if.h                  |    6 +
+ 7 files changed, 200 insertions(+), 49 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@ -2188,16 +2188,17 @@ out:
+ static int qed_fill_eth_dev_info(struct qed_dev *cdev,
+ 				 struct qed_dev_eth_info *info)
+ {
++	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
+ 	int i;
+ 
+ 	memset(info, 0, sizeof(*info));
+ 
+-	info->num_tc = 1;
+-
+ 	if (IS_PF(cdev)) {
+ 		int max_vf_vlan_filters = 0;
+ 		int max_vf_mac_filters = 0;
+ 
++		info->num_tc = p_hwfn->hw_info.num_hw_tc;
++
+ 		if (cdev->int_params.out.int_mode == QED_INT_MODE_MSIX) {
+ 			u16 num_queues = 0;
+ 
+@@ -2248,6 +2249,8 @@ static int qed_fill_eth_dev_info(struct
+ 	} else {
+ 		u16 total_cids = 0;
+ 
++		info->num_tc = 1;
++
+ 		/* Determine queues &  XDP support */
+ 		for_each_hwfn(cdev, i) {
+ 			struct qed_hwfn *p_hwfn = &cdev->hwfns[i];
+@@ -2554,7 +2557,7 @@ static int qed_start_txq(struct qed_dev
+ 
+ 	rc = qed_eth_tx_queue_start(p_hwfn,
+ 				    p_hwfn->hw_info.opaque_fid,
+-				    p_params, 0,
++				    p_params, p_params->tc,
+ 				    pbl_addr, pbl_size, ret_params);
+ 
+ 	if (rc) {
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -948,13 +948,14 @@ static void qed_update_pf_params(struct
+ 		params->eth_pf_params.num_arfs_filters = 0;
+ 
+ 	/* In case we might support RDMA, don't allow qede to be greedy
+-	 * with the L2 contexts. Allow for 64 queues [rx, tx, xdp] per hwfn.
++	 * with the L2 contexts. Allow for 64 queues [rx, tx cos, xdp]
++	 * per hwfn.
+ 	 */
+ 	if (QED_IS_RDMA_PERSONALITY(QED_LEADING_HWFN(cdev))) {
+ 		u16 *num_cons;
+ 
+ 		num_cons = &params->eth_pf_params.num_cons;
+-		*num_cons = min_t(u16, *num_cons, 192);
++		*num_cons = min_t(u16, *num_cons, QED_MAX_L2_CONS);
+ 	}
+ 
+ 	for (i = 0; i < cdev->num_hwfns; i++) {
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@ -386,6 +386,15 @@ struct qede_tx_queue {
+ #define QEDE_TXQ_XDP_TO_IDX(edev, txq)	((txq)->index - \
+ 					 QEDE_MAX_TSS_CNT(edev))
+ #define QEDE_TXQ_IDX_TO_XDP(edev, idx)	((idx) + QEDE_MAX_TSS_CNT(edev))
++#define QEDE_NDEV_TXQ_ID_TO_FP_ID(edev, idx)	((edev)->fp_num_rx + \
++						 ((idx) % QEDE_TSS_COUNT(edev)))
++#define QEDE_NDEV_TXQ_ID_TO_TXQ_COS(edev, idx)	((idx) / QEDE_TSS_COUNT(edev))
++#define QEDE_TXQ_TO_NDEV_TXQ_ID(edev, txq)	((QEDE_TSS_COUNT(edev) * \
++						 (txq)->cos) + (txq)->index)
++#define QEDE_NDEV_TXQ_ID_TO_TXQ(edev, idx)	\
++	(&((edev)->fp_array[QEDE_NDEV_TXQ_ID_TO_FP_ID(edev, idx)].txq \
++	[QEDE_NDEV_TXQ_ID_TO_TXQ_COS(edev, idx)]))
++#define QEDE_FP_TC0_TXQ(fp)	(&((fp)->txq[0]))
+ 
+ 	/* Regular Tx requires skb + metadata for release purpose,
+ 	 * while XDP requires the pages and the mapped address.
+@@ -399,6 +408,8 @@ struct qede_tx_queue {
+ 
+ 	/* Slowpath; Should be kept in end [unless missing padding] */
+ 	void *handle;
++	u16 cos;
++	u16 ndev_txq_id;
+ };
+ 
+ #define BD_UNMAP_ADDR(bd)		HILO_U64(le32_to_cpu((bd)->addr.hi), \
+@@ -541,5 +552,7 @@ void qede_update_rx_prod(struct qede_dev
+ #define QEDE_RX_HDR_SIZE		256
+ #define QEDE_MAX_JUMBO_PACKET_SIZE	9600
+ #define	for_each_queue(i) for (i = 0; i < edev->num_queues; i++)
++#define for_each_cos_in_txq(edev, var) \
++	for ((var) = 0; (var) < (edev)->dev_info.num_tc; (var)++)
+ 
+ #endif /* _QEDE_H_ */
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@ -222,7 +222,7 @@ static void qede_get_strings_stats_txq(s
+ 				QEDE_TXQ_XDP_TO_IDX(edev, txq),
+ 				qede_tqstats_arr[i].string);
+ 		else
+-			sprintf(*buf, "%d: %s", txq->index,
++			sprintf(*buf, "%d_%d: %s", txq->index, txq->cos,
+ 				qede_tqstats_arr[i].string);
+ 		*buf += ETH_GSTRING_LEN;
+ 	}
+@@ -262,8 +262,13 @@ static void qede_get_strings_stats(struc
+ 		if (fp->type & QEDE_FASTPATH_XDP)
+ 			qede_get_strings_stats_txq(edev, fp->xdp_tx, &buf);
+ 
+-		if (fp->type & QEDE_FASTPATH_TX)
+-			qede_get_strings_stats_txq(edev, fp->txq, &buf);
++		if (fp->type & QEDE_FASTPATH_TX) {
++			int cos;
++
++			for_each_cos_in_txq(edev, cos)
++				qede_get_strings_stats_txq(edev,
++							   &fp->txq[cos], &buf);
++		}
+ 	}
+ 
+ 	/* Account for non-queue statistics */
+@@ -338,8 +343,12 @@ static void qede_get_ethtool_stats(struc
+ 		if (fp->type & QEDE_FASTPATH_XDP)
+ 			qede_get_ethtool_stats_txq(fp->xdp_tx, &buf);
+ 
+-		if (fp->type & QEDE_FASTPATH_TX)
+-			qede_get_ethtool_stats_txq(fp->txq, &buf);
++		if (fp->type & QEDE_FASTPATH_TX) {
++			int cos;
++
++			for_each_cos_in_txq(edev, cos)
++				qede_get_ethtool_stats_txq(&fp->txq[cos], &buf);
++		}
+ 	}
+ 
+ 	for (i = 0; i < QEDE_NUM_STATS; i++) {
+@@ -366,7 +375,8 @@ static int qede_get_sset_count(struct ne
+ 				num_stats--;
+ 
+ 		/* Account for the Regular Tx statistics */
+-		num_stats += QEDE_TSS_COUNT(edev) * QEDE_NUM_TQSTATS;
++		num_stats += QEDE_TSS_COUNT(edev) * QEDE_NUM_TQSTATS *
++				edev->dev_info.num_tc;
+ 
+ 		/* Account for the Regular Rx statistics */
+ 		num_stats += QEDE_RSS_COUNT(edev) * QEDE_NUM_RQSTATS;
+@@ -741,9 +751,17 @@ static int qede_get_coalesce(struct net_
+ 		}
+ 
+ 		for_each_queue(i) {
++			struct qede_tx_queue *txq;
++
+ 			fp = &edev->fp_array[i];
++
++			/* All TX queues of given fastpath uses same
++			 * coalescing value, so no need to iterate over
++			 * all TCs, TC0 txq should suffice.
++			 */
+ 			if (fp->type & QEDE_FASTPATH_TX) {
+-				tx_handle = fp->txq->handle;
++				txq = QEDE_FP_TC0_TXQ(fp);
++				tx_handle = txq->handle;
+ 				break;
+ 			}
+ 		}
+@@ -801,9 +819,17 @@ static int qede_set_coalesce(struct net_
+ 		}
+ 
+ 		if (edev->fp_array[i].type & QEDE_FASTPATH_TX) {
++			struct qede_tx_queue *txq;
++
++			/* All TX queues of given fastpath uses same
++			 * coalescing value, so no need to iterate over
++			 * all TCs, TC0 txq should suffice.
++			 */
++			txq = QEDE_FP_TC0_TXQ(fp);
++
+ 			rc = edev->ops->common->set_coalesce(edev->cdev,
+ 							     0, txc,
+-							     fp->txq->handle);
++							     txq->handle);
+ 			if (rc) {
+ 				DP_INFO(edev,
+ 					"Set TX coalesce error, rc = %d\n", rc);
+@@ -1385,8 +1411,10 @@ static int qede_selftest_transmit_traffi
+ 	u16 val;
+ 
+ 	for_each_queue(i) {
+-		if (edev->fp_array[i].type & QEDE_FASTPATH_TX) {
+-			txq = edev->fp_array[i].txq;
++		struct qede_fastpath *fp = &edev->fp_array[i];
++
++		if (fp->type & QEDE_FASTPATH_TX) {
++			txq = QEDE_FP_TC0_TXQ(fp);
+ 			break;
+ 		}
+ 	}
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@ -408,12 +408,12 @@ static void qede_xdp_tx_int(struct qede_
+ 
+ static int qede_tx_int(struct qede_dev *edev, struct qede_tx_queue *txq)
+ {
++	unsigned int pkts_compl = 0, bytes_compl = 0;
+ 	struct netdev_queue *netdev_txq;
+ 	u16 hw_bd_cons;
+-	unsigned int pkts_compl = 0, bytes_compl = 0;
+ 	int rc;
+ 
+-	netdev_txq = netdev_get_tx_queue(edev->ndev, txq->index);
++	netdev_txq = netdev_get_tx_queue(edev->ndev, txq->ndev_txq_id);
+ 
+ 	hw_bd_cons = le16_to_cpu(*txq->hw_cons_ptr);
+ 	barrier();
+@@ -1365,9 +1365,14 @@ static bool qede_poll_is_more_work(struc
+ 		if (qede_txq_has_work(fp->xdp_tx))
+ 			return true;
+ 
+-	if (likely(fp->type & QEDE_FASTPATH_TX))
+-		if (qede_txq_has_work(fp->txq))
+-			return true;
++	if (likely(fp->type & QEDE_FASTPATH_TX)) {
++		int cos;
++
++		for_each_cos_in_txq(fp->edev, cos) {
++			if (qede_txq_has_work(&fp->txq[cos]))
++				return true;
++		}
++	}
+ 
+ 	return false;
+ }
+@@ -1382,8 +1387,14 @@ int qede_poll(struct napi_struct *napi,
+ 	struct qede_dev *edev = fp->edev;
+ 	int rx_work_done = 0;
+ 
+-	if (likely(fp->type & QEDE_FASTPATH_TX) && qede_txq_has_work(fp->txq))
+-		qede_tx_int(edev, fp->txq);
++	if (likely(fp->type & QEDE_FASTPATH_TX)) {
++		int cos;
++
++		for_each_cos_in_txq(fp->edev, cos) {
++			if (qede_txq_has_work(&fp->txq[cos]))
++				qede_tx_int(edev, &fp->txq[cos]);
++		}
++	}
+ 
+ 	if ((fp->type & QEDE_FASTPATH_XDP) && qede_txq_has_work(fp->xdp_tx))
+ 		qede_xdp_tx_int(edev, fp->xdp_tx);
+@@ -1444,8 +1455,8 @@ netdev_tx_t qede_start_xmit(struct sk_bu
+ 
+ 	/* Get tx-queue context and netdev index */
+ 	txq_index = skb_get_queue_mapping(skb);
+-	WARN_ON(txq_index >= QEDE_TSS_COUNT(edev));
+-	txq = edev->fp_array[edev->fp_num_rx + txq_index].txq;
++	WARN_ON(txq_index >= QEDE_TSS_COUNT(edev) * edev->dev_info.num_tc);
++	txq = QEDE_NDEV_TXQ_ID_TO_TXQ(edev, txq_index);
+ 	netdev_txq = netdev_get_tx_queue(ndev, txq_index);
+ 
+ 	WARN_ON(qed_chain_get_elem_left(&txq->tx_pbl) < (MAX_SKB_FRAGS + 1));
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -536,6 +536,43 @@ static int qede_ioctl(struct net_device
+ 	return 0;
+ }
+ 
++int qede_setup_tc(struct net_device *ndev, u8 num_tc)
++{
++	struct qede_dev *edev = netdev_priv(ndev);
++	int cos, count, offset;
++
++	if (num_tc > edev->dev_info.num_tc)
++		return -EINVAL;
++
++	netdev_reset_tc(ndev);
++	netdev_set_num_tc(ndev, num_tc);
++
++	for_each_cos_in_txq(edev, cos) {
++		count = QEDE_TSS_COUNT(edev);
++		offset = cos * QEDE_TSS_COUNT(edev);
++		netdev_set_tc_queue(ndev, cos, count, offset);
++	}
++
++	return 0;
++}
++
++static int
++qede_setup_tc_offload(struct net_device *dev, enum tc_setup_type type,
++		      void *type_data)
++{
++	struct tc_mqprio_qopt *mqprio;
++
++	switch (type) {
++	case TC_SETUP_QDISC_MQPRIO:
++		mqprio = type_data;
++
++		mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++		return qede_setup_tc(dev, mqprio->num_tc);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static const struct net_device_ops qede_netdev_ops = {
+ 	.ndo_open = qede_open,
+ 	.ndo_stop = qede_close,
+@@ -568,6 +605,7 @@ static const struct net_device_ops qede_
+ #ifdef CONFIG_RFS_ACCEL
+ 	.ndo_rx_flow_steer = qede_rx_flow_steer,
+ #endif
++	.ndo_setup_tc = qede_setup_tc_offload,
+ };
+ 
+ static const struct net_device_ops qede_netdev_vf_ops = {
+@@ -621,7 +659,8 @@ static struct qede_dev *qede_alloc_ether
+ 	struct qede_dev *edev;
+ 
+ 	ndev = alloc_etherdev_mqs(sizeof(*edev),
+-				  info->num_queues, info->num_queues);
++				  info->num_queues * info->num_tc,
++				  info->num_queues);
+ 	if (!ndev) {
+ 		pr_err("etherdev allocation failed\n");
+ 		return NULL;
+@@ -830,7 +869,8 @@ static int qede_alloc_fp_array(struct qe
+ 		}
+ 
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+-			fp->txq = kzalloc(sizeof(*fp->txq), GFP_KERNEL);
++			fp->txq = kcalloc(edev->dev_info.num_tc,
++					  sizeof(*fp->txq), GFP_KERNEL);
+ 			if (!fp->txq)
+ 				goto err;
+ 		}
+@@ -879,10 +919,15 @@ static void qede_sp_task(struct work_str
+ static void qede_update_pf_params(struct qed_dev *cdev)
+ {
+ 	struct qed_pf_params pf_params;
++	u16 num_cons;
+ 
+ 	/* 64 rx + 64 tx + 64 XDP */
+ 	memset(&pf_params, 0, sizeof(struct qed_pf_params));
+-	pf_params.eth_pf_params.num_cons = (MAX_SB_PER_PF_MIMD - 1) * 3;
++
++	/* 1 rx + 1 xdp + max tx cos */
++	num_cons = QED_MIN_L2_CONS;
++
++	pf_params.eth_pf_params.num_cons = (MAX_SB_PER_PF_MIMD - 1) * num_cons;
+ 
+ 	/* Same for VFs - make sure they'll have sufficient connections
+ 	 * to support XDP Tx queues.
+@@ -1363,8 +1408,12 @@ static void qede_free_mem_fp(struct qede
+ 	if (fp->type & QEDE_FASTPATH_XDP)
+ 		qede_free_mem_txq(edev, fp->xdp_tx);
+ 
+-	if (fp->type & QEDE_FASTPATH_TX)
+-		qede_free_mem_txq(edev, fp->txq);
++	if (fp->type & QEDE_FASTPATH_TX) {
++		int cos;
++
++		for_each_cos_in_txq(edev, cos)
++			qede_free_mem_txq(edev, &fp->txq[cos]);
++	}
+ }
+ 
+ /* This function allocates all memory needed for a single fp (i.e. an entity
+@@ -1391,9 +1440,13 @@ static int qede_alloc_mem_fp(struct qede
+ 	}
+ 
+ 	if (fp->type & QEDE_FASTPATH_TX) {
+-		rc = qede_alloc_mem_txq(edev, fp->txq);
+-		if (rc)
+-			goto out;
++		int cos;
++
++		for_each_cos_in_txq(edev, cos) {
++			rc = qede_alloc_mem_txq(edev, &fp->txq[cos]);
++			if (rc)
++				goto out;
++		}
+ 	}
+ 
+ out:
+@@ -1466,10 +1519,23 @@ static void qede_init_fp(struct qede_dev
+ 		}
+ 
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+-			fp->txq->index = txq_index++;
+-			if (edev->dev_info.is_legacy)
+-				fp->txq->is_legacy = 1;
+-			fp->txq->dev = &edev->pdev->dev;
++			int cos;
++
++			for_each_cos_in_txq(edev, cos) {
++				struct qede_tx_queue *txq = &fp->txq[cos];
++				u16 ndev_tx_id;
++
++				txq->cos = cos;
++				txq->index = txq_index;
++				ndev_tx_id = QEDE_TXQ_TO_NDEV_TXQ_ID(edev, txq);
++				txq->ndev_txq_id = ndev_tx_id;
++
++				if (edev->dev_info.is_legacy)
++					txq->is_legacy = 1;
++				txq->dev = &edev->pdev->dev;
++			}
++
++			txq_index++;
+ 		}
+ 
+ 		snprintf(fp->name, sizeof(fp->name), "%s-fp-%d",
+@@ -1483,7 +1549,9 @@ static int qede_set_real_num_queues(stru
+ {
+ 	int rc = 0;
+ 
+-	rc = netif_set_real_num_tx_queues(edev->ndev, QEDE_TSS_COUNT(edev));
++	rc = netif_set_real_num_tx_queues(edev->ndev,
++					  QEDE_TSS_COUNT(edev) *
++					  edev->dev_info.num_tc);
+ 	if (rc) {
+ 		DP_NOTICE(edev, "Failed to set real number of Tx queues\n");
+ 		return rc;
+@@ -1685,9 +1753,13 @@ static int qede_stop_queues(struct qede_
+ 		fp = &edev->fp_array[i];
+ 
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+-			rc = qede_drain_txq(edev, fp->txq, true);
+-			if (rc)
+-				return rc;
++			int cos;
++
++			for_each_cos_in_txq(edev, cos) {
++				rc = qede_drain_txq(edev, &fp->txq[cos], true);
++				if (rc)
++					return rc;
++			}
+ 		}
+ 
+ 		if (fp->type & QEDE_FASTPATH_XDP) {
+@@ -1703,9 +1775,13 @@ static int qede_stop_queues(struct qede_
+ 
+ 		/* Stop the Tx Queue(s) */
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+-			rc = qede_stop_txq(edev, fp->txq, i);
+-			if (rc)
+-				return rc;
++			int cos;
++
++			for_each_cos_in_txq(edev, cos) {
++				rc = qede_stop_txq(edev, &fp->txq[cos], i);
++				if (rc)
++					return rc;
++			}
+ 		}
+ 
+ 		/* Stop the Rx Queue */
+@@ -1758,6 +1834,7 @@ static int qede_start_txq(struct qede_de
+ 
+ 	params.p_sb = fp->sb_info;
+ 	params.sb_idx = sb_idx;
++	params.tc = txq->cos;
+ 
+ 	rc = edev->ops->q_tx_start(edev->cdev, rss_id, &params, phys_table,
+ 				   page_cnt, &ret_params);
+@@ -1877,9 +1954,14 @@ static int qede_start_queues(struct qede
+ 		}
+ 
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+-			rc = qede_start_txq(edev, fp, fp->txq, i, TX_PI(0));
+-			if (rc)
+-				goto out;
++			int cos;
++
++			for_each_cos_in_txq(edev, cos) {
++				rc = qede_start_txq(edev, fp, &fp->txq[cos], i,
++						    TX_PI(cos));
++				if (rc)
++					goto out;
++			}
+ 		}
+ 	}
+ 
+@@ -1973,6 +2055,7 @@ static int qede_load(struct qede_dev *ed
+ 		     bool is_locked)
+ {
+ 	struct qed_link_params link_params;
++	u8 num_tc;
+ 	int rc;
+ 
+ 	DP_INFO(edev, "Starting qede load\n");
+@@ -2019,6 +2102,10 @@ static int qede_load(struct qede_dev *ed
+ 		goto err4;
+ 	DP_INFO(edev, "Start VPORT, RXQ and TXQ succeeded\n");
+ 
++	num_tc = netdev_get_num_tc(edev->ndev);
++	num_tc = num_tc ? num_tc : edev->dev_info.num_tc;
++	qede_setup_tc(edev->ndev, num_tc);
++
+ 	/* Program un-configured VLANs */
+ 	qede_configure_vlan_filters(edev);
+ 
+@@ -2143,7 +2230,7 @@ static bool qede_is_txq_full(struct qede
+ {
+ 	struct netdev_queue *netdev_txq;
+ 
+-	netdev_txq = netdev_get_tx_queue(edev->ndev, txq->index);
++	netdev_txq = netdev_get_tx_queue(edev->ndev, txq->ndev_txq_id);
+ 	if (netif_xmit_stopped(netdev_txq))
+ 		return true;
+ 
+@@ -2208,9 +2295,11 @@ static void qede_get_eth_tlv_data(void *
+ 	for_each_queue(i) {
+ 		fp = &edev->fp_array[i];
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+-			if (fp->txq->sw_tx_cons != fp->txq->sw_tx_prod)
++			struct qede_tx_queue *txq = QEDE_FP_TC0_TXQ(fp);
++
++			if (txq->sw_tx_cons != txq->sw_tx_prod)
+ 				etlv->txqs_empty = false;
+-			if (qede_is_txq_full(edev, fp->txq))
++			if (qede_is_txq_full(edev, txq))
+ 				etlv->num_txqs_full++;
+ 		}
+ 		if (fp->type & QEDE_FASTPATH_RX) {
+--- a/include/linux/qed/qed_eth_if.h
++++ b/include/linux/qed/qed_eth_if.h
+@@ -39,6 +39,10 @@
+ #include <linux/qed/qed_if.h>
+ #include <linux/qed/qed_iov_if.h>
+ 
++/* 64 max queues * (1 rx + 4 tx-cos + 1 xdp) */
++#define QED_MIN_L2_CONS (2 + NUM_PHYS_TCS_4PORT_K2)
++#define QED_MAX_L2_CONS (64 * (QED_MIN_L2_CONS))
++
+ struct qed_queue_start_common_params {
+ 	/* Should always be relative to entity sending this. */
+ 	u8 vport_id;
+@@ -49,6 +53,8 @@ struct qed_queue_start_common_params {
+ 
+ 	struct qed_sb_info *p_sb;
+ 	u8 sb_idx;
++
++	u8 tc;
+ };
+ 
+ struct qed_rxq_start_ret_params {
