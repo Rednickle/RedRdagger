@@ -1,0 +1,292 @@
+From: Tariq Toukan <tariqt@mellanox.com>
+Date: Sun, 15 Jul 2018 10:34:39 +0300
+Subject: net/mlx5e: Make XDP xmit functions more generic
+Patch-mainline: v4.19-rc1
+Git-commit: c94e4f117e473dec11c7b9395b4d88cae2ba27c9
+References: bsc#1103990 FATE#326006
+
+Convert the XDP xmit functions to use the generic xdp_frame API
+in XDP_TX flow.
+Same functions will be used later in this series to transmit
+the XDP redirect-out packets as well.
+
+Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h      |   20 ++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c  |   70 +++++++++++++---------
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h  |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c |   10 +--
+ 4 files changed, 61 insertions(+), 42 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -395,6 +395,17 @@ struct mlx5e_txqsq {
+ 	} recover;
+ } ____cacheline_aligned_in_smp;
+ 
++struct mlx5e_dma_info {
++	struct page     *page;
++	dma_addr_t      addr;
++};
++
++struct mlx5e_xdp_info {
++	struct xdp_frame      *xdpf;
++	dma_addr_t            dma_addr;
++	struct mlx5e_dma_info di;
++};
++
+ struct mlx5e_xdpsq {
+ 	/* data path */
+ 
+@@ -406,7 +417,7 @@ struct mlx5e_xdpsq {
+ 
+ 	/* write@xmit, read@completion */
+ 	struct {
+-		struct mlx5e_dma_info     *di;
++		struct mlx5e_xdp_info     *xdpi;
+ 		bool                       doorbell;
+ 		bool                       redirect_flush;
+ 	} db;
+@@ -419,6 +430,7 @@ struct mlx5e_xdpsq {
+ 	__be32                     mkey_be;
+ 	u8                         min_inline_mode;
+ 	unsigned long              state;
++	unsigned int               hw_mtu;
+ 
+ 	/* control path */
+ 	struct mlx5_wq_ctrl        wq_ctrl;
+@@ -455,11 +467,6 @@ mlx5e_wqc_has_room_for(struct mlx5_wq_cy
+ 	return (mlx5_wq_cyc_ctr2ix(wq, cc - pc) >= n) || (cc == pc);
+ }
+ 
+-struct mlx5e_dma_info {
+-	struct page	*page;
+-	dma_addr_t	addr;
+-};
+-
+ struct mlx5e_wqe_frag_info {
+ 	struct mlx5e_dma_info *di;
+ 	u32 offset;
+@@ -562,7 +569,6 @@ struct mlx5e_rq {
+ 
+ 	/* XDP */
+ 	struct bpf_prog       *xdp_prog;
+-	unsigned int           hw_mtu;
+ 	struct mlx5e_xdpsq     xdpsq;
+ 	DECLARE_BITMAP(flags, 8);
+ 	struct page_pool      *page_pool;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -33,6 +33,23 @@
+ #include <linux/bpf_trace.h>
+ #include "en/xdp.h"
+ 
++static inline bool
++mlx5e_xmit_xdp_buff(struct mlx5e_xdpsq *sq, struct mlx5e_dma_info *di,
++		    struct xdp_buff *xdp)
++{
++	struct mlx5e_xdp_info xdpi;
++
++	xdpi.xdpf = convert_to_xdp_frame(xdp);
++	if (unlikely(!xdpi.xdpf))
++		return false;
++	xdpi.dma_addr = di->addr + (xdpi.xdpf->data - (void *)xdpi.xdpf);
++	dma_sync_single_for_device(sq->pdev, xdpi.dma_addr,
++				   xdpi.xdpf->len, PCI_DMA_TODEVICE);
++	xdpi.di = *di;
++
++	return mlx5e_xmit_xdp_frame(sq, &xdpi);
++}
++
+ /* returns true if packet was consumed by xdp */
+ bool mlx5e_xdp_handle(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
+ 		      void *va, u16 *rx_headroom, u32 *len)
+@@ -58,22 +75,24 @@ bool mlx5e_xdp_handle(struct mlx5e_rq *r
+ 		*len = xdp.data_end - xdp.data;
+ 		return false;
+ 	case XDP_TX:
+-		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
+-			trace_xdp_exception(rq->netdev, prog, act);
++		if (unlikely(!mlx5e_xmit_xdp_buff(&rq->xdpsq, di, &xdp)))
++			goto xdp_abort;
++		__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags); /* non-atomic */
+ 		return true;
+ 	case XDP_REDIRECT:
+ 		/* When XDP enabled then page-refcnt==1 here */
+ 		err = xdp_do_redirect(rq->netdev, &xdp, prog);
+-		if (!err) {
+-			__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags);
+-			rq->xdpsq.db.redirect_flush = true;
+-			mlx5e_page_dma_unmap(rq, di);
+-		}
++		if (unlikely(err))
++			goto xdp_abort;
++		__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags);
++		rq->xdpsq.db.redirect_flush = true;
++		mlx5e_page_dma_unmap(rq, di);
+ 		rq->stats->xdp_redirect++;
+ 		return true;
+ 	default:
+ 		bpf_warn_invalid_xdp_action(act);
+ 	case XDP_ABORTED:
++xdp_abort:
+ 		trace_xdp_exception(rq->netdev, prog, act);
+ 	case XDP_DROP:
+ 		rq->stats->xdp_drop++;
+@@ -81,27 +100,27 @@ bool mlx5e_xdp_handle(struct mlx5e_rq *r
+ 	}
+ }
+ 
+-bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
+-			  const struct xdp_buff *xdp)
++bool mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq, struct mlx5e_xdp_info *xdpi)
+ {
+-	struct mlx5e_xdpsq       *sq   = &rq->xdpsq;
+ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
+ 	u16                       pi   = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
+ 	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
+ 
++	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
++
+ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
+ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
+-	struct mlx5_wqe_data_seg *dseg;
++	struct mlx5_wqe_data_seg *dseg = wqe->data;
+ 
+-	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
+-	dma_addr_t dma_addr  = di->addr + data_offset;
+-	unsigned int dma_len = xdp->data_end - xdp->data;
++	struct xdp_frame *xdpf = xdpi->xdpf;
++	dma_addr_t dma_addr  = xdpi->dma_addr;
++	unsigned int dma_len = xdpf->len;
+ 
+ 	struct mlx5e_rq_stats *stats = rq->stats;
+ 
+ 	prefetchw(wqe);
+ 
+-	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE || rq->hw_mtu < dma_len)) {
++	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE || sq->hw_mtu < dma_len)) {
+ 		stats->xdp_drop++;
+ 		return false;
+ 	}
+@@ -116,15 +135,11 @@ bool mlx5e_xmit_xdp_frame(struct mlx5e_r
+ 		return false;
+ 	}
+ 
+-	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len, PCI_DMA_TODEVICE);
+-
+ 	cseg->fm_ce_se = 0;
+ 
+-	dseg = (struct mlx5_wqe_data_seg *)eseg + 1;
+-
+ 	/* copy the inline part if required */
+ 	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
+-		memcpy(eseg->inline_hdr.start, xdp->data, MLX5E_XDP_MIN_INLINE);
++		memcpy(eseg->inline_hdr.start, xdpf->data, MLX5E_XDP_MIN_INLINE);
+ 		eseg->inline_hdr.sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
+ 		dma_len  -= MLX5E_XDP_MIN_INLINE;
+ 		dma_addr += MLX5E_XDP_MIN_INLINE;
+@@ -140,8 +155,7 @@ bool mlx5e_xmit_xdp_frame(struct mlx5e_r
+ 	/* move page to reference to sq responsibility,
+ 	 * and mark so it's not put back in page-cache.
+ 	 */
+-	__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags); /* non-atomic */
+-	sq->db.di[pi] = *di;
++	sq->db.xdpi[pi] = *xdpi;
+ 	sq->pc++;
+ 
+ 	sq->db.doorbell = true;
+@@ -184,17 +198,17 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq
+ 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
+ 
+ 		do {
+-			struct mlx5e_dma_info *di;
++			struct mlx5e_xdp_info *xdpi;
+ 			u16 ci;
+ 
+ 			last_wqe = (sqcc == wqe_counter);
+ 
+ 			ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sqcc);
+-			di = &sq->db.di[ci];
++			xdpi = &sq->db.xdpi[ci];
+ 
+ 			sqcc++;
+ 			/* Recycle RX page */
+-			mlx5e_page_release(rq, di, true);
++			mlx5e_page_release(rq, &xdpi->di, true);
+ 		} while (!last_wqe);
+ 	} while ((++i < MLX5E_TX_CQ_POLL_BUDGET) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
+ 
+@@ -212,15 +226,15 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq
+ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
+ {
+ 	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
+-	struct mlx5e_dma_info *di;
++	struct mlx5e_xdp_info *xdpi;
+ 	u16 ci;
+ 
+ 	while (sq->cc != sq->pc) {
+ 		ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sq->cc);
+-		di = &sq->db.di[ci];
++		xdpi = &sq->db.xdpi[ci];
+ 		sq->cc++;
+ 
+-		mlx5e_page_release(rq, di, false);
++		mlx5e_page_release(rq, &xdpi->di, false);
+ 	}
+ }
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -45,8 +45,7 @@ bool mlx5e_xdp_handle(struct mlx5e_rq *r
+ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq);
+ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
+ 
+-bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
+-			  const struct xdp_buff *xdp);
++bool mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq, struct mlx5e_xdp_info *xdpi);
+ 
+ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
+ {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -491,7 +491,6 @@ static int mlx5e_alloc_rq(struct mlx5e_c
+ 	rq->channel = c;
+ 	rq->ix      = c->ix;
+ 	rq->mdev    = mdev;
+-	rq->hw_mtu  = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+ 	rq->stats   = &c->priv->channel_stats[c->ix].rq;
+ 
+ 	rq->xdp_prog = params->xdp_prog ? bpf_prog_inc(params->xdp_prog) : NULL;
+@@ -969,16 +968,16 @@ static void mlx5e_close_rq(struct mlx5e_
+ 
+ static void mlx5e_free_xdpsq_db(struct mlx5e_xdpsq *sq)
+ {
+-	kvfree(sq->db.di);
++	kvfree(sq->db.xdpi);
+ }
+ 
+ static int mlx5e_alloc_xdpsq_db(struct mlx5e_xdpsq *sq, int numa)
+ {
+ 	int wq_sz = mlx5_wq_cyc_get_size(&sq->wq);
+ 
+-	sq->db.di = kvzalloc_node(array_size(wq_sz, sizeof(*sq->db.di)),
+-				  GFP_KERNEL, numa);
+-	if (!sq->db.di) {
++	sq->db.xdpi = kvzalloc_node(array_size(wq_sz, sizeof(*sq->db.xdpi)),
++				    GFP_KERNEL, numa);
++	if (!sq->db.xdpi) {
+ 		mlx5e_free_xdpsq_db(sq);
+ 		return -ENOMEM;
+ 	}
+@@ -1001,6 +1000,7 @@ static int mlx5e_alloc_xdpsq(struct mlx5
+ 	sq->channel   = c;
+ 	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
++	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+ 
+ 	param->wq.db_numa_node = cpu_to_node(c->cpu);
+ 	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, wq, &sq->wq_ctrl);
