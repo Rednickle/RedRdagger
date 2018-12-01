@@ -1,0 +1,363 @@
+From: Denis Bolotin <denis.bolotin@cavium.com>
+Date: Tue, 7 Aug 2018 15:48:10 +0300
+Subject: qed: Add Multi-TC RoCE support
+Patch-mainline: v4.19-rc1
+Git-commit: 61be82b087e201511bc53cf614f733dee1f47344
+References: bsc#1104393 FATE#325891 bsc#1104389 FATE#325890
+
+RoCE qps use a pair of physical queues (pq) received from the Queue Manager
+(QM) - an offload queue (OFLD) and a low latency queue (LLT). The QM block
+creates a pq for each TC, and allows RoCE qps to ask for a pq with a
+specific TC. As a result, qps with different VLAN priorities can be mapped
+to different TCs, and employ features such as PFC and ETS.
+
+Signed-off-by: Michal Kalderon <michal.kalderon@cavium.com>
+Signed-off-by: Ariel Elior <ariel.elior@cavium.com>
+Signed-off-by: Denis Bolotin <denis.bolotin@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qed/qed.h      |   10 ++-
+ drivers/net/ethernet/qlogic/qed/qed_dev.c  |   89 ++++++++++++++++++++++++-----
+ drivers/net/ethernet/qlogic/qed/qed_roce.c |   54 ++++++++++++-----
+ 3 files changed, 121 insertions(+), 32 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -338,6 +338,9 @@ struct qed_hw_info {
+ 	u8				offload_tc;
+ 	bool				offload_tc_set;
+ 
++	bool				multi_tc_roce_en;
++#define IS_QED_MULTI_TC_ROCE(p_hwfn) (((p_hwfn)->hw_info.multi_tc_roce_en))
++
+ 	u32				concrete_fid;
+ 	u16				opaque_fid;
+ 	u16				ovlan;
+@@ -400,8 +403,8 @@ struct qed_qm_info {
+ 	u16				start_pq;
+ 	u8				start_vport;
+ 	u16				 pure_lb_pq;
+-	u16				offload_pq;
+-	u16				low_latency_pq;
++	u16				first_ofld_pq;
++	u16				first_llt_pq;
+ 	u16				pure_ack_pq;
+ 	u16				ooo_pq;
+ 	u16				first_vf_pq;
+@@ -882,11 +885,14 @@ void qed_set_fw_mac_addr(__le16 *fw_msb,
+ #define PQ_FLAGS_OFLD   (BIT(5))
+ #define PQ_FLAGS_VFS    (BIT(6))
+ #define PQ_FLAGS_LLT    (BIT(7))
++#define PQ_FLAGS_MTC    (BIT(8))
+ 
+ /* physical queue index for cm context intialization */
+ u16 qed_get_cm_pq_idx(struct qed_hwfn *p_hwfn, u32 pq_flags);
+ u16 qed_get_cm_pq_idx_mcos(struct qed_hwfn *p_hwfn, u8 tc);
+ u16 qed_get_cm_pq_idx_vf(struct qed_hwfn *p_hwfn, u16 vf);
++u16 qed_get_cm_pq_idx_ofld_mtc(struct qed_hwfn *p_hwfn, u8 tc);
++u16 qed_get_cm_pq_idx_llt_mtc(struct qed_hwfn *p_hwfn, u8 tc);
+ 
+ #define QED_LEADING_HWFN(dev)   (&dev->hwfns[0])
+ 
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -215,6 +215,8 @@ static u32 qed_get_pq_flags(struct qed_h
+ 		break;
+ 	case QED_PCI_ETH_ROCE:
+ 		flags |= PQ_FLAGS_MCOS | PQ_FLAGS_OFLD | PQ_FLAGS_LLT;
++		if (IS_QED_MULTI_TC_ROCE(p_hwfn))
++			flags |= PQ_FLAGS_MTC;
+ 		break;
+ 	case QED_PCI_ETH_IWARP:
+ 		flags |= PQ_FLAGS_MCOS | PQ_FLAGS_ACK | PQ_FLAGS_OOO |
+@@ -241,6 +243,16 @@ static u16 qed_init_qm_get_num_vfs(struc
+ 	       p_hwfn->cdev->p_iov_info->total_vfs : 0;
+ }
+ 
++static u8 qed_init_qm_get_num_mtc_tcs(struct qed_hwfn *p_hwfn)
++{
++	u32 pq_flags = qed_get_pq_flags(p_hwfn);
++
++	if (!(PQ_FLAGS_MTC & pq_flags))
++		return 1;
++
++	return qed_init_qm_get_num_tcs(p_hwfn);
++}
++
+ #define NUM_DEFAULT_RLS 1
+ 
+ static u16 qed_init_qm_get_num_pf_rls(struct qed_hwfn *p_hwfn)
+@@ -282,8 +294,11 @@ static u16 qed_init_qm_get_num_pqs(struc
+ 	       (!!(PQ_FLAGS_MCOS & pq_flags)) *
+ 	       qed_init_qm_get_num_tcs(p_hwfn) +
+ 	       (!!(PQ_FLAGS_LB & pq_flags)) + (!!(PQ_FLAGS_OOO & pq_flags)) +
+-	       (!!(PQ_FLAGS_ACK & pq_flags)) + (!!(PQ_FLAGS_OFLD & pq_flags)) +
+-	       (!!(PQ_FLAGS_LLT & pq_flags)) +
++	       (!!(PQ_FLAGS_ACK & pq_flags)) +
++	       (!!(PQ_FLAGS_OFLD & pq_flags)) *
++	       qed_init_qm_get_num_mtc_tcs(p_hwfn) +
++	       (!!(PQ_FLAGS_LLT & pq_flags)) *
++	       qed_init_qm_get_num_mtc_tcs(p_hwfn) +
+ 	       (!!(PQ_FLAGS_VFS & pq_flags)) * qed_init_qm_get_num_vfs(p_hwfn);
+ }
+ 
+@@ -474,9 +489,9 @@ static u16 *qed_init_qm_get_idx_from_fla
+ 	case PQ_FLAGS_ACK:
+ 		return &qm_info->pure_ack_pq;
+ 	case PQ_FLAGS_OFLD:
+-		return &qm_info->offload_pq;
++		return &qm_info->first_ofld_pq;
+ 	case PQ_FLAGS_LLT:
+-		return &qm_info->low_latency_pq;
++		return &qm_info->first_llt_pq;
+ 	case PQ_FLAGS_VFS:
+ 		return &qm_info->first_vf_pq;
+ 	default:
+@@ -525,6 +540,28 @@ u16 qed_get_cm_pq_idx_vf(struct qed_hwfn
+ 	return qed_get_cm_pq_idx(p_hwfn, PQ_FLAGS_VFS) + vf;
+ }
+ 
++u16 qed_get_cm_pq_idx_ofld_mtc(struct qed_hwfn *p_hwfn, u8 tc)
++{
++	u16 first_ofld_pq, pq_offset;
++
++	first_ofld_pq = qed_get_cm_pq_idx(p_hwfn, PQ_FLAGS_OFLD);
++	pq_offset = (tc < qed_init_qm_get_num_mtc_tcs(p_hwfn)) ?
++		    tc : PQ_INIT_DEFAULT_TC;
++
++	return first_ofld_pq + pq_offset;
++}
++
++u16 qed_get_cm_pq_idx_llt_mtc(struct qed_hwfn *p_hwfn, u8 tc)
++{
++	u16 first_llt_pq, pq_offset;
++
++	first_llt_pq = qed_get_cm_pq_idx(p_hwfn, PQ_FLAGS_LLT);
++	pq_offset = (tc < qed_init_qm_get_num_mtc_tcs(p_hwfn)) ?
++		    tc : PQ_INIT_DEFAULT_TC;
++
++	return first_llt_pq + pq_offset;
++}
++
+ /* Functions for creating specific types of pqs */
+ static void qed_init_qm_lb_pq(struct qed_hwfn *p_hwfn)
+ {
+@@ -560,6 +597,20 @@ static void qed_init_qm_pure_ack_pq(stru
+ 		       PQ_INIT_SHARE_VPORT);
+ }
+ 
++static void qed_init_qm_mtc_pqs(struct qed_hwfn *p_hwfn)
++{
++	u8 num_tcs = qed_init_qm_get_num_mtc_tcs(p_hwfn);
++	struct qed_qm_info *qm_info = &p_hwfn->qm_info;
++	u8 tc;
++
++	/* override pq's TC if offload TC is set */
++	for (tc = 0; tc < num_tcs; tc++)
++		qed_init_qm_pq(p_hwfn, qm_info,
++			       qed_is_offload_tc_set(p_hwfn) ?
++			       p_hwfn->hw_info.offload_tc : tc,
++			       PQ_INIT_SHARE_VPORT);
++}
++
+ static void qed_init_qm_offload_pq(struct qed_hwfn *p_hwfn)
+ {
+ 	struct qed_qm_info *qm_info = &p_hwfn->qm_info;
+@@ -568,8 +619,7 @@ static void qed_init_qm_offload_pq(struc
+ 		return;
+ 
+ 	qed_init_qm_set_idx(p_hwfn, PQ_FLAGS_OFLD, qm_info->num_pqs);
+-	qed_init_qm_pq(p_hwfn, qm_info, qed_get_offload_tc(p_hwfn),
+-		       PQ_INIT_SHARE_VPORT);
++	qed_init_qm_mtc_pqs(p_hwfn);
+ }
+ 
+ static void qed_init_qm_low_latency_pq(struct qed_hwfn *p_hwfn)
+@@ -580,8 +630,7 @@ static void qed_init_qm_low_latency_pq(s
+ 		return;
+ 
+ 	qed_init_qm_set_idx(p_hwfn, PQ_FLAGS_LLT, qm_info->num_pqs);
+-	qed_init_qm_pq(p_hwfn, qm_info, qed_get_offload_tc(p_hwfn),
+-		       PQ_INIT_SHARE_VPORT);
++	qed_init_qm_mtc_pqs(p_hwfn);
+ }
+ 
+ static void qed_init_qm_mcos_pqs(struct qed_hwfn *p_hwfn)
+@@ -664,12 +713,19 @@ static int qed_init_qm_sanity(struct qed
+ 		return -EINVAL;
+ 	}
+ 
+-	if (qed_init_qm_get_num_pqs(p_hwfn) > RESC_NUM(p_hwfn, QED_PQ)) {
+-		DP_ERR(p_hwfn, "requested amount of pqs exceeds resource\n");
+-		return -EINVAL;
++	if (qed_init_qm_get_num_pqs(p_hwfn) <= RESC_NUM(p_hwfn, QED_PQ))
++		return 0;
++
++	if (QED_IS_ROCE_PERSONALITY(p_hwfn)) {
++		p_hwfn->hw_info.multi_tc_roce_en = 0;
++		DP_NOTICE(p_hwfn,
++			  "multi-tc roce was disabled to reduce requested amount of pqs\n");
++		if (qed_init_qm_get_num_pqs(p_hwfn) <= RESC_NUM(p_hwfn, QED_PQ))
++			return 0;
+ 	}
+ 
+-	return 0;
++	DP_ERR(p_hwfn, "requested amount of pqs exceeds resource\n");
++	return -EINVAL;
+ }
+ 
+ static void qed_dp_init_qm_params(struct qed_hwfn *p_hwfn)
+@@ -683,11 +739,13 @@ static void qed_dp_init_qm_params(struct
+ 	/* top level params */
+ 	DP_VERBOSE(p_hwfn,
+ 		   NETIF_MSG_HW,
+-		   "qm init top level params: start_pq %d, start_vport %d, pure_lb_pq %d, offload_pq %d, pure_ack_pq %d\n",
++		   "qm init top level params: start_pq %d, start_vport %d, pure_lb_pq %d, offload_pq %d, llt_pq %d, pure_ack_pq %d\n",
+ 		   qm_info->start_pq,
+ 		   qm_info->start_vport,
+ 		   qm_info->pure_lb_pq,
+-		   qm_info->offload_pq, qm_info->pure_ack_pq);
++		   qm_info->first_ofld_pq,
++		   qm_info->first_llt_pq,
++		   qm_info->pure_ack_pq);
+ 	DP_VERBOSE(p_hwfn,
+ 		   NETIF_MSG_HW,
+ 		   "ooo_pq %d, first_vf_pq %d, num_pqs %d, num_vf_pqs %d, num_vports %d, max_phys_tcs_per_port %d\n",
+@@ -2920,6 +2978,9 @@ qed_get_hw_info(struct qed_hwfn *p_hwfn,
+ 		p_hwfn->hw_info.personality = protocol;
+ 	}
+ 
++	if (QED_IS_ROCE_PERSONALITY(p_hwfn))
++		p_hwfn->hw_info.multi_tc_roce_en = 1;
++
+ 	p_hwfn->hw_info.num_hw_tc = NUM_PHYS_TCS_4PORT_K2;
+ 	p_hwfn->hw_info.num_active_tc = 1;
+ 
+--- a/drivers/net/ethernet/qlogic/qed/qed_roce.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_roce.c
+@@ -44,8 +44,10 @@
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/string.h>
++#include <linux/if_vlan.h>
+ #include "qed.h"
+ #include "qed_cxt.h"
++#include "qed_dcbx.h"
+ #include "qed_hsi.h"
+ #include "qed_hw.h"
+ #include "qed_init_ops.h"
+@@ -231,16 +233,33 @@ static void qed_roce_set_real_cid(struct
+ 	spin_unlock_bh(&p_hwfn->p_rdma_info->lock);
+ }
+ 
++static u8 qed_roce_get_qp_tc(struct qed_hwfn *p_hwfn, struct qed_rdma_qp *qp)
++{
++	u8 pri, tc = 0;
++
++	if (qp->vlan_id) {
++		pri = (qp->vlan_id & VLAN_PRIO_MASK) >> VLAN_PRIO_SHIFT;
++		tc = qed_dcbx_get_priority_tc(p_hwfn, pri);
++	}
++
++	DP_VERBOSE(p_hwfn, QED_MSG_SP,
++		   "qp icid %u tc: %u (vlan priority %s)\n",
++		   qp->icid, tc, qp->vlan_id ? "enabled" : "disabled");
++
++	return tc;
++}
++
+ static int qed_roce_sp_create_responder(struct qed_hwfn *p_hwfn,
+ 					struct qed_rdma_qp *qp)
+ {
+ 	struct roce_create_qp_resp_ramrod_data *p_ramrod;
++	u16 regular_latency_queue, low_latency_queue;
+ 	struct qed_sp_init_data init_data;
+ 	enum roce_flavor roce_flavor;
+ 	struct qed_spq_entry *p_ent;
+-	u16 regular_latency_queue;
+ 	enum protocol_type proto;
+ 	int rc;
++	u8 tc;
+ 
+ 	DP_VERBOSE(p_hwfn, QED_MSG_RDMA, "icid = %08x\n", qp->icid);
+ 
+@@ -324,12 +343,17 @@ static int qed_roce_sp_create_responder(
+ 	p_ramrod->cq_cid = cpu_to_le32((p_hwfn->hw_info.opaque_fid << 16) |
+ 				       qp->rq_cq_id);
+ 
+-	regular_latency_queue = qed_get_cm_pq_idx(p_hwfn, PQ_FLAGS_OFLD);
+-
++	tc = qed_roce_get_qp_tc(p_hwfn, qp);
++	regular_latency_queue = qed_get_cm_pq_idx_ofld_mtc(p_hwfn, tc);
++	low_latency_queue = qed_get_cm_pq_idx_llt_mtc(p_hwfn, tc);
++	DP_VERBOSE(p_hwfn, QED_MSG_SP,
++		   "qp icid %u pqs: regular_latency %u low_latency %u\n",
++		   qp->icid, regular_latency_queue - CM_TX_PQ_BASE,
++		   low_latency_queue - CM_TX_PQ_BASE);
+ 	p_ramrod->regular_latency_phy_queue =
+ 	    cpu_to_le16(regular_latency_queue);
+ 	p_ramrod->low_latency_phy_queue =
+-	    cpu_to_le16(regular_latency_queue);
++	    cpu_to_le16(low_latency_queue);
+ 
+ 	p_ramrod->dpi = cpu_to_le16(qp->dpi);
+ 
+@@ -345,11 +369,6 @@ static int qed_roce_sp_create_responder(
+ 				     qp->stats_queue;
+ 
+ 	rc = qed_spq_post(p_hwfn, p_ent, NULL);
+-
+-	DP_VERBOSE(p_hwfn, QED_MSG_RDMA,
+-		   "rc = %d regular physical queue = 0x%x\n", rc,
+-		   regular_latency_queue);
+-
+ 	if (rc)
+ 		goto err;
+ 
+@@ -375,12 +394,13 @@ static int qed_roce_sp_create_requester(
+ 					struct qed_rdma_qp *qp)
+ {
+ 	struct roce_create_qp_req_ramrod_data *p_ramrod;
++	u16 regular_latency_queue, low_latency_queue;
+ 	struct qed_sp_init_data init_data;
+ 	enum roce_flavor roce_flavor;
+ 	struct qed_spq_entry *p_ent;
+-	u16 regular_latency_queue;
+ 	enum protocol_type proto;
+ 	int rc;
++	u8 tc;
+ 
+ 	DP_VERBOSE(p_hwfn, QED_MSG_RDMA, "icid = %08x\n", qp->icid);
+ 
+@@ -453,12 +473,17 @@ static int qed_roce_sp_create_requester(
+ 	p_ramrod->cq_cid =
+ 	    cpu_to_le32((p_hwfn->hw_info.opaque_fid << 16) | qp->sq_cq_id);
+ 
+-	regular_latency_queue = qed_get_cm_pq_idx(p_hwfn, PQ_FLAGS_OFLD);
+-
++	tc = qed_roce_get_qp_tc(p_hwfn, qp);
++	regular_latency_queue = qed_get_cm_pq_idx_ofld_mtc(p_hwfn, tc);
++	low_latency_queue = qed_get_cm_pq_idx_llt_mtc(p_hwfn, tc);
++	DP_VERBOSE(p_hwfn, QED_MSG_SP,
++		   "qp icid %u pqs: regular_latency %u low_latency %u\n",
++		   qp->icid, regular_latency_queue - CM_TX_PQ_BASE,
++		   low_latency_queue - CM_TX_PQ_BASE);
+ 	p_ramrod->regular_latency_phy_queue =
+ 	    cpu_to_le16(regular_latency_queue);
+ 	p_ramrod->low_latency_phy_queue =
+-	    cpu_to_le16(regular_latency_queue);
++	    cpu_to_le16(low_latency_queue);
+ 
+ 	p_ramrod->dpi = cpu_to_le16(qp->dpi);
+ 
+@@ -471,9 +496,6 @@ static int qed_roce_sp_create_requester(
+ 				     qp->stats_queue;
+ 
+ 	rc = qed_spq_post(p_hwfn, p_ent, NULL);
+-
+-	DP_VERBOSE(p_hwfn, QED_MSG_RDMA, "rc = %d\n", rc);
+-
+ 	if (rc)
+ 		goto err;
+ 
