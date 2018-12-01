@@ -1,0 +1,209 @@
+From: Boris Pismenny <borisp@mellanox.com>
+Date: Fri, 13 Jul 2018 14:33:48 +0300
+Subject: net/mlx5e: TLS, add Innova TLS rx data path
+Patch-mainline: v4.19-rc1
+Git-commit: 00aebab27c8752c7420dce286270ccedc70ac39a
+References: bsc#1103990 FATE#326006
+
+Implement the TLS rx offload data path according to the
+requirements of the TLS generic NIC offload infrastructure.
+
+Special metadata ethertype is used to pass information to
+the hardware.
+
+When hardware loses synchronization a special resync request
+metadata message is used to request resync.
+
+Signed-off-by: Boris Pismenny <borisp@mellanox.com>
+Signed-off-by: Ilya Lesokhin <ilyal@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_rxtx.c |  112 +++++++++++-
+ drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_rxtx.h |    3 
+ drivers/net/ethernet/mellanox/mlx5/core/en_rx.c             |    6 
+ 3 files changed, 118 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_rxtx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_rxtx.c
+@@ -33,6 +33,12 @@
+ 
+ #include "en_accel/tls.h"
+ #include "en_accel/tls_rxtx.h"
++#include <net/inet6_hashtables.h>
++#include <linux/ipv6.h>
++
++#define SYNDROM_DECRYPTED  0x30
++#define SYNDROM_RESYNC_REQUEST 0x31
++#define SYNDROM_AUTH_FAILED 0x32
+ 
+ #define SYNDROME_OFFLOAD_REQUIRED 32
+ #define SYNDROME_SYNC 33
+@@ -44,10 +50,26 @@ struct sync_info {
+ 	skb_frag_t frags[MAX_SKB_FRAGS];
+ };
+ 
+-struct mlx5e_tls_metadata {
++struct recv_metadata_content {
++	u8 syndrome;
++	u8 reserved;
++	__be32 sync_seq;
++} __packed;
++
++struct send_metadata_content {
+ 	/* One byte of syndrome followed by 3 bytes of swid */
+ 	__be32 syndrome_swid;
+ 	__be16 first_seq;
++} __packed;
++
++struct mlx5e_tls_metadata {
++	union {
++		/* from fpga to host */
++		struct recv_metadata_content recv;
++		/* from host to fpga */
++		struct send_metadata_content send;
++		unsigned char raw[6];
++	} __packed content;
+ 	/* packet type ID field	*/
+ 	__be16 ethertype;
+ } __packed;
+@@ -68,7 +90,8 @@ static int mlx5e_tls_add_metadata(struct
+ 		2 * ETH_ALEN);
+ 
+ 	eth->h_proto = cpu_to_be16(MLX5E_METADATA_ETHER_TYPE);
+-	pet->syndrome_swid = htonl(SYNDROME_OFFLOAD_REQUIRED << 24) | swid;
++	pet->content.send.syndrome_swid =
++		htonl(SYNDROME_OFFLOAD_REQUIRED << 24) | swid;
+ 
+ 	return 0;
+ }
+@@ -149,7 +172,7 @@ static void mlx5e_tls_complete_sync_skb(
+ 
+ 	pet = (struct mlx5e_tls_metadata *)(nskb->data + sizeof(struct ethhdr));
+ 	memcpy(pet, &syndrome, sizeof(syndrome));
+-	pet->first_seq = htons(tcp_seq);
++	pet->content.send.first_seq = htons(tcp_seq);
+ 
+ 	/* MLX5 devices don't care about the checksum partial start, offset
+ 	 * and pseudo header
+@@ -276,3 +299,86 @@ struct sk_buff *mlx5e_tls_handle_tx_skb(
+ out:
+ 	return skb;
+ }
++
++static int tls_update_resync_sn(struct net_device *netdev,
++				struct sk_buff *skb,
++				struct mlx5e_tls_metadata *mdata)
++{
++	struct sock *sk = NULL;
++	struct iphdr *iph;
++	struct tcphdr *th;
++	__be32 seq;
++
++	if (mdata->ethertype != htons(ETH_P_IP))
++		return -EINVAL;
++
++	iph = (struct iphdr *)(mdata + 1);
++
++	th = ((void *)iph) + iph->ihl * 4;
++
++	if (iph->version == 4) {
++		sk = inet_lookup_established(dev_net(netdev), &tcp_hashinfo,
++					     iph->saddr, th->source, iph->daddr,
++					     th->dest, netdev->ifindex);
++#if IS_ENABLED(CONFIG_IPV6)
++	} else {
++		struct ipv6hdr *ipv6h = (struct ipv6hdr *)iph;
++
++		sk = __inet6_lookup_established(dev_net(netdev), &tcp_hashinfo,
++						&ipv6h->saddr, th->source,
++						&ipv6h->daddr, th->dest,
++						netdev->ifindex);
++#endif
++	}
++	if (!sk || sk->sk_state == TCP_TIME_WAIT)
++		goto out;
++
++	skb->sk = sk;
++	skb->destructor = sock_edemux;
++
++	memcpy(&seq, &mdata->content.recv.sync_seq, sizeof(seq));
++	tls_offload_rx_resync_request(sk, seq);
++out:
++	return 0;
++}
++
++void mlx5e_tls_handle_rx_skb(struct net_device *netdev, struct sk_buff *skb,
++			     u32 *cqe_bcnt)
++{
++	struct mlx5e_tls_metadata *mdata;
++	struct ethhdr *old_eth;
++	struct ethhdr *new_eth;
++	__be16 *ethtype;
++
++	/* Detect inline metadata */
++	if (skb->len < ETH_HLEN + MLX5E_METADATA_ETHER_LEN)
++		return;
++	ethtype = (__be16 *)(skb->data + ETH_ALEN * 2);
++	if (*ethtype != cpu_to_be16(MLX5E_METADATA_ETHER_TYPE))
++		return;
++
++	/* Use the metadata */
++	mdata = (struct mlx5e_tls_metadata *)(skb->data + ETH_HLEN);
++	switch (mdata->content.recv.syndrome) {
++	case SYNDROM_DECRYPTED:
++		skb->decrypted = 1;
++		break;
++	case SYNDROM_RESYNC_REQUEST:
++		tls_update_resync_sn(netdev, skb, mdata);
++		break;
++	case SYNDROM_AUTH_FAILED:
++		/* Authentication failure will be observed and verified by kTLS */
++		break;
++	default:
++		/* Bypass the metadata header to others */
++		return;
++	}
++
++	/* Remove the metadata from the buffer */
++	old_eth = (struct ethhdr *)skb->data;
++	new_eth = (struct ethhdr *)(skb->data + MLX5E_METADATA_ETHER_LEN);
++	memmove(new_eth, old_eth, 2 * ETH_ALEN);
++	/* Ethertype is already in its new place */
++	skb_pull_inline(skb, MLX5E_METADATA_ETHER_LEN);
++	*cqe_bcnt -= MLX5E_METADATA_ETHER_LEN;
++}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_rxtx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/tls_rxtx.h
+@@ -45,6 +45,9 @@ struct sk_buff *mlx5e_tls_handle_tx_skb(
+ 					struct mlx5e_tx_wqe **wqe,
+ 					u16 *pi);
+ 
++void mlx5e_tls_handle_rx_skb(struct net_device *netdev, struct sk_buff *skb,
++			     u32 *cqe_bcnt);
++
+ #endif /* CONFIG_MLX5_EN_TLS */
+ 
+ #endif /* __MLX5E_TLS_RXTX_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -44,6 +44,7 @@
+ #include "en_rep.h"
+ #include "ipoib/ipoib.h"
+ #include "en_accel/ipsec_rxtx.h"
++#include "en_accel/tls_rxtx.h"
+ #include "lib/clock.h"
+ 
+ static inline bool mlx5e_rx_hw_stamp(struct hwtstamp_config *config)
+@@ -797,6 +798,11 @@ static inline void mlx5e_build_rx_skb(st
+ 	struct net_device *netdev = rq->netdev;
+ 
+ 	skb->mac_len = ETH_HLEN;
++
++#ifdef CONFIG_MLX5_EN_TLS
++	mlx5e_tls_handle_rx_skb(netdev, skb, &cqe_bcnt);
++#endif
++
+ 	if (lro_num_seg > 1) {
+ 		mlx5e_lro_update_hdr(skb, cqe, cqe_bcnt);
+ 		skb_shinfo(skb)->gso_size = DIV_ROUND_UP(cqe_bcnt, lro_num_seg);
