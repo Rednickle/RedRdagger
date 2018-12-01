@@ -1,0 +1,371 @@
+From: Alex Vesker <valex@mellanox.com>
+Date: Thu, 12 Jul 2018 15:13:16 +0300
+Subject: net/mlx4_core: Add Crdump FW snapshot support
+Patch-mainline: v4.19-rc1
+Git-commit: bedc989b0c98285b277ff8a08ff9514e580913f4
+References: bsc#1103989 FATE#326004
+
+Crdump allows the driver to create a snapshot of the FW PCI
+crspace and health buffer during a critical FW issue.
+In case of a FW command timeout, FW getting stuck or a non zero
+value on the catastrophic buffer, a snapshot will be taken.
+
+The snapshot is exposed using devlink, cr-space, fw-health
+address regions are registered on init and snapshots are attached
+once a new snapshot is collected by the driver.
+
+Signed-off-by: Alex Vesker <valex@mellanox.com>
+Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx4/Makefile |    2 
+ drivers/net/ethernet/mellanox/mlx4/catas.c  |    6 
+ drivers/net/ethernet/mellanox/mlx4/crdump.c |  231 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/mellanox/mlx4/main.c   |   10 +
+ drivers/net/ethernet/mellanox/mlx4/mlx4.h   |    4 
+ include/linux/mlx4/device.h                 |    6 
+ 6 files changed, 255 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/net/ethernet/mellanox/mlx4/crdump.c
+
+--- a/drivers/net/ethernet/mellanox/mlx4/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx4/Makefile
+@@ -2,7 +2,7 @@ obj-$(CONFIG_MLX4_CORE)		+= mlx4_core.o
+ 
+ mlx4_core-y :=	alloc.o catas.o cmd.o cq.o eq.o fw.o fw_qos.o icm.o intf.o \
+ 		main.o mcg.o mr.o pd.o port.o profile.o qp.o reset.o sense.o \
+-		srq.o resource_tracker.o
++		srq.o resource_tracker.o crdump.o
+ 
+ obj-$(CONFIG_MLX4_EN)               += mlx4_en.o
+ 
+--- a/drivers/net/ethernet/mellanox/mlx4/catas.c
++++ b/drivers/net/ethernet/mellanox/mlx4/catas.c
+@@ -178,10 +178,12 @@ void mlx4_enter_error_state(struct mlx4_
+ 
+ 	dev = persist->dev;
+ 	mlx4_err(dev, "device is going to be reset\n");
+-	if (mlx4_is_slave(dev))
++	if (mlx4_is_slave(dev)) {
+ 		err = mlx4_reset_slave(dev);
+-	else
++	} else {
++		mlx4_crdump_collect(dev);
+ 		err = mlx4_reset_master(dev);
++	}
+ 
+ 	if (!err) {
+ 		mlx4_err(dev, "device was reset successfully\n");
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx4/crdump.c
+@@ -0,0 +1,231 @@
++/*
++ * Copyright (c) 2018, Mellanox Technologies. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "mlx4.h"
++
++#define BAD_ACCESS			0xBADACCE5
++#define HEALTH_BUFFER_SIZE		0x40
++#define CR_ENABLE_BIT			swab32(BIT(6))
++#define CR_ENABLE_BIT_OFFSET		0xF3F04
++#define MAX_NUM_OF_DUMPS_TO_STORE	(8)
++
++static const char *region_cr_space_str = "cr-space";
++static const char *region_fw_health_str = "fw-health";
++
++/* Set to true in case cr enable bit was set to true before crdump */
++static bool crdump_enbale_bit_set;
++
++static void crdump_enable_crspace_access(struct mlx4_dev *dev,
++					 u8 __iomem *cr_space)
++{
++	/* Get current enable bit value */
++	crdump_enbale_bit_set =
++		readl(cr_space + CR_ENABLE_BIT_OFFSET) & CR_ENABLE_BIT;
++
++	/* Enable FW CR filter (set bit6 to 0) */
++	if (crdump_enbale_bit_set)
++		writel(readl(cr_space + CR_ENABLE_BIT_OFFSET) & ~CR_ENABLE_BIT,
++		       cr_space + CR_ENABLE_BIT_OFFSET);
++
++	/* Enable block volatile crspace accesses */
++	writel(swab32(1), cr_space + dev->caps.health_buffer_addrs +
++	       HEALTH_BUFFER_SIZE);
++}
++
++static void crdump_disable_crspace_access(struct mlx4_dev *dev,
++					  u8 __iomem *cr_space)
++{
++	/* Disable block volatile crspace accesses */
++	writel(0, cr_space + dev->caps.health_buffer_addrs +
++	       HEALTH_BUFFER_SIZE);
++
++	/* Restore FW CR filter value (set bit6 to original value) */
++	if (crdump_enbale_bit_set)
++		writel(readl(cr_space + CR_ENABLE_BIT_OFFSET) | CR_ENABLE_BIT,
++		       cr_space + CR_ENABLE_BIT_OFFSET);
++}
++
++static void mlx4_crdump_collect_crspace(struct mlx4_dev *dev,
++					u8 __iomem *cr_space,
++					u32 id)
++{
++	struct mlx4_fw_crdump *crdump = &dev->persist->crdump;
++	struct pci_dev *pdev = dev->persist->pdev;
++	unsigned long cr_res_size;
++	u8 *crspace_data;
++	int offset;
++	int err;
++
++	if (!crdump->region_crspace) {
++		mlx4_err(dev, "crdump: cr-space region is NULL\n");
++		return;
++	}
++
++	/* Try to collect CR space */
++	cr_res_size = pci_resource_len(pdev, 0);
++	crspace_data = kvmalloc(cr_res_size, GFP_KERNEL);
++	if (crspace_data) {
++		for (offset = 0; offset < cr_res_size; offset += 4)
++			*(u32 *)(crspace_data + offset) =
++					readl(cr_space + offset);
++
++		err = devlink_region_snapshot_create(crdump->region_crspace,
++						     cr_res_size, crspace_data,
++						     id, &kvfree);
++		if (err) {
++			kvfree(crspace_data);
++			mlx4_warn(dev, "crdump: devlink create %s snapshot id %d err %d\n",
++				  region_cr_space_str, id, err);
++		} else {
++			mlx4_info(dev, "crdump: added snapshot %d to devlink region %s\n",
++				  id, region_cr_space_str);
++		}
++	} else {
++		mlx4_err(dev, "crdump: Failed to allocate crspace buffer\n");
++	}
++}
++
++static void mlx4_crdump_collect_fw_health(struct mlx4_dev *dev,
++					  u8 __iomem *cr_space,
++					  u32 id)
++{
++	struct mlx4_fw_crdump *crdump = &dev->persist->crdump;
++	u8 *health_data;
++	int offset;
++	int err;
++
++	if (!crdump->region_fw_health) {
++		mlx4_err(dev, "crdump: fw-health region is NULL\n");
++		return;
++	}
++
++	/* Try to collect health buffer */
++	health_data = kvmalloc(HEALTH_BUFFER_SIZE, GFP_KERNEL);
++	if (health_data) {
++		u8 __iomem *health_buf_start =
++				cr_space + dev->caps.health_buffer_addrs;
++
++		for (offset = 0; offset < HEALTH_BUFFER_SIZE; offset += 4)
++			*(u32 *)(health_data + offset) =
++					readl(health_buf_start + offset);
++
++		err = devlink_region_snapshot_create(crdump->region_fw_health,
++						     HEALTH_BUFFER_SIZE,
++						     health_data,
++						     id, &kvfree);
++		if (err) {
++			kvfree(health_data);
++			mlx4_warn(dev, "crdump: devlink create %s snapshot id %d err %d\n",
++				  region_fw_health_str, id, err);
++		} else {
++			mlx4_info(dev, "crdump: added snapshot %d to devlink region %s\n",
++				  id, region_fw_health_str);
++		}
++	} else {
++		mlx4_err(dev, "crdump: Failed to allocate health buffer\n");
++	}
++}
++
++int mlx4_crdump_collect(struct mlx4_dev *dev)
++{
++	struct devlink *devlink = priv_to_devlink(mlx4_priv(dev));
++	struct pci_dev *pdev = dev->persist->pdev;
++	unsigned long cr_res_size;
++	u8 __iomem *cr_space;
++	u32 id;
++
++	if (!dev->caps.health_buffer_addrs) {
++		mlx4_info(dev, "crdump: FW doesn't support health buffer access, skipping\n");
++		return 0;
++	}
++
++	cr_res_size = pci_resource_len(pdev, 0);
++
++	cr_space = ioremap(pci_resource_start(pdev, 0), cr_res_size);
++	if (!cr_space) {
++		mlx4_err(dev, "crdump: Failed to map pci cr region\n");
++		return -ENODEV;
++	}
++
++	crdump_enable_crspace_access(dev, cr_space);
++
++	/* Get the available snapshot ID for the dumps */
++	id = devlink_region_shapshot_id_get(devlink);
++
++	/* Try to capture dumps */
++	mlx4_crdump_collect_crspace(dev, cr_space, id);
++	mlx4_crdump_collect_fw_health(dev, cr_space, id);
++
++	crdump_disable_crspace_access(dev, cr_space);
++
++	iounmap(cr_space);
++	return 0;
++}
++
++int mlx4_crdump_init(struct mlx4_dev *dev)
++{
++	struct devlink *devlink = priv_to_devlink(mlx4_priv(dev));
++	struct mlx4_fw_crdump *crdump = &dev->persist->crdump;
++	struct pci_dev *pdev = dev->persist->pdev;
++
++	/* Create cr-space region */
++	crdump->region_crspace =
++		devlink_region_create(devlink,
++				      region_cr_space_str,
++				      MAX_NUM_OF_DUMPS_TO_STORE,
++				      pci_resource_len(pdev, 0));
++	if (IS_ERR(crdump->region_crspace))
++		mlx4_warn(dev, "crdump: create devlink region %s err %ld\n",
++			  region_cr_space_str,
++			  PTR_ERR(crdump->region_crspace));
++
++	/* Create fw-health region */
++	crdump->region_fw_health =
++		devlink_region_create(devlink,
++				      region_fw_health_str,
++				      MAX_NUM_OF_DUMPS_TO_STORE,
++				      HEALTH_BUFFER_SIZE);
++	if (IS_ERR(crdump->region_fw_health))
++		mlx4_warn(dev, "crdump: create devlink region %s err %ld\n",
++			  region_fw_health_str,
++			  PTR_ERR(crdump->region_fw_health));
++
++	return 0;
++}
++
++void mlx4_crdump_end(struct mlx4_dev *dev)
++{
++	struct mlx4_fw_crdump *crdump = &dev->persist->crdump;
++
++	devlink_region_destroy(crdump->region_fw_health);
++	devlink_region_destroy(crdump->region_crspace);
++}
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -3806,10 +3806,14 @@ static int __mlx4_init_one(struct pci_de
+ 		}
+ 	}
+ 
+-	err = mlx4_catas_init(&priv->dev);
++	err = mlx4_crdump_init(&priv->dev);
+ 	if (err)
+ 		goto err_release_regions;
+ 
++	err = mlx4_catas_init(&priv->dev);
++	if (err)
++		goto err_crdump;
++
+ 	err = mlx4_load_one(pdev, pci_dev_data, total_vfs, nvfs, priv, 0);
+ 	if (err)
+ 		goto err_catas;
+@@ -3819,6 +3823,9 @@ static int __mlx4_init_one(struct pci_de
+ err_catas:
+ 	mlx4_catas_end(&priv->dev);
+ 
++err_crdump:
++	mlx4_crdump_end(&priv->dev);
++
+ err_release_regions:
+ 	pci_release_regions(pdev);
+ 
+@@ -4080,6 +4087,7 @@ static void mlx4_remove_one(struct pci_d
+ 	else
+ 		mlx4_info(dev, "%s: interface is down\n", __func__);
+ 	mlx4_catas_end(dev);
++	mlx4_crdump_end(dev);
+ 	if (dev->flags & MLX4_FLAG_SRIOV && !active_vfs) {
+ 		mlx4_warn(dev, "Disabling SR-IOV\n");
+ 		pci_disable_sriov(pdev);
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -1042,6 +1042,8 @@ void mlx4_start_catas_poll(struct mlx4_d
+ void mlx4_stop_catas_poll(struct mlx4_dev *dev);
+ int mlx4_catas_init(struct mlx4_dev *dev);
+ void mlx4_catas_end(struct mlx4_dev *dev);
++int mlx4_crdump_init(struct mlx4_dev *dev);
++void mlx4_crdump_end(struct mlx4_dev *dev);
+ int mlx4_restart_one(struct pci_dev *pdev, bool reload,
+ 		     struct devlink *devlink);
+ int mlx4_register_device(struct mlx4_dev *dev);
+@@ -1228,6 +1230,8 @@ void mlx4_srq_event(struct mlx4_dev *dev
+ void mlx4_enter_error_state(struct mlx4_dev_persistent *persist);
+ int mlx4_comm_internal_err(u32 slave_read);
+ 
++int mlx4_crdump_collect(struct mlx4_dev *dev);
++
+ int mlx4_SENSE_PORT(struct mlx4_dev *dev, int port,
+ 		    enum mlx4_port_type *type);
+ void mlx4_do_sense_ports(struct mlx4_dev *dev,
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -852,6 +852,11 @@ struct mlx4_vf_dev {
+ 	u8			n_ports;
+ };
+ 
++struct mlx4_fw_crdump {
++	struct devlink_region *region_crspace;
++	struct devlink_region *region_fw_health;
++};
++
+ enum mlx4_pci_status {
+ 	MLX4_PCI_STATUS_DISABLED,
+ 	MLX4_PCI_STATUS_ENABLED,
+@@ -872,6 +877,7 @@ struct mlx4_dev_persistent {
+ 	u8	interface_state;
+ 	struct mutex		pci_status_mutex; /* sync pci state */
+ 	enum mlx4_pci_status	pci_status;
++	struct mlx4_fw_crdump	crdump;
+ };
+ 
+ struct mlx4_dev {
