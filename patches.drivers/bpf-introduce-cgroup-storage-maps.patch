@@ -1,0 +1,585 @@
+From: Roman Gushchin <guro@fb.com>
+Date: Thu, 2 Aug 2018 14:27:18 -0700
+Subject: bpf: introduce cgroup storage maps
+Patch-mainline: v4.19-rc1
+Git-commit: de9cbbaadba5adf88a19e46df61f7054000838f6
+References: bsc#1109837
+
+This commit introduces BPF_MAP_TYPE_CGROUP_STORAGE maps:
+a special type of maps which are implementing the cgroup storage.
+
+>From the userspace point of view it's almost a generic
+hash map with the (cgroup inode id, attachment type) pair
+used as a key.
+
+The only difference is that some operations are restricted:
+  1) a user can't create new entries,
+  2) a user can't remove existing entries.
+
+The lookup from userspace is o(log(n)).
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf-cgroup.h |   38 ++++
+ include/linux/bpf.h        |    1 
+ include/linux/bpf_types.h  |    3 
+ include/uapi/linux/bpf.h   |    6 
+ kernel/bpf/Makefile        |    1 
+ kernel/bpf/local_storage.c |  376 +++++++++++++++++++++++++++++++++++++++++++++
+ kernel/bpf/syscall.c       |    3 
+ kernel/bpf/verifier.c      |   12 +
+ 8 files changed, 440 insertions(+)
+ create mode 100644 kernel/bpf/local_storage.c
+
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -2,19 +2,39 @@
+ #define _BPF_CGROUP_H
+ 
+ #include <linux/jump_label.h>
++#include <linux/rbtree.h>
+ #include <uapi/linux/bpf.h>
+ 
+ struct sock;
+ struct sockaddr;
+ struct cgroup;
+ struct sk_buff;
++struct bpf_map;
++struct bpf_prog;
+ struct bpf_sock_ops_kern;
++struct bpf_cgroup_storage;
+ 
+ #ifdef CONFIG_CGROUP_BPF
+ 
+ extern struct static_key_false cgroup_bpf_enabled_key;
+ #define cgroup_bpf_enabled static_branch_unlikely(&cgroup_bpf_enabled_key)
+ 
++struct bpf_cgroup_storage_map;
++
++struct bpf_storage_buffer {
++	struct rcu_head rcu;
++	char data[0];
++};
++
++struct bpf_cgroup_storage {
++	struct bpf_storage_buffer *buf;
++	struct bpf_cgroup_storage_map *map;
++	struct bpf_cgroup_storage_key key;
++	struct list_head list;
++	struct rb_node node;
++	struct rcu_head rcu;
++};
++
+ struct bpf_prog_list {
+ 	struct list_head node;
+ 	struct bpf_prog *prog;
+@@ -75,6 +95,15 @@ int __cgroup_bpf_run_filter_sock_ops(str
+ int __cgroup_bpf_check_dev_permission(short dev_type, u32 major, u32 minor,
+ 				      short access, enum bpf_attach_type type);
+ 
++struct bpf_cgroup_storage *bpf_cgroup_storage_alloc(struct bpf_prog *prog);
++void bpf_cgroup_storage_free(struct bpf_cgroup_storage *storage);
++void bpf_cgroup_storage_link(struct bpf_cgroup_storage *storage,
++			     struct cgroup *cgroup,
++			     enum bpf_attach_type type);
++void bpf_cgroup_storage_unlink(struct bpf_cgroup_storage *storage);
++int bpf_cgroup_storage_assign(struct bpf_prog *prog, struct bpf_map *map);
++void bpf_cgroup_storage_release(struct bpf_prog *prog, struct bpf_map *map);
++
+ /* Wrappers for __cgroup_bpf_run_filter_skb() guarded by cgroup_bpf_enabled. */
+ #define BPF_CGROUP_RUN_PROG_INET_INGRESS(sk, skb)			      \
+ ({									      \
+@@ -193,6 +222,15 @@ struct cgroup_bpf {};
+ static inline void cgroup_bpf_put(struct cgroup *cgrp) {}
+ static inline int cgroup_bpf_inherit(struct cgroup *cgrp) { return 0; }
+ 
++static inline int bpf_cgroup_storage_assign(struct bpf_prog *prog,
++					    struct bpf_map *map) { return 0; }
++static inline void bpf_cgroup_storage_release(struct bpf_prog *prog,
++					      struct bpf_map *map) {}
++static inline struct bpf_cgroup_storage *bpf_cgroup_storage_alloc(
++	struct bpf_prog *prog) { return 0; }
++static inline void bpf_cgroup_storage_free(
++	struct bpf_cgroup_storage *storage) {}
++
+ #define cgroup_bpf_enabled (0)
+ #define BPF_CGROUP_PRE_CONNECT_ENABLED(sk) (0)
+ #define BPF_CGROUP_RUN_PROG_INET_INGRESS(sk,skb) ({ 0; })
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -282,6 +282,7 @@ struct bpf_prog_aux {
+ 	struct bpf_prog *prog;
+ 	struct user_struct *user;
+ 	u64 load_time; /* ns since boottime */
++	struct bpf_map *cgroup_storage;
+ 	char name[BPF_OBJ_NAME_LEN];
+ 	struct bpf_prog_offload *offload;
+ 	union {
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -32,6 +32,9 @@ BPF_MAP_TYPE(BPF_MAP_TYPE_PERF_EVENT_ARR
+ #ifdef CONFIG_CGROUPS
+ BPF_MAP_TYPE(BPF_MAP_TYPE_CGROUP_ARRAY, cgroup_array_map_ops)
+ #endif
++#ifdef CONFIG_CGROUP_BPF
++BPF_MAP_TYPE(BPF_MAP_TYPE_CGROUP_STORAGE, cgroup_storage_map_ops)
++#endif
+ BPF_MAP_TYPE(BPF_MAP_TYPE_HASH, htab_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_HASH, htab_percpu_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_LRU_HASH, htab_lru_map_ops)
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -74,6 +74,11 @@ struct bpf_lpm_trie_key {
+ 	__u8	data[0];	/* Arbitrary size */
+ };
+ 
++struct bpf_cgroup_storage_key {
++	__u64	cgroup_inode_id;	/* cgroup inode id */
++	__u32	attach_type;		/* program attach type */
++};
++
+ /* BPF syscall commands, see bpf(2) man-page for details. */
+ enum bpf_cmd {
+ 	BPF_MAP_CREATE,
+@@ -118,6 +123,7 @@ enum bpf_map_type {
+ 	BPF_MAP_TYPE_CPUMAP,
+ 	BPF_MAP_TYPE_XSKMAP,
+ 	BPF_MAP_TYPE_SOCKHASH,
++	BPF_MAP_TYPE_CGROUP_STORAGE,
+ };
+ 
+ enum bpf_prog_type {
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -2,6 +2,7 @@ obj-y := core.o
+ 
+ obj-$(CONFIG_BPF_SYSCALL) += syscall.o verifier.o inode.o helpers.o tnum.o
+ obj-$(CONFIG_BPF_SYSCALL) += hashtab.o arraymap.o percpu_freelist.o bpf_lru_list.o lpm_trie.o map_in_map.o
++obj-$(CONFIG_BPF_SYSCALL) += local_storage.o
+ obj-$(CONFIG_BPF_SYSCALL) += disasm.o
+ obj-$(CONFIG_BPF_SYSCALL) += btf.o
+ ifeq ($(CONFIG_NET),y)
+--- /dev/null
++++ b/kernel/bpf/local_storage.c
+@@ -0,0 +1,376 @@
++//SPDX-License-Identifier: GPL-2.0
++#include <linux/bpf-cgroup.h>
++#include <linux/bpf.h>
++#include <linux/bug.h>
++#include <linux/filter.h>
++#include <linux/mm.h>
++#include <linux/rbtree.h>
++#include <linux/slab.h>
++
++#ifdef CONFIG_CGROUP_BPF
++
++#define LOCAL_STORAGE_CREATE_FLAG_MASK					\
++	(BPF_F_NUMA_NODE | BPF_F_RDONLY | BPF_F_WRONLY)
++
++struct bpf_cgroup_storage_map {
++	struct bpf_map map;
++
++	spinlock_t lock;
++	struct bpf_prog *prog;
++	struct rb_root root;
++	struct list_head list;
++};
++
++static struct bpf_cgroup_storage_map *map_to_storage(struct bpf_map *map)
++{
++	return container_of(map, struct bpf_cgroup_storage_map, map);
++}
++
++static int bpf_cgroup_storage_key_cmp(
++	const struct bpf_cgroup_storage_key *key1,
++	const struct bpf_cgroup_storage_key *key2)
++{
++	if (key1->cgroup_inode_id < key2->cgroup_inode_id)
++		return -1;
++	else if (key1->cgroup_inode_id > key2->cgroup_inode_id)
++		return 1;
++	else if (key1->attach_type < key2->attach_type)
++		return -1;
++	else if (key1->attach_type > key2->attach_type)
++		return 1;
++	return 0;
++}
++
++static struct bpf_cgroup_storage *cgroup_storage_lookup(
++	struct bpf_cgroup_storage_map *map, struct bpf_cgroup_storage_key *key,
++	bool locked)
++{
++	struct rb_root *root = &map->root;
++	struct rb_node *node;
++
++	if (!locked)
++		spin_lock_bh(&map->lock);
++
++	node = root->rb_node;
++	while (node) {
++		struct bpf_cgroup_storage *storage;
++
++		storage = container_of(node, struct bpf_cgroup_storage, node);
++
++		switch (bpf_cgroup_storage_key_cmp(key, &storage->key)) {
++		case -1:
++			node = node->rb_left;
++			break;
++		case 1:
++			node = node->rb_right;
++			break;
++		default:
++			if (!locked)
++				spin_unlock_bh(&map->lock);
++			return storage;
++		}
++	}
++
++	if (!locked)
++		spin_unlock_bh(&map->lock);
++
++	return NULL;
++}
++
++static int cgroup_storage_insert(struct bpf_cgroup_storage_map *map,
++				 struct bpf_cgroup_storage *storage)
++{
++	struct rb_root *root = &map->root;
++	struct rb_node **new = &(root->rb_node), *parent = NULL;
++
++	while (*new) {
++		struct bpf_cgroup_storage *this;
++
++		this = container_of(*new, struct bpf_cgroup_storage, node);
++
++		parent = *new;
++		switch (bpf_cgroup_storage_key_cmp(&storage->key, &this->key)) {
++		case -1:
++			new = &((*new)->rb_left);
++			break;
++		case 1:
++			new = &((*new)->rb_right);
++			break;
++		default:
++			return -EEXIST;
++		}
++	}
++
++	rb_link_node(&storage->node, parent, new);
++	rb_insert_color(&storage->node, root);
++
++	return 0;
++}
++
++static void *cgroup_storage_lookup_elem(struct bpf_map *_map, void *_key)
++{
++	struct bpf_cgroup_storage_map *map = map_to_storage(_map);
++	struct bpf_cgroup_storage_key *key = _key;
++	struct bpf_cgroup_storage *storage;
++
++	storage = cgroup_storage_lookup(map, key, false);
++	if (!storage)
++		return NULL;
++
++	return &READ_ONCE(storage->buf)->data[0];
++}
++
++static int cgroup_storage_update_elem(struct bpf_map *map, void *_key,
++				      void *value, u64 flags)
++{
++	struct bpf_cgroup_storage_key *key = _key;
++	struct bpf_cgroup_storage *storage;
++	struct bpf_storage_buffer *new;
++
++	if (flags & BPF_NOEXIST)
++		return -EINVAL;
++
++	storage = cgroup_storage_lookup((struct bpf_cgroup_storage_map *)map,
++					key, false);
++	if (!storage)
++		return -ENOENT;
++
++	new = kmalloc_node(sizeof(struct bpf_storage_buffer) +
++			   map->value_size, __GFP_ZERO | GFP_USER,
++			   map->numa_node);
++	if (!new)
++		return -ENOMEM;
++
++	memcpy(&new->data[0], value, map->value_size);
++
++	new = xchg(&storage->buf, new);
++	kfree_rcu(new, rcu);
++
++	return 0;
++}
++
++static int cgroup_storage_get_next_key(struct bpf_map *_map, void *_key,
++				       void *_next_key)
++{
++	struct bpf_cgroup_storage_map *map = map_to_storage(_map);
++	struct bpf_cgroup_storage_key *key = _key;
++	struct bpf_cgroup_storage_key *next = _next_key;
++	struct bpf_cgroup_storage *storage;
++
++	spin_lock_bh(&map->lock);
++
++	if (list_empty(&map->list))
++		goto enoent;
++
++	if (key) {
++		storage = cgroup_storage_lookup(map, key, true);
++		if (!storage)
++			goto enoent;
++
++		storage = list_next_entry(storage, list);
++		if (!storage)
++			goto enoent;
++	} else {
++		storage = list_first_entry(&map->list,
++					 struct bpf_cgroup_storage, list);
++	}
++
++	spin_unlock_bh(&map->lock);
++	next->attach_type = storage->key.attach_type;
++	next->cgroup_inode_id = storage->key.cgroup_inode_id;
++	return 0;
++
++enoent:
++	spin_unlock_bh(&map->lock);
++	return -ENOENT;
++}
++
++static struct bpf_map *cgroup_storage_map_alloc(union bpf_attr *attr)
++{
++	int numa_node = bpf_map_attr_numa_node(attr);
++	struct bpf_cgroup_storage_map *map;
++
++	if (attr->key_size != sizeof(struct bpf_cgroup_storage_key))
++		return ERR_PTR(-EINVAL);
++
++	if (attr->value_size > PAGE_SIZE)
++		return ERR_PTR(-E2BIG);
++
++	if (attr->map_flags & ~LOCAL_STORAGE_CREATE_FLAG_MASK)
++		/* reserved bits should not be used */
++		return ERR_PTR(-EINVAL);
++
++	if (attr->max_entries)
++		/* max_entries is not used and enforced to be 0 */
++		return ERR_PTR(-EINVAL);
++
++	map = kmalloc_node(sizeof(struct bpf_cgroup_storage_map),
++			   __GFP_ZERO | GFP_USER, numa_node);
++	if (!map)
++		return ERR_PTR(-ENOMEM);
++
++	map->map.pages = round_up(sizeof(struct bpf_cgroup_storage_map),
++				  PAGE_SIZE) >> PAGE_SHIFT;
++
++	/* copy mandatory map attributes */
++	bpf_map_init_from_attr(&map->map, attr);
++
++	spin_lock_init(&map->lock);
++	map->root = RB_ROOT;
++	INIT_LIST_HEAD(&map->list);
++
++	return &map->map;
++}
++
++static void cgroup_storage_map_free(struct bpf_map *_map)
++{
++	struct bpf_cgroup_storage_map *map = map_to_storage(_map);
++
++	WARN_ON(!RB_EMPTY_ROOT(&map->root));
++	WARN_ON(!list_empty(&map->list));
++
++	kfree(map);
++}
++
++static int cgroup_storage_delete_elem(struct bpf_map *map, void *key)
++{
++	return -EINVAL;
++}
++
++const struct bpf_map_ops cgroup_storage_map_ops = {
++	.map_alloc = cgroup_storage_map_alloc,
++	.map_free = cgroup_storage_map_free,
++	.map_get_next_key = cgroup_storage_get_next_key,
++	.map_lookup_elem = cgroup_storage_lookup_elem,
++	.map_update_elem = cgroup_storage_update_elem,
++	.map_delete_elem = cgroup_storage_delete_elem,
++};
++
++int bpf_cgroup_storage_assign(struct bpf_prog *prog, struct bpf_map *_map)
++{
++	struct bpf_cgroup_storage_map *map = map_to_storage(_map);
++	int ret = -EBUSY;
++
++	spin_lock_bh(&map->lock);
++
++	if (map->prog && map->prog != prog)
++		goto unlock;
++	if (prog->aux->cgroup_storage && prog->aux->cgroup_storage != _map)
++		goto unlock;
++
++	map->prog = prog;
++	prog->aux->cgroup_storage = _map;
++	ret = 0;
++unlock:
++	spin_unlock_bh(&map->lock);
++
++	return ret;
++}
++
++void bpf_cgroup_storage_release(struct bpf_prog *prog, struct bpf_map *_map)
++{
++	struct bpf_cgroup_storage_map *map = map_to_storage(_map);
++
++	spin_lock_bh(&map->lock);
++	if (map->prog == prog) {
++		WARN_ON(prog->aux->cgroup_storage != _map);
++		map->prog = NULL;
++		prog->aux->cgroup_storage = NULL;
++	}
++	spin_unlock_bh(&map->lock);
++}
++
++struct bpf_cgroup_storage *bpf_cgroup_storage_alloc(struct bpf_prog *prog)
++{
++	struct bpf_cgroup_storage *storage;
++	struct bpf_map *map;
++	u32 pages;
++
++	map = prog->aux->cgroup_storage;
++	if (!map)
++		return NULL;
++
++	pages = round_up(sizeof(struct bpf_cgroup_storage) +
++			 sizeof(struct bpf_storage_buffer) +
++			 map->value_size, PAGE_SIZE) >> PAGE_SHIFT;
++	if (bpf_map_charge_memlock(map, pages))
++		return ERR_PTR(-EPERM);
++
++	storage = kmalloc_node(sizeof(struct bpf_cgroup_storage),
++			       __GFP_ZERO | GFP_USER, map->numa_node);
++	if (!storage) {
++		bpf_map_uncharge_memlock(map, pages);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	storage->buf = kmalloc_node(sizeof(struct bpf_storage_buffer) +
++				    map->value_size, __GFP_ZERO | GFP_USER,
++				    map->numa_node);
++	if (!storage->buf) {
++		bpf_map_uncharge_memlock(map, pages);
++		kfree(storage);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	storage->map = (struct bpf_cgroup_storage_map *)map;
++
++	return storage;
++}
++
++void bpf_cgroup_storage_free(struct bpf_cgroup_storage *storage)
++{
++	u32 pages;
++	struct bpf_map *map;
++
++	if (!storage)
++		return;
++
++	map = &storage->map->map;
++	pages = round_up(sizeof(struct bpf_cgroup_storage) +
++			 sizeof(struct bpf_storage_buffer) +
++			 map->value_size, PAGE_SIZE) >> PAGE_SHIFT;
++	bpf_map_uncharge_memlock(map, pages);
++
++	kfree_rcu(storage->buf, rcu);
++	kfree_rcu(storage, rcu);
++}
++
++void bpf_cgroup_storage_link(struct bpf_cgroup_storage *storage,
++			     struct cgroup *cgroup,
++			     enum bpf_attach_type type)
++{
++	struct bpf_cgroup_storage_map *map;
++
++	if (!storage)
++		return;
++
++	storage->key.attach_type = type;
++	storage->key.cgroup_inode_id = cgroup->kn->id.id;
++
++	map = storage->map;
++
++	spin_lock_bh(&map->lock);
++	WARN_ON(cgroup_storage_insert(map, storage));
++	list_add(&storage->list, &map->list);
++	spin_unlock_bh(&map->lock);
++}
++
++void bpf_cgroup_storage_unlink(struct bpf_cgroup_storage *storage)
++{
++	struct bpf_cgroup_storage_map *map;
++	struct rb_root *root;
++
++	if (!storage)
++		return;
++
++	map = storage->map;
++
++	spin_lock_bh(&map->lock);
++	root = &map->root;
++	rb_erase(&storage->node, root);
++
++	list_del(&storage->list);
++	spin_unlock_bh(&map->lock);
++}
++
++#endif
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -941,6 +941,9 @@ static void free_used_maps(struct bpf_pr
+ {
+ 	int i;
+ 
++	if (aux->cgroup_storage)
++		bpf_cgroup_storage_release(aux->prog, aux->cgroup_storage);
++
+ 	for (i = 0; i < aux->used_map_cnt; i++)
+ 		bpf_map_put(aux->used_maps[i]);
+ 
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5153,6 +5153,14 @@ static int replace_map_fd_with_map_ptr(s
+ 			}
+ 			env->used_maps[env->used_map_cnt++] = map;
+ 
++			if (map->map_type == BPF_MAP_TYPE_CGROUP_STORAGE &&
++			    bpf_cgroup_storage_assign(env->prog, map)) {
++				verbose(env,
++					"only one cgroup storage is allowed\n");
++				fdput(f);
++				return -EBUSY;
++			}
++
+ 			fdput(f);
+ next_insn:
+ 			insn++;
+@@ -5179,6 +5187,10 @@ static void release_maps(struct bpf_veri
+ {
+ 	int i;
+ 
++	if (env->prog->aux->cgroup_storage)
++		bpf_cgroup_storage_release(env->prog,
++					   env->prog->aux->cgroup_storage);
++
+ 	for (i = 0; i < env->used_map_cnt; i++)
+ 		bpf_map_put(env->used_maps[i]);
+ }
