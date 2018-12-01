@@ -1,0 +1,192 @@
+From: Jiong Wang <jiong.wang@netronome.com>
+Date: Fri, 6 Jul 2018 15:13:22 -0700
+Subject: nfp: bpf: support u32 divide using reciprocal_div.h
+Patch-mainline: v4.19-rc1
+Git-commit: 2a952b03d1a011e2e7ddc9ca59cbb21df7dc3525
+References: bsc#1109837
+
+NFP doesn't have integer divide instruction, this patch use reciprocal
+algorithm (the basic one, reciprocal_div) to emulate it.
+
+For each u32 divide, we would need 11 instructions to finish the operation.
+
+  7 (for multiplication) + 4 (various ALUs) = 11
+
+Given NFP only supports multiplication no bigger than u32, we'd require
+divisor and dividend no bigger than that as well.
+
+Also eBPF doesn't support signed divide and has enforced this on C language
+level by failing compilation. However LLVM assembler hasn't enforced this,
+so it is possible for negative constant to leak in as a BPF_K operand
+through assembly code, we reject such cases as well.
+
+Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Acked-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/jit.c      |   58 +++++++++++++++++++++-
+ drivers/net/ethernet/netronome/nfp/bpf/main.h     |    5 +
+ drivers/net/ethernet/netronome/nfp/bpf/verifier.c |   31 +++++++++++
+ 3 files changed, 93 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -34,10 +34,11 @@
+ #define pr_fmt(fmt)	"NFP net bpf: " fmt
+ 
+ #include <linux/bug.h>
+-#include <linux/kernel.h>
+ #include <linux/bpf.h>
+ #include <linux/filter.h>
++#include <linux/kernel.h>
+ #include <linux/pkt_cls.h>
++#include <linux/reciprocal_div.h>
+ #include <linux/unistd.h>
+ 
+ #include "main.h"
+@@ -1493,6 +1494,32 @@ wrp_mul(struct nfp_prog *nfp_prog, struc
+ 	return 0;
+ }
+ 
++static int wrp_div_imm(struct nfp_prog *nfp_prog, u8 dst, u64 imm)
++{
++	swreg dst_both = reg_both(dst), dst_a = reg_a(dst), dst_b = reg_a(dst);
++	struct reciprocal_value rvalue;
++	swreg tmp_b = imm_b(nfp_prog);
++	swreg magic;
++
++	if (imm > U32_MAX) {
++		wrp_immed(nfp_prog, dst_both, 0);
++		return 0;
++	}
++
++	rvalue = reciprocal_value(imm);
++	magic = ur_load_imm_any(nfp_prog, rvalue.m, imm_b(nfp_prog));
++	wrp_mul_u32(nfp_prog, imm_both(nfp_prog), reg_none(), dst_a, magic,
++		    true);
++	emit_alu(nfp_prog, dst_both, dst_a, ALU_OP_SUB, tmp_b);
++	emit_shf(nfp_prog, dst_both, reg_none(), SHF_OP_NONE, dst_b,
++		 SHF_SC_R_SHF, rvalue.sh1);
++	emit_alu(nfp_prog, dst_both, dst_a, ALU_OP_ADD, tmp_b);
++	emit_shf(nfp_prog, dst_both, reg_none(), SHF_OP_NONE, dst_b,
++		 SHF_SC_R_SHF, rvalue.sh2);
++
++	return 0;
++}
++
+ static int adjust_head(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+ 	swreg tmp = imm_a(nfp_prog), tmp_len = imm_b(nfp_prog);
+@@ -1807,6 +1834,21 @@ static int mul_imm64(struct nfp_prog *nf
+ 	return wrp_mul(nfp_prog, meta, true, false);
+ }
+ 
++static int div_imm64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	const struct bpf_insn *insn = &meta->insn;
++
++	return wrp_div_imm(nfp_prog, insn->dst_reg * 2, insn->imm);
++}
++
++static int div_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	/* NOTE: verifier hook has rejected cases for which verifier doesn't
++	 * know whether the source operand is constant or not.
++	 */
++	return wrp_div_imm(nfp_prog, meta->insn.dst_reg * 2, meta->umin_src);
++}
++
+ static int neg_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+ 	const struct bpf_insn *insn = &meta->insn;
+@@ -2230,6 +2272,16 @@ static int mul_imm(struct nfp_prog *nfp_
+ 	return wrp_mul(nfp_prog, meta, false, false);
+ }
+ 
++static int div_reg(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	return div_reg64(nfp_prog, meta);
++}
++
++static int div_imm(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	return div_imm64(nfp_prog, meta);
++}
++
+ static int neg_reg(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+ 	u8 dst = meta->insn.dst_reg * 2;
+@@ -2983,6 +3035,8 @@ static const instr_cb_t instr_cb[256] =
+ 	[BPF_ALU64 | BPF_SUB | BPF_K] =	sub_imm64,
+ 	[BPF_ALU64 | BPF_MUL | BPF_X] =	mul_reg64,
+ 	[BPF_ALU64 | BPF_MUL | BPF_K] =	mul_imm64,
++	[BPF_ALU64 | BPF_DIV | BPF_X] =	div_reg64,
++	[BPF_ALU64 | BPF_DIV | BPF_K] =	div_imm64,
+ 	[BPF_ALU64 | BPF_NEG] =		neg_reg64,
+ 	[BPF_ALU64 | BPF_LSH | BPF_X] =	shl_reg64,
+ 	[BPF_ALU64 | BPF_LSH | BPF_K] =	shl_imm64,
+@@ -3004,6 +3058,8 @@ static const instr_cb_t instr_cb[256] =
+ 	[BPF_ALU | BPF_SUB | BPF_K] =	sub_imm,
+ 	[BPF_ALU | BPF_MUL | BPF_X] =	mul_reg,
+ 	[BPF_ALU | BPF_MUL | BPF_K] =	mul_imm,
++	[BPF_ALU | BPF_DIV | BPF_X] =	div_reg,
++	[BPF_ALU | BPF_DIV | BPF_K] =	div_imm,
+ 	[BPF_ALU | BPF_NEG] =		neg_reg,
+ 	[BPF_ALU | BPF_LSH | BPF_K] =	shl_imm,
+ 	[BPF_ALU | BPF_END | BPF_X] =	end_reg32,
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -399,6 +399,11 @@ static inline bool is_mbpf_mul(const str
+ 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MUL;
+ }
+ 
++static inline bool is_mbpf_div(const struct nfp_insn_meta *meta)
++{
++	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_DIV;
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -558,6 +558,37 @@ nfp_bpf_check_alu(struct nfp_prog *nfp_p
+ 		}
+ 	}
+ 
++	/* NFP doesn't have divide instructions, we support divide by constant
++	 * through reciprocal multiplication. Given NFP support multiplication
++	 * no bigger than u32, we'd require divisor and dividend no bigger than
++	 * that as well.
++	 *
++	 * Also eBPF doesn't support signed divide and has enforced this on C
++	 * language level by failing compilation. However LLVM assembler hasn't
++	 * enforced this, so it is possible for negative constant to leak in as
++	 * a BPF_K operand through assembly code, we reject such cases as well.
++	 */
++	if (is_mbpf_div(meta)) {
++		if (meta->umax_dst > U32_MAX) {
++			pr_vlog(env, "dividend is not within u32 value range\n");
++			return -EINVAL;
++		}
++		if (mbpf_src(meta) == BPF_X) {
++			if (meta->umin_src != meta->umax_src) {
++				pr_vlog(env, "divisor is not constant\n");
++				return -EINVAL;
++			}
++			if (meta->umax_src > U32_MAX) {
++				pr_vlog(env, "divisor is not within u32 value range\n");
++				return -EINVAL;
++			}
++		}
++		if (mbpf_src(meta) == BPF_K && meta->insn.imm < 0) {
++			pr_vlog(env, "divide by negative constant is not supported\n");
++			return -EINVAL;
++		}
++	}
++
+ 	return 0;
+ }
+ 
