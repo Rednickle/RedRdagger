@@ -1,0 +1,234 @@
+From: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+Date: Tue, 7 Aug 2018 17:36:02 +0200
+Subject: nfp: flower: add geneve option push action offload
+Patch-mainline: v4.19-rc1
+Git-commit: 9e7c32fe44248b5101173b1184707bc5506e00f3
+References: bsc#1109837
+
+Introduce new push geneve option action. This allows offloading
+filters configured to entunnel geneve with options.
+
+Signed-off-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Simon Horman <simon.horman@netronome.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/flower/action.c |  100 +++++++++++++++++++--
+ drivers/net/ethernet/netronome/nfp/flower/cmsg.h   |   20 +++-
+ drivers/net/ethernet/netronome/nfp/flower/main.h   |    1 
+ 3 files changed, 114 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/flower/action.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/action.c
+@@ -32,6 +32,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <net/geneve.h>
+ #include <net/pkt_cls.h>
+ #include <net/switchdev.h>
+ #include <net/tc_act/tc_csum.h>
+@@ -45,7 +46,15 @@
+ #include "main.h"
+ #include "../nfp_net_repr.h"
+ 
+-#define NFP_FL_SUPPORTED_IPV4_UDP_TUN_FLAGS	(TUNNEL_CSUM | TUNNEL_KEY)
++/* The kernel versions of TUNNEL_* are not ABI and therefore vulnerable
++ * to change. Such changes will break our FW ABI.
++ */
++#define NFP_FL_TUNNEL_CSUM			cpu_to_be16(0x01)
++#define NFP_FL_TUNNEL_KEY			cpu_to_be16(0x04)
++#define NFP_FL_TUNNEL_GENEVE_OPT		cpu_to_be16(0x0800)
++#define NFP_FL_SUPPORTED_IPV4_UDP_TUN_FLAGS	(NFP_FL_TUNNEL_CSUM | \
++						 NFP_FL_TUNNEL_KEY | \
++						 NFP_FL_TUNNEL_GENEVE_OPT)
+ 
+ static void nfp_fl_pop_vlan(struct nfp_fl_pop_vlan *pop_vlan)
+ {
+@@ -227,7 +236,71 @@ static struct nfp_fl_pre_tunnel *nfp_fl_
+ }
+ 
+ static int
+-nfp_fl_set_ipv4_udp_tun(struct nfp_fl_set_ipv4_udp_tun *set_tun,
++nfp_fl_push_geneve_options(struct nfp_fl_payload *nfp_fl, int *list_len,
++			   const struct tc_action *action)
++{
++	struct ip_tunnel_info *ip_tun = tcf_tunnel_info(action);
++	int opt_len, opt_cnt, act_start, tot_push_len;
++	u8 *src = ip_tunnel_info_opts(ip_tun);
++
++	/* We need to populate the options in reverse order for HW.
++	 * Therefore we go through the options, calculating the
++	 * number of options and the total size, then we populate
++	 * them in reverse order in the action list.
++	 */
++	opt_cnt = 0;
++	tot_push_len = 0;
++	opt_len = ip_tun->options_len;
++	while (opt_len > 0) {
++		struct geneve_opt *opt = (struct geneve_opt *)src;
++
++		opt_cnt++;
++		if (opt_cnt > NFP_FL_MAX_GENEVE_OPT_CNT)
++			return -EOPNOTSUPP;
++
++		tot_push_len += sizeof(struct nfp_fl_push_geneve) +
++			       opt->length * 4;
++		if (tot_push_len > NFP_FL_MAX_GENEVE_OPT_ACT)
++			return -EOPNOTSUPP;
++
++		opt_len -= sizeof(struct geneve_opt) + opt->length * 4;
++		src += sizeof(struct geneve_opt) + opt->length * 4;
++	}
++
++	if (*list_len + tot_push_len > NFP_FL_MAX_A_SIZ)
++		return -EOPNOTSUPP;
++
++	act_start = *list_len;
++	*list_len += tot_push_len;
++	src = ip_tunnel_info_opts(ip_tun);
++	while (opt_cnt) {
++		struct geneve_opt *opt = (struct geneve_opt *)src;
++		struct nfp_fl_push_geneve *push;
++		size_t act_size, len;
++
++		opt_cnt--;
++		act_size = sizeof(struct nfp_fl_push_geneve) + opt->length * 4;
++		tot_push_len -= act_size;
++		len = act_start + tot_push_len;
++
++		push = (struct nfp_fl_push_geneve *)&nfp_fl->action_data[len];
++		push->head.jump_id = NFP_FL_ACTION_OPCODE_PUSH_GENEVE;
++		push->head.len_lw = act_size >> NFP_FL_LW_SIZ;
++		push->reserved = 0;
++		push->class = opt->opt_class;
++		push->type = opt->type;
++		push->length = opt->length;
++		memcpy(&push->opt_data, opt->opt_data, opt->length * 4);
++
++		src += sizeof(struct geneve_opt) + opt->length * 4;
++	}
++
++	return 0;
++}
++
++static int
++nfp_fl_set_ipv4_udp_tun(struct nfp_app *app,
++			struct nfp_fl_set_ipv4_udp_tun *set_tun,
+ 			const struct tc_action *action,
+ 			struct nfp_fl_pre_tunnel *pre_tun,
+ 			enum nfp_flower_tun_type tun_type,
+@@ -235,11 +308,17 @@ nfp_fl_set_ipv4_udp_tun(struct nfp_fl_se
+ {
+ 	size_t act_size = sizeof(struct nfp_fl_set_ipv4_udp_tun);
+ 	struct ip_tunnel_info *ip_tun = tcf_tunnel_info(action);
++	struct nfp_flower_priv *priv = app->priv;
+ 	u32 tmp_set_ip_tun_type_index = 0;
+ 	/* Currently support one pre-tunnel so index is always 0. */
+ 	int pretun_idx = 0;
+ 
+-	if (ip_tun->options_len)
++	BUILD_BUG_ON(NFP_FL_TUNNEL_CSUM != TUNNEL_CSUM ||
++		     NFP_FL_TUNNEL_KEY	!= TUNNEL_KEY ||
++		     NFP_FL_TUNNEL_GENEVE_OPT != TUNNEL_GENEVE_OPT);
++	if (ip_tun->options_len &&
++	    (tun_type != NFP_FL_TUNNEL_GENEVE ||
++	    !(priv->flower_ext_feats & NFP_FL_FEATS_GENEVE_OPT)))
+ 		return -EOPNOTSUPP;
+ 
+ 	set_tun->head.jump_id = NFP_FL_ACTION_OPCODE_SET_IPV4_TUNNEL;
+@@ -279,11 +358,16 @@ nfp_fl_set_ipv4_udp_tun(struct nfp_fl_se
+ 
+ 	set_tun->tos = ip_tun->key.tos;
+ 
+-	if (!(ip_tun->key.tun_flags & TUNNEL_KEY) ||
++	if (!(ip_tun->key.tun_flags & NFP_FL_TUNNEL_KEY) ||
+ 	    ip_tun->key.tun_flags & ~NFP_FL_SUPPORTED_IPV4_UDP_TUN_FLAGS)
+ 		return -EOPNOTSUPP;
+ 	set_tun->tun_flags = ip_tun->key.tun_flags;
+ 
++	if (tun_type == NFP_FL_TUNNEL_GENEVE) {
++		set_tun->tun_proto = htons(ETH_P_TEB);
++		set_tun->tun_len = ip_tun->options_len / 4;
++	}
++
+ 	/* Complete pre_tunnel action. */
+ 	pre_tun->ipv4_dst = ip_tun->key.u.ipv4.dst;
+ 
+@@ -672,9 +756,13 @@ nfp_flower_loop_action(struct nfp_app *a
+ 		nfp_fl->meta.shortcut = cpu_to_be32(NFP_FL_SC_ACT_NULL);
+ 		*a_len += sizeof(struct nfp_fl_pre_tunnel);
+ 
++		err = nfp_fl_push_geneve_options(nfp_fl, a_len, a);
++		if (err)
++			return err;
++
+ 		set_tun = (void *)&nfp_fl->action_data[*a_len];
+-		err = nfp_fl_set_ipv4_udp_tun(set_tun, a, pre_tun, *tun_type,
+-					      netdev);
++		err = nfp_fl_set_ipv4_udp_tun(app, set_tun, a, pre_tun,
++					      *tun_type, netdev);
+ 		if (err)
+ 			return err;
+ 		*a_len += sizeof(struct nfp_fl_set_ipv4_udp_tun);
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -37,6 +37,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/skbuff.h>
+ #include <linux/types.h>
++#include <net/geneve.h>
+ 
+ #include "../nfp_app.h"
+ #include "../nfpcore/nfp_cpp.h"
+@@ -81,6 +82,10 @@
+ #define NFP_FL_MAX_A_SIZ		1216
+ #define NFP_FL_LW_SIZ			2
+ 
++/* Maximum allowed geneve options */
++#define NFP_FL_MAX_GENEVE_OPT_ACT	32
++#define NFP_FL_MAX_GENEVE_OPT_CNT	64
++
+ /* Action opcodes */
+ #define NFP_FL_ACTION_OPCODE_OUTPUT		0
+ #define NFP_FL_ACTION_OPCODE_PUSH_VLAN		1
+@@ -94,6 +99,7 @@
+ #define NFP_FL_ACTION_OPCODE_SET_TCP		15
+ #define NFP_FL_ACTION_OPCODE_PRE_LAG		16
+ #define NFP_FL_ACTION_OPCODE_PRE_TUNNEL		17
++#define NFP_FL_ACTION_OPCODE_PUSH_GENEVE	26
+ #define NFP_FL_ACTION_OPCODE_NUM		32
+ 
+ #define NFP_FL_OUT_FLAGS_LAST		BIT(15)
+@@ -206,7 +212,19 @@ struct nfp_fl_set_ipv4_udp_tun {
+ 	__be16 tun_flags;
+ 	u8 ttl;
+ 	u8 tos;
+-	__be32 extra[2];
++	__be32 extra;
++	u8 tun_len;
++	u8 res2;
++	__be16 tun_proto;
++};
++
++struct nfp_fl_push_geneve {
++	struct nfp_fl_act_head head;
++	__be16 reserved;
++	__be16 class;
++	u8 type;
++	u8 length;
++	u8 opt_data[];
+ };
+ 
+ /* Metadata with L2 (1W/4B)
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -69,6 +69,7 @@ struct nfp_app;
+ /* Extra features bitmap. */
+ #define NFP_FL_FEATS_GENEVE		BIT(0)
+ #define NFP_FL_NBI_MTU_SETTING		BIT(1)
++#define NFP_FL_FEATS_GENEVE_OPT		BIT(2)
+ #define NFP_FL_FEATS_LAG		BIT(31)
+ 
+ struct nfp_fl_mask_id {
