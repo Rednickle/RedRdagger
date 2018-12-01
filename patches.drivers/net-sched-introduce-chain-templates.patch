@@ -1,0 +1,174 @@
+From: Jiri Pirko <jiri@mellanox.com>
+Date: Mon, 23 Jul 2018 09:23:07 +0200
+Subject: net: sched: introduce chain templates
+Patch-mainline: v4.19-rc1
+Git-commit: 9f407f1768d3e1a5ddd7bd49fa4d1f5a26e10ed2
+References: bsc#1109837
+
+Allow user to set a template for newly created chains. Template lock
+down the chain for particular classifier type/options combinations.
+The classifier needs to support templates, otherwise kernel would
+reply with error.
+
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/sch_generic.h |   12 ++++++++
+ net/sched/cls_api.c       |   65 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+)
+
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -237,6 +237,8 @@ struct tcf_result {
+ 	};
+ };
+ 
++struct tcf_chain;
++
+ struct tcf_proto_ops {
+ 	struct list_head	head;
+ 	char			kind[IFNAMSIZ];
+@@ -262,10 +264,18 @@ struct tcf_proto_ops {
+ 					     tc_setup_cb_t *cb, void *cb_priv,
+ 					     struct netlink_ext_ack *extack);
+ 	void			(*bind_class)(void *, u32, unsigned long);
++	void *			(*tmplt_create)(struct net *net,
++						struct tcf_chain *chain,
++						struct nlattr **tca,
++						struct netlink_ext_ack *extack);
++	void			(*tmplt_destroy)(void *tmplt_priv);
+ 
+ 	/* rtnetlink specific */
+ 	int			(*dump)(struct net*, struct tcf_proto*, void *,
+ 					struct sk_buff *skb, struct tcmsg*);
++	int			(*tmplt_dump)(struct sk_buff *skb,
++					      struct net *net,
++					      void *tmplt_priv);
+ 
+ 	struct module		*owner;
+ };
+@@ -304,6 +314,8 @@ struct tcf_chain {
+ 	u32 index; /* chain index */
+ 	unsigned int refcnt;
+ 	bool explicitly_created;
++	const struct tcf_proto_ops *tmplt_ops;
++	void *tmplt_priv;
+ };
+ 
+ struct tcf_block {
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -299,10 +299,13 @@ struct tcf_chain *tcf_chain_get(struct t
+ }
+ EXPORT_SYMBOL(tcf_chain_get);
+ 
++static void tc_chain_tmplt_del(struct tcf_chain *chain);
++
+ void tcf_chain_put(struct tcf_chain *chain)
+ {
+ 	if (--chain->refcnt == 0) {
+ 		tc_chain_notify(chain, NULL, 0, 0, RTM_DELCHAIN, false);
++		tc_chain_tmplt_del(chain);
+ 		tcf_chain_destroy(chain);
+ 	}
+ }
+@@ -1258,6 +1261,12 @@ replay:
+ 		goto errout;
+ 	}
+ 
++	if (chain->tmplt_ops && chain->tmplt_ops != tp->ops) {
++		NL_SET_ERR_MSG(extack, "Chain template is set to a different filter kind");
++		err = -EINVAL;
++		goto errout;
++	}
++
+ 	err = tp->ops->change(net, skb, tp, cl, t->tcm_handle, tca, &fh,
+ 			      n->nlmsg_flags & NLM_F_CREATE ? TCA_ACT_NOREPLACE : TCA_ACT_REPLACE,
+ 			      extack);
+@@ -1644,8 +1653,13 @@ static int tc_chain_fill_node(struct tcf
+ 			      u32 portid, u32 seq, u16 flags, int event)
+ {
+ 	unsigned char *b = skb_tail_pointer(skb);
++	const struct tcf_proto_ops *ops;
+ 	struct nlmsghdr *nlh;
+ 	struct tcmsg *tcm;
++	void *priv;
++
++	ops = chain->tmplt_ops;
++	priv = chain->tmplt_priv;
+ 
+ 	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*tcm), flags);
+ 	if (!nlh)
+@@ -1666,6 +1680,13 @@ static int tc_chain_fill_node(struct tcf
+ 	if (nla_put_u32(skb, TCA_CHAIN, chain->index))
+ 		goto nla_put_failure;
+ 
++	if (ops) {
++		if (nla_put_string(skb, TCA_KIND, ops->kind))
++			goto nla_put_failure;
++		if (ops->tmplt_dump(skb, net, priv) < 0)
++			goto nla_put_failure;
++	}
++
+ 	nlh->nlmsg_len = skb_tail_pointer(skb) - b;
+ 	return skb->len;
+ 
+@@ -1699,6 +1720,47 @@ static int tc_chain_notify(struct tcf_ch
+ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC, flags & NLM_F_ECHO);
+ }
+ 
++static int tc_chain_tmplt_add(struct tcf_chain *chain, struct net *net,
++			      struct nlattr **tca,
++			      struct netlink_ext_ack *extack)
++{
++	const struct tcf_proto_ops *ops;
++	void *tmplt_priv;
++
++	/* If kind is not set, user did not specify template. */
++	if (!tca[TCA_KIND])
++		return 0;
++
++	ops = tcf_proto_lookup_ops(nla_data(tca[TCA_KIND]), extack);
++	if (IS_ERR(ops))
++		return PTR_ERR(ops);
++	if (!ops->tmplt_create || !ops->tmplt_destroy || !ops->tmplt_dump) {
++		NL_SET_ERR_MSG(extack, "Chain templates are not supported with specified classifier");
++		return -EOPNOTSUPP;
++	}
++
++	tmplt_priv = ops->tmplt_create(net, chain, tca, extack);
++	if (IS_ERR(tmplt_priv)) {
++		module_put(ops->owner);
++		return PTR_ERR(tmplt_priv);
++	}
++	chain->tmplt_ops = ops;
++	chain->tmplt_priv = tmplt_priv;
++	return 0;
++}
++
++static void tc_chain_tmplt_del(struct tcf_chain *chain)
++{
++	const struct tcf_proto_ops *ops = chain->tmplt_ops;
++
++	/* If template ops are set, no work to do for us. */
++	if (!ops)
++		return;
++
++	ops->tmplt_destroy(chain->tmplt_priv);
++	module_put(ops->owner);
++}
++
+ /* Add/delete/get a chain */
+ 
+ static int tc_ctl_chain(struct sk_buff *skb, struct nlmsghdr *n,
+@@ -1763,6 +1825,9 @@ replay:
+ 
+ 	switch (n->nlmsg_type) {
+ 	case RTM_NEWCHAIN:
++		err = tc_chain_tmplt_add(chain, net, tca, extack);
++		if (err)
++			goto errout;
+ 		/* In case the chain was successfully added, take a reference
+ 		 * to the chain. This ensures that an empty chain
+ 		 * does not disappear at the end of this function.
