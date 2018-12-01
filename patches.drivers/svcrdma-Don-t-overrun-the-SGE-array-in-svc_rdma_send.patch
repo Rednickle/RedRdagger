@@ -1,0 +1,211 @@
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Mon, 7 May 2018 15:28:09 -0400
+Subject: svcrdma: Don't overrun the SGE array in svc_rdma_send_ctxt
+Patch-mainline: v4.18-rc1
+Git-commit: 25fd86eca11c26bad2aede6dd4709ff58f89c7cb
+References: bsc#1103992 FATE#326009
+
+Receive buffers are always the same size, but each Send WR has a
+variable number of SGEs, based on the contents of the xdr_buf being
+sent.
+
+While assembling a Send WR, keep track of the number of SGEs so that
+we don't exceed the device's maximum, or walk off the end of the
+Send SGE array.
+
+For now the Send path just fails if it exceeds the maximum.
+
+The current logic in svc_rdma_accept bases the maximum number of
+Send SGEs on the largest NFS request that can be sent or received.
+In the transport layer, the limit is actually based on the
+capabilities of the underlying device, not on properties of the
+Upper Layer Protocol.
+
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/sunrpc/svc_rdma.h          |    9 ++-----
+ net/sunrpc/xprtrdma/svc_rdma_sendto.c    |   36 ++++++++++++++++++-------------
+ net/sunrpc/xprtrdma/svc_rdma_transport.c |   13 +++++++----
+ 3 files changed, 33 insertions(+), 25 deletions(-)
+
+--- a/include/linux/sunrpc/svc_rdma.h
++++ b/include/linux/sunrpc/svc_rdma.h
+@@ -96,7 +96,7 @@ struct svcxprt_rdma {
+ 	struct rdma_cm_id    *sc_cm_id;		/* RDMA connection id */
+ 	struct list_head     sc_accept_q;	/* Conn. waiting accept */
+ 	int		     sc_ord;		/* RDMA read limit */
+-	int                  sc_max_sge;
++	int                  sc_max_send_sges;
+ 	bool		     sc_snd_w_inv;	/* OK to use Send With Invalidate */
+ 
+ 	atomic_t             sc_sq_avail;	/* SQEs ready to be consumed */
+@@ -158,17 +158,14 @@ struct svc_rdma_recv_ctxt {
+ 	struct page		*rc_pages[RPCSVC_MAXPAGES];
+ };
+ 
+-enum {
+-	RPCRDMA_MAX_SGES	= 1 + (RPCRDMA_MAX_INLINE_THRESH / PAGE_SIZE),
+-};
+-
+ struct svc_rdma_send_ctxt {
+ 	struct list_head	sc_list;
+ 	struct ib_send_wr	sc_send_wr;
+ 	struct ib_cqe		sc_cqe;
+ 	int			sc_page_count;
++	int			sc_cur_sge_no;
+ 	struct page		*sc_pages[RPCSVC_MAXPAGES];
+-	struct ib_sge		sc_sges[RPCRDMA_MAX_SGES];
++	struct ib_sge		sc_sges[];
+ };
+ 
+ /* svc_rdma_backchannel.c */
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@ -127,9 +127,12 @@ static struct svc_rdma_send_ctxt *
+ svc_rdma_send_ctxt_alloc(struct svcxprt_rdma *rdma)
+ {
+ 	struct svc_rdma_send_ctxt *ctxt;
++	size_t size;
+ 	int i;
+ 
+-	ctxt = kmalloc(sizeof(*ctxt), GFP_KERNEL);
++	size = sizeof(*ctxt);
++	size += rdma->sc_max_send_sges * sizeof(struct ib_sge);
++	ctxt = kmalloc(size, GFP_KERNEL);
+ 	if (!ctxt)
+ 		return NULL;
+ 
+@@ -138,7 +141,7 @@ svc_rdma_send_ctxt_alloc(struct svcxprt_
+ 	ctxt->sc_send_wr.wr_cqe = &ctxt->sc_cqe;
+ 	ctxt->sc_send_wr.sg_list = ctxt->sc_sges;
+ 	ctxt->sc_send_wr.send_flags = IB_SEND_SIGNALED;
+-	for (i = 0; i < ARRAY_SIZE(ctxt->sc_sges); i++)
++	for (i = 0; i < rdma->sc_max_send_sges; i++)
+ 		ctxt->sc_sges[i].lkey = rdma->sc_pd->local_dma_lkey;
+ 	return ctxt;
+ }
+@@ -482,7 +485,6 @@ static u32 svc_rdma_get_inv_rkey(__be32
+ 
+ static int svc_rdma_dma_map_page(struct svcxprt_rdma *rdma,
+ 				 struct svc_rdma_send_ctxt *ctxt,
+-				 unsigned int sge_no,
+ 				 struct page *page,
+ 				 unsigned long offset,
+ 				 unsigned int len)
+@@ -494,8 +496,8 @@ static int svc_rdma_dma_map_page(struct
+ 	if (ib_dma_mapping_error(dev, dma_addr))
+ 		goto out_maperr;
+ 
+-	ctxt->sc_sges[sge_no].addr = dma_addr;
+-	ctxt->sc_sges[sge_no].length = len;
++	ctxt->sc_sges[ctxt->sc_cur_sge_no].addr = dma_addr;
++	ctxt->sc_sges[ctxt->sc_cur_sge_no].length = len;
+ 	ctxt->sc_send_wr.num_sge++;
+ 	return 0;
+ 
+@@ -509,11 +511,10 @@ out_maperr:
+  */
+ static int svc_rdma_dma_map_buf(struct svcxprt_rdma *rdma,
+ 				struct svc_rdma_send_ctxt *ctxt,
+-				unsigned int sge_no,
+ 				unsigned char *base,
+ 				unsigned int len)
+ {
+-	return svc_rdma_dma_map_page(rdma, ctxt, sge_no, virt_to_page(base),
++	return svc_rdma_dma_map_page(rdma, ctxt, virt_to_page(base),
+ 				     offset_in_page(base), len);
+ }
+ 
+@@ -535,7 +536,8 @@ int svc_rdma_map_reply_hdr(struct svcxpr
+ {
+ 	ctxt->sc_pages[0] = virt_to_page(rdma_resp);
+ 	ctxt->sc_page_count++;
+-	return svc_rdma_dma_map_page(rdma, ctxt, 0, ctxt->sc_pages[0], 0, len);
++	ctxt->sc_cur_sge_no = 0;
++	return svc_rdma_dma_map_page(rdma, ctxt, ctxt->sc_pages[0], 0, len);
+ }
+ 
+ /* Load the xdr_buf into the ctxt's sge array, and DMA map each
+@@ -547,16 +549,16 @@ static int svc_rdma_map_reply_msg(struct
+ 				  struct svc_rdma_send_ctxt *ctxt,
+ 				  struct xdr_buf *xdr, __be32 *wr_lst)
+ {
+-	unsigned int len, sge_no, remaining;
++	unsigned int len, remaining;
+ 	unsigned long page_off;
+ 	struct page **ppages;
+ 	unsigned char *base;
+ 	u32 xdr_pad;
+ 	int ret;
+ 
+-	sge_no = 1;
+-
+-	ret = svc_rdma_dma_map_buf(rdma, ctxt, sge_no++,
++	if (++ctxt->sc_cur_sge_no >= rdma->sc_max_send_sges)
++		return -EIO;
++	ret = svc_rdma_dma_map_buf(rdma, ctxt,
+ 				   xdr->head[0].iov_base,
+ 				   xdr->head[0].iov_len);
+ 	if (ret < 0)
+@@ -586,8 +588,10 @@ static int svc_rdma_map_reply_msg(struct
+ 	while (remaining) {
+ 		len = min_t(u32, PAGE_SIZE - page_off, remaining);
+ 
+-		ret = svc_rdma_dma_map_page(rdma, ctxt, sge_no++,
+-					    *ppages++, page_off, len);
++		if (++ctxt->sc_cur_sge_no >= rdma->sc_max_send_sges)
++			return -EIO;
++		ret = svc_rdma_dma_map_page(rdma, ctxt, *ppages++,
++					    page_off, len);
+ 		if (ret < 0)
+ 			return ret;
+ 
+@@ -599,7 +603,9 @@ static int svc_rdma_map_reply_msg(struct
+ 	len = xdr->tail[0].iov_len;
+ tail:
+ 	if (len) {
+-		ret = svc_rdma_dma_map_buf(rdma, ctxt, sge_no++, base, len);
++		if (++ctxt->sc_cur_sge_no >= rdma->sc_max_send_sges)
++			return -EIO;
++		ret = svc_rdma_dma_map_buf(rdma, ctxt, base, len);
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@ -475,8 +475,13 @@ static struct svc_xprt *svc_rdma_accept(
+ 
+ 	/* Qualify the transport resource defaults with the
+ 	 * capabilities of this particular device */
+-	newxprt->sc_max_sge = min((size_t)dev->attrs.max_sge,
+-				  (size_t)RPCSVC_MAXPAGES);
++	newxprt->sc_max_send_sges = dev->attrs.max_sge;
++	/* transport hdr, head iovec, one page list entry, tail iovec */
++	if (newxprt->sc_max_send_sges < 4) {
++		pr_err("svcrdma: too few Send SGEs available (%d)\n",
++		       newxprt->sc_max_send_sges);
++		goto errout;
++	}
+ 	newxprt->sc_max_req_size = svcrdma_max_req_size;
+ 	newxprt->sc_max_requests = svcrdma_max_requests;
+ 	newxprt->sc_max_bc_requests = svcrdma_max_bc_requests;
+@@ -524,7 +529,7 @@ static struct svc_xprt *svc_rdma_accept(
+ 	qp_attr.cap.max_rdma_ctxs = ctxts;
+ 	qp_attr.cap.max_send_wr = newxprt->sc_sq_depth - ctxts;
+ 	qp_attr.cap.max_recv_wr = rq_depth;
+-	qp_attr.cap.max_send_sge = newxprt->sc_max_sge;
++	qp_attr.cap.max_send_sge = newxprt->sc_max_send_sges;
+ 	qp_attr.cap.max_recv_sge = 1;
+ 	qp_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+ 	qp_attr.qp_type = IB_QPT_RC;
+@@ -585,7 +590,7 @@ static struct svc_xprt *svc_rdma_accept(
+ 	dprintk("    local address   : %pIS:%u\n", sap, rpc_get_port(sap));
+ 	sap = (struct sockaddr *)&newxprt->sc_cm_id->route.addr.dst_addr;
+ 	dprintk("    remote address  : %pIS:%u\n", sap, rpc_get_port(sap));
+-	dprintk("    max_sge         : %d\n", newxprt->sc_max_sge);
++	dprintk("    max_sge         : %d\n", newxprt->sc_max_send_sges);
+ 	dprintk("    sq_depth        : %d\n", newxprt->sc_sq_depth);
+ 	dprintk("    rdma_rw_ctxs    : %d\n", ctxts);
+ 	dprintk("    max_requests    : %d\n", newxprt->sc_max_requests);
