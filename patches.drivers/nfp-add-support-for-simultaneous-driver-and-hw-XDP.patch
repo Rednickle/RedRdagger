@@ -1,0 +1,188 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Wed, 11 Jul 2018 20:36:44 -0700
+Subject: nfp: add support for simultaneous driver and hw XDP
+Patch-mainline: v4.19-rc1
+Git-commit: 5f4284015e29c2de501d83eb647c8ec8802b58ac
+References: bsc#1109837
+
+Split handling of offloaded and driver programs completely.  Since
+offloaded programs always come with XDP_FLAGS_HW_MODE set in reality
+there could be no sharing, anyway, programs would only be installed
+in driver or in hardware.  Splitting the handling allows us to install
+programs in HW and in driver at the same time.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/main.c       |   11 ----
+ drivers/net/ethernet/netronome/nfp/nfp_net.h        |    6 +-
+ drivers/net/ethernet/netronome/nfp/nfp_net_common.c |   49 ++++++++------------
+ 3 files changed, 26 insertions(+), 40 deletions(-)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -66,26 +66,19 @@ nfp_bpf_xdp_offload(struct nfp_app *app,
+ 		    struct bpf_prog *prog, struct netlink_ext_ack *extack)
+ {
+ 	bool running, xdp_running;
+-	int ret;
+ 
+ 	if (!nfp_net_ebpf_capable(nn))
+ 		return -EINVAL;
+ 
+ 	running = nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF;
+-	xdp_running = running && nn->dp.bpf_offload_xdp;
++	xdp_running = running && nn->xdp_hw.prog;
+ 
+ 	if (!prog && !xdp_running)
+ 		return 0;
+ 	if (prog && running && !xdp_running)
+ 		return -EBUSY;
+ 
+-	ret = nfp_net_bpf_offload(nn, prog, running, extack);
+-	/* Stop offload if replace not possible */
+-	if (ret)
+-		return ret;
+-
+-	nn->dp.bpf_offload_xdp = !!prog;
+-	return ret;
++	return nfp_net_bpf_offload(nn, prog, running, extack);
+ }
+ 
+ static const char *nfp_bpf_extra_cap(struct nfp_app *app, struct nfp_net *nn)
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -485,7 +485,6 @@ struct nfp_stat_pair {
+  * @dev:		Backpointer to struct device
+  * @netdev:		Backpointer to net_device structure
+  * @is_vf:		Is the driver attached to a VF?
+- * @bpf_offload_xdp:	Offloaded BPF program is XDP
+  * @chained_metadata_format:  Firemware will use new metadata format
+  * @rx_dma_dir:		Mapping direction for RX buffers
+  * @rx_dma_off:		Offset at which DMA packets (for XDP headroom)
+@@ -510,7 +509,6 @@ struct nfp_net_dp {
+ 	struct net_device *netdev;
+ 
+ 	u8 is_vf:1;
+-	u8 bpf_offload_xdp:1;
+ 	u8 chained_metadata_format:1;
+ 
+ 	u8 rx_dma_dir;
+@@ -553,7 +551,8 @@ struct nfp_net_dp {
+  * @rss_cfg:            RSS configuration
+  * @rss_key:            RSS secret key
+  * @rss_itbl:           RSS indirection table
+- * @xdp:		Information about the attached XDP program
++ * @xdp:		Information about the driver XDP program
++ * @xdp_hw:		Information about the HW XDP program
+  * @max_r_vecs:		Number of allocated interrupt vectors for RX/TX
+  * @max_tx_rings:       Maximum number of TX rings supported by the Firmware
+  * @max_rx_rings:       Maximum number of RX rings supported by the Firmware
+@@ -610,6 +609,7 @@ struct nfp_net {
+ 	u8 rss_itbl[NFP_NET_CFG_RSS_ITBL_SZ];
+ 
+ 	struct xdp_attachment_info xdp;
++	struct xdp_attachment_info xdp_hw;
+ 
+ 	unsigned int max_tx_rings;
+ 	unsigned int max_rx_rings;
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -1710,8 +1710,7 @@ static int nfp_net_rx(struct nfp_net_rx_
+ 			}
+ 		}
+ 
+-		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
+-				  dp->bpf_offload_xdp) && !meta.portid) {
++		if (xdp_prog && !meta.portid) {
+ 			void *orig_data = rxbuf->frag + pkt_off;
+ 			unsigned int dma_off;
+ 			int act;
+@@ -3393,14 +3392,18 @@ static void nfp_net_del_vxlan_port(struc
+ 		nfp_net_set_vxlan_port(nn, idx, 0);
+ }
+ 
+-static int
+-nfp_net_xdp_setup_drv(struct nfp_net *nn, struct bpf_prog *prog,
+-		      struct netlink_ext_ack *extack)
++static int nfp_net_xdp_setup_drv(struct nfp_net *nn, struct netdev_bpf *bpf)
+ {
++	struct bpf_prog *prog = bpf->prog;
+ 	struct nfp_net_dp *dp;
++	int err;
++
++	if (!xdp_attachment_flags_ok(&nn->xdp, bpf))
++		return -EBUSY;
+ 
+ 	if (!prog == !nn->dp.xdp_prog) {
+ 		WRITE_ONCE(nn->dp.xdp_prog, prog);
++		xdp_attachment_setup(&nn->xdp, bpf);
+ 		return 0;
+ 	}
+ 
+@@ -3414,33 +3417,26 @@ nfp_net_xdp_setup_drv(struct nfp_net *nn
+ 	dp->rx_dma_off = prog ? XDP_PACKET_HEADROOM - nn->dp.rx_offset : 0;
+ 
+ 	/* We need RX reconfig to remap the buffers (BIDIR vs FROM_DEV) */
+-	return nfp_net_ring_reconfig(nn, dp, extack);
++	err = nfp_net_ring_reconfig(nn, dp, bpf->extack);
++	if (err)
++		return err;
++
++	xdp_attachment_setup(&nn->xdp, bpf);
++	return 0;
+ }
+ 
+-static int nfp_net_xdp_setup(struct nfp_net *nn, struct netdev_bpf *bpf)
++static int nfp_net_xdp_setup_hw(struct nfp_net *nn, struct netdev_bpf *bpf)
+ {
+-	struct bpf_prog *drv_prog, *offload_prog;
+ 	int err;
+ 
+-	if (!xdp_attachment_flags_ok(&nn->xdp, bpf))
++	if (!xdp_attachment_flags_ok(&nn->xdp_hw, bpf))
+ 		return -EBUSY;
+ 
+-	/* Load both when no flags set to allow easy activation of driver path
+-	 * when program is replaced by one which can't be offloaded.
+-	 */
+-	drv_prog     = bpf->flags & XDP_FLAGS_HW_MODE  ? NULL : bpf->prog;
+-	offload_prog = bpf->flags & XDP_FLAGS_DRV_MODE ? NULL : bpf->prog;
+-
+-	err = nfp_net_xdp_setup_drv(nn, drv_prog, bpf->extack);
++	err = nfp_app_xdp_offload(nn->app, nn, bpf->prog, bpf->extack);
+ 	if (err)
+ 		return err;
+ 
+-	err = nfp_app_xdp_offload(nn->app, nn, offload_prog, bpf->extack);
+-	if (err && bpf->flags & XDP_FLAGS_HW_MODE)
+-		return err;
+-
+-	xdp_attachment_setup(&nn->xdp, bpf);
+-
++	xdp_attachment_setup(&nn->xdp_hw, bpf);
+ 	return 0;
+ }
+ 
+@@ -3450,16 +3446,13 @@ static int nfp_net_xdp(struct net_device
+ 
+ 	switch (xdp->command) {
+ 	case XDP_SETUP_PROG:
++		return nfp_net_xdp_setup_drv(nn, xdp);
+ 	case XDP_SETUP_PROG_HW:
+-		return nfp_net_xdp_setup(nn, xdp);
++		return nfp_net_xdp_setup_hw(nn, xdp);
+ 	case XDP_QUERY_PROG:
+-		if (nn->dp.bpf_offload_xdp)
+-			return 0;
+ 		return xdp_attachment_query(&nn->xdp, xdp);
+ 	case XDP_QUERY_PROG_HW:
+-		if (!nn->dp.bpf_offload_xdp)
+-			return 0;
+-		return xdp_attachment_query(&nn->xdp, xdp);
++		return xdp_attachment_query(&nn->xdp_hw, xdp);
+ 	default:
+ 		return nfp_app_bpf(nn->app, nn, xdp);
+ 	}
