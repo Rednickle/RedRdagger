@@ -1,0 +1,177 @@
+From: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date: Fri, 3 Aug 2018 22:06:00 -0700
+Subject: nfp: bpf: xdp_adjust_tail support
+Patch-mainline: v4.19-rc1
+Git-commit: 0c26159352ba1cdc5a8c8d74131cc19cdfdf9371
+References: bsc#1109837
+
+Add support for adjust_tail.  There are no FW changes needed but add
+a FW capability just in case there would be any issue with previously
+released FW, or we will have to change the ABI in the future.
+
+The helper is trivial and shouldn't be used too often so just inline
+the body of the function.  We add the delta to locally maintained
+packet length register and check for overflow, since add of negative
+value must overflow if result is positive.  Note that if delta of 0
+would be allowed in the kernel this trick stops working and we need
+one more instruction to compare lengths before and after the change.
+
+Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/netronome/nfp/bpf/fw.h       |    1 
+ drivers/net/ethernet/netronome/nfp/bpf/jit.c      |   47 ++++++++++++++++++++++
+ drivers/net/ethernet/netronome/nfp/bpf/main.c     |   13 ++++++
+ drivers/net/ethernet/netronome/nfp/bpf/main.h     |    2 
+ drivers/net/ethernet/netronome/nfp/bpf/verifier.c |    7 +++
+ drivers/net/ethernet/netronome/nfp/nfp_asm.h      |    1 
+ 6 files changed, 71 insertions(+)
+
+--- a/drivers/net/ethernet/netronome/nfp/bpf/fw.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/fw.h
+@@ -51,6 +51,7 @@ enum bpf_cap_tlv_type {
+ 	NFP_BPF_CAP_TYPE_MAPS		= 3,
+ 	NFP_BPF_CAP_TYPE_RANDOM		= 4,
+ 	NFP_BPF_CAP_TYPE_QUEUE_SELECT	= 5,
++	NFP_BPF_CAP_TYPE_ADJUST_TAIL	= 6,
+ };
+ 
+ struct nfp_bpf_cap_tlv_func {
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -1642,6 +1642,51 @@ static int adjust_head(struct nfp_prog *
+ 	return 0;
+ }
+ 
++static int adjust_tail(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++{
++	u32 ret_einval, end;
++	swreg plen, delta;
++
++	BUILD_BUG_ON(plen_reg(nfp_prog) != reg_b(STATIC_REG_PKT_LEN));
++
++	plen = imm_a(nfp_prog);
++	delta = reg_a(2 * 2);
++
++	ret_einval = nfp_prog_current_offset(nfp_prog) + 9;
++	end = nfp_prog_current_offset(nfp_prog) + 11;
++
++	/* Calculate resulting length */
++	emit_alu(nfp_prog, plen, plen_reg(nfp_prog), ALU_OP_ADD, delta);
++	/* delta == 0 is not allowed by the kernel, add must overflow to make
++	 * length smaller.
++	 */
++	emit_br(nfp_prog, BR_BCC, ret_einval, 0);
++
++	/* if (new_len < 14) then -EINVAL */
++	emit_alu(nfp_prog, reg_none(), plen, ALU_OP_SUB, reg_imm(ETH_HLEN));
++	emit_br(nfp_prog, BR_BMI, ret_einval, 0);
++
++	emit_alu(nfp_prog, plen_reg(nfp_prog),
++		 plen_reg(nfp_prog), ALU_OP_ADD, delta);
++	emit_alu(nfp_prog, pv_len(nfp_prog),
++		 pv_len(nfp_prog), ALU_OP_ADD, delta);
++
++	emit_br(nfp_prog, BR_UNC, end, 2);
++	wrp_immed(nfp_prog, reg_both(0), 0);
++	wrp_immed(nfp_prog, reg_both(1), 0);
++
++	if (!nfp_prog_confirm_current_offset(nfp_prog, ret_einval))
++		return -EINVAL;
++
++	wrp_immed(nfp_prog, reg_both(0), -22);
++	wrp_immed(nfp_prog, reg_both(1), ~0);
++
++	if (!nfp_prog_confirm_current_offset(nfp_prog, end))
++		return -EINVAL;
++
++	return 0;
++}
++
+ static int
+ map_call_stack_common(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+ {
+@@ -3041,6 +3086,8 @@ static int call(struct nfp_prog *nfp_pro
+ 	switch (meta->insn.imm) {
+ 	case BPF_FUNC_xdp_adjust_head:
+ 		return adjust_head(nfp_prog, meta);
++	case BPF_FUNC_xdp_adjust_tail:
++		return adjust_tail(nfp_prog, meta);
+ 	case BPF_FUNC_map_lookup_elem:
+ 	case BPF_FUNC_map_update_elem:
+ 	case BPF_FUNC_map_delete_elem:
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@ -334,6 +334,14 @@ nfp_bpf_parse_cap_qsel(struct nfp_app_bp
+ 	return 0;
+ }
+ 
++static int
++nfp_bpf_parse_cap_adjust_tail(struct nfp_app_bpf *bpf, void __iomem *value,
++			      u32 length)
++{
++	bpf->adjust_tail = true;
++	return 0;
++}
++
+ static int nfp_bpf_parse_capabilities(struct nfp_app *app)
+ {
+ 	struct nfp_cpp *cpp = app->pf->cpp;
+@@ -380,6 +388,11 @@ static int nfp_bpf_parse_capabilities(st
+ 			if (nfp_bpf_parse_cap_qsel(app->priv, value, length))
+ 				goto err_release_free;
+ 			break;
++		case NFP_BPF_CAP_TYPE_ADJUST_TAIL:
++			if (nfp_bpf_parse_cap_adjust_tail(app->priv, value,
++							  length))
++				goto err_release_free;
++			break;
+ 		default:
+ 			nfp_dbg(cpp, "unknown BPF capability: %d\n", type);
+ 			break;
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -150,6 +150,7 @@ enum pkt_vec {
+  *
+  * @pseudo_random:	FW initialized the pseudo-random machinery (CSRs)
+  * @queue_select:	BPF can set the RX queue ID in packet vector
++ * @adjust_tail:	BPF can simply trunc packet size for adjust tail
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -195,6 +196,7 @@ struct nfp_app_bpf {
+ 
+ 	bool pseudo_random;
+ 	bool queue_select;
++	bool adjust_tail;
+ };
+ 
+ enum nfp_bpf_map_use {
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -178,6 +178,13 @@ nfp_bpf_check_call(struct nfp_prog *nfp_
+ 		nfp_record_adjust_head(bpf, nfp_prog, meta, reg2);
+ 		break;
+ 
++	case BPF_FUNC_xdp_adjust_tail:
++		if (!bpf->adjust_tail) {
++			pr_vlog(env, "adjust_tail not supported by FW\n");
++			return -EOPNOTSUPP;
++		}
++		break;
++
+ 	case BPF_FUNC_map_lookup_elem:
+ 		if (!nfp_bpf_map_call_ok("map_lookup", env, meta,
+ 					 bpf->helpers.map_lookup, reg1) ||
+--- a/drivers/net/ethernet/netronome/nfp/nfp_asm.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_asm.h
+@@ -93,6 +93,7 @@ enum br_mask {
+ 	BR_BNE = 0x01,
+ 	BR_BMI = 0x02,
+ 	BR_BHS = 0x04,
++	BR_BCC = 0x05,
+ 	BR_BLO = 0x05,
+ 	BR_BGE = 0x08,
+ 	BR_BLT = 0x09,
