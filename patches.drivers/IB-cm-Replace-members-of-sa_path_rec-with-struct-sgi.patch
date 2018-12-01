@@ -1,0 +1,464 @@
+From: Parav Pandit <parav@mellanox.com>
+Date: Tue, 19 Jun 2018 10:59:19 +0300
+Subject: IB/cm: Replace members of sa_path_rec with 'struct sgid_attr *'
+Patch-mainline: v4.19-rc1
+Git-commit: 398391071f2576bbc6351bcb92c78fc432190ac3
+References: bsc#1103992 FATE#326009
+
+While processing a path record entry in CM messages the associated GID
+attribute is now also supplied.
+
+Currently for RoCE a netdevice's net namespace pointer and ifindex are
+stored in path record entry. Both of these fields of the netdev can change
+anytime while processing CM messages. Additionally storing net namespace
+without holding reference will lead to use-after-free crash. Therefore it
+is removed. Netdevice information for RoCE is instead provided via
+referenced gid attribute in ib_cm requests.
+
+Such a design leads to a situation where the kernel can crash when the net
+pointer becomes invalid. However today it is always initialized to
+init_net, which cannot become invalid. In order to support processing
+packets in any arbitrary namespace of the received packet, it is necessary
+to avoid such conditions.
+
+This patch removes the dependency on the net pointer and ifindex; instead
+it will rely on SGID attribute which contains a pointer to netdev.
+
+Signed-off-by: Parav Pandit <parav@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/cm.c              |   76 ++++++++++++++++++------------
+ drivers/infiniband/core/cma.c             |    5 -
+ drivers/infiniband/core/sa_query.c        |   71 ++++++++++++++++------------
+ drivers/infiniband/core/uverbs_marshall.c |    2 
+ drivers/infiniband/ulp/ipoib/ipoib_main.c |    2 
+ include/rdma/ib_sa.h                      |   49 +------------------
+ 6 files changed, 96 insertions(+), 109 deletions(-)
+
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -508,31 +508,50 @@ static int add_cm_id_to_port_list(struct
+ 	return ret;
+ }
+ 
+-static struct cm_port *get_cm_port_from_path(struct sa_path_rec *path)
++static struct cm_port *
++get_cm_port_from_path(struct sa_path_rec *path, const struct ib_gid_attr *attr)
+ {
+ 	struct cm_device *cm_dev;
+ 	struct cm_port *port = NULL;
+ 	unsigned long flags;
+-	u8 p;
+-	struct net_device *ndev = ib_get_ndev_from_path(path);
+ 
+-	read_lock_irqsave(&cm.device_lock, flags);
+-	list_for_each_entry(cm_dev, &cm.device_list, list) {
+-		if (!ib_find_cached_gid(cm_dev->ib_device, &path->sgid,
+-					sa_conv_pathrec_to_gid_type(path),
+-					ndev, &p, NULL)) {
+-			port = cm_dev->port[p - 1];
+-			break;
++	if (attr) {
++		read_lock_irqsave(&cm.device_lock, flags);
++		list_for_each_entry(cm_dev, &cm.device_list, list) {
++			if (cm_dev->ib_device == attr->device) {
++				port = cm_dev->port[attr->port_num - 1];
++				break;
++			}
++		}
++		read_unlock_irqrestore(&cm.device_lock, flags);
++	} else {
++		/* SGID attribute can be NULL in following
++		 * conditions.
++		 * (a) Alternative path
++		 * (b) IB link layer without GRH
++		 * (c) LAP send messages
++		 */
++		read_lock_irqsave(&cm.device_lock, flags);
++		list_for_each_entry(cm_dev, &cm.device_list, list) {
++			attr = rdma_find_gid(cm_dev->ib_device,
++					     &path->sgid,
++					     sa_conv_pathrec_to_gid_type(path),
++					     NULL);
++			if (!IS_ERR(attr)) {
++				port = cm_dev->port[attr->port_num - 1];
++				break;
++			}
+ 		}
++		read_unlock_irqrestore(&cm.device_lock, flags);
++		if (port)
++			rdma_put_gid_attr(attr);
+ 	}
+-	read_unlock_irqrestore(&cm.device_lock, flags);
+-
+-	if (ndev)
+-		dev_put(ndev);
+ 	return port;
+ }
+ 
+-static int cm_init_av_by_path(struct sa_path_rec *path, struct cm_av *av,
++static int cm_init_av_by_path(struct sa_path_rec *path,
++			      const struct ib_gid_attr *sgid_attr,
++			      struct cm_av *av,
+ 			      struct cm_id_private *cm_id_priv)
+ {
+ 	struct rdma_ah_attr new_ah_attr;
+@@ -540,7 +559,7 @@ static int cm_init_av_by_path(struct sa_
+ 	struct cm_port *port;
+ 	int ret;
+ 
+-	port = get_cm_port_from_path(path);
++	port = get_cm_port_from_path(path, sgid_attr);
+ 	if (!port)
+ 		return -EINVAL;
+ 	cm_dev = port->cm_dev;
+@@ -562,7 +581,7 @@ static int cm_init_av_by_path(struct sa_
+ 	 * can be used to return an error response.
+ 	 */
+ 	ret = ib_init_ah_attr_from_path(cm_dev->ib_device, port->port_num, path,
+-					&new_ah_attr);
++					&new_ah_attr, sgid_attr);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1420,12 +1439,13 @@ int ib_send_cm_req(struct ib_cm_id *cm_i
+ 		goto out;
+ 	}
+ 
+-	ret = cm_init_av_by_path(param->primary_path, &cm_id_priv->av,
++	ret = cm_init_av_by_path(param->primary_path,
++				 param->ppath_sgid_attr, &cm_id_priv->av,
+ 				 cm_id_priv);
+ 	if (ret)
+ 		goto error1;
+ 	if (param->alternate_path) {
+-		ret = cm_init_av_by_path(param->alternate_path,
++		ret = cm_init_av_by_path(param->alternate_path, NULL,
+ 					 &cm_id_priv->alt_av, cm_id_priv);
+ 		if (ret)
+ 			goto error1;
+@@ -1980,10 +2000,6 @@ static int cm_req_handler(struct cm_work
+ 	if (gid_attr.ndev) {
+ 		work->path[0].rec_type =
+ 			sa_conv_gid_to_pathrec_type(gid_attr.gid_type);
+-		sa_path_set_ifindex(&work->path[0],
+-				    gid_attr.ndev->ifindex);
+-		sa_path_set_ndev(&work->path[0],
+-				 dev_net(gid_attr.ndev));
+ 		dev_put(gid_attr.ndev);
+ 	} else {
+ 		cm_path_set_rec_type(work->port->cm_dev->ib_device,
+@@ -1999,7 +2015,7 @@ static int cm_req_handler(struct cm_work
+ 		sa_path_set_dmac(&work->path[0],
+ 				 cm_id_priv->av.ah_attr.roce.dmac);
+ 	work->path[0].hop_limit = grh->hop_limit;
+-	ret = cm_init_av_by_path(&work->path[0], &cm_id_priv->av,
++	ret = cm_init_av_by_path(&work->path[0], &gid_attr, &cm_id_priv->av,
+ 				 cm_id_priv);
+ 	if (ret) {
+ 		int err;
+@@ -2018,8 +2034,8 @@ static int cm_req_handler(struct cm_work
+ 		goto rejected;
+ 	}
+ 	if (cm_req_has_alt_path(req_msg)) {
+-		ret = cm_init_av_by_path(&work->path[1], &cm_id_priv->alt_av,
+-					 cm_id_priv);
++		ret = cm_init_av_by_path(&work->path[1], NULL,
++					 &cm_id_priv->alt_av, cm_id_priv);
+ 		if (ret) {
+ 			ib_send_cm_rej(cm_id, IB_CM_REJ_INVALID_ALT_GID,
+ 				       &work->path[0].sgid,
+@@ -3142,7 +3158,7 @@ int ib_send_cm_lap(struct ib_cm_id *cm_i
+ 		goto out;
+ 	}
+ 
+-	ret = cm_init_av_by_path(alternate_path, &cm_id_priv->alt_av,
++	ret = cm_init_av_by_path(alternate_path, NULL, &cm_id_priv->alt_av,
+ 				 cm_id_priv);
+ 	if (ret)
+ 		goto out;
+@@ -3285,7 +3301,7 @@ static int cm_lap_handler(struct cm_work
+ 	if (ret)
+ 		goto unlock;
+ 
+-	cm_init_av_by_path(param->alternate_path, &cm_id_priv->alt_av,
++	cm_init_av_by_path(param->alternate_path, NULL, &cm_id_priv->alt_av,
+ 			   cm_id_priv);
+ 	cm_id_priv->id.lap_state = IB_CM_LAP_RCVD;
+ 	cm_id_priv->tid = lap_msg->hdr.tid;
+@@ -3487,7 +3503,9 @@ int ib_send_cm_sidr_req(struct ib_cm_id
+ 		return -EINVAL;
+ 
+ 	cm_id_priv = container_of(cm_id, struct cm_id_private, id);
+-	ret = cm_init_av_by_path(param->path, &cm_id_priv->av, cm_id_priv);
++	ret = cm_init_av_by_path(param->path, param->sgid_attr,
++				 &cm_id_priv->av,
++				 cm_id_priv);
+ 	if (ret)
+ 		goto out;
+ 
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -2583,8 +2583,6 @@ cma_iboe_set_path_rec_l2_fields(struct r
+ 	route->path_rec->rec_type = sa_conv_gid_to_pathrec_type(gid_type);
+ 
+ 	route->path_rec->roce.route_resolved = true;
+-	sa_path_set_ndev(route->path_rec, addr->dev_addr.net);
+-	sa_path_set_ifindex(route->path_rec, ndev->ifindex);
+ 	sa_path_set_dmac(route->path_rec, addr->dev_addr.dst_dev_addr);
+ 	return ndev;
+ }
+@@ -3510,7 +3508,8 @@ static int cma_sidr_rep_handler(struct i
+ 		ib_init_ah_attr_from_path(id_priv->id.device,
+ 					  id_priv->id.port_num,
+ 					  id_priv->id.route.path_rec,
+-					  &event.param.ud.ah_attr);
++					  &event.param.ud.ah_attr,
++					  rep->sgid_attr);
+ 		event.param.ud.qp_num = rep->qpn;
+ 		event.param.ud.qkey = rep->qkey;
+ 		event.event = RDMA_CM_EVENT_ESTABLISHED;
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@ -1229,18 +1229,12 @@ static u8 get_src_path_mask(struct ib_de
+ 
+ static int
+ roce_resolve_route_from_path(struct ib_device *device, u8 port_num,
+-			     struct sa_path_rec *rec)
++			     struct sa_path_rec *rec,
++			     const struct ib_gid_attr *attr)
+ {
+ 	struct net_device *resolved_dev;
+-	struct net_device *ndev;
+ 	struct net_device *idev;
+-	struct rdma_dev_addr dev_addr = {
+-		.bound_dev_if = ((sa_path_get_ifindex(rec) >= 0) ?
+-				 sa_path_get_ifindex(rec) : 0),
+-		.net = sa_path_get_ndev(rec) ?
+-			sa_path_get_ndev(rec) :
+-			&init_net
+-	};
++	struct rdma_dev_addr dev_addr = {};
+ 	union {
+ 		struct sockaddr     _sockaddr;
+ 		struct sockaddr_in  _sockaddr_in;
+@@ -1250,6 +1244,14 @@ roce_resolve_route_from_path(struct ib_d
+ 
+ 	if (rec->roce.route_resolved)
+ 		return 0;
++	if (!attr || !attr->ndev)
++		return -EINVAL;
++
++	dev_addr.bound_dev_if = attr->ndev->ifindex;
++	/* TODO: Use net from the ib_gid_attr once it is added to it,
++	 * until than, limit itself to init_net.
++	 */
++	dev_addr.net = &init_net;
+ 
+ 	if (!device->get_netdev)
+ 		return -EOPNOTSUPP;
+@@ -1278,16 +1280,13 @@ roce_resolve_route_from_path(struct ib_d
+ 		ret = -ENODEV;
+ 		goto done;
+ 	}
+-	ndev = ib_get_ndev_from_path(rec);
+ 	rcu_read_lock();
+-	if ((ndev && ndev != resolved_dev) ||
++	if (attr->ndev != resolved_dev ||
+ 	    (resolved_dev != idev &&
+ 	     !rdma_is_upper_dev_rcu(idev, resolved_dev)))
+ 		ret = -EHOSTUNREACH;
+ 	rcu_read_unlock();
+ 	dev_put(resolved_dev);
+-	if (ndev)
+-		dev_put(ndev);
+ done:
+ 	dev_put(idev);
+ 	if (!ret)
+@@ -1297,19 +1296,18 @@ done:
+ 
+ static int init_ah_attr_grh_fields(struct ib_device *device, u8 port_num,
+ 				   struct sa_path_rec *rec,
+-				   struct rdma_ah_attr *ah_attr)
++				   struct rdma_ah_attr *ah_attr,
++				   const struct ib_gid_attr *gid_attr)
+ {
+ 	enum ib_gid_type type = sa_conv_pathrec_to_gid_type(rec);
+-	struct net_device *ndev;
+-	const struct ib_gid_attr *gid_attr;
+ 
+-	ndev = ib_get_ndev_from_path(rec);
+-	gid_attr =
+-		rdma_find_gid_by_port(device, &rec->sgid, type, port_num, ndev);
+-	if (ndev)
+-		dev_put(ndev);
+-	if (IS_ERR(gid_attr))
+-		return PTR_ERR(gid_attr);
++	if (!gid_attr) {
++		gid_attr = rdma_find_gid_by_port(device, &rec->sgid, type,
++						 port_num, NULL);
++		if (IS_ERR(gid_attr))
++			return PTR_ERR(gid_attr);
++	} else
++		rdma_hold_gid_attr(gid_attr);
+ 
+ 	rdma_move_grh_sgid_attr(ah_attr, &rec->dgid,
+ 				be32_to_cpu(rec->flow_label),
+@@ -1318,9 +1316,26 @@ static int init_ah_attr_grh_fields(struc
+ 	return 0;
+ }
+ 
++/**
++ * ib_init_ah_attr_from_path - Initialize address handle attributes based on
++ *   an SA path record.
++ * @device: Device associated ah attributes initialization.
++ * @port_num: Port on the specified device.
++ * @rec: path record entry to use for ah attributes initialization.
++ * @ah_attr: address handle attributes to initialization from path record.
++ * @sgid_attr: SGID attribute to consider during initialization.
++ *
++ * When ib_init_ah_attr_from_path() returns success,
++ * (a) for IB link layer it optionally contains a reference to SGID attribute
++ * when GRH is present for IB link layer.
++ * (b) for RoCE link layer it contains a reference to SGID attribute.
++ * User must invoke rdma_destroy_ah_attr() to release reference to SGID
++ * attributes which are initialized using ib_init_ah_attr_from_path().
++ */
+ int ib_init_ah_attr_from_path(struct ib_device *device, u8 port_num,
+ 			      struct sa_path_rec *rec,
+-			      struct rdma_ah_attr *ah_attr)
++			      struct rdma_ah_attr *ah_attr,
++			      const struct ib_gid_attr *gid_attr)
+ {
+ 	int ret = 0;
+ 
+@@ -1331,7 +1346,8 @@ int ib_init_ah_attr_from_path(struct ib_
+ 	rdma_ah_set_static_rate(ah_attr, rec->rate);
+ 
+ 	if (sa_path_is_roce(rec)) {
+-		ret = roce_resolve_route_from_path(device, port_num, rec);
++		ret = roce_resolve_route_from_path(device, port_num, rec,
++						   gid_attr);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -1348,7 +1364,8 @@ int ib_init_ah_attr_from_path(struct ib_
+ 	}
+ 
+ 	if (rec->hop_limit > 0 || sa_path_is_roce(rec))
+-		ret = init_ah_attr_grh_fields(device, port_num, rec, ah_attr);
++		ret = init_ah_attr_grh_fields(device, port_num,
++					      rec, ah_attr, gid_attr);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(ib_init_ah_attr_from_path);
+@@ -1556,8 +1573,6 @@ static void ib_sa_path_rec_callback(stru
+ 				  ARRAY_SIZE(path_rec_table),
+ 				  mad->data, &rec);
+ 			rec.rec_type = SA_PATH_REC_TYPE_IB;
+-			sa_path_set_ndev(&rec, NULL);
+-			sa_path_set_ifindex(&rec, 0);
+ 			sa_path_set_dmac_zero(&rec);
+ 
+ 			if (query->conv_pr) {
+--- a/drivers/infiniband/core/uverbs_marshall.c
++++ b/drivers/infiniband/core/uverbs_marshall.c
+@@ -211,7 +211,5 @@ void ib_copy_path_rec_from_user(struct s
+ 
+ 	/* TODO: No need to set this */
+ 	sa_path_set_dmac_zero(dst);
+-	sa_path_set_ndev(dst, NULL);
+-	sa_path_set_ifindex(dst, 0);
+ }
+ EXPORT_SYMBOL(ib_copy_path_rec_from_user);
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -770,7 +770,7 @@ static void path_rec_completion(int stat
+ 		struct rdma_ah_attr av;
+ 
+ 		if (!ib_init_ah_attr_from_path(priv->ca, priv->port,
+-					       pathrec, &av)) {
++					       pathrec, &av, NULL)) {
+ 			ah = ipoib_create_ah(dev, priv->pd, &av);
+ 			rdma_destroy_ah_attr(&av);
+ 		}
+--- a/include/rdma/ib_sa.h
++++ b/include/rdma/ib_sa.h
+@@ -172,12 +172,7 @@ struct sa_path_rec_ib {
+  */
+ struct sa_path_rec_roce {
+ 	bool	route_resolved;
+-	u8           dmac[ETH_ALEN];
+-	/* ignored in IB */
+-	int	     ifindex;
+-	/* ignored in IB */
+-	struct net  *net;
+-
++	u8	dmac[ETH_ALEN];
+ };
+ 
+ struct sa_path_rec_opa {
+@@ -556,13 +551,10 @@ int ib_init_ah_from_mcmember(struct ib_d
+ 			     enum ib_gid_type gid_type,
+ 			     struct rdma_ah_attr *ah_attr);
+ 
+-/**
+- * ib_init_ah_attr_from_path - Initialize address handle attributes based on
+- *   an SA path record.
+- */
+ int ib_init_ah_attr_from_path(struct ib_device *device, u8 port_num,
+ 			      struct sa_path_rec *rec,
+-			      struct rdma_ah_attr *ah_attr);
++			      struct rdma_ah_attr *ah_attr,
++			      const struct ib_gid_attr *sgid_attr);
+ 
+ /**
+  * ib_sa_pack_path - Conert a path record from struct ib_sa_path_rec
+@@ -667,45 +659,10 @@ static inline void sa_path_set_dmac_zero
+ 		eth_zero_addr(rec->roce.dmac);
+ }
+ 
+-static inline void sa_path_set_ifindex(struct sa_path_rec *rec, int ifindex)
+-{
+-	if (sa_path_is_roce(rec))
+-		rec->roce.ifindex = ifindex;
+-}
+-
+-static inline void sa_path_set_ndev(struct sa_path_rec *rec, struct net *net)
+-{
+-	if (sa_path_is_roce(rec))
+-		rec->roce.net = net;
+-}
+-
+ static inline u8 *sa_path_get_dmac(struct sa_path_rec *rec)
+ {
+ 	if (sa_path_is_roce(rec))
+ 		return rec->roce.dmac;
+ 	return NULL;
+ }
+-
+-static inline int sa_path_get_ifindex(struct sa_path_rec *rec)
+-{
+-	if (sa_path_is_roce(rec))
+-		return rec->roce.ifindex;
+-	return 0;
+-}
+-
+-static inline struct net *sa_path_get_ndev(struct sa_path_rec *rec)
+-{
+-	if (sa_path_is_roce(rec))
+-		return rec->roce.net;
+-	return NULL;
+-}
+-
+-static inline struct net_device *ib_get_ndev_from_path(struct sa_path_rec *rec)
+-{
+-	return sa_path_get_ndev(rec) ?
+-		dev_get_by_index(sa_path_get_ndev(rec),
+-				 sa_path_get_ifindex(rec))
+-		: NULL;
+-}
+-
+ #endif /* IB_SA_H */
