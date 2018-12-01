@@ -1,0 +1,462 @@
+From: Tariq Toukan <tariqt@mellanox.com>
+Date: Tue, 22 May 2018 16:48:48 +0300
+Subject: net/mlx5e: Add support for XDP_REDIRECT in device-out side
+Patch-mainline: v4.19-rc1
+Git-commit: 58b99ee3e3ebecfaccc5641a4014d92a818494a5
+References: bsc#1103990 FATE#326006
+
+Add implementation for the ndo_xdp_xmit callback.
+
+Dedicate a new set of XDP-SQ instances to satisfy the XDP_REDIRECT
+requests.  These instances are totally separated from the existing
+XDP-SQ objects that satisfy local XDP_TX actions.
+
+Performance tests:
+
+xdp_redirect_map from ConnectX-5 to ConnectX-5.
+CPU: Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+Packet-rate of 64B packets.
+
+Single queue: 7 Mpps.
+Multi queue: 55 Mpps.
+
+Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+Signed-off-by: Eugenia Emantayev <eugenia@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h       |    5 +
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c   |   92 +++++++++++++++++----
+ drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h   |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/en_main.c  |   36 ++++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en_stats.c |   32 +++++++
+ drivers/net/ethernet/mellanox/mlx5/core/en_stats.h |    5 +
+ drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c  |    3 
+ 7 files changed, 154 insertions(+), 21 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -344,6 +344,7 @@ enum {
+ 	MLX5E_SQ_STATE_IPSEC,
+ 	MLX5E_SQ_STATE_AM,
+ 	MLX5E_SQ_STATE_TLS,
++	MLX5E_SQ_STATE_REDIRECT,
+ };
+ 
+ struct mlx5e_sq_wqe_info {
+@@ -598,6 +599,9 @@ struct mlx5e_channel {
+ 	__be32                     mkey_be;
+ 	u8                         num_tc;
+ 
++	/* XDP_REDIRECT */
++	struct mlx5e_xdpsq         xdpsq;
++
+ 	/* data path - accessed per napi poll */
+ 	struct irq_desc *irq_desc;
+ 	struct mlx5e_ch_stats     *stats;
+@@ -621,6 +625,7 @@ struct mlx5e_channel_stats {
+ 	struct mlx5e_sq_stats sq[MLX5E_MAX_NUM_TC];
+ 	struct mlx5e_rq_stats rq;
+ 	struct mlx5e_xdpsq_stats rq_xdpsq;
++	struct mlx5e_xdpsq_stats xdpsq;
+ } ____cacheline_aligned_in_smp;
+ 
+ enum mlx5e_traffic_types {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -167,6 +167,7 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq
+ 	struct mlx5e_xdpsq *sq;
+ 	struct mlx5_cqe64 *cqe;
+ 	struct mlx5e_rq *rq;
++	bool is_redirect;
+ 	u16 sqcc;
+ 	int i;
+ 
+@@ -179,6 +180,7 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq
+ 	if (!cqe)
+ 		return false;
+ 
++	is_redirect = test_bit(MLX5E_SQ_STATE_REDIRECT, &sq->state);
+ 	rq = container_of(sq, struct mlx5e_rq, xdpsq);
+ 
+ 	/* sq->cc must be updated only after mlx5_cqwq_update_db_record(),
+@@ -196,17 +198,20 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq
+ 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
+ 
+ 		do {
+-			struct mlx5e_xdp_info *xdpi;
+-			u16 ci;
++			u16 ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sqcc);
++			struct mlx5e_xdp_info *xdpi = &sq->db.xdpi[ci];
+ 
+ 			last_wqe = (sqcc == wqe_counter);
+-
+-			ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sqcc);
+-			xdpi = &sq->db.xdpi[ci];
+-
+ 			sqcc++;
+-			/* Recycle RX page */
+-			mlx5e_page_release(rq, &xdpi->di, true);
++
++			if (is_redirect) {
++				xdp_return_frame(xdpi->xdpf);
++				dma_unmap_single(sq->pdev, xdpi->dma_addr,
++						 xdpi->xdpf->len, DMA_TO_DEVICE);
++			} else {
++				/* Recycle RX page */
++				mlx5e_page_release(rq, &xdpi->di, true);
++			}
+ 		} while (!last_wqe);
+ 	} while ((++i < MLX5E_TX_CQ_POLL_BUDGET) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
+ 
+@@ -223,16 +228,75 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq
+ 
+ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
+ {
+-	struct mlx5e_rq *rq = container_of(sq, struct mlx5e_rq, xdpsq);
+-	struct mlx5e_xdp_info *xdpi;
+-	u16 ci;
++	struct mlx5e_rq *rq;
++	bool is_redirect;
++
++	is_redirect = test_bit(MLX5E_SQ_STATE_REDIRECT, &sq->state);
++	rq = is_redirect ? NULL : container_of(sq, struct mlx5e_rq, xdpsq);
+ 
+ 	while (sq->cc != sq->pc) {
+-		ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sq->cc);
+-		xdpi = &sq->db.xdpi[ci];
++		u16 ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sq->cc);
++		struct mlx5e_xdp_info *xdpi = &sq->db.xdpi[ci];
++
+ 		sq->cc++;
+ 
+-		mlx5e_page_release(rq, &xdpi->di, false);
++		if (is_redirect) {
++			xdp_return_frame(xdpi->xdpf);
++			dma_unmap_single(sq->pdev, xdpi->dma_addr,
++					 xdpi->xdpf->len, DMA_TO_DEVICE);
++		} else {
++			/* Recycle RX page */
++			mlx5e_page_release(rq, &xdpi->di, false);
++		}
+ 	}
+ }
+ 
++int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
++		   u32 flags)
++{
++	struct mlx5e_priv *priv = netdev_priv(dev);
++	struct mlx5e_xdpsq *sq;
++	int drops = 0;
++	int sq_num;
++	int i;
++
++	if (unlikely(!test_bit(MLX5E_STATE_OPENED, &priv->state)))
++		return -ENETDOWN;
++
++	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++		return -EINVAL;
++
++	sq_num = smp_processor_id();
++
++	if (unlikely(sq_num >= priv->channels.num))
++		return -ENXIO;
++
++	sq = &priv->channels.c[sq_num]->xdpsq;
++
++	if (unlikely(!test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state)))
++		return -ENETDOWN;
++
++	for (i = 0; i < n; i++) {
++		struct xdp_frame *xdpf = frames[i];
++		struct mlx5e_xdp_info xdpi;
++
++		xdpi.dma_addr = dma_map_single(sq->pdev, xdpf->data, xdpf->len,
++					       DMA_TO_DEVICE);
++		if (unlikely(dma_mapping_error(sq->pdev, xdpi.dma_addr))) {
++			drops++;
++			continue;
++		}
++
++		xdpi.xdpf = xdpf;
++
++		if (unlikely(!mlx5e_xmit_xdp_frame(sq, &xdpi))) {
++			xdp_return_frame_rx_napi(xdpf);
++			drops++;
++		}
++	}
++
++	if (flags & XDP_XMIT_FLUSH)
++		mlx5e_xmit_xdp_doorbell(sq);
++
++	return n - drops;
++}
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -46,6 +46,8 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq
+ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
+ 
+ bool mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq, struct mlx5e_xdp_info *xdpi);
++int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
++		   u32 flags);
+ 
+ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
+ {
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -988,7 +988,8 @@ static int mlx5e_alloc_xdpsq_db(struct m
+ static int mlx5e_alloc_xdpsq(struct mlx5e_channel *c,
+ 			     struct mlx5e_params *params,
+ 			     struct mlx5e_sq_param *param,
+-			     struct mlx5e_xdpsq *sq)
++			     struct mlx5e_xdpsq *sq,
++			     bool is_redirect)
+ {
+ 	void *sqc_wq               = MLX5_ADDR_OF(sqc, param->sqc, wq);
+ 	struct mlx5_core_dev *mdev = c->mdev;
+@@ -1001,7 +1002,9 @@ static int mlx5e_alloc_xdpsq(struct mlx5
+ 	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
+ 	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+-	sq->stats     = &c->priv->channel_stats[c->ix].rq_xdpsq;
++	sq->stats     = is_redirect ?
++		&c->priv->channel_stats[c->ix].xdpsq :
++		&c->priv->channel_stats[c->ix].rq_xdpsq;
+ 
+ 	param->wq.db_numa_node = cpu_to_node(c->cpu);
+ 	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, wq, &sq->wq_ctrl);
+@@ -1531,7 +1534,8 @@ static void mlx5e_close_icosq(struct mlx
+ static int mlx5e_open_xdpsq(struct mlx5e_channel *c,
+ 			    struct mlx5e_params *params,
+ 			    struct mlx5e_sq_param *param,
+-			    struct mlx5e_xdpsq *sq)
++			    struct mlx5e_xdpsq *sq,
++			    bool is_redirect)
+ {
+ 	unsigned int ds_cnt = MLX5E_XDP_TX_DS_COUNT;
+ 	struct mlx5e_create_sq_param csp = {};
+@@ -1539,7 +1543,7 @@ static int mlx5e_open_xdpsq(struct mlx5e
+ 	int err;
+ 	int i;
+ 
+-	err = mlx5e_alloc_xdpsq(c, params, param, sq);
++	err = mlx5e_alloc_xdpsq(c, params, param, sq, is_redirect);
+ 	if (err)
+ 		return err;
+ 
+@@ -1548,6 +1552,8 @@ static int mlx5e_open_xdpsq(struct mlx5e
+ 	csp.cqn             = sq->cq.mcq.cqn;
+ 	csp.wq_ctrl         = &sq->wq_ctrl;
+ 	csp.min_inline_mode = sq->min_inline_mode;
++	if (is_redirect)
++		set_bit(MLX5E_SQ_STATE_REDIRECT, &sq->state);
+ 	set_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ 	err = mlx5e_create_sq_rdy(c->mdev, param, &csp, &sq->sqn);
+ 	if (err)
+@@ -1930,10 +1936,14 @@ static int mlx5e_open_channel(struct mlx
+ 	if (err)
+ 		goto err_close_icosq_cq;
+ 
+-	err = mlx5e_open_cq(c, params->rx_cq_moderation, &cparam->rx_cq, &c->rq.cq);
++	err = mlx5e_open_cq(c, params->tx_cq_moderation, &cparam->tx_cq, &c->xdpsq.cq);
+ 	if (err)
+ 		goto err_close_tx_cqs;
+ 
++	err = mlx5e_open_cq(c, params->rx_cq_moderation, &cparam->rx_cq, &c->rq.cq);
++	if (err)
++		goto err_close_xdp_tx_cqs;
++
+ 	/* XDP SQ CQ params are same as normal TXQ sq CQ params */
+ 	err = c->xdp ? mlx5e_open_cq(c, params->tx_cq_moderation,
+ 				     &cparam->tx_cq, &c->rq.xdpsq.cq) : 0;
+@@ -1950,7 +1960,7 @@ static int mlx5e_open_channel(struct mlx
+ 	if (err)
+ 		goto err_close_icosq;
+ 
+-	err = c->xdp ? mlx5e_open_xdpsq(c, params, &cparam->xdp_sq, &c->rq.xdpsq) : 0;
++	err = c->xdp ? mlx5e_open_xdpsq(c, params, &cparam->xdp_sq, &c->rq.xdpsq, false) : 0;
+ 	if (err)
+ 		goto err_close_sqs;
+ 
+@@ -1958,9 +1968,17 @@ static int mlx5e_open_channel(struct mlx
+ 	if (err)
+ 		goto err_close_xdp_sq;
+ 
++	err = mlx5e_open_xdpsq(c, params, &cparam->xdp_sq, &c->xdpsq, true);
++	if (err)
++		goto err_close_rq;
++
+ 	*cp = c;
+ 
+ 	return 0;
++
++err_close_rq:
++	mlx5e_close_rq(&c->rq);
++
+ err_close_xdp_sq:
+ 	if (c->xdp)
+ 		mlx5e_close_xdpsq(&c->rq.xdpsq);
+@@ -1979,6 +1997,9 @@ err_disable_napi:
+ err_close_rx_cq:
+ 	mlx5e_close_cq(&c->rq.cq);
+ 
++err_close_xdp_tx_cqs:
++	mlx5e_close_cq(&c->xdpsq.cq);
++
+ err_close_tx_cqs:
+ 	mlx5e_close_tx_cqs(c);
+ 
+@@ -2013,6 +2034,7 @@ static void mlx5e_deactivate_channel(str
+ 
+ static void mlx5e_close_channel(struct mlx5e_channel *c)
+ {
++	mlx5e_close_xdpsq(&c->xdpsq);
+ 	mlx5e_close_rq(&c->rq);
+ 	if (c->xdp)
+ 		mlx5e_close_xdpsq(&c->rq.xdpsq);
+@@ -2022,6 +2044,7 @@ static void mlx5e_close_channel(struct m
+ 	if (c->xdp)
+ 		mlx5e_close_cq(&c->rq.xdpsq.cq);
+ 	mlx5e_close_cq(&c->rq.cq);
++	mlx5e_close_cq(&c->xdpsq.cq);
+ 	mlx5e_close_tx_cqs(c);
+ 	mlx5e_close_cq(&c->icosq.cq);
+ 	netif_napi_del(&c->napi);
+@@ -4279,6 +4302,7 @@ static const struct net_device_ops mlx5e
+ #endif
+ 	.ndo_tx_timeout          = mlx5e_tx_timeout,
+ 	.ndo_bpf		 = mlx5e_xdp,
++	.ndo_xdp_xmit            = mlx5e_xdp_xmit,
+ #ifdef CONFIG_NET_POLL_CONTROLLER
+ 	.ndo_poll_controller     = mlx5e_netpoll,
+ #endif
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -75,6 +75,10 @@ static const struct counter_desc sw_stat
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_queue_wake) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_udp_seg_rem) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_cqe_err) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_xmit) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_full) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_err) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xdp_cqes) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_wqe_err) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_mpwqe_filler_cqes) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_mpwqe_filler_strides) },
+@@ -130,6 +134,7 @@ void mlx5e_grp_sw_update_stats(struct ml
+ 	for (i = 0; i < priv->profile->max_nch(priv->mdev); i++) {
+ 		struct mlx5e_channel_stats *channel_stats =
+ 			&priv->channel_stats[i];
++		struct mlx5e_xdpsq_stats *xdpsq_red_stats = &channel_stats->xdpsq;
+ 		struct mlx5e_xdpsq_stats *xdpsq_stats = &channel_stats->rq_xdpsq;
+ 		struct mlx5e_rq_stats *rq_stats = &channel_stats->rq;
+ 		struct mlx5e_ch_stats *ch_stats = &channel_stats->ch;
+@@ -168,6 +173,11 @@ void mlx5e_grp_sw_update_stats(struct ml
+ 		s->ch_arm         += ch_stats->arm;
+ 		s->ch_aff_change  += ch_stats->aff_change;
+ 		s->ch_eq_rearm    += ch_stats->eq_rearm;
++		/* xdp redirect */
++		s->tx_xdp_xmit    += xdpsq_red_stats->xmit;
++		s->tx_xdp_full    += xdpsq_red_stats->full;
++		s->tx_xdp_err     += xdpsq_red_stats->err;
++		s->tx_xdp_cqes    += xdpsq_red_stats->cqes;
+ 
+ 		for (j = 0; j < priv->max_opened_tc; j++) {
+ 			struct mlx5e_sq_stats *sq_stats = &channel_stats->sq[j];
+@@ -1178,6 +1188,13 @@ static const struct counter_desc rq_xdps
+ 	{ MLX5E_DECLARE_RQ_XDPSQ_STAT(struct mlx5e_xdpsq_stats, cqes) },
+ };
+ 
++static const struct counter_desc xdpsq_stats_desc[] = {
++	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, xmit) },
++	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, full) },
++	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, err) },
++	{ MLX5E_DECLARE_XDPSQ_STAT(struct mlx5e_xdpsq_stats, cqes) },
++};
++
+ static const struct counter_desc ch_stats_desc[] = {
+ 	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, events) },
+ 	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, poll) },
+@@ -1188,6 +1205,7 @@ static const struct counter_desc ch_stat
+ 
+ #define NUM_RQ_STATS			ARRAY_SIZE(rq_stats_desc)
+ #define NUM_SQ_STATS			ARRAY_SIZE(sq_stats_desc)
++#define NUM_XDPSQ_STATS			ARRAY_SIZE(xdpsq_stats_desc)
+ #define NUM_RQ_XDPSQ_STATS		ARRAY_SIZE(rq_xdpsq_stats_desc)
+ #define NUM_CH_STATS			ARRAY_SIZE(ch_stats_desc)
+ 
+@@ -1198,7 +1216,8 @@ static int mlx5e_grp_channels_get_num_st
+ 	return (NUM_RQ_STATS * max_nch) +
+ 	       (NUM_CH_STATS * max_nch) +
+ 	       (NUM_SQ_STATS * max_nch * priv->max_opened_tc) +
+-	       (NUM_RQ_XDPSQ_STATS * max_nch);
++	       (NUM_RQ_XDPSQ_STATS * max_nch) +
++	       (NUM_XDPSQ_STATS * max_nch);
+ }
+ 
+ static int mlx5e_grp_channels_fill_strings(struct mlx5e_priv *priv, u8 *data,
+@@ -1228,6 +1247,11 @@ static int mlx5e_grp_channels_fill_strin
+ 					sq_stats_desc[j].format,
+ 					priv->channel_tc2txq[i][tc]);
+ 
++	for (i = 0; i < max_nch; i++)
++		for (j = 0; j < NUM_XDPSQ_STATS; j++)
++			sprintf(data + (idx++) * ETH_GSTRING_LEN,
++				xdpsq_stats_desc[j].format, i);
++
+ 	return idx;
+ }
+ 
+@@ -1261,6 +1285,12 @@ static int mlx5e_grp_channels_fill_stats
+ 					MLX5E_READ_CTR64_CPU(&priv->channel_stats[i].sq[tc],
+ 							     sq_stats_desc, j);
+ 
++	for (i = 0; i < max_nch; i++)
++		for (j = 0; j < NUM_XDPSQ_STATS; j++)
++			data[idx++] =
++				MLX5E_READ_CTR64_CPU(&priv->channel_stats[i].xdpsq,
++						     xdpsq_stats_desc, j);
++
+ 	return idx;
+ }
+ 
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -44,6 +44,7 @@
+ #define MLX5E_DECLARE_STAT(type, fld) #fld, offsetof(type, fld)
+ #define MLX5E_DECLARE_RX_STAT(type, fld) "rx%d_"#fld, offsetof(type, fld)
+ #define MLX5E_DECLARE_TX_STAT(type, fld) "tx%d_"#fld, offsetof(type, fld)
++#define MLX5E_DECLARE_XDPSQ_STAT(type, fld) "tx%d_xdp_"#fld, offsetof(type, fld)
+ #define MLX5E_DECLARE_RQ_XDPSQ_STAT(type, fld) "rx%d_xdp_tx_"#fld, offsetof(type, fld)
+ #define MLX5E_DECLARE_CH_STAT(type, fld) "ch%d_"#fld, offsetof(type, fld)
+ 
+@@ -87,6 +88,10 @@ struct mlx5e_sw_stats {
+ 	u64 tx_queue_wake;
+ 	u64 tx_udp_seg_rem;
+ 	u64 tx_cqe_err;
++	u64 tx_xdp_xmit;
++	u64 tx_xdp_full;
++	u64 tx_xdp_err;
++	u64 tx_xdp_cqes;
+ 	u64 rx_wqe_err;
+ 	u64 rx_mpwqe_filler_cqes;
+ 	u64 rx_mpwqe_filler_strides;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -85,6 +85,8 @@ int mlx5e_napi_poll(struct napi_struct *
+ 	for (i = 0; i < c->num_tc; i++)
+ 		busy |= mlx5e_poll_tx_cq(&c->sq[i].cq, budget);
+ 
++	busy |= mlx5e_poll_xdpsq_cq(&c->xdpsq.cq);
++
+ 	if (c->xdp)
+ 		busy |= mlx5e_poll_xdpsq_cq(&c->rq.xdpsq.cq);
+ 
+@@ -117,6 +119,7 @@ int mlx5e_napi_poll(struct napi_struct *
+ 
+ 	mlx5e_cq_arm(&c->rq.cq);
+ 	mlx5e_cq_arm(&c->icosq.cq);
++	mlx5e_cq_arm(&c->xdpsq.cq);
+ 
+ 	return work_done;
+ }
