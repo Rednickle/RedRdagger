@@ -1,0 +1,355 @@
+From: Andrey Ignatov <rdna@fb.com>
+Date: Mon, 30 Jul 2018 17:42:31 -0700
+Subject: selftests/bpf: Test for get_socket_cookie
+Patch-mainline: v4.19-rc1
+Git-commit: 194db0d95802fb48d03034fb6bfead1235de3450
+References: bsc#1109837
+
+Add test to use get_socket_cookie() from BPF programs of types
+BPF_PROG_TYPE_SOCK_OPS and BPF_PROG_TYPE_CGROUP_SOCK_ADDR.
+
+The test attaches two programs to cgroup, runs TCP server and client in
+the cgroup and checks that two operations are done properly on client
+socket when user calls connect(2):
+
+1. In BPF_CGROUP_INET6_CONNECT socket cookie is used as the key to write
+   new value in a map for client socket.
+
+2. In BPF_CGROUP_SOCK_OPS (BPF_SOCK_OPS_TCP_CONNECT_CB callback) the
+   value written in "1." is found by socket cookie, since it's the same
+   socket, and updated.
+
+Finally the test verifies the value in the map.
+
+Signed-off-by: Andrey Ignatov <rdna@fb.com>
+Acked-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ tools/testing/selftests/bpf/Makefile             |    6 
+ tools/testing/selftests/bpf/socket_cookie_prog.c |   60 ++++++
+ tools/testing/selftests/bpf/test_socket_cookie.c |  225 +++++++++++++++++++++++
+ 3 files changed, 289 insertions(+), 2 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/socket_cookie_prog.c
+ create mode 100644 tools/testing/selftests/bpf/test_socket_cookie.c
+
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -22,7 +22,8 @@ $(TEST_CUSTOM_PROGS): $(OUTPUT)/%: %.c
+ # Order correspond to 'make run_tests' order
+ TEST_GEN_PROGS = test_verifier test_tag test_maps test_lru_map test_lpm_map test_progs \
+ 	test_align test_verifier_log test_dev_cgroup test_tcpbpf_user \
+-	test_sock test_btf test_sockmap get_cgroup_id_user
++	test_sock test_btf test_sockmap get_cgroup_id_user \
++	test_socket_cookie
+ 
+ TEST_GEN_FILES = test_pkt_access.o test_xdp.o test_l4lb.o test_tcp_estats.o test_obj_id.o \
+ 	test_pkt_md_access.o test_xdp_redirect.o test_xdp_meta.o sockmap_parse_prog.o     \
+@@ -33,7 +34,7 @@ TEST_GEN_FILES = test_pkt_access.o test_
+ 	test_btf_haskv.o test_btf_nokv.o test_sockmap_kern.o test_tunnel_kern.o \
+ 	test_get_stack_rawtp.o test_sockmap_kern.o test_sockhash_kern.o \
+ 	sendmsg4_prog.o sendmsg6_prog.o \
+-	get_cgroup_id_kern.o
++	get_cgroup_id_kern.o socket_cookie_prog.o
+ 
+ # Order correspond to 'make run_tests' order
+ TEST_PROGS := test_kmod.sh \
+@@ -58,6 +59,7 @@ $(TEST_GEN_PROGS_EXTENDED): $(OUTPUT)/li
+ $(OUTPUT)/test_dev_cgroup: cgroup_helpers.c
+ $(OUTPUT)/test_sock: cgroup_helpers.c
+ $(OUTPUT)/test_sock_addr: cgroup_helpers.c
++$(OUTPUT)/test_socket_cookie: cgroup_helpers.c
+ $(OUTPUT)/test_sockmap: cgroup_helpers.c
+ $(OUTPUT)/test_tcpbpf_user: cgroup_helpers.c
+ $(OUTPUT)/test_progs: trace_helpers.c
+--- /dev/null
++++ b/tools/testing/selftests/bpf/socket_cookie_prog.c
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2018 Facebook
++
++#include <linux/bpf.h>
++#include <sys/socket.h>
++
++#include "bpf_helpers.h"
++#include "bpf_endian.h"
++
++struct bpf_map_def SEC("maps") socket_cookies = {
++	.type = BPF_MAP_TYPE_HASH,
++	.key_size = sizeof(__u64),
++	.value_size = sizeof(__u32),
++	.max_entries = 1 << 8,
++};
++
++SEC("cgroup/connect6")
++int set_cookie(struct bpf_sock_addr *ctx)
++{
++	__u32 cookie_value = 0xFF;
++	__u64 cookie_key;
++
++	if (ctx->family != AF_INET6 || ctx->user_family != AF_INET6)
++		return 1;
++
++	cookie_key = bpf_get_socket_cookie(ctx);
++	if (bpf_map_update_elem(&socket_cookies, &cookie_key, &cookie_value, 0))
++		return 0;
++
++	return 1;
++}
++
++SEC("sockops")
++int update_cookie(struct bpf_sock_ops *ctx)
++{
++	__u32 new_cookie_value;
++	__u32 *cookie_value;
++	__u64 cookie_key;
++
++	if (ctx->family != AF_INET6)
++		return 1;
++
++	if (ctx->op != BPF_SOCK_OPS_TCP_CONNECT_CB)
++		return 1;
++
++	cookie_key = bpf_get_socket_cookie(ctx);
++
++	cookie_value = bpf_map_lookup_elem(&socket_cookies, &cookie_key);
++	if (!cookie_value)
++		return 1;
++
++	new_cookie_value = (ctx->local_port << 8) | *cookie_value;
++	bpf_map_update_elem(&socket_cookies, &cookie_key, &new_cookie_value, 0);
++
++	return 1;
++}
++
++int _version SEC("version") = 1;
++
++char _license[] SEC("license") = "GPL";
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_socket_cookie.c
+@@ -0,0 +1,225 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2018 Facebook
++
++#include <string.h>
++#include <unistd.h>
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++
++#include <bpf/bpf.h>
++#include <bpf/libbpf.h>
++
++#include "bpf_rlimit.h"
++#include "cgroup_helpers.h"
++
++#define CG_PATH			"/foo"
++#define SOCKET_COOKIE_PROG	"./socket_cookie_prog.o"
++
++static int start_server(void)
++{
++	struct sockaddr_in6 addr;
++	int fd;
++
++	fd = socket(AF_INET6, SOCK_STREAM, 0);
++	if (fd == -1) {
++		log_err("Failed to create server socket");
++		goto out;
++	}
++
++	memset(&addr, 0, sizeof(addr));
++	addr.sin6_family = AF_INET6;
++	addr.sin6_addr = in6addr_loopback;
++	addr.sin6_port = 0;
++
++	if (bind(fd, (const struct sockaddr *)&addr, sizeof(addr)) == -1) {
++		log_err("Failed to bind server socket");
++		goto close_out;
++	}
++
++	if (listen(fd, 128) == -1) {
++		log_err("Failed to listen on server socket");
++		goto close_out;
++	}
++
++	goto out;
++
++close_out:
++	close(fd);
++	fd = -1;
++out:
++	return fd;
++}
++
++static int connect_to_server(int server_fd)
++{
++	struct sockaddr_storage addr;
++	socklen_t len = sizeof(addr);
++	int fd;
++
++	fd = socket(AF_INET6, SOCK_STREAM, 0);
++	if (fd == -1) {
++		log_err("Failed to create client socket");
++		goto out;
++	}
++
++	if (getsockname(server_fd, (struct sockaddr *)&addr, &len)) {
++		log_err("Failed to get server addr");
++		goto close_out;
++	}
++
++	if (connect(fd, (const struct sockaddr *)&addr, len) == -1) {
++		log_err("Fail to connect to server");
++		goto close_out;
++	}
++
++	goto out;
++
++close_out:
++	close(fd);
++	fd = -1;
++out:
++	return fd;
++}
++
++static int validate_map(struct bpf_map *map, int client_fd)
++{
++	__u32 cookie_expected_value;
++	struct sockaddr_in6 addr;
++	socklen_t len = sizeof(addr);
++	__u32 cookie_value;
++	__u64 cookie_key;
++	int err = 0;
++	int map_fd;
++
++	if (!map) {
++		log_err("Map not found in BPF object");
++		goto err;
++	}
++
++	map_fd = bpf_map__fd(map);
++
++	err = bpf_map_get_next_key(map_fd, NULL, &cookie_key);
++	if (err) {
++		log_err("Can't get cookie key from map");
++		goto out;
++	}
++
++	err = bpf_map_lookup_elem(map_fd, &cookie_key, &cookie_value);
++	if (err) {
++		log_err("Can't get cookie value from map");
++		goto out;
++	}
++
++	err = getsockname(client_fd, (struct sockaddr *)&addr, &len);
++	if (err) {
++		log_err("Can't get client local addr");
++		goto out;
++	}
++
++	cookie_expected_value = (ntohs(addr.sin6_port) << 8) | 0xFF;
++	if (cookie_value != cookie_expected_value) {
++		log_err("Unexpected value in map: %x != %x", cookie_value,
++			cookie_expected_value);
++		goto err;
++	}
++
++	goto out;
++err:
++	err = -1;
++out:
++	return err;
++}
++
++static int run_test(int cgfd)
++{
++	enum bpf_attach_type attach_type;
++	struct bpf_prog_load_attr attr;
++	struct bpf_program *prog;
++	struct bpf_object *pobj;
++	const char *prog_name;
++	int server_fd = -1;
++	int client_fd = -1;
++	int prog_fd = -1;
++	int err = 0;
++
++	memset(&attr, 0, sizeof(attr));
++	attr.file = SOCKET_COOKIE_PROG;
++	attr.prog_type = BPF_PROG_TYPE_UNSPEC;
++
++	err = bpf_prog_load_xattr(&attr, &pobj, &prog_fd);
++	if (err) {
++		log_err("Failed to load %s", attr.file);
++		goto out;
++	}
++
++	bpf_object__for_each_program(prog, pobj) {
++		prog_name = bpf_program__title(prog, /*needs_copy*/ false);
++
++		if (strcmp(prog_name, "cgroup/connect6") == 0) {
++			attach_type = BPF_CGROUP_INET6_CONNECT;
++		} else if (strcmp(prog_name, "sockops") == 0) {
++			attach_type = BPF_CGROUP_SOCK_OPS;
++		} else {
++			log_err("Unexpected prog: %s", prog_name);
++			goto err;
++		}
++
++		err = bpf_prog_attach(bpf_program__fd(prog), cgfd, attach_type,
++				      BPF_F_ALLOW_OVERRIDE);
++		if (err) {
++			log_err("Failed to attach prog %s", prog_name);
++			goto out;
++		}
++	}
++
++	server_fd = start_server();
++	if (server_fd == -1)
++		goto err;
++
++	client_fd = connect_to_server(server_fd);
++	if (client_fd == -1)
++		goto err;
++
++	if (validate_map(bpf_map__next(NULL, pobj), client_fd))
++		goto err;
++
++	goto out;
++err:
++	err = -1;
++out:
++	close(client_fd);
++	close(server_fd);
++	bpf_object__close(pobj);
++	printf("%s\n", err ? "FAILED" : "PASSED");
++	return err;
++}
++
++int main(int argc, char **argv)
++{
++	int cgfd = -1;
++	int err = 0;
++
++	if (setup_cgroup_environment())
++		goto err;
++
++	cgfd = create_and_get_cgroup(CG_PATH);
++	if (!cgfd)
++		goto err;
++
++	if (join_cgroup(CG_PATH))
++		goto err;
++
++	if (run_test(cgfd))
++		goto err;
++
++	goto out;
++err:
++	err = -1;
++out:
++	close(cgfd);
++	cleanup_cgroup_environment();
++	return err;
++}
