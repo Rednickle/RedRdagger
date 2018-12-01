@@ -1,0 +1,222 @@
+From: Edward Cree <ecree@solarflare.com>
+Date: Mon, 2 Jul 2018 16:14:12 +0100
+Subject: net: ipv4: listified version of ip_rcv
+Patch-mainline: v4.19-rc1
+Git-commit: 17266ee939849cb095ed7dd9edbec4162172226b
+References: bsc#1109837
+
+Also involved adding a way to run a netfilter hook over a list of packets.
+ Rather than attempting to make netfilter know about lists (which would be
+ a major project in itself) we just let it call the regular okfn (in this
+ case ip_rcv_finish()) for any packets it steals, and have it give us back
+ a list of packets it's synchronously accepted (which normally NF_HOOK
+ would automatically call okfn() on, but we want to be able to potentially
+ pass the list to a listified version of okfn().)
+The netfilter hooks themselves are indirect calls that still happen per-
+ packet (see nf_hook_entry_hookfn()), but again, changing that can be left
+ for future work.
+
+There is potential for out-of-order receives if the netfilter hook ends up
+ synchronously stealing packets, as they will be processed before any
+ accepts earlier in the list.  However, it was already possible for an
+ asynchronous accept to cause out-of-order receives, so presumably this is
+ considered OK.
+
+Signed-off-by: Edward Cree <ecree@solarflare.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/netdevice.h |    3 ++
+ include/linux/netfilter.h |   22 ++++++++++++++
+ include/net/ip.h          |    2 +
+ net/core/dev.c            |    8 +++--
+ net/ipv4/af_inet.c        |    1 
+ net/ipv4/ip_input.c       |   68 +++++++++++++++++++++++++++++++++++++++++-----
+ 6 files changed, 94 insertions(+), 10 deletions(-)
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2266,6 +2266,9 @@ struct packet_type {
+ 					 struct net_device *,
+ 					 struct packet_type *,
+ 					 struct net_device *);
++	void			(*list_func) (struct list_head *,
++					      struct packet_type *,
++					      struct net_device *);
+ 	bool			(*id_match)(struct packet_type *ptype,
+ 					    struct sock *sk);
+ 	void			*af_packet_priv;
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -258,6 +258,20 @@ NF_HOOK(uint8_t pf, unsigned int hook, s
+ 	return ret;
+ }
+ 
++static inline void
++NF_HOOK_LIST(uint8_t pf, unsigned int hook, struct net *net, struct sock *sk,
++	     struct list_head *head, struct net_device *in, struct net_device *out,
++	     int (*okfn)(struct net *, struct sock *, struct sk_buff *))
++{
++	struct sk_buff *skb, *next;
++
++	list_for_each_entry_safe(skb, next, head, list) {
++		int ret = nf_hook(pf, hook, net, sk, skb, in, out, okfn);
++		if (ret != 1)
++			list_del(&skb->list);
++	}
++}
++
+ /* Call setsockopt() */
+ int nf_setsockopt(struct sock *sk, u_int8_t pf, int optval, char __user *opt,
+ 		  unsigned int len);
+@@ -372,6 +386,14 @@ NF_HOOK(uint8_t pf, unsigned int hook, s
+ 	return okfn(net, sk, skb);
+ }
+ 
++static inline void
++NF_HOOK_LIST(uint8_t pf, unsigned int hook, struct net *net, struct sock *sk,
++	     struct list_head *head, struct net_device *in, struct net_device *out,
++	     int (*okfn)(struct net *, struct sock *, struct sk_buff *))
++{
++	/* nothing to do */
++}
++
+ static inline int nf_hook(u_int8_t pf, unsigned int hook, struct net *net,
+ 			  struct sock *sk, struct sk_buff *skb,
+ 			  struct net_device *indev, struct net_device *outdev,
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -116,6 +116,8 @@ int ip_build_and_send_pkt(struct sk_buff
+ 			  struct ip_options_rcu *opt);
+ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
+ 	   struct net_device *orig_dev);
++void ip_list_rcv(struct list_head *head, struct packet_type *pt,
++		 struct net_device *orig_dev);
+ int ip_local_deliver(struct sk_buff *skb);
+ int ip_mr_input(struct sk_buff *skb);
+ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb);
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4781,9 +4781,11 @@ static inline void __netif_receive_skb_l
+ 		return;
+ 	if (list_empty(head))
+ 		return;
+-
+-	list_for_each_entry_safe(skb, next, head, list)
+-		pt_prev->func(skb, skb->dev, pt_prev, orig_dev);
++	if (pt_prev->list_func != NULL)
++		pt_prev->list_func(head, pt_prev, orig_dev);
++	else
++		list_for_each_entry_safe(skb, next, head, list)
++			pt_prev->func(skb, skb->dev, pt_prev, orig_dev);
+ }
+ 
+ static void __netif_receive_skb_list_core(struct list_head *head, bool pfmemalloc)
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1835,6 +1835,7 @@ fs_initcall(ipv4_offload_init);
+ static struct packet_type ip_packet_type __read_mostly = {
+ 	.type = cpu_to_be16(ETH_P_IP),
+ 	.func = ip_rcv,
++	.list_func = ip_list_rcv,
+ };
+ 
+ static int __init inet_init(void)
+--- a/net/ipv4/ip_input.c
++++ b/net/ipv4/ip_input.c
+@@ -409,10 +409,9 @@ drop_error:
+ /*
+  * 	Main IP Receive routine.
+  */
+-int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
++static struct sk_buff *ip_rcv_core(struct sk_buff *skb, struct net *net)
+ {
+ 	const struct iphdr *iph;
+-	struct net *net;
+ 	u32 len;
+ 
+ 	/* When the interface is in promisc. mode, drop all the crap
+@@ -422,7 +421,6 @@ int ip_rcv(struct sk_buff *skb, struct n
+ 		goto drop;
+ 
+ 
+-	net = dev_net(dev);
+ 	__IP_UPD_PO_STATS(net, IPSTATS_MIB_IN, skb->len);
+ 
+ 	skb = skb_share_check(skb, GFP_ATOMIC);
+@@ -490,9 +488,7 @@ int ip_rcv(struct sk_buff *skb, struct n
+ 	/* Must drop socket now because of tproxy. */
+ 	skb_orphan(skb);
+ 
+-	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
+-		       net, NULL, skb, dev, NULL,
+-		       ip_rcv_finish);
++	return skb;
+ 
+ csum_error:
+ 	__IP_INC_STATS(net, IPSTATS_MIB_CSUMERRORS);
+@@ -501,5 +497,63 @@ inhdr_error:
+ drop:
+ 	kfree_skb(skb);
+ out:
+-	return NET_RX_DROP;
++	return NULL;
++}
++
++/*
++ * IP receive entry point
++ */
++int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
++	   struct net_device *orig_dev)
++{
++	struct net *net = dev_net(dev);
++
++	skb = ip_rcv_core(skb, net);
++	if (skb == NULL)
++		return NET_RX_DROP;
++	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
++		       net, NULL, skb, dev, NULL,
++		       ip_rcv_finish);
++}
++
++static void ip_sublist_rcv(struct list_head *head, struct net_device *dev,
++			   struct net *net)
++{
++	struct sk_buff *skb, *next;
++
++	NF_HOOK_LIST(NFPROTO_IPV4, NF_INET_PRE_ROUTING, net, NULL,
++		     head, dev, NULL, ip_rcv_finish);
++	list_for_each_entry_safe(skb, next, head, list)
++		ip_rcv_finish(net, NULL, skb);
++}
++
++/* Receive a list of IP packets */
++void ip_list_rcv(struct list_head *head, struct packet_type *pt,
++		 struct net_device *orig_dev)
++{
++	struct net_device *curr_dev = NULL;
++	struct net *curr_net = NULL;
++	struct sk_buff *skb, *next;
++	struct list_head sublist;
++
++	list_for_each_entry_safe(skb, next, head, list) {
++		struct net_device *dev = skb->dev;
++		struct net *net = dev_net(dev);
++
++		skb = ip_rcv_core(skb, net);
++		if (skb == NULL)
++			continue;
++
++		if (curr_dev != dev || curr_net != net) {
++			/* dispatch old sublist */
++			list_cut_before(&sublist, head, &skb->list);
++			if (!list_empty(&sublist))
++				ip_sublist_rcv(&sublist, dev, net);
++			/* start new sublist */
++			curr_dev = dev;
++			curr_net = net;
++		}
++	}
++	/* dispatch final sublist */
++	ip_sublist_rcv(head, curr_dev, curr_net);
+ }
