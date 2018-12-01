@@ -1,0 +1,273 @@
+From: Roman Gushchin <guro@fb.com>
+Date: Thu, 2 Aug 2018 14:27:21 -0700
+Subject: bpf: extend bpf_prog_array to store pointers to the cgroup storage
+Patch-mainline: v4.19-rc1
+Git-commit: 394e40a29788820c9c0526b1c3497c9e0ec2a126
+References: bsc#1109837
+
+This patch converts bpf_prog_array from an array of prog pointers
+to the array of struct bpf_prog_array_item elements.
+
+This allows to save a cgroup storage pointer for each bpf program
+efficiently attached to a cgroup.
+
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/bpf.h |   19 ++++++++-----
+ kernel/bpf/cgroup.c |   21 ++++++++------
+ kernel/bpf/core.c   |   76 ++++++++++++++++++++++++++--------------------------
+ 3 files changed, 64 insertions(+), 52 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -346,9 +346,14 @@ int bpf_prog_test_run_skb(struct bpf_pro
+  * The 'struct bpf_prog_array *' should only be replaced with xchg()
+  * since other cpus are walking the array of pointers in parallel.
+  */
++struct bpf_prog_array_item {
++	struct bpf_prog *prog;
++	struct bpf_cgroup_storage *cgroup_storage;
++};
++
+ struct bpf_prog_array {
+ 	struct rcu_head rcu;
+-	struct bpf_prog *progs[0];
++	struct bpf_prog_array_item items[0];
+ };
+ 
+ struct bpf_prog_array *bpf_prog_array_alloc(u32 prog_cnt, gfp_t flags);
+@@ -369,7 +374,8 @@ int bpf_prog_array_copy(struct bpf_prog_
+ 
+ #define __BPF_PROG_RUN_ARRAY(array, ctx, func, check_non_null)	\
+ 	({						\
+-		struct bpf_prog **_prog, *__prog;	\
++		struct bpf_prog_array_item *_item;	\
++		struct bpf_prog *_prog;			\
+ 		struct bpf_prog_array *_array;		\
+ 		u32 _ret = 1;				\
+ 		preempt_disable();			\
+@@ -377,10 +383,11 @@ int bpf_prog_array_copy(struct bpf_prog_
+ 		_array = rcu_dereference(array);	\
+ 		if (unlikely(check_non_null && !_array))\
+ 			goto _out;			\
+-		_prog = _array->progs;			\
+-		while ((__prog = READ_ONCE(*_prog))) {	\
+-			_ret &= func(__prog, ctx);	\
+-			_prog++;			\
++		_item = &_array->items[0];		\
++		while ((_prog = READ_ONCE(_item->prog))) {		\
++			bpf_cgroup_storage_set(_item->cgroup_storage);	\
++			_ret &= func(_prog, ctx);	\
++			_item++;			\
+ 		}					\
+ _out:							\
+ 		rcu_read_unlock();			\
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -117,15 +117,18 @@ static int compute_effective_progs(struc
+ 	cnt = 0;
+ 	p = cgrp;
+ 	do {
+-		if (cnt == 0 || (p->bpf.flags[type] & BPF_F_ALLOW_MULTI))
+-			list_for_each_entry(pl,
+-					    &p->bpf.progs[type], node) {
+-				if (!pl->prog)
+-					continue;
+-				progs->progs[cnt++] = pl->prog;
+-			}
+-		p = cgroup_parent(p);
+-	} while (p);
++		if (cnt > 0 && !(p->bpf.flags[type] & BPF_F_ALLOW_MULTI))
++			continue;
++
++		list_for_each_entry(pl, &p->bpf.progs[type], node) {
++			if (!pl->prog)
++				continue;
++
++			progs->items[cnt].prog = pl->prog;
++			progs->items[cnt].cgroup_storage = pl->storage;
++			cnt++;
++		}
++	} while ((p = cgroup_parent(p)));
+ 
+ 	rcu_assign_pointer(*array, progs);
+ 	return 0;
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1545,7 +1545,8 @@ struct bpf_prog_array *bpf_prog_array_al
+ {
+ 	if (prog_cnt)
+ 		return kzalloc(sizeof(struct bpf_prog_array) +
+-			       sizeof(struct bpf_prog *) * (prog_cnt + 1),
++			       sizeof(struct bpf_prog_array_item) *
++			       (prog_cnt + 1),
+ 			       flags);
+ 
+ 	return &empty_prog_array.hdr;
+@@ -1559,43 +1560,45 @@ void bpf_prog_array_free(struct bpf_prog
+ 	kfree_rcu(progs, rcu);
+ }
+ 
+-int bpf_prog_array_length(struct bpf_prog_array __rcu *progs)
++int bpf_prog_array_length(struct bpf_prog_array __rcu *array)
+ {
+-	struct bpf_prog **prog;
++	struct bpf_prog_array_item *item;
+ 	u32 cnt = 0;
+ 
+ 	rcu_read_lock();
+-	prog = rcu_dereference(progs)->progs;
+-	for (; *prog; prog++)
+-		if (*prog != &dummy_bpf_prog.prog)
++	item = rcu_dereference(array)->items;
++	for (; item->prog; item++)
++		if (item->prog != &dummy_bpf_prog.prog)
+ 			cnt++;
+ 	rcu_read_unlock();
+ 	return cnt;
+ }
+ 
+-static bool bpf_prog_array_copy_core(struct bpf_prog **prog,
++
++static bool bpf_prog_array_copy_core(struct bpf_prog_array __rcu *array,
+ 				     u32 *prog_ids,
+ 				     u32 request_cnt)
+ {
++	struct bpf_prog_array_item *item;
+ 	int i = 0;
+ 
+-	for (; *prog; prog++) {
+-		if (*prog == &dummy_bpf_prog.prog)
++	item = rcu_dereference(array)->items;
++	for (; item->prog; item++) {
++		if (item->prog == &dummy_bpf_prog.prog)
+ 			continue;
+-		prog_ids[i] = (*prog)->aux->id;
++		prog_ids[i] = item->prog->aux->id;
+ 		if (++i == request_cnt) {
+-			prog++;
++			item++;
+ 			break;
+ 		}
+ 	}
+ 
+-	return !!(*prog);
++	return !!(item->prog);
+ }
+ 
+-int bpf_prog_array_copy_to_user(struct bpf_prog_array __rcu *progs,
++int bpf_prog_array_copy_to_user(struct bpf_prog_array __rcu *array,
+ 				__u32 __user *prog_ids, u32 cnt)
+ {
+-	struct bpf_prog **prog;
+ 	unsigned long err = 0;
+ 	bool nospc;
+ 	u32 *ids;
+@@ -1614,8 +1617,7 @@ int bpf_prog_array_copy_to_user(struct b
+ 	if (!ids)
+ 		return -ENOMEM;
+ 	rcu_read_lock();
+-	prog = rcu_dereference(progs)->progs;
+-	nospc = bpf_prog_array_copy_core(prog, ids, cnt);
++	nospc = bpf_prog_array_copy_core(array, ids, cnt);
+ 	rcu_read_unlock();
+ 	err = copy_to_user(prog_ids, ids, cnt * sizeof(u32));
+ 	kfree(ids);
+@@ -1626,14 +1628,14 @@ int bpf_prog_array_copy_to_user(struct b
+ 	return 0;
+ }
+ 
+-void bpf_prog_array_delete_safe(struct bpf_prog_array __rcu *progs,
++void bpf_prog_array_delete_safe(struct bpf_prog_array __rcu *array,
+ 				struct bpf_prog *old_prog)
+ {
+-	struct bpf_prog **prog = progs->progs;
++	struct bpf_prog_array_item *item = array->items;
+ 
+-	for (; *prog; prog++)
+-		if (*prog == old_prog) {
+-			WRITE_ONCE(*prog, &dummy_bpf_prog.prog);
++	for (; item->prog; item++)
++		if (item->prog == old_prog) {
++			WRITE_ONCE(item->prog, &dummy_bpf_prog.prog);
+ 			break;
+ 		}
+ }
+@@ -1644,7 +1646,7 @@ int bpf_prog_array_copy(struct bpf_prog_
+ 			struct bpf_prog_array **new_array)
+ {
+ 	int new_prog_cnt, carry_prog_cnt = 0;
+-	struct bpf_prog **existing_prog;
++	struct bpf_prog_array_item *existing;
+ 	struct bpf_prog_array *array;
+ 	bool found_exclude = false;
+ 	int new_prog_idx = 0;
+@@ -1653,15 +1655,15 @@ int bpf_prog_array_copy(struct bpf_prog_
+ 	 * the new array.
+ 	 */
+ 	if (old_array) {
+-		existing_prog = old_array->progs;
+-		for (; *existing_prog; existing_prog++) {
+-			if (*existing_prog == exclude_prog) {
++		existing = old_array->items;
++		for (; existing->prog; existing++) {
++			if (existing->prog == exclude_prog) {
+ 				found_exclude = true;
+ 				continue;
+ 			}
+-			if (*existing_prog != &dummy_bpf_prog.prog)
++			if (existing->prog != &dummy_bpf_prog.prog)
+ 				carry_prog_cnt++;
+-			if (*existing_prog == include_prog)
++			if (existing->prog == include_prog)
+ 				return -EEXIST;
+ 		}
+ 	}
+@@ -1687,15 +1689,17 @@ int bpf_prog_array_copy(struct bpf_prog_
+ 
+ 	/* Fill in the new prog array */
+ 	if (carry_prog_cnt) {
+-		existing_prog = old_array->progs;
+-		for (; *existing_prog; existing_prog++)
+-			if (*existing_prog != exclude_prog &&
+-			    *existing_prog != &dummy_bpf_prog.prog)
+-				array->progs[new_prog_idx++] = *existing_prog;
++		existing = old_array->items;
++		for (; existing->prog; existing++)
++			if (existing->prog != exclude_prog &&
++			    existing->prog != &dummy_bpf_prog.prog) {
++				array->items[new_prog_idx++].prog =
++					existing->prog;
++			}
+ 	}
+ 	if (include_prog)
+-		array->progs[new_prog_idx++] = include_prog;
+-	array->progs[new_prog_idx] = NULL;
++		array->items[new_prog_idx++].prog = include_prog;
++	array->items[new_prog_idx].prog = NULL;
+ 	*new_array = array;
+ 	return 0;
+ }
+@@ -1704,7 +1708,6 @@ int bpf_prog_array_copy_info(struct bpf_
+ 			     u32 *prog_ids, u32 request_cnt,
+ 			     u32 *prog_cnt)
+ {
+-	struct bpf_prog **prog;
+ 	u32 cnt = 0;
+ 
+ 	if (array)
+@@ -1717,8 +1720,7 @@ int bpf_prog_array_copy_info(struct bpf_
+ 		return 0;
+ 
+ 	/* this function is called under trace/bpf_trace.c: bpf_event_mutex */
+-	prog = rcu_dereference_check(array, 1)->progs;
+-	return bpf_prog_array_copy_core(prog, prog_ids, request_cnt) ? -ENOSPC
++	return bpf_prog_array_copy_core(array, prog_ids, request_cnt) ? -ENOSPC
+ 								     : 0;
+ }
+ 
