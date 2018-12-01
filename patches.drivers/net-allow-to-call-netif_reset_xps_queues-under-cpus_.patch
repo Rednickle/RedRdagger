@@ -1,0 +1,161 @@
+From: Andrei Vagin <avagin@gmail.com>
+Date: Wed, 8 Aug 2018 20:07:35 -0700
+Subject: net: allow to call netif_reset_xps_queues() under cpus_read_lock
+Patch-mainline: v4.19-rc1
+Git-commit: 4d99f6602cb552fb58db0c3b1d935bb6fa017f24
+References: bsc#1109837
+
+The definition of static_key_slow_inc() has cpus_read_lock in place. In the
+virtio_net driver, XPS queues are initialized after setting the queue:cpu
+affinity in virtnet_set_affinity() which is already protected within
+cpus_read_lock. Lockdep prints a warning when we are trying to acquire
+cpus_read_lock when it is already held.
+
+This patch adds an ability to call __netif_set_xps_queue under
+cpus_read_lock().
+Acked-by: Jason Wang <jasowang@redhat.com>
+
+============================================
+WARNING: possible recursive locking detected
+4.18.0-rc3-next-20180703+ #1 Not tainted
+--------------------------------------------
+swapper/0/1 is trying to acquire lock:
+00000000cf973d46 (cpu_hotplug_lock.rw_sem){++++}, at: static_key_slow_inc+0xe/0x20
+
+but task is already holding lock:
+00000000cf973d46 (cpu_hotplug_lock.rw_sem){++++}, at: init_vqs+0x513/0x5a0
+
+other info that might help us debug this:
+ Possible unsafe locking scenario:
+
+       CPU0
+       ----
+  lock(cpu_hotplug_lock.rw_sem);
+  lock(cpu_hotplug_lock.rw_sem);
+
+ *** DEADLOCK ***
+
+ May be due to missing lock nesting notation
+
+3 locks held by swapper/0/1:
+ #0: 00000000244bc7da (&dev->mutex){....}, at: __driver_attach+0x5a/0x110
+ #1: 00000000cf973d46 (cpu_hotplug_lock.rw_sem){++++}, at: init_vqs+0x513/0x5a0
+ #2: 000000005cd8463f (xps_map_mutex){+.+.}, at: __netif_set_xps_queue+0x8d/0xc60
+
+v2: move cpus_read_lock() out of __netif_set_xps_queue()
+
+Cc: "Nambiar, Amritha" <amritha.nambiar@intel.com>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Jason Wang <jasowang@redhat.com>
+Fixes: 8af2c06ff4b1 ("net-sysfs: Add interface for Rx queue(s) map per Tx queue")
+
+Signed-off-by: Andrei Vagin <avagin@gmail.com>
+
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/virtio_net.c |    4 +++-
+ net/core/dev.c           |   20 +++++++++++++++-----
+ net/core/net-sysfs.c     |    4 ++++
+ 3 files changed, 22 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -1904,9 +1904,11 @@ static void virtnet_set_affinity(struct
+ 
+ 	i = 0;
+ 	for_each_online_cpu(cpu) {
++		const unsigned long *mask = cpumask_bits(cpumask_of(cpu));
++
+ 		virtqueue_set_affinity(vi->rq[i].vq, cpu);
+ 		virtqueue_set_affinity(vi->sq[i].vq, cpu);
+-		netif_set_xps_queue(vi->dev, cpumask_of(cpu), i);
++		__netif_set_xps_queue(vi->dev, mask, i, false);
+ 		i++;
+ 	}
+ 
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2133,6 +2133,7 @@ static void netif_reset_xps_queues(struc
+ 	if (!static_key_false(&xps_needed))
+ 		return;
+ 
++	cpus_read_lock();
+ 	mutex_lock(&xps_map_mutex);
+ 
+ 	if (static_key_false(&xps_rxqs_needed)) {
+@@ -2156,10 +2157,11 @@ static void netif_reset_xps_queues(struc
+ 
+ out_no_maps:
+ 	if (static_key_enabled(&xps_rxqs_needed))
+-		static_key_slow_dec(&xps_rxqs_needed);
++		static_key_slow_dec_cpuslocked(&xps_rxqs_needed);
+ 
+-	static_key_slow_dec(&xps_needed);
++	static_key_slow_dec_cpuslocked(&xps_needed);
+ 	mutex_unlock(&xps_map_mutex);
++	cpus_read_unlock();
+ }
+ 
+ static void netif_reset_xps_queues_gt(struct net_device *dev, u16 index)
+@@ -2207,6 +2209,7 @@ static struct xps_map *expand_xps_map(st
+ 	return new_map;
+ }
+ 
++/* Must be called under cpus_read_lock */
+ int __netif_set_xps_queue(struct net_device *dev, const unsigned long *mask,
+ 			  u16 index, bool is_rxqs_map)
+ {
+@@ -2274,9 +2277,9 @@ int __netif_set_xps_queue(struct net_dev
+ 	if (!new_dev_maps)
+ 		goto out_no_new_maps;
+ 
+-	static_key_slow_inc(&xps_needed);
++	static_key_slow_inc_cpuslocked(&xps_needed);
+ 	if (is_rxqs_map)
+-		static_key_slow_inc(&xps_rxqs_needed);
++		static_key_slow_inc_cpuslocked(&xps_rxqs_needed);
+ 
+ 	for (j = -1; j = netif_attrmask_next(j, possible_mask, nr_ids),
+ 	     j < nr_ids;) {
+@@ -2405,11 +2408,18 @@ error:
+ 	kfree(new_dev_maps);
+ 	return -ENOMEM;
+ }
++EXPORT_SYMBOL_GPL(__netif_set_xps_queue);
+ 
+ int netif_set_xps_queue(struct net_device *dev, const struct cpumask *mask,
+ 			u16 index)
+ {
+-	return __netif_set_xps_queue(dev, cpumask_bits(mask), index, false);
++	int ret;
++
++	cpus_read_lock();
++	ret =  __netif_set_xps_queue(dev, cpumask_bits(mask), index, false);
++	cpus_read_unlock();
++
++	return ret;
+ }
+ EXPORT_SYMBOL(netif_set_xps_queue);
+ 
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -26,6 +26,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/of.h>
+ #include <linux/of_net.h>
++#include <linux/cpu.h>
+ 
+ #include "net-sysfs.h"
+ 
+@@ -1358,7 +1359,10 @@ static ssize_t xps_rxqs_store(struct net
+ 		return err;
+ 	}
+ 
++	cpus_read_lock();
+ 	err = __netif_set_xps_queue(dev, mask, index, true);
++	cpus_read_unlock();
++
+ 	kfree(mask);
+ 	return err ? : len;
+ }
