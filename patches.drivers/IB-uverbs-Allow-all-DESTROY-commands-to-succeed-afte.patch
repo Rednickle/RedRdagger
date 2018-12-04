@@ -1,0 +1,231 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Wed, 25 Jul 2018 21:40:20 -0600
+Subject: IB/uverbs: Allow all DESTROY commands to succeed after disassociate
+Patch-mainline: v4.19-rc1
+Git-commit: 0f50d88a6e9ae6d9dd14ed1a7d6b309280a9c23b
+References: bsc#1103992 FATE#326009
+
+The disassociate function was broken by design because it failed all
+commands. This prevents userspace from calling destroy on a uobject after
+it has detected a device fatal error and thus reclaiming the resources in
+userspace is prevented.
+
+This fix is now straightforward, when anything destroys a uobject that is
+not the user the object remains on the IDR with a NULL context and object
+pointer. All lookup locking modes other than DESTROY will fail. When the
+user ultimately calls the destroy function it is simply dropped from the
+IDR while any related information is returned.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/rdma_core.c   |   66 ++++++++++++++++++++++++++++------
+ drivers/infiniband/core/rdma_core.h   |    3 +
+ drivers/infiniband/core/uverbs_main.c |    7 ++-
+ include/rdma/uverbs_types.h           |    6 ++-
+ 4 files changed, 66 insertions(+), 16 deletions(-)
+
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -180,7 +180,7 @@ static int uverbs_destroy_uobject(struct
+ 	assert_uverbs_usecnt(uobj, UVERBS_LOOKUP_WRITE);
+ 
+ 	if (uobj->object) {
+-		ret = uobj->type->type_class->remove_commit(uobj, reason);
++		ret = uobj->type->type_class->destroy_hw(uobj, reason);
+ 		if (ret) {
+ 			if (ib_is_destroy_retryable(ret, reason, uobj))
+ 				return ret;
+@@ -204,10 +204,13 @@ static int uverbs_destroy_uobject(struct
+ 
+ 	/*
+ 	 * For DESTROY the usecnt is held write locked, the caller is expected
+-	 * to put it unlock and put the object when done with it.
++	 * to put it unlock and put the object when done with it. Only DESTROY
++	 * can remove the IDR handle.
+ 	 */
+ 	if (reason != RDMA_REMOVE_DESTROY)
+ 		atomic_set(&uobj->usecnt, 0);
++	else
++		uobj->type->type_class->remove_handle(uobj);
+ 
+ 	if (!list_empty(&uobj->list)) {
+ 		spin_lock_irqsave(&ufile->uobjects_lock, flags);
+@@ -554,8 +557,8 @@ static void alloc_abort_idr_uobject(stru
+ 	spin_unlock(&uobj->ufile->idr_lock);
+ }
+ 
+-static int __must_check remove_commit_idr_uobject(struct ib_uobject *uobj,
+-						  enum rdma_remove_reason why)
++static int __must_check destroy_hw_idr_uobject(struct ib_uobject *uobj,
++					       enum rdma_remove_reason why)
+ {
+ 	const struct uverbs_obj_idr_type *idr_type =
+ 		container_of(uobj->type, struct uverbs_obj_idr_type,
+@@ -573,20 +576,28 @@ static int __must_check remove_commit_id
+ 	if (why == RDMA_REMOVE_ABORT)
+ 		return 0;
+ 
+-	alloc_abort_idr_uobject(uobj);
+-	/* Matches the kref in alloc_commit_idr_uobject */
+-	uverbs_uobject_put(uobj);
++	ib_rdmacg_uncharge(&uobj->cg_obj, uobj->context->device,
++			   RDMACG_RESOURCE_HCA_OBJECT);
+ 
+ 	return 0;
+ }
+ 
++static void remove_handle_idr_uobject(struct ib_uobject *uobj)
++{
++	spin_lock(&uobj->ufile->idr_lock);
++	idr_remove(&uobj->ufile->idr, uobj->id);
++	spin_unlock(&uobj->ufile->idr_lock);
++	/* Matches the kref in alloc_commit_idr_uobject */
++	uverbs_uobject_put(uobj);
++}
++
+ static void alloc_abort_fd_uobject(struct ib_uobject *uobj)
+ {
+ 	put_unused_fd(uobj->id);
+ }
+ 
+-static int __must_check remove_commit_fd_uobject(struct ib_uobject *uobj,
+-						 enum rdma_remove_reason why)
++static int __must_check destroy_hw_fd_uobject(struct ib_uobject *uobj,
++					      enum rdma_remove_reason why)
+ {
+ 	const struct uverbs_obj_fd_type *fd_type =
+ 		container_of(uobj->type, struct uverbs_obj_fd_type, type);
+@@ -598,6 +609,10 @@ static int __must_check remove_commit_fd
+ 	return 0;
+ }
+ 
++static void remove_handle_fd_uobject(struct ib_uobject *uobj)
++{
++}
++
+ static int alloc_commit_idr_uobject(struct ib_uobject *uobj)
+ {
+ 	struct ib_uverbs_file *ufile = uobj->ufile;
+@@ -741,13 +756,41 @@ void rdma_lookup_put_uobject(struct ib_u
+ 	uverbs_uobject_put(uobj);
+ }
+ 
++void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile)
++{
++	spin_lock_init(&ufile->idr_lock);
++	idr_init(&ufile->idr);
++}
++
++void release_ufile_idr_uobject(struct ib_uverbs_file *ufile)
++{
++	struct ib_uobject *entry;
++	int id;
++
++	/*
++	 * At this point uverbs_cleanup_ufile() is guaranteed to have run, and
++	 * there are no HW objects left, however the IDR is still populated
++	 * with anything that has not been cleaned up by userspace. Since the
++	 * kref on ufile is 0, nothing is allowed to call lookup_get.
++	 *
++	 * This is an optimized equivalent to remove_handle_idr_uobject
++	 */
++	idr_for_each_entry(&ufile->idr, entry, id) {
++		WARN_ON(entry->object);
++		uverbs_uobject_put(entry);
++	}
++
++	idr_destroy(&ufile->idr);
++}
++
+ const struct uverbs_obj_type_class uverbs_idr_class = {
+ 	.alloc_begin = alloc_begin_idr_uobject,
+ 	.lookup_get = lookup_get_idr_uobject,
+ 	.alloc_commit = alloc_commit_idr_uobject,
+ 	.alloc_abort = alloc_abort_idr_uobject,
+ 	.lookup_put = lookup_put_idr_uobject,
+-	.remove_commit = remove_commit_idr_uobject,
++	.destroy_hw = destroy_hw_idr_uobject,
++	.remove_handle = remove_handle_idr_uobject,
+ 	/*
+ 	 * When we destroy an object, we first just lock it for WRITE and
+ 	 * actually DESTROY it in the finalize stage. So, the problematic
+@@ -945,7 +988,8 @@ const struct uverbs_obj_type_class uverb
+ 	.alloc_commit = alloc_commit_fd_uobject,
+ 	.alloc_abort = alloc_abort_fd_uobject,
+ 	.lookup_put = lookup_put_fd_uobject,
+-	.remove_commit = remove_commit_fd_uobject,
++	.destroy_hw = destroy_hw_fd_uobject,
++	.remove_handle = remove_handle_fd_uobject,
+ 	.needs_kfree_rcu = false,
+ };
+ EXPORT_SYMBOL(uverbs_fd_class);
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@ -110,4 +110,7 @@ int uverbs_finalize_object(struct ib_uob
+ 			   enum uverbs_obj_access access,
+ 			   bool commit);
+ 
++void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++
+ #endif /* RDMA_CORE_H */
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -253,6 +253,8 @@ void ib_uverbs_release_file(struct kref
+ 	struct ib_device *ib_dev;
+ 	int srcu_key;
+ 
++	release_ufile_idr_uobject(file);
++
+ 	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ 	ib_dev = srcu_dereference(file->device->ib_dev,
+ 				  &file->device->disassociate_srcu);
+@@ -866,8 +868,6 @@ static int ib_uverbs_open(struct inode *
+ 	}
+ 
+ 	file->device	 = dev;
+-	spin_lock_init(&file->idr_lock);
+-	idr_init(&file->idr);
+ 	kref_init(&file->ref);
+ 	mutex_init(&file->ucontext_lock);
+ 
+@@ -884,6 +884,8 @@ static int ib_uverbs_open(struct inode *
+ 	file->uverbs_cmd_mask = ib_dev->uverbs_cmd_mask;
+ 	file->uverbs_ex_cmd_mask = ib_dev->uverbs_ex_cmd_mask;
+ 
++	setup_ufile_idr_uobject(file);
++
+ 	return nonseekable_open(inode, filp);
+ 
+ err_module:
+@@ -903,7 +905,6 @@ static int ib_uverbs_close(struct inode
+ 	struct ib_uverbs_file *file = filp->private_data;
+ 
+ 	uverbs_destroy_ufile_hw(file, RDMA_REMOVE_CLOSE);
+-	idr_destroy(&file->idr);
+ 
+ 	mutex_lock(&file->device->lists_mutex);
+ 	if (!file->is_closed) {
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -61,6 +61,7 @@ enum rdma_lookup_mode {
+  * Destruction flow:
+  *   lookup_get(exclusive=true) & uverbs_try_lock_object
+  *   remove_commit
++ *   remove_handle (optional)
+  *   lookup_put(exclusive=true) via rdma_lookup_put_uobject
+  *
+  * Allocate Error flow #1
+@@ -92,8 +93,9 @@ struct uverbs_obj_type_class {
+ 					 enum rdma_lookup_mode mode);
+ 	void (*lookup_put)(struct ib_uobject *uobj, enum rdma_lookup_mode mode);
+ 	/* This does not consume the kref on uobj */
+-	int __must_check (*remove_commit)(struct ib_uobject *uobj,
+-					  enum rdma_remove_reason why);
++	int __must_check (*destroy_hw)(struct ib_uobject *uobj,
++				       enum rdma_remove_reason why);
++	void (*remove_handle)(struct ib_uobject *uobj);
+ 	u8    needs_kfree_rcu;
+ };
+ 
