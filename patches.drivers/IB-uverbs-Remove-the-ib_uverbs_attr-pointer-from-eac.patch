@@ -1,0 +1,238 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Thu, 9 Aug 2018 20:14:39 -0600
+Subject: IB/uverbs: Remove the ib_uverbs_attr pointer from each attr
+Patch-mainline: v4.19-rc1
+Git-commit: 6a1f444fefeba392d1232b408aaf5902e33e0982
+References: bsc#1103992 FATE#326009
+
+Memory in the bundle is valuable, do not waste it holding an 8 byte
+pointer for the rare case of writing to a PTR_OUT. We can compute the
+pointer by storing a small 1 byte array offset and the base address of the
+uattr memory in the bundle private memory.
+
+This also means we can access the kernel's copy of the ib_uverbs_attr, so
+drop the copy of flags as well.
+
+Since the uattr base should be private bundle information this also
+de-inlines the already too big uverbs_copy_to inline and moves
+create_udata into uverbs_ioctl.c so they can see the private struct
+definition.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/uverbs_ioctl.c     |   67 +++++++++++++++++++++++++++--
+ drivers/infiniband/core/uverbs_std_types.c |   32 -------------
+ include/rdma/uverbs_ioctl.h                |   36 +++------------
+ 3 files changed, 72 insertions(+), 63 deletions(-)
+
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@ -84,7 +84,6 @@ static int uverbs_process_attr(struct bu
+ 	spec = &attr_spec_bucket->attrs[attr_id];
+ 	val_spec = spec;
+ 	e = &elements[attr_id];
+-	e->uattr = uattr_ptr;
+ 
+ 	switch (spec->type) {
+ 	case UVERBS_ATTR_TYPE_ENUM_IN:
+@@ -124,8 +123,8 @@ static int uverbs_process_attr(struct bu
+ 		    uattr->attr_data.reserved)
+ 			return -EINVAL;
+ 
++		e->ptr_attr.uattr_idx = uattr - pbundle->uattrs;
+ 		e->ptr_attr.len = uattr->len;
+-		e->ptr_attr.flags = uattr->flags;
+ 
+ 		if (val_spec->alloc_and_copy && !uverbs_attr_ptr_is_inline(e)) {
+ 			void *p;
+@@ -181,7 +180,7 @@ static int uverbs_process_attr(struct bu
+ 			s64 id = o_attr->uobject->id;
+ 
+ 			/* Copy the allocated id to the user-space */
+-			if (put_user(id, &e->uattr->data)) {
++			if (put_user(id, &uattr_ptr->data)) {
+ 				uverbs_finalize_object(o_attr->uobject,
+ 						       UVERBS_ACCESS_NEW,
+ 						       false);
+@@ -562,3 +561,65 @@ int uverbs_get_flags32(u32 *to, const st
+ 	return 0;
+ }
+ EXPORT_SYMBOL(uverbs_get_flags32);
++
++/*
++ * This is for ease of conversion. The purpose is to convert all drivers to
++ * use uverbs_attr_bundle instead of ib_udata.  Assume attr == 0 is input and
++ * attr == 1 is output.
++ */
++void create_udata(struct uverbs_attr_bundle *bundle, struct ib_udata *udata)
++{
++	struct bundle_priv *pbundle =
++		container_of(bundle, struct bundle_priv, bundle);
++	const struct uverbs_attr *uhw_in =
++		uverbs_attr_get(bundle, UVERBS_ATTR_UHW_IN);
++	const struct uverbs_attr *uhw_out =
++		uverbs_attr_get(bundle, UVERBS_ATTR_UHW_OUT);
++
++	if (!IS_ERR(uhw_in)) {
++		udata->inlen = uhw_in->ptr_attr.len;
++		if (uverbs_attr_ptr_is_inline(uhw_in))
++			udata->inbuf =
++				&pbundle->user_attrs[uhw_in->ptr_attr.uattr_idx]
++					 .data;
++		else
++			udata->inbuf = u64_to_user_ptr(uhw_in->ptr_attr.data);
++	} else {
++		udata->inbuf = NULL;
++		udata->inlen = 0;
++	}
++
++	if (!IS_ERR(uhw_out)) {
++		udata->outbuf = u64_to_user_ptr(uhw_out->ptr_attr.data);
++		udata->outlen = uhw_out->ptr_attr.len;
++	} else {
++		udata->outbuf = NULL;
++		udata->outlen = 0;
++	}
++}
++
++int uverbs_copy_to(const struct uverbs_attr_bundle *bundle, size_t idx,
++		   const void *from, size_t size)
++{
++	struct bundle_priv *pbundle =
++		container_of(bundle, struct bundle_priv, bundle);
++	const struct uverbs_attr *attr = uverbs_attr_get(bundle, idx);
++	u16 flags;
++	size_t min_size;
++
++	if (IS_ERR(attr))
++		return PTR_ERR(attr);
++
++	min_size = min_t(size_t, attr->ptr_attr.len, size);
++	if (copy_to_user(u64_to_user_ptr(attr->ptr_attr.data), from, min_size))
++		return -EFAULT;
++
++	flags = pbundle->uattrs[attr->ptr_attr.uattr_idx].flags |
++		UVERBS_ATTR_F_VALID_OUTPUT;
++	if (put_user(flags,
++		     &pbundle->user_attrs[attr->ptr_attr.uattr_idx].flags))
++		return -EFAULT;
++
++	return 0;
++}
++EXPORT_SYMBOL(uverbs_copy_to);
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@ -217,38 +217,6 @@ int uverbs_destroy_def_handler(struct ib
+ }
+ EXPORT_SYMBOL(uverbs_destroy_def_handler);
+ 
+-void create_udata(struct uverbs_attr_bundle *ctx, struct ib_udata *udata)
+-{
+-	/*
+-	 * This is for ease of conversion. The purpose is to convert all drivers
+-	 * to use uverbs_attr_bundle instead of ib_udata.
+-	 * Assume attr == 0 is input and attr == 1 is output.
+-	 */
+-	const struct uverbs_attr *uhw_in =
+-		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_IN);
+-	const struct uverbs_attr *uhw_out =
+-		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_OUT);
+-
+-	if (!IS_ERR(uhw_in)) {
+-		udata->inlen = uhw_in->ptr_attr.len;
+-		if (uverbs_attr_ptr_is_inline(uhw_in))
+-			udata->inbuf = &uhw_in->uattr->data;
+-		else
+-			udata->inbuf = u64_to_user_ptr(uhw_in->ptr_attr.data);
+-	} else {
+-		udata->inbuf = NULL;
+-		udata->inlen = 0;
+-	}
+-
+-	if (!IS_ERR(uhw_out)) {
+-		udata->outbuf = u64_to_user_ptr(uhw_out->ptr_attr.data);
+-		udata->outlen = uhw_out->ptr_attr.len;
+-	} else {
+-		udata->outbuf = NULL;
+-		udata->outlen = 0;
+-	}
+-}
+-
+ DECLARE_UVERBS_NAMED_OBJECT(
+ 	UVERBS_OBJECT_COMP_CHANNEL,
+ 	UVERBS_TYPE_ALLOC_FD(sizeof(struct ib_uverbs_completion_event_file),
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@ -461,8 +461,7 @@ struct uverbs_ptr_attr {
+ 		u64 data;
+ 	};
+ 	u16		len;
+-	/* Combination of bits from enum UVERBS_ATTR_F_XXXX */
+-	u16		flags;
++	u16		uattr_idx;
+ 	u8		enum_id;
+ };
+ 
+@@ -471,11 +470,6 @@ struct uverbs_obj_attr {
+ };
+ 
+ struct uverbs_attr {
+-	/*
+-	 * pointer to the user-space given attribute, in order to write the
+-	 * new uobject's id or update flags.
+-	 */
+-	struct ib_uverbs_attr __user	*uattr;
+ 	union {
+ 		struct uverbs_ptr_attr	ptr_attr;
+ 		struct uverbs_obj_attr	obj_attr;
+@@ -575,27 +569,6 @@ uverbs_attr_get_len(const struct uverbs_
+ 	return attr->ptr_attr.len;
+ }
+ 
+-static inline int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle,
+-				 size_t idx, const void *from, size_t size)
+-{
+-	const struct uverbs_attr *attr = uverbs_attr_get(attrs_bundle, idx);
+-	u16 flags;
+-	size_t min_size;
+-
+-	if (IS_ERR(attr))
+-		return PTR_ERR(attr);
+-
+-	min_size = min_t(size_t, attr->ptr_attr.len, size);
+-	if (copy_to_user(u64_to_user_ptr(attr->ptr_attr.data), from, min_size))
+-		return -EFAULT;
+-
+-	flags = attr->ptr_attr.flags | UVERBS_ATTR_F_VALID_OUTPUT;
+-	if (put_user(flags, &attr->uattr->flags))
+-		return -EFAULT;
+-
+-	return 0;
+-}
+-
+ static inline bool uverbs_attr_ptr_is_inline(const struct uverbs_attr *attr)
+ {
+ 	return attr->ptr_attr.len <= sizeof(attr->ptr_attr.data);
+@@ -676,6 +649,8 @@ int uverbs_get_flags64(u64 *to, const st
+ 		       size_t idx, u64 allowed_bits);
+ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ 		       size_t idx, u64 allowed_bits);
++int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle, size_t idx,
++		   const void *from, size_t size);
+ #else
+ static inline int
+ uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
+@@ -689,6 +664,11 @@ uverbs_get_flags32(u32 *to, const struct
+ {
+ 	return -EINVAL;
+ }
++static inline int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle,
++				 size_t idx, const void *from, size_t size)
++{
++	return -EINVAL;
++}
+ #endif
+ 
+ /* =================================================
