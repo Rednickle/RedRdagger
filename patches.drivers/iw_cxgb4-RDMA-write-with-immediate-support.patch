@@ -1,0 +1,267 @@
+From: Potnuri Bharat Teja <bharat@chelsio.com>
+Date: Thu, 2 Aug 2018 11:33:03 +0530
+Subject: iw_cxgb4: RDMA write with immediate support
+Patch-mainline: v4.19-rc1
+Git-commit: b9855f4ca0fe582aabfdbd08f0d856b22486e157
+References: bsc#1104276 FATE#325935
+
+Adds iw_cxgb4 functionality to support RDMA_WRITE_WITH_IMMEDATE opcode.
+
+Signed-off-by: Potnuri Bharat Teja <bharat@chelsio.com>
+Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/cxgb4/cq.c          |   23 ++++++++++++++++--
+ drivers/infiniband/hw/cxgb4/qp.c          |   37 +++++++++++++++++++++++-------
+ drivers/infiniband/hw/cxgb4/t4.h          |   16 ++++++++++++
+ drivers/infiniband/hw/cxgb4/t4fw_ri_api.h |   18 ++++++++++++--
+ include/uapi/rdma/cxgb4-abi.h             |    3 +-
+ 5 files changed, 81 insertions(+), 16 deletions(-)
+
+--- a/drivers/infiniband/hw/cxgb4/cq.c
++++ b/drivers/infiniband/hw/cxgb4/cq.c
+@@ -791,15 +791,32 @@ static int __c4iw_poll_cq_one(struct c4i
+ 			wc->byte_len = CQE_LEN(&cqe);
+ 		else
+ 			wc->byte_len = 0;
+-		wc->opcode = IB_WC_RECV;
+-		if (CQE_OPCODE(&cqe) == FW_RI_SEND_WITH_INV ||
+-		    CQE_OPCODE(&cqe) == FW_RI_SEND_WITH_SE_INV) {
++
++		switch (CQE_OPCODE(&cqe)) {
++		case FW_RI_SEND:
++			wc->opcode = IB_WC_RECV;
++			break;
++		case FW_RI_SEND_WITH_INV:
++		case FW_RI_SEND_WITH_SE_INV:
++			wc->opcode = IB_WC_RECV;
+ 			wc->ex.invalidate_rkey = CQE_WRID_STAG(&cqe);
+ 			wc->wc_flags |= IB_WC_WITH_INVALIDATE;
+ 			c4iw_invalidate_mr(qhp->rhp, wc->ex.invalidate_rkey);
++			break;
++		case FW_RI_WRITE_IMMEDIATE:
++			wc->opcode = IB_WC_RECV_RDMA_WITH_IMM;
++			wc->ex.imm_data = CQE_IMM_DATA(&cqe);
++			wc->wc_flags |= IB_WC_WITH_IMM;
++			break;
++		default:
++			pr_err("Unexpected opcode %d in the CQE received for QPID=0x%0x\n",
++			       CQE_OPCODE(&cqe), CQE_QPID(&cqe));
++			ret = -EINVAL;
++			goto out;
+ 		}
+ 	} else {
+ 		switch (CQE_OPCODE(&cqe)) {
++		case FW_RI_WRITE_IMMEDIATE:
+ 		case FW_RI_RDMA_WRITE:
+ 			wc->opcode = IB_WC_RDMA_WRITE;
+ 			break;
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@ -555,7 +555,15 @@ static int build_rdma_write(struct t4_sq
+ 
+ 	if (wr->num_sge > T4_MAX_SEND_SGE)
+ 		return -EINVAL;
+-	wqe->write.r2 = 0;
++
++	/*
++	 * iWARP protocol supports 64 bit immediate data but rdma api
++	 * limits it to 32bit.
++	 */
++	if (wr->opcode == IB_WR_RDMA_WRITE_WITH_IMM)
++		wqe->write.iw_imm_data.ib_imm_data.imm_data32 = wr->ex.imm_data;
++	else
++		wqe->write.iw_imm_data.ib_imm_data.imm_data32 = 0;
+ 	wqe->write.stag_sink = cpu_to_be32(rdma_wr(wr)->rkey);
+ 	wqe->write.to_sink = cpu_to_be64(rdma_wr(wr)->remote_addr);
+ 	if (wr->num_sge) {
+@@ -848,6 +856,9 @@ static int ib_to_fw_opcode(int ib_opcode
+ 	case IB_WR_RDMA_WRITE:
+ 		opcode = FW_RI_RDMA_WRITE;
+ 		break;
++	case IB_WR_RDMA_WRITE_WITH_IMM:
++		opcode = FW_RI_WRITE_IMMEDIATE;
++		break;
+ 	case IB_WR_RDMA_READ:
+ 	case IB_WR_RDMA_READ_WITH_INV:
+ 		opcode = FW_RI_READ_REQ;
+@@ -970,6 +981,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 	enum fw_wr_opcodes fw_opcode = 0;
+ 	enum fw_ri_wr_flags fw_flags;
+ 	struct c4iw_qp *qhp;
++	struct c4iw_dev *rhp;
+ 	union t4_wr *wqe = NULL;
+ 	u32 num_wrs;
+ 	struct t4_swsqe *swsqe;
+@@ -977,6 +989,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 	u16 idx = 0;
+ 
+ 	qhp = to_c4iw_qp(ibqp);
++	rhp = qhp->rhp;
+ 	spin_lock_irqsave(&qhp->lock, flag);
+ 
+ 	/*
+@@ -1021,6 +1034,13 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 				swsqe->opcode = FW_RI_SEND_WITH_INV;
+ 			err = build_rdma_send(&qhp->wq.sq, wqe, wr, &len16);
+ 			break;
++		case IB_WR_RDMA_WRITE_WITH_IMM:
++			if (unlikely(!rhp->rdev.lldi.write_w_imm_support)) {
++				err = -EINVAL;
++				break;
++			}
++			fw_flags |= FW_RI_RDMA_WRITE_WITH_IMMEDIATE;
++			/*FALLTHROUGH*/
+ 		case IB_WR_RDMA_WRITE:
+ 			fw_opcode = FW_RI_RDMA_WRITE_WR;
+ 			swsqe->opcode = FW_RI_RDMA_WRITE;
+@@ -1031,8 +1051,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 			fw_opcode = FW_RI_RDMA_READ_WR;
+ 			swsqe->opcode = FW_RI_READ_REQ;
+ 			if (wr->opcode == IB_WR_RDMA_READ_WITH_INV) {
+-				c4iw_invalidate_mr(qhp->rhp,
+-						   wr->sg_list[0].lkey);
++				c4iw_invalidate_mr(rhp, wr->sg_list[0].lkey);
+ 				fw_flags = FW_RI_RDMA_READ_INVALIDATE;
+ 			} else {
+ 				fw_flags = 0;
+@@ -1048,7 +1067,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 			struct c4iw_mr *mhp = to_c4iw_mr(reg_wr(wr)->mr);
+ 
+ 			swsqe->opcode = FW_RI_FAST_REGISTER;
+-			if (qhp->rhp->rdev.lldi.fr_nsmr_tpte_wr_support &&
++			if (rhp->rdev.lldi.fr_nsmr_tpte_wr_support &&
+ 			    !mhp->attr.state && mhp->mpl_len <= 2) {
+ 				fw_opcode = FW_RI_FR_NSMR_TPTE_WR;
+ 				build_tpte_memreg(&wqe->fr_tpte, reg_wr(wr),
+@@ -1057,7 +1076,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 				fw_opcode = FW_RI_FR_NSMR_WR;
+ 				err = build_memreg(&qhp->wq.sq, wqe, reg_wr(wr),
+ 				       mhp, &len16,
+-				       qhp->rhp->rdev.lldi.ulptx_memwrite_dsgl);
++				       rhp->rdev.lldi.ulptx_memwrite_dsgl);
+ 				if (err)
+ 					break;
+ 			}
+@@ -1070,7 +1089,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 			fw_opcode = FW_RI_INV_LSTAG_WR;
+ 			swsqe->opcode = FW_RI_LOCAL_INV;
+ 			err = build_inv_stag(wqe, wr, &len16);
+-			c4iw_invalidate_mr(qhp->rhp, wr->ex.invalidate_rkey);
++			c4iw_invalidate_mr(rhp, wr->ex.invalidate_rkey);
+ 			break;
+ 		default:
+ 			pr_warn("%s post of type=%d TBD!\n", __func__,
+@@ -1089,7 +1108,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 		swsqe->wr_id = wr->wr_id;
+ 		if (c4iw_wr_log) {
+ 			swsqe->sge_ts = cxgb4_read_sge_timestamp(
+-					qhp->rhp->rdev.lldi.ports[0]);
++					rhp->rdev.lldi.ports[0]);
+ 			swsqe->host_time = ktime_get();
+ 		}
+ 
+@@ -1103,7 +1122,7 @@ int c4iw_post_send(struct ib_qp *ibqp, c
+ 		t4_sq_produce(&qhp->wq, len16);
+ 		idx += DIV_ROUND_UP(len16*16, T4_EQ_ENTRY_SIZE);
+ 	}
+-	if (!qhp->rhp->rdev.status_page->db_off) {
++	if (!rhp->rdev.status_page->db_off) {
+ 		t4_ring_sq_db(&qhp->wq, idx, wqe);
+ 		spin_unlock_irqrestore(&qhp->lock, flag);
+ 	} else {
+@@ -2098,6 +2117,8 @@ struct ib_qp *c4iw_create_qp(struct ib_p
+ 			}
+ 			uresp.flags = C4IW_QPF_ONCHIP;
+ 		}
++		if (rhp->rdev.lldi.write_w_imm_support)
++			uresp.flags |= C4IW_QPF_WRITE_W_IMM;
+ 		uresp.qid_mask = rhp->rdev.qpmask;
+ 		uresp.sqid = qhp->wq.sq.qid;
+ 		uresp.sq_size = qhp->wq.sq.size;
+--- a/drivers/infiniband/hw/cxgb4/t4.h
++++ b/drivers/infiniband/hw/cxgb4/t4.h
+@@ -190,7 +190,19 @@ struct t4_cqe {
+ 			__be32 abs_rqe_idx;
+ 		} srcqe;
+ 		struct {
+-			__be64 imm_data;
++			__be32 mo;
++			__be32 msn;
++			/*
++			 * Use union for immediate data to be consistent with
++			 * stack's 32 bit data and iWARP spec's 64 bit data.
++			 */
++			union {
++				struct {
++					__be32 imm_data32;
++					u32 reserved;
++				} ib_imm_data;
++				__be64 imm_data64;
++			} iw_imm_data;
+ 		} imm_data_rcqe;
+ 
+ 		u64 drain_cookie;
+@@ -253,6 +265,8 @@ struct t4_cqe {
+ #define CQE_WRID_STAG(x)  (be32_to_cpu((x)->u.rcqe.stag))
+ #define CQE_WRID_MSN(x)   (be32_to_cpu((x)->u.rcqe.msn))
+ #define CQE_ABS_RQE_IDX(x) (be32_to_cpu((x)->u.srcqe.abs_rqe_idx))
++#define CQE_IMM_DATA(x)( \
++	(x)->u.imm_data_rcqe.iw_imm_data.ib_imm_data.imm_data32)
+ 
+ /* used for SQ completion processing */
+ #define CQE_WRID_SQ_IDX(x)	((x)->u.scqe.cidx)
+--- a/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
++++ b/drivers/infiniband/hw/cxgb4/t4fw_ri_api.h
+@@ -50,7 +50,8 @@ enum fw_ri_wr_opcode {
+ 	FW_RI_BYPASS			= 0xd,
+ 	FW_RI_RECEIVE			= 0xe,
+ 
+-	FW_RI_SGE_EC_CR_RETURN		= 0xf
++	FW_RI_SGE_EC_CR_RETURN		= 0xf,
++	FW_RI_WRITE_IMMEDIATE           = FW_RI_RDMA_INIT
+ };
+ 
+ enum fw_ri_wr_flags {
+@@ -59,7 +60,8 @@ enum fw_ri_wr_flags {
+ 	FW_RI_SOLICITED_EVENT_FLAG	= 0x04,
+ 	FW_RI_READ_FENCE_FLAG		= 0x08,
+ 	FW_RI_LOCAL_FENCE_FLAG		= 0x10,
+-	FW_RI_RDMA_READ_INVALIDATE	= 0x20
++	FW_RI_RDMA_READ_INVALIDATE	= 0x20,
++	FW_RI_RDMA_WRITE_WITH_IMMEDIATE = 0x40
+ };
+ 
+ enum fw_ri_mpa_attrs {
+@@ -546,7 +548,17 @@ struct fw_ri_rdma_write_wr {
+ 	__u16  wrid;
+ 	__u8   r1[3];
+ 	__u8   len16;
+-	__be64 r2;
++	/*
++	 * Use union for immediate data to be consistent with stack's 32 bit
++	 * data and iWARP spec's 64 bit data.
++	 */
++	union {
++		struct {
++			__be32 imm_data32;
++			u32 reserved;
++		} ib_imm_data;
++		__be64 imm_data64;
++	} iw_imm_data;
+ 	__be32 plen;
+ 	__be32 stag_sink;
+ 	__be64 to_sink;
+--- a/include/uapi/rdma/cxgb4-abi.h
++++ b/include/uapi/rdma/cxgb4-abi.h
+@@ -64,7 +64,8 @@ struct c4iw_create_cq_resp {
+ };
+ 
+ enum {
+-	C4IW_QPF_ONCHIP = (1 << 0)
++	C4IW_QPF_ONCHIP	= (1 << 0),
++	C4IW_QPF_WRITE_W_IMM = (1 << 1)
+ };
+ 
+ struct c4iw_create_qp_resp {
