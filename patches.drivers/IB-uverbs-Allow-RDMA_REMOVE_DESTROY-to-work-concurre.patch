@@ -1,0 +1,228 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Wed, 25 Jul 2018 21:40:14 -0600
+Subject: IB/uverbs: Allow RDMA_REMOVE_DESTROY to work concurrently with
+ disassociate
+Patch-mainline: v4.19-rc1
+Git-commit: 7452a3c745a2e7eb70d09dc5bb870759b1f26c91
+References: bsc#1103992 FATE#326009
+
+After all the recent structural changes this is now straightfoward, hoist
+the hw_destroy_rwsem up out of rdma_destroy_explicit and wrap it around
+the uobject write lock as well as the destroy.
+
+This is necessary as obtaining a write lock concurrently with
+uverbs_destroy_ufile_hw() will cause malfunction.
+
+After this change none of the destroy callbacks require the
+disassociate_srcu lock to be correct.
+
+This requires introducing a new lookup mode, UVERBS_LOOKUP_DESTROY as the
+IOCTL interface needs to hold an unlocked kref until all command
+verification is completed.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/rdma_core.c    |   71 ++++++++++++++++++++++-----------
+ drivers/infiniband/core/rdma_core.h    |    2 
+ drivers/infiniband/core/uverbs_ioctl.c |    7 ++-
+ include/rdma/uverbs_types.h            |    7 ++-
+ 4 files changed, 63 insertions(+), 24 deletions(-)
+
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -127,8 +127,10 @@ static int uverbs_try_lock_object(struct
+ 		return __atomic_add_unless(&uobj->usecnt, 1, -1) == -1 ?
+ 			-EBUSY : 0;
+ 	case UVERBS_LOOKUP_WRITE:
+-		/* lock is either WRITE or DESTROY - should be exclusive */
++		/* lock is exclusive */
+ 		return atomic_cmpxchg(&uobj->usecnt, 0, -1) == 0 ? 0 : -EBUSY;
++	case UVERBS_LOOKUP_DESTROY:
++		return 0;
+ 	}
+ 	return 0;
+ }
+@@ -144,6 +146,8 @@ static void assert_uverbs_usecnt(struct
+ 	case UVERBS_LOOKUP_WRITE:
+ 		WARN_ON(atomic_read(&uobj->usecnt) != -1);
+ 		break;
++	case UVERBS_LOOKUP_DESTROY:
++		break;
+ 	}
+ #endif
+ }
+@@ -228,6 +232,35 @@ static int uverbs_destroy_uobject(struct
+ }
+ 
+ /*
++ * This calls uverbs_destroy_uobject() using the RDMA_REMOVE_DESTROY
++ * sequence. It should only be used from command callbacks. On success the
++ * caller must pair this with rdma_lookup_put_uobject(LOOKUP_WRITE). This
++ * version requires the caller to have already obtained an
++ * LOOKUP_DESTROY uobject kref.
++ */
++int uobj_destroy(struct ib_uobject *uobj)
++{
++	struct ib_uverbs_file *ufile = uobj->ufile;
++	int ret;
++
++	down_read(&ufile->hw_destroy_rwsem);
++
++	ret = uverbs_try_lock_object(uobj, UVERBS_LOOKUP_WRITE);
++	if (ret)
++		goto out_unlock;
++
++	ret = uverbs_destroy_uobject(uobj, RDMA_REMOVE_DESTROY);
++	if (ret) {
++		atomic_set(&uobj->usecnt, 0);
++		goto out_unlock;
++	}
++
++out_unlock:
++	up_read(&ufile->hw_destroy_rwsem);
++	return ret;
++}
++
++/*
+  * uobj_get_destroy destroys the HW object and returns a handle to the uobj
+  * with a NULL object pointer. The caller must pair this with
+  * uverbs_put_destroy.
+@@ -238,13 +271,13 @@ struct ib_uobject *__uobj_get_destroy(co
+ 	struct ib_uobject *uobj;
+ 	int ret;
+ 
+-	uobj = rdma_lookup_get_uobject(type, ufile, id, UVERBS_LOOKUP_WRITE);
++	uobj = rdma_lookup_get_uobject(type, ufile, id, UVERBS_LOOKUP_DESTROY);
+ 	if (IS_ERR(uobj))
+ 		return uobj;
+ 
+-	ret = rdma_explicit_destroy(uobj);
++	ret = uobj_destroy(uobj);
+ 	if (ret) {
+-		rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_WRITE);
++		rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_DESTROY);
+ 		return ERR_PTR(ret);
+ 	}
+ 
+@@ -265,6 +298,11 @@ int __uobj_perform_destroy(const struct
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
++	/*
++	 * FIXME: After destroy this is not safe. We no longer hold the rwsem
++	 * so disassociation could have completed and unloaded the module that
++	 * backs the uobj->type pointer.
++	 */
+ 	rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_WRITE);
+ 	return success_res;
+ }
+@@ -534,23 +572,6 @@ static int __must_check remove_commit_fd
+ 	return 0;
+ }
+ 
+-int rdma_explicit_destroy(struct ib_uobject *uobject)
+-{
+-	int ret;
+-	struct ib_uverbs_file *ufile = uobject->ufile;
+-
+-	/* Cleanup is running. Calling this should have been impossible */
+-	if (!down_read_trylock(&ufile->hw_destroy_rwsem)) {
+-		WARN(true, "ib_uverbs: Cleanup is running while removing an uobject\n");
+-		return 0;
+-	}
+-
+-	ret = uverbs_destroy_uobject(uobject, RDMA_REMOVE_DESTROY);
+-
+-	up_read(&ufile->hw_destroy_rwsem);
+-	return ret;
+-}
+-
+ static int alloc_commit_idr_uobject(struct ib_uobject *uobj)
+ {
+ 	struct ib_uverbs_file *ufile = uobj->ufile;
+@@ -686,6 +707,8 @@ void rdma_lookup_put_uobject(struct ib_u
+ 	case UVERBS_LOOKUP_WRITE:
+ 		atomic_set(&uobj->usecnt, 0);
+ 		break;
++	case UVERBS_LOOKUP_DESTROY:
++		break;
+ 	}
+ 
+ 	/* Pairs with the kref obtained by type->lookup_get */
+@@ -911,6 +934,9 @@ uverbs_get_uobject_from_file(const struc
+ 		return rdma_lookup_get_uobject(type_attrs, ufile, id,
+ 					       UVERBS_LOOKUP_READ);
+ 	case UVERBS_ACCESS_DESTROY:
++		/* Actual destruction is done inside uverbs_handle_method */
++		return rdma_lookup_get_uobject(type_attrs, ufile, id,
++					       UVERBS_LOOKUP_DESTROY);
+ 	case UVERBS_ACCESS_WRITE:
+ 		return rdma_lookup_get_uobject(type_attrs, ufile, id,
+ 					       UVERBS_LOOKUP_WRITE);
+@@ -942,7 +968,8 @@ int uverbs_finalize_object(struct ib_uob
+ 		rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_WRITE);
+ 		break;
+ 	case UVERBS_ACCESS_DESTROY:
+-		rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_WRITE);
++		if (uobj)
++			rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_DESTROY);
+ 		break;
+ 	case UVERBS_ACCESS_NEW:
+ 		if (commit)
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@ -52,6 +52,8 @@ const struct uverbs_method_spec *uverbs_
+ void uverbs_destroy_ufile_hw(struct ib_uverbs_file *ufile,
+ 			     enum rdma_remove_reason reason);
+ 
++int uobj_destroy(struct ib_uobject *uobj);
++
+ /*
+  * uverbs_uobject_get is called in order to increase the reference count on
+  * an uobject. This is useful when a handler wants to keep the uobject's memory
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@ -349,13 +349,18 @@ static int uverbs_handle_method(struct i
+ 	 * not get to manipulate the HW objects.
+ 	 */
+ 	if (destroy_attr) {
+-		ret = rdma_explicit_destroy(destroy_attr->uobject);
++		ret = uobj_destroy(destroy_attr->uobject);
+ 		if (ret)
+ 			goto cleanup;
+ 	}
+ 
+ 	ret = method_spec->handler(ibdev, ufile, attr_bundle);
+ 
++	if (destroy_attr) {
++		uobj_put_destroy(destroy_attr->uobject);
++		destroy_attr->uobject = NULL;
++	}
++
+ cleanup:
+ 	finalize_ret = uverbs_finalize_attrs(attr_bundle,
+ 					     method_spec->attr_buckets,
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -41,6 +41,12 @@ struct uverbs_obj_type;
+ enum rdma_lookup_mode {
+ 	UVERBS_LOOKUP_READ,
+ 	UVERBS_LOOKUP_WRITE,
++	/*
++	 * Destroy is like LOOKUP_WRITE, except that the uobject is not
++	 * locked.  uobj_destroy is used to convert a LOOKUP_DESTROY lock into
++	 * a LOOKUP_WRITE lock.
++	 */
++	UVERBS_LOOKUP_DESTROY,
+ };
+ 
+ /*
+@@ -129,7 +135,6 @@ struct ib_uobject *rdma_alloc_begin_uobj
+ 					    struct ib_uverbs_file *ufile);
+ void rdma_alloc_abort_uobject(struct ib_uobject *uobj);
+ int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj);
+-int rdma_explicit_destroy(struct ib_uobject *uobject);
+ 
+ struct uverbs_obj_fd_type {
+ 	/*
