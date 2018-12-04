@@ -1,0 +1,109 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Wed, 25 Jul 2018 21:40:15 -0600
+Subject: IB/uverbs: Allow uobject allocation to work concurrently with
+ disassociate
+Patch-mainline: v4.19-rc1
+Git-commit: 1e857e65d4bb76738d3fb3b15ce9b73a0ce550f8
+References: bsc#1103992 FATE#326009
+
+After all the recent structural changes this is now straightforward, hold
+the hw_destroy_rwsem across the entire uobject creation. We already take
+this semaphore on the success path, so holding it a bit longer is not
+going to change the performance.
+
+After this change none of the create callbacks require the
+disassociate_srcu lock to be correct.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/rdma_core.c |   37 +++++++++++++++++++++++++-----------
+ 1 file changed, 26 insertions(+), 11 deletions(-)
+
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -153,9 +153,8 @@ static void assert_uverbs_usecnt(struct
+ }
+ 
+ /*
+- * This must be called with the hw_destroy_rwsem locked (except for
+- * RDMA_REMOVE_ABORT) for read or write, also The uobject itself must be
+- * locked for write.
++ * This must be called with the hw_destroy_rwsem locked for read or write,
++ * also the uobject itself must be locked for write.
+  *
+  * Upon return the HW object is guaranteed to be destroyed.
+  *
+@@ -177,6 +176,7 @@ static int uverbs_destroy_uobject(struct
+ 	unsigned long flags;
+ 	int ret;
+ 
++	lockdep_assert_held(&ufile->hw_destroy_rwsem);
+ 	assert_uverbs_usecnt(uobj, UVERBS_LOOKUP_WRITE);
+ 
+ 	if (uobj->object) {
+@@ -515,7 +515,22 @@ static struct ib_uobject *alloc_begin_fd
+ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+ 					    struct ib_uverbs_file *ufile)
+ {
+-	return type->type_class->alloc_begin(type, ufile);
++	struct ib_uobject *ret;
++
++	/*
++	 * The hw_destroy_rwsem is held across the entire object creation and
++	 * released during rdma_alloc_commit_uobject or
++	 * rdma_alloc_abort_uobject
++	 */
++	if (!down_read_trylock(&ufile->hw_destroy_rwsem))
++		return ERR_PTR(-EIO);
++
++	ret = type->type_class->alloc_begin(type, ufile);
++	if (IS_ERR(ret)) {
++		up_read(&ufile->hw_destroy_rwsem);
++		return ret;
++	}
++	return ret;
+ }
+ 
+ static void alloc_abort_idr_uobject(struct ib_uobject *uobj)
+@@ -637,17 +652,11 @@ int __must_check rdma_alloc_commit_uobje
+ 	struct ib_uverbs_file *ufile = uobj->ufile;
+ 	int ret;
+ 
+-	/* Cleanup is running. Calling this should have been impossible */
+-	if (!down_read_trylock(&ufile->hw_destroy_rwsem)) {
+-		WARN(true, "ib_uverbs: Cleanup is running while allocating an uobject\n");
+-		uverbs_destroy_uobject(uobj, RDMA_REMOVE_ABORT);
+-		return -EINVAL;
+-	}
+-
+ 	/* alloc_commit consumes the uobj kref */
+ 	ret = uobj->type->type_class->alloc_commit(uobj);
+ 	if (ret) {
+ 		uverbs_destroy_uobject(uobj, RDMA_REMOVE_ABORT);
++		up_read(&ufile->hw_destroy_rwsem);
+ 		return ret;
+ 	}
+ 
+@@ -660,6 +669,7 @@ int __must_check rdma_alloc_commit_uobje
+ 	/* matches atomic_set(-1) in alloc_uobj */
+ 	atomic_set(&uobj->usecnt, 0);
+ 
++	/* Matches the down_read in rdma_alloc_begin_uobject */
+ 	up_read(&ufile->hw_destroy_rwsem);
+ 
+ 	return 0;
+@@ -671,8 +681,13 @@ int __must_check rdma_alloc_commit_uobje
+  */
+ void rdma_alloc_abort_uobject(struct ib_uobject *uobj)
+ {
++	struct ib_uverbs_file *ufile = uobj->ufile;
++
+ 	uobj->object = NULL;
+ 	uverbs_destroy_uobject(uobj, RDMA_REMOVE_ABORT);
++
++	/* Matches the down_read in rdma_alloc_begin_uobject */
++	up_read(&ufile->hw_destroy_rwsem);
+ }
+ 
+ static void lookup_put_idr_uobject(struct ib_uobject *uobj,
