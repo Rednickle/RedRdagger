@@ -1,0 +1,293 @@
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Fri, 17 Aug 2018 23:26:14 +0200
+Subject: bpf: fix redirect to map under tail calls
+Patch-mainline: v4.19-rc1
+Git-commit: f6069b9aa9934ede26f41ac0781fce241279ad43
+References: bsc#1109837
+
+Commits 109980b894e9 ("bpf: don't select potentially stale ri->map
+from buggy xdp progs") and 7c3001313396 ("bpf: fix ri->map_owner
+pointer on bpf_prog_realloc") tried to mitigate that buggy programs
+using bpf_redirect_map() helper call do not leave stale maps behind.
+Idea was to add a map_owner cookie into the per CPU struct redirect_info
+which was set to prog->aux by the prog making the helper call as a
+proof that the map is not stale since the prog is implicitly holding
+a reference to it. This owner cookie could later on get compared with
+the program calling into BPF whether they match and therefore the
+redirect could proceed with processing the map safely.
+
+In (obvious) hindsight, this approach breaks down when tail calls are
+involved since the original caller's prog->aux pointer does not have
+to match the one from one of the progs out of the tail call chain,
+and therefore the xdp buffer will be dropped instead of redirected.
+A way around that would be to fix the issue differently (which also
+allows to remove related work in fast path at the same time): once
+the life-time of a redirect map has come to its end we use it's map
+free callback where we need to wait on synchronize_rcu() for current
+outstanding xdp buffers and remove such a map pointer from the
+redirect info if found to be present. At that time no program is
+using this map anymore so we simply invalidate the map pointers to
+NULL iff they previously pointed to that instance while making sure
+that the redirect path only reads out the map once.
+
+Fixes: 97f91a7cf04f ("bpf: add bpf_redirect_map helper routine")
+Fixes: 109980b894e9 ("bpf: don't select potentially stale ri->map from buggy xdp progs")
+Reported-by: Sebastiano Miano <sebastiano.miano@polito.it>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/linux/filter.h     |    3 +
+ include/trace/events/xdp.h |    5 +--
+ kernel/bpf/cpumap.c        |    2 +
+ kernel/bpf/devmap.c        |    1 
+ kernel/bpf/verifier.c      |   21 -------------
+ kernel/bpf/xskmap.c        |    1 
+ net/core/filter.c          |   68 +++++++++++++++++++--------------------------
+ 7 files changed, 38 insertions(+), 63 deletions(-)
+
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -541,7 +541,6 @@ struct bpf_redirect_info {
+ 	u32 flags;
+ 	struct bpf_map *map;
+ 	struct bpf_map *map_to_flush;
+-	unsigned long   map_owner;
+ 	u32 kern_flags;
+ };
+ 
+@@ -778,6 +777,8 @@ static inline bool bpf_dump_raw_ok(void)
+ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
+ 				       const struct bpf_insn *patch, u32 len);
+ 
++void bpf_clear_redirect_map(struct bpf_map *map);
++
+ static inline bool xdp_return_frame_no_direct(void)
+ {
+ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+--- a/include/trace/events/xdp.h
++++ b/include/trace/events/xdp.h
+@@ -146,9 +146,8 @@ struct _bpf_dtab_netdev {
+ 
+ #define devmap_ifindex(fwd, map)				\
+ 	(!fwd ? 0 :						\
+-	 (!map ? 0 :						\
+-	  ((map->map_type == BPF_MAP_TYPE_DEVMAP) ?		\
+-	   ((struct _bpf_dtab_netdev *)fwd)->dev->ifindex : 0)))
++	 ((map->map_type == BPF_MAP_TYPE_DEVMAP) ?		\
++	  ((struct _bpf_dtab_netdev *)fwd)->dev->ifindex : 0))
+ 
+ #define _trace_xdp_redirect_map(dev, xdp, fwd, map, idx)		\
+ 	 trace_xdp_redirect_map(dev, xdp, devmap_ifindex(fwd, map),	\
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -479,6 +479,8 @@ static void cpu_map_free(struct bpf_map
+ 	 * It does __not__ ensure pending flush operations (if any) are
+ 	 * complete.
+ 	 */
++
++	bpf_clear_redirect_map(map);
+ 	synchronize_rcu();
+ 
+ 	/* To ensure all pending flush operations have completed wait for flush
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -161,6 +161,7 @@ static void dev_map_free(struct bpf_map
+ 	list_del_rcu(&dtab->list);
+ 	spin_unlock(&dev_map_lock);
+ 
++	bpf_clear_redirect_map(map);
+ 	synchronize_rcu();
+ 
+ 	/* To ensure all pending flush operations have completed wait for flush
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5832,27 +5832,6 @@ static int fixup_bpf_calls(struct bpf_ve
+ 			goto patch_call_imm;
+ 		}
+ 
+-		if (insn->imm == BPF_FUNC_redirect_map) {
+-			/* Note, we cannot use prog directly as imm as subsequent
+-			 * rewrites would still change the prog pointer. The only
+-			 * stable address we can use is aux, which also works with
+-			 * prog clones during blinding.
+-			 */
+-			u64 addr = (unsigned long)prog->aux;
+-			struct bpf_insn r4_ld[] = {
+-				BPF_LD_IMM64(BPF_REG_4, addr),
+-				*insn,
+-			};
+-			cnt = ARRAY_SIZE(r4_ld);
+-
+-			new_prog = bpf_patch_insn_data(env, i + delta, r4_ld, cnt);
+-			if (!new_prog)
+-				return -ENOMEM;
+-
+-			delta    += cnt - 1;
+-			env->prog = prog = new_prog;
+-			insn      = new_prog->insnsi + i + delta;
+-		}
+ patch_call_imm:
+ 		fn = env->ops->get_func_proto(insn->imm, env->prog);
+ 		/* all functions that have prototype and verifier allowed
+--- a/kernel/bpf/xskmap.c
++++ b/kernel/bpf/xskmap.c
+@@ -75,6 +75,7 @@ static void xsk_map_free(struct bpf_map
+ 	struct xsk_map *m = container_of(map, struct xsk_map, map);
+ 	int i;
+ 
++	bpf_clear_redirect_map(map);
+ 	synchronize_net();
+ 
+ 	for (i = 0; i < map->max_entries; i++) {
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -3209,31 +3209,33 @@ static void *__xdp_map_lookup_elem(struc
+ 	}
+ }
+ 
+-static inline bool xdp_map_invalid(const struct bpf_prog *xdp_prog,
+-				   unsigned long aux)
++void bpf_clear_redirect_map(struct bpf_map *map)
+ {
+-	return (unsigned long)xdp_prog->aux != aux;
++	struct bpf_redirect_info *ri;
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		ri = per_cpu_ptr(&bpf_redirect_info, cpu);
++		/* Avoid polluting remote cacheline due to writes if
++		 * not needed. Once we pass this test, we need the
++		 * cmpxchg() to make sure it hasn't been changed in
++		 * the meantime by remote CPU.
++		 */
++		if (unlikely(READ_ONCE(ri->map) == map))
++			cmpxchg(&ri->map, map, NULL);
++	}
+ }
+ 
+ static int xdp_do_redirect_map(struct net_device *dev, struct xdp_buff *xdp,
+-			       struct bpf_prog *xdp_prog)
++			       struct bpf_prog *xdp_prog, struct bpf_map *map)
+ {
+ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+-	unsigned long map_owner = ri->map_owner;
+-	struct bpf_map *map = ri->map;
+ 	u32 index = ri->ifindex;
+ 	void *fwd = NULL;
+ 	int err;
+ 
+ 	ri->ifindex = 0;
+-	ri->map = NULL;
+-	ri->map_owner = 0;
+-
+-	if (unlikely(xdp_map_invalid(xdp_prog, map_owner))) {
+-		err = -EFAULT;
+-		map = NULL;
+-		goto err;
+-	}
++	WRITE_ONCE(ri->map, NULL);
+ 
+ 	fwd = __xdp_map_lookup_elem(map, index);
+ 	if (!fwd) {
+@@ -3259,12 +3261,13 @@ int xdp_do_redirect(struct net_device *d
+ 		    struct bpf_prog *xdp_prog)
+ {
+ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
++	struct bpf_map *map = READ_ONCE(ri->map);
+ 	struct net_device *fwd;
+ 	u32 index = ri->ifindex;
+ 	int err;
+ 
+-	if (ri->map)
+-		return xdp_do_redirect_map(dev, xdp, xdp_prog);
++	if (map)
++		return xdp_do_redirect_map(dev, xdp, xdp_prog, map);
+ 
+ 	fwd = dev_get_by_index_rcu(dev_net(dev), index);
+ 	ri->ifindex = 0;
+@@ -3288,24 +3291,17 @@ EXPORT_SYMBOL_GPL(xdp_do_redirect);
+ static int xdp_do_generic_redirect_map(struct net_device *dev,
+ 				       struct sk_buff *skb,
+ 				       struct xdp_buff *xdp,
+-				       struct bpf_prog *xdp_prog)
++				       struct bpf_prog *xdp_prog,
++				       struct bpf_map *map)
+ {
+ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+-	unsigned long map_owner = ri->map_owner;
+-	struct bpf_map *map = ri->map;
+ 	u32 index = ri->ifindex;
+ 	void *fwd = NULL;
+ 	int err = 0;
+ 
+ 	ri->ifindex = 0;
+-	ri->map = NULL;
+-	ri->map_owner = 0;
++	WRITE_ONCE(ri->map, NULL);
+ 
+-	if (unlikely(xdp_map_invalid(xdp_prog, map_owner))) {
+-		err = -EFAULT;
+-		map = NULL;
+-		goto err;
+-	}
+ 	fwd = __xdp_map_lookup_elem(map, index);
+ 	if (unlikely(!fwd)) {
+ 		err = -EINVAL;
+@@ -3342,13 +3338,14 @@ int xdp_do_generic_redirect(struct net_d
+ 			    struct xdp_buff *xdp, struct bpf_prog *xdp_prog)
+ {
+ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
++	struct bpf_map *map = READ_ONCE(ri->map);
+ 	u32 index = ri->ifindex;
+ 	struct net_device *fwd;
+ 	int err = 0;
+ 
+-	if (ri->map)
+-		return xdp_do_generic_redirect_map(dev, skb, xdp, xdp_prog);
+-
++	if (map)
++		return xdp_do_generic_redirect_map(dev, skb, xdp, xdp_prog,
++						   map);
+ 	ri->ifindex = 0;
+ 	fwd = dev_get_by_index_rcu(dev_net(dev), index);
+ 	if (unlikely(!fwd)) {
+@@ -3379,8 +3376,7 @@ BPF_CALL_2(bpf_xdp_redirect, u32, ifinde
+ 
+ 	ri->ifindex = ifindex;
+ 	ri->flags = flags;
+-	ri->map = NULL;
+-	ri->map_owner = 0;
++	WRITE_ONCE(ri->map, NULL);
+ 
+ 	return XDP_REDIRECT;
+ }
+@@ -3393,8 +3389,8 @@ static const struct bpf_func_proto bpf_x
+ 	.arg2_type      = ARG_ANYTHING,
+ };
+ 
+-BPF_CALL_4(bpf_xdp_redirect_map, struct bpf_map *, map, u32, ifindex, u64, flags,
+-	   unsigned long, map_owner)
++BPF_CALL_3(bpf_xdp_redirect_map, struct bpf_map *, map, u32, ifindex,
++	   u64, flags)
+ {
+ 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+ 
+@@ -3403,15 +3399,11 @@ BPF_CALL_4(bpf_xdp_redirect_map, struct
+ 
+ 	ri->ifindex = ifindex;
+ 	ri->flags = flags;
+-	ri->map = map;
+-	ri->map_owner = map_owner;
++	WRITE_ONCE(ri->map, map);
+ 
+ 	return XDP_REDIRECT;
+ }
+ 
+-/* Note, arg4 is hidden from users and populated by the verifier
+- * with the right pointer.
+- */
+ static const struct bpf_func_proto bpf_xdp_redirect_map_proto = {
+ 	.func           = bpf_xdp_redirect_map,
+ 	.gpl_only       = false,
