@@ -1,0 +1,292 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Tue, 10 Jul 2018 20:55:14 -0600
+Subject: IB/uverbs: Handle IDR and FD types without truncation
+Patch-mainline: v4.19-rc1
+Git-commit: 1250c3048cf1632f5dbb99a0242410baff67955d
+References: bsc#1103992 FATE#326009
+
+Our ABI for write() uses a s32 for FDs and a u32 for IDRs, but internally
+we ended up implicitly casting these ABI values into an 'int'. For ioctl()
+we use a s64 for FDs and a u64 for IDRs, again casting to an int.
+
+The various casts to int are all missing range checks which can cause
+userspace values that should be considered invalid to be accepted.
+
+Fix this by making the generic lookup routine accept a s64, which does not
+truncate the write API's u32/s32 or the ioctl API's s64. Then push the
+detailed range checking down to the actual type implementations to be
+shared by both interfaces.
+
+Finally, change the copy of the uobj->id to sign extend into a s64, so eg,
+if we ever wish to return a negative value for a FD it is carried
+properly.
+
+This ensures that userspace values are never weirdly interpreted due to
+the various trunctations and everything that is really out of range gets
+an EINVAL.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/rdma_core.c      |   22 ++++++++++++-----
+ drivers/infiniband/core/rdma_core.h      |    2 -
+ drivers/infiniband/core/uverbs_cmd.c     |    8 ++++--
+ drivers/infiniband/core/uverbs_ioctl.c   |   16 +++++++------
+ include/rdma/uverbs_std_types.h          |   38 +++++++++++++++++--------------
+ include/rdma/uverbs_types.h              |    4 +--
+ include/uapi/rdma/rdma_user_ioctl_cmds.h |    7 ++++-
+ 7 files changed, 59 insertions(+), 38 deletions(-)
+
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -133,7 +133,7 @@ static int uverbs_try_lock_object(struct
+  * returns success_res on success (negative errno on failure). For use by
+  * callers that do not need the uobj.
+  */
+-int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
++int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
+ 			   struct ib_uverbs_file *ufile, int success_res)
+ {
+ 	struct ib_uobject *uobj;
+@@ -212,13 +212,17 @@ static void uverbs_idr_remove_uobj(struc
+ /* Returns the ib_uobject or an error. The caller should check for IS_ERR. */
+ static struct ib_uobject *
+ lookup_get_idr_uobject(const struct uverbs_obj_type *type,
+-		       struct ib_uverbs_file *ufile, int id, bool exclusive)
++		       struct ib_uverbs_file *ufile, s64 id, bool exclusive)
+ {
+ 	struct ib_uobject *uobj;
++	unsigned long idrno = id;
++
++	if (id < 0 || id > ULONG_MAX)
++		return ERR_PTR(-EINVAL);
+ 
+ 	rcu_read_lock();
+ 	/* object won't be released as we're protected in rcu */
+-	uobj = idr_find(&ufile->idr, id);
++	uobj = idr_find(&ufile->idr, idrno);
+ 	if (!uobj) {
+ 		uobj = ERR_PTR(-ENOENT);
+ 		goto free;
+@@ -240,17 +244,21 @@ free:
+ 
+ static struct ib_uobject *lookup_get_fd_uobject(const struct uverbs_obj_type *type,
+ 						struct ib_uverbs_file *ufile,
+-						int id, bool exclusive)
++						s64 id, bool exclusive)
+ {
+ 	struct file *f;
+ 	struct ib_uobject *uobject;
++	int fdno = id;
+ 	const struct uverbs_obj_fd_type *fd_type =
+ 		container_of(type, struct uverbs_obj_fd_type, type);
+ 
++	if (fdno != id)
++		return ERR_PTR(-EINVAL);
++
+ 	if (exclusive)
+ 		return ERR_PTR(-EOPNOTSUPP);
+ 
+-	f = fget(id);
++	f = fget(fdno);
+ 	if (!f)
+ 		return ERR_PTR(-EBADF);
+ 
+@@ -270,7 +278,7 @@ static struct ib_uobject *lookup_get_fd_
+ }
+ 
+ struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_obj_type *type,
+-					   struct ib_uverbs_file *ufile, int id,
++					   struct ib_uverbs_file *ufile, s64 id,
+ 					   bool exclusive)
+ {
+ 	struct ib_uobject *uobj;
+@@ -725,7 +733,7 @@ EXPORT_SYMBOL(uverbs_fd_class);
+ struct ib_uobject *
+ uverbs_get_uobject_from_file(const struct uverbs_obj_type *type_attrs,
+ 			     struct ib_uverbs_file *ufile,
+-			     enum uverbs_obj_access access, int id)
++			     enum uverbs_obj_access access, s64 id)
+ {
+ 	switch (access) {
+ 	case UVERBS_ACCESS_READ:
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@ -86,7 +86,7 @@ void uverbs_close_fd(struct file *f);
+ struct ib_uobject *
+ uverbs_get_uobject_from_file(const struct uverbs_obj_type *type_attrs,
+ 			     struct ib_uverbs_file *ufile,
+-			     enum uverbs_obj_access access, int id);
++			     enum uverbs_obj_access access, s64 id);
+ 
+ /*
+  * Note that certain finalize stages could return a status:
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -48,10 +48,10 @@
+ #include "core_priv.h"
+ 
+ static struct ib_uverbs_completion_event_file *
+-ib_uverbs_lookup_comp_file(int fd, struct ib_uverbs_file *ufile)
++_ib_uverbs_lookup_comp_file(s32 fd, struct ib_uverbs_file *ufile)
+ {
+-	struct ib_uobject *uobj = uobj_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+-						fd, ufile);
++	struct ib_uobject *uobj = ufd_get_read(UVERBS_OBJECT_COMP_CHANNEL,
++					       fd, ufile);
+ 
+ 	if (IS_ERR(uobj))
+ 		return (void *)uobj;
+@@ -62,6 +62,8 @@ ib_uverbs_lookup_comp_file(int fd, struc
+ 	return container_of(uobj, struct ib_uverbs_completion_event_file,
+ 			    uobj);
+ }
++#define ib_uverbs_lookup_comp_file(_fd, _ufile)                                \
++	_ib_uverbs_lookup_comp_file((_fd)*typecheck(s32, _fd), _ufile)
+ 
+ ssize_t ib_uverbs_get_context(struct ib_uverbs_file *file,
+ 			      struct ib_device *ib_dev,
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@ -136,15 +136,11 @@ static int uverbs_process_attr(struct ib
+ 		break;
+ 
+ 	case UVERBS_ATTR_TYPE_IDR:
+-		if (uattr->data >> 32)
+-			return -EINVAL;
+-	/* fall through */
+ 	case UVERBS_ATTR_TYPE_FD:
+ 		if (uattr->attr_data.reserved)
+ 			return -EINVAL;
+ 
+-		if (uattr->len != 0 || !ufile->ucontext ||
+-		    uattr->data > INT_MAX)
++		if (uattr->len != 0 || !ufile->ucontext)
+ 			return -EINVAL;
+ 
+ 		o_attr = &e->obj_attr;
+@@ -152,17 +148,23 @@ static int uverbs_process_attr(struct ib
+ 		if (!object)
+ 			return -EINVAL;
+ 
++		/*
++		 * The type of uattr->data is u64 for UVERBS_ATTR_TYPE_IDR and
++		 * s64 for UVERBS_ATTR_TYPE_FD. We can cast the u64 to s64
++		 * here without caring about truncation as we know that the
++		 * IDR implementation today rejects negative IDs
++		 */
+ 		o_attr->uobject = uverbs_get_uobject_from_file(
+ 					object->type_attrs,
+ 					ufile,
+ 					spec->u.obj.access,
+-					(int)uattr->data);
++					uattr->data_s64);
+ 
+ 		if (IS_ERR(o_attr->uobject))
+ 			return PTR_ERR(o_attr->uobject);
+ 
+ 		if (spec->u.obj.access == UVERBS_ACCESS_NEW) {
+-			u64 id = o_attr->uobject->id;
++			s64 id = o_attr->uobject->id;
+ 
+ 			/* Copy the allocated id to the user-space */
+ 			if (put_user(id, &e->uattr->data)) {
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@ -46,39 +46,43 @@ static inline const struct uverbs_object
+ }
+ #endif
+ 
+-static inline struct ib_uobject *__uobj_get(const struct uverbs_obj_type *type,
+-					    bool write,
+-					    struct ib_uverbs_file *ufile,
+-					    int id)
+-{
+-	return rdma_lookup_get_uobject(type, ufile, id, write);
+-}
++/* Returns _id, or causes a compile error if _id is not a u32.
++ *
++ * The uobj APIs should only be used with the write based uAPI to access
++ * object IDs. The write API must use a u32 for the object handle, which is
++ * checked by this macro.
++ */
++#define _uobj_check_id(_id) ((_id) * typecheck(u32, _id))
+ 
+ #define uobj_get_type(_object) UVERBS_OBJECT(_object).type_attrs
+ 
+ #define uobj_get_read(_type, _id, _ufile)                                      \
+-	__uobj_get(uobj_get_type(_type), false, _ufile, _id)
++	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
++				_uobj_check_id(_id), false)
+ 
+-static inline void *_uobj_get_obj_read(const struct uverbs_obj_type *type,
+-				       int id, struct ib_uverbs_file *ufile)
+-{
+-	struct ib_uobject *uobj = __uobj_get(type, false, ufile, id);
++#define ufd_get_read(_type, _fdnum, _ufile)                                    \
++	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
++				(_fdnum)*typecheck(s32, _fdnum), false)
+ 
++static inline void *_uobj_get_obj_read(struct ib_uobject *uobj)
++{
+ 	if (IS_ERR(uobj))
+ 		return NULL;
+ 	return uobj->object;
+ }
+ #define uobj_get_obj_read(_object, _type, _id, _ufile)                         \
+-	((struct ib_##_object *)_uobj_get_obj_read(uobj_get_type(_type), _id,  \
+-						   _ufile))
++	((struct ib_##_object *)_uobj_get_obj_read(                            \
++		uobj_get_read(_type, _id, _ufile)))
+ 
+ #define uobj_get_write(_type, _id, _ufile)                                     \
+-	__uobj_get(uobj_get_type(_type), true, _ufile, _id)
++	rdma_lookup_get_uobject(uobj_get_type(_type), _ufile,                  \
++				_uobj_check_id(_id), true)
+ 
+-int __uobj_perform_destroy(const struct uverbs_obj_type *type, int id,
++int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
+ 			   struct ib_uverbs_file *ufile, int success_res);
+ #define uobj_perform_destroy(_type, _id, _ufile, _success_res)                 \
+-	__uobj_perform_destroy(uobj_get_type(_type), _id, _ufile, _success_res)
++	__uobj_perform_destroy(uobj_get_type(_type), _uobj_check_id(_id),      \
++			       _ufile, _success_res)
+ 
+ static inline void uobj_put_read(struct ib_uobject *uobj)
+ {
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -77,7 +77,7 @@ struct uverbs_obj_type_class {
+ 	void (*alloc_abort)(struct ib_uobject *uobj);
+ 
+ 	struct ib_uobject *(*lookup_get)(const struct uverbs_obj_type *type,
+-					 struct ib_uverbs_file *ufile, int id,
++					 struct ib_uverbs_file *ufile, s64 id,
+ 					 bool exclusive);
+ 	void (*lookup_put)(struct ib_uobject *uobj, bool exclusive);
+ 	/*
+@@ -121,7 +121,7 @@ struct uverbs_obj_idr_type {
+ 
+ struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_obj_type *type,
+ 					   struct ib_uverbs_file *ufile,
+-					   int id, bool exclusive);
++					   s64 id, bool exclusive);
+ void rdma_lookup_put_uobject(struct ib_uobject *uobj, bool exclusive);
+ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+ 					    struct ib_uverbs_file *ufile);
+--- a/include/uapi/rdma/rdma_user_ioctl_cmds.h
++++ b/include/uapi/rdma/rdma_user_ioctl_cmds.h
+@@ -62,7 +62,12 @@ struct ib_uverbs_attr {
+ 		} enum_data;
+ 		__u16 reserved;
+ 	} attr_data;
+-	__aligned_u64 data;	/* ptr to command, inline data or idr/fd */
++	union {
++		/* Used by PTR_IN/OUT, ENUM_IN and IDR */
++		__aligned_u64 data;
++		/* Used by FD_IN and FD_OUT */
++		__s64 data_s64;
++	};
+ };
+ 
+ struct ib_uverbs_ioctl_hdr {
