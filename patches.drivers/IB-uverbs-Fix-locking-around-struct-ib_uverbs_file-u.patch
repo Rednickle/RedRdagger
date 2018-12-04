@@ -1,0 +1,315 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Tue, 10 Jul 2018 13:43:06 -0600
+Subject: IB/uverbs: Fix locking around struct ib_uverbs_file ucontext
+Patch-mainline: v4.19-rc1
+Git-commit: 22fa27fbc64d01cbbe1e4da751e64cc22d24a6e4
+References: bsc#1103992 FATE#326009
+
+We have a parallel unlocked reader and writer with ib_uverbs_get_context()
+vs everything else, and nothing guarantees this works properly.
+
+Audit and fix all of the places that access ucontext to use one of the
+following locking schemes:
+- Call ib_uverbs_get_ucontext() under SRCU and check for failure
+- Access the ucontext through an struct ib_uobject context member
+  while holding a READ or WRITE lock on the uobject.
+  This value cannot be NULL and has no race.
+- Hold the ucontext_lock and check for ufile->ucontext !NULL
+
+This also re-implements ib_uverbs_get_ucontext() in a way that is safe
+against concurrent ib_uverbs_get_context() and disassociation.
+
+As a side effect, every access to ucontext in the commands is via
+ib_uverbs_get_context() with an error check, or via the uobject, so there
+is no longer any need for the core code to check ucontext on every command
+call. These checks are also removed.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/rdma_core.c           |   14 +++++++---
+ drivers/infiniband/core/uverbs.h              |    5 +++
+ drivers/infiniband/core/uverbs_cmd.c          |   14 ++++++----
+ drivers/infiniband/core/uverbs_ioctl.c        |    5 ---
+ drivers/infiniband/core/uverbs_main.c         |   34 ++++++++++++++++++--------
+ drivers/infiniband/core/uverbs_std_types_cq.c |    2 -
+ drivers/infiniband/core/uverbs_std_types_dm.c |    2 -
+ drivers/infiniband/hw/mlx5/devx.c             |   20 +++++++++++----
+ include/rdma/uverbs_ioctl.h                   |    8 ------
+ 9 files changed, 65 insertions(+), 39 deletions(-)
+
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -154,8 +154,14 @@ int __uobj_perform_destroy(const struct
+ static struct ib_uobject *alloc_uobj(struct ib_uverbs_file *ufile,
+ 				     const struct uverbs_obj_type *type)
+ {
+-	struct ib_uobject *uobj = kzalloc(type->obj_size, GFP_KERNEL);
++	struct ib_uobject *uobj;
++	struct ib_ucontext *ucontext;
++
++	ucontext = ib_uverbs_get_ucontext(ufile);
++	if (IS_ERR(ucontext))
++		return ERR_CAST(ucontext);
+ 
++	uobj = kzalloc(type->obj_size, GFP_KERNEL);
+ 	if (!uobj)
+ 		return ERR_PTR(-ENOMEM);
+ 	/*
+@@ -163,7 +169,7 @@ static struct ib_uobject *alloc_uobj(str
+ 	 * The object is added to the list in the commit stage.
+ 	 */
+ 	uobj->ufile = ufile;
+-	uobj->context = ufile->ucontext;
++	uobj->context = ucontext;
+ 	INIT_LIST_HEAD(&uobj->list);
+ 	uobj->type = type;
+ 	/*
+@@ -309,7 +315,7 @@ static struct ib_uobject *alloc_begin_id
+ 	if (ret)
+ 		goto uobj_put;
+ 
+-	ret = ib_rdmacg_try_charge(&uobj->cg_obj, ufile->ucontext->device,
++	ret = ib_rdmacg_try_charge(&uobj->cg_obj, uobj->context->device,
+ 				   RDMACG_RESOURCE_HCA_OBJECT);
+ 	if (ret)
+ 		goto idr_remove;
+@@ -761,7 +767,7 @@ static void ufile_destroy_ucontext(struc
+ 	 * FIXME: Drivers are not permitted to fail dealloc_ucontext, remove
+ 	 * the error return.
+ 	 */
+-	ret = ucontext->device->dealloc_ucontext(ufile->ucontext);
++	ret = ucontext->device->dealloc_ucontext(ucontext);
+ 	WARN_ON(ret);
+ 
+ 	ufile->ucontext = NULL;
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -137,8 +137,11 @@ struct ib_uverbs_completion_event_file {
+ struct ib_uverbs_file {
+ 	struct kref				ref;
+ 	struct ib_uverbs_device		       *device;
+-	/* Protects writing to ucontext */
+ 	struct mutex				ucontext_lock;
++	/*
++	 * ucontext must be accessed via ib_uverbs_get_ucontext() or with
++	 * ucontext_lock held
++	 */
+ 	struct ib_ucontext		       *ucontext;
+ 	struct ib_event_handler			event_handler;
+ 	struct ib_uverbs_async_event_file       *async_file;
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -146,10 +146,14 @@ ssize_t ib_uverbs_get_context(struct ib_
+ 		goto err_file;
+ 	}
+ 
+-	file->ucontext = ucontext;
+-
+ 	fd_install(resp.async_fd, filp);
+ 
++	/*
++	 * Make sure that ib_uverbs_get_ucontext() sees the pointer update
++	 * only after all writes to setup the ucontext have completed
++	 */
++	smp_store_release(&file->ucontext, ucontext);
++
+ 	mutex_unlock(&file->ucontext_lock);
+ 
+ 	return in_len;
+@@ -350,7 +354,7 @@ ssize_t ib_uverbs_alloc_pd(struct ib_uve
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
+-	pd = ib_dev->alloc_pd(ib_dev, file->ucontext, &udata);
++	pd = ib_dev->alloc_pd(ib_dev, uobj->context, &udata);
+ 	if (IS_ERR(pd)) {
+ 		ret = PTR_ERR(pd);
+ 		goto err;
+@@ -538,7 +542,7 @@ ssize_t ib_uverbs_open_xrcd(struct ib_uv
+ 	}
+ 
+ 	if (!xrcd) {
+-		xrcd = ib_dev->alloc_xrcd(ib_dev, file->ucontext, &udata);
++		xrcd = ib_dev->alloc_xrcd(ib_dev, obj->uobject.context, &udata);
+ 		if (IS_ERR(xrcd)) {
+ 			ret = PTR_ERR(xrcd);
+ 			goto err;
+@@ -1004,7 +1008,7 @@ static struct ib_ucq_object *create_cq(s
+ 	if (cmd_sz > offsetof(typeof(*cmd), flags) + sizeof(cmd->flags))
+ 		attr.flags = cmd->flags;
+ 
+-	cq = ib_dev->create_cq(ib_dev, &attr, file->ucontext, uhw);
++	cq = ib_dev->create_cq(ib_dev, &attr, obj->uobject.context, uhw);
+ 	if (IS_ERR(cq)) {
+ 		ret = PTR_ERR(cq);
+ 		goto err_file;
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@ -140,7 +140,7 @@ static int uverbs_process_attr(struct ib
+ 		if (uattr->attr_data.reserved)
+ 			return -EINVAL;
+ 
+-		if (uattr->len != 0 || !ufile->ucontext)
++		if (uattr->len != 0)
+ 			return -EINVAL;
+ 
+ 		o_attr = &e->obj_attr;
+@@ -373,9 +373,6 @@ static long ib_uverbs_cmd_verbs(struct i
+ 	if (!method_spec)
+ 		return -EPROTONOSUPPORT;
+ 
+-	if ((method_spec->flags & UVERBS_ACTION_FLAG_CREATE_ROOT) ^ !file->ucontext)
+-		return -EINVAL;
+-
+ 	ctx_size = sizeof(*ctx) +
+ 		   sizeof(struct uverbs_attr_bundle) +
+ 		   sizeof(struct uverbs_attr_bundle_hash) * method_spec->num_buckets +
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -136,9 +136,27 @@ static int (*uverbs_ex_cmd_table[])(stru
+ static void ib_uverbs_add_one(struct ib_device *device);
+ static void ib_uverbs_remove_one(struct ib_device *device, void *client_data);
+ 
++/*
++ * Must be called with the ufile->device->disassociate_srcu held, and the lock
++ * must be held until use of the ucontext is finished.
++ */
+ struct ib_ucontext *ib_uverbs_get_ucontext(struct ib_uverbs_file *ufile)
+ {
+-	return ufile->ucontext;
++	/*
++	 * We do not hold the hw_destroy_rwsem lock for this flow, instead
++	 * srcu is used. It does not matter if someone races this with
++	 * get_context, we get NULL or valid ucontext.
++	 */
++	struct ib_ucontext *ucontext = smp_load_acquire(&ufile->ucontext);
++
++	if (!srcu_dereference(ufile->device->ib_dev,
++			      &ufile->device->disassociate_srcu))
++		return ERR_PTR(-EIO);
++
++	if (!ucontext)
++		return ERR_PTR(-EINVAL);
++
++	return ucontext;
+ }
+ EXPORT_SYMBOL(ib_uverbs_get_ucontext);
+ 
+@@ -797,22 +815,18 @@ out:
+ static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
+ {
+ 	struct ib_uverbs_file *file = filp->private_data;
+-	struct ib_device *ib_dev;
++	struct ib_ucontext *ucontext;
+ 	int ret = 0;
+ 	int srcu_key;
+ 
+ 	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+-	ib_dev = srcu_dereference(file->device->ib_dev,
+-				  &file->device->disassociate_srcu);
+-	if (!ib_dev) {
+-		ret = -EIO;
++	ucontext = ib_uverbs_get_ucontext(file);
++	if (IS_ERR(ucontext)) {
++		ret = PTR_ERR(ucontext);
+ 		goto out;
+ 	}
+ 
+-	if (!file->ucontext)
+-		ret = -ENODEV;
+-	else
+-		ret = ib_dev->mmap(file->ucontext, vma);
++	ret = ucontext->device->mmap(ucontext, vma);
+ out:
+ 	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+ 	return ret;
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -113,7 +113,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_
+ 	/* Temporary, only until drivers get the new uverbs_attr_bundle */
+ 	create_udata(attrs, &uhw);
+ 
+-	cq = ib_dev->create_cq(ib_dev, &attr, file->ucontext, &uhw);
++	cq = ib_dev->create_cq(ib_dev, &attr, obj->uobject.context, &uhw);
+ 	if (IS_ERR(cq)) {
+ 		ret = PTR_ERR(cq);
+ 		goto err_event_file;
+--- a/drivers/infiniband/core/uverbs_std_types_dm.c
++++ b/drivers/infiniband/core/uverbs_std_types_dm.c
+@@ -70,7 +70,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_
+ 
+ 	uobj = uverbs_attr_get(attrs, UVERBS_ATTR_ALLOC_DM_HANDLE)->obj_attr.uobject;
+ 
+-	dm = ib_dev->alloc_dm(ib_dev, file->ucontext, &attr, attrs);
++	dm = ib_dev->alloc_dm(ib_dev, uobj->context, &attr, attrs);
+ 	if (IS_ERR(dm))
+ 		return PTR_ERR(dm);
+ 
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@ -458,16 +458,21 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD
+ 				  struct ib_uverbs_file *file,
+ 				  struct uverbs_attr_bundle *attrs)
+ {
+-	struct mlx5_ib_ucontext *c = devx_ufile2uctx(file);
++	struct mlx5_ib_ucontext *c;
++	struct mlx5_ib_dev *dev;
+ 	u32 user_idx;
+ 	s32 dev_idx;
+ 
++	c = devx_ufile2uctx(file);
++	if (IS_ERR(c))
++		return PTR_ERR(c);
++	dev = to_mdev(c->ibucontext.device);
++
+ 	if (uverbs_copy_from(&user_idx, attrs,
+ 			     MLX5_IB_ATTR_DEVX_QUERY_UAR_USER_IDX))
+ 		return -EFAULT;
+ 
+-	dev_idx = bfregn_to_uar_index(to_mdev(ib_dev),
+-				      &c->bfregi, user_idx, true);
++	dev_idx = bfregn_to_uar_index(dev, &c->bfregi, user_idx, true);
+ 	if (dev_idx < 0)
+ 		return dev_idx;
+ 
+@@ -482,8 +487,8 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD
+ 				  struct ib_uverbs_file *file,
+ 				  struct uverbs_attr_bundle *attrs)
+ {
+-	struct mlx5_ib_ucontext *c = devx_ufile2uctx(file);
+-	struct mlx5_ib_dev *dev = to_mdev(ib_dev);
++	struct mlx5_ib_ucontext *c;
++	struct mlx5_ib_dev *dev;
+ 	void *cmd_in = uverbs_attr_get_alloced_ptr(
+ 		attrs, MLX5_IB_ATTR_DEVX_OTHER_CMD_IN);
+ 	int cmd_out_len = uverbs_attr_get_len(attrs,
+@@ -491,6 +496,11 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD
+ 	void *cmd_out;
+ 	int err;
+ 
++	c = devx_ufile2uctx(file);
++	if (IS_ERR(c))
++		return PTR_ERR(c);
++	dev = to_mdev(c->ibucontext.device);
++
+ 	if (!c->devx_uid)
+ 		return -EPERM;
+ 
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@ -123,14 +123,6 @@ struct uverbs_attr_spec_hash {
+ struct uverbs_attr_bundle;
+ struct ib_uverbs_file;
+ 
+-enum {
+-	/*
+-	 * Action marked with this flag creates a context (or root for all
+-	 * objects).
+-	 */
+-	UVERBS_ACTION_FLAG_CREATE_ROOT = 1U << 0,
+-};
+-
+ struct uverbs_method_spec {
+ 	/* Combination of bits from enum UVERBS_ACTION_FLAG_XXXX */
+ 	u32						flags;
