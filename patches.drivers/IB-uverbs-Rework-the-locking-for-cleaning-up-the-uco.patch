@@ -1,0 +1,430 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Tue, 10 Jul 2018 20:55:19 -0600
+Subject: IB/uverbs: Rework the locking for cleaning up the ucontext
+Patch-mainline: v4.19-rc1
+Git-commit: e951747a087a8655f467833bb367ebf53d57527c
+References: bsc#1103992 FATE#326009
+
+The locking here has always been a bit crazy and spread out, upon some
+careful analysis we can simplify things.
+
+Create a single function uverbs_destroy_ufile_hw() that internally handles
+all locking. This pulls together pieces of this process that were
+sprinkled all over the places into one place, and covers them with one
+lock.
+
+This eliminates several duplicate/confusing locks and makes the control
+flow in ib_uverbs_close() and ib_uverbs_free_hw_resources() extremely
+simple.
+
+Unfortunately we have to keep an extra mutex, ucontext_lock.  This lock is
+logically part of the rwsem and provides the 'down write, fail if write
+locked, wait if read locked' semantic we require.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/rdma_core.c   |  117 ++++++++++++++++++++++++++++++----
+ drivers/infiniband/core/rdma_core.h   |    3 
+ drivers/infiniband/core/uverbs.h      |    6 -
+ drivers/infiniband/core/uverbs_cmd.c  |    6 -
+ drivers/infiniband/core/uverbs_main.c |   98 +++-------------------------
+ include/rdma/ib_verbs.h               |    5 +
+ 6 files changed, 127 insertions(+), 108 deletions(-)
+
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -32,6 +32,7 @@
+ 
+ #include <linux/file.h>
+ #include <linux/anon_inodes.h>
++#include <linux/sched/mm.h>
+ #include <rdma/ib_verbs.h>
+ #include <rdma/uverbs_types.h>
+ #include <linux/rcupdate.h>
+@@ -284,11 +285,8 @@ struct ib_uobject *rdma_lookup_get_uobje
+ 	}
+ 
+ 	ret = uverbs_try_lock_object(uobj, exclusive);
+-	if (ret) {
+-		WARN(uobj->ufile->cleanup_reason,
+-		     "ib_uverbs: Trying to lookup_get while cleanup context\n");
++	if (ret)
+ 		goto free;
+-	}
+ 
+ 	return uobj;
+ free:
+@@ -694,6 +692,71 @@ void uverbs_close_fd(struct file *f)
+ 	uverbs_uobject_put(uobj);
+ }
+ 
++static void ufile_disassociate_ucontext(struct ib_ucontext *ibcontext)
++{
++	struct ib_device *ib_dev = ibcontext->device;
++	struct task_struct *owning_process  = NULL;
++	struct mm_struct   *owning_mm       = NULL;
++
++	owning_process = get_pid_task(ibcontext->tgid, PIDTYPE_PID);
++	if (!owning_process)
++		return;
++
++	owning_mm = get_task_mm(owning_process);
++	if (!owning_mm) {
++		pr_info("no mm, disassociate ucontext is pending task termination\n");
++		while (1) {
++			put_task_struct(owning_process);
++			usleep_range(1000, 2000);
++			owning_process = get_pid_task(ibcontext->tgid,
++						      PIDTYPE_PID);
++			if (!owning_process ||
++			    owning_process->state == TASK_DEAD) {
++				pr_info("disassociate ucontext done, task was terminated\n");
++				/* in case task was dead need to release the
++				 * task struct.
++				 */
++				if (owning_process)
++					put_task_struct(owning_process);
++				return;
++			}
++		}
++	}
++
++	down_write(&owning_mm->mmap_sem);
++	ib_dev->disassociate_ucontext(ibcontext);
++	up_write(&owning_mm->mmap_sem);
++	mmput(owning_mm);
++	put_task_struct(owning_process);
++}
++
++/*
++ * Drop the ucontext off the ufile and completely disconnect it from the
++ * ib_device
++ */
++static void ufile_destroy_ucontext(struct ib_uverbs_file *ufile,
++				   enum rdma_remove_reason reason)
++{
++	struct ib_ucontext *ucontext = ufile->ucontext;
++	int ret;
++
++	if (reason == RDMA_REMOVE_DRIVER_REMOVE)
++		ufile_disassociate_ucontext(ucontext);
++
++	put_pid(ucontext->tgid);
++	ib_rdmacg_uncharge(&ucontext->cg_obj, ucontext->device,
++			   RDMACG_RESOURCE_HCA_HANDLE);
++
++	/*
++	 * FIXME: Drivers are not permitted to fail dealloc_ucontext, remove
++	 * the error return.
++	 */
++	ret = ucontext->device->dealloc_ucontext(ufile->ucontext);
++	WARN_ON(ret);
++
++	ufile->ucontext = NULL;
++}
++
+ static int __uverbs_cleanup_ufile(struct ib_uverbs_file *ufile,
+ 				  enum rdma_remove_reason reason)
+ {
+@@ -710,7 +773,6 @@ static int __uverbs_cleanup_ufile(struct
+ 	 * We take and release the lock per traversal in order to let
+ 	 * other threads (which might still use the FDs) chance to run.
+ 	 */
+-	ufile->cleanup_reason = reason;
+ 	list_for_each_entry_safe(obj, next_obj, &ufile->uobjects, list) {
+ 		/*
+ 		 * if we hit this WARN_ON, that means we are
+@@ -738,18 +800,43 @@ static int __uverbs_cleanup_ufile(struct
+ 	return ret;
+ }
+ 
+-void uverbs_cleanup_ufile(struct ib_uverbs_file *ufile, bool device_removed)
++/*
++ * Destroy the uncontext and every uobject associated with it. If called with
++ * reason != RDMA_REMOVE_CLOSE this will not return until the destruction has
++ * been completed and ufile->ucontext is NULL.
++ *
++ * This is internally locked and can be called in parallel from multiple
++ * contexts.
++ */
++void uverbs_destroy_ufile_hw(struct ib_uverbs_file *ufile,
++			     enum rdma_remove_reason reason)
+ {
+-	enum rdma_remove_reason reason = device_removed ?
+-					RDMA_REMOVE_DRIVER_REMOVE :
+-					RDMA_REMOVE_CLOSE;
++	if (reason == RDMA_REMOVE_CLOSE) {
++		/*
++		 * During destruction we might trigger something that
++		 * synchronously calls release on any file descriptor. For
++		 * this reason all paths that come from file_operations
++		 * release must use try_lock. They can progress knowing that
++		 * there is an ongoing uverbs_destroy_ufile_hw that will clean
++		 * up the driver resources.
++		 */
++		if (!mutex_trylock(&ufile->ucontext_lock))
++			return;
++
++	} else {
++		mutex_lock(&ufile->ucontext_lock);
++	}
++
++	down_write(&ufile->hw_destroy_rwsem);
+ 
+ 	/*
+-	 * Waits for all remove_commit and alloc_commit to finish. Logically, We
+-	 * want to hold this forever as the context is going to be destroyed,
+-	 * but we'll release it since it causes a "held lock freed" BUG message.
++	 * If a ucontext was never created then we can't have any uobjects to
++	 * cleanup, nothing to do.
+ 	 */
+-	down_write(&ufile->hw_destroy_rwsem);
++	if (!ufile->ucontext)
++		goto done;
++
++	ufile->ucontext->closing = true;
+ 	ufile->ucontext->cleanup_retryable = true;
+ 	while (!list_empty(&ufile->uobjects))
+ 		if (__uverbs_cleanup_ufile(ufile, reason)) {
+@@ -764,7 +851,11 @@ void uverbs_cleanup_ufile(struct ib_uver
+ 	if (!list_empty(&ufile->uobjects))
+ 		__uverbs_cleanup_ufile(ufile, reason);
+ 
++	ufile_destroy_ucontext(ufile, reason);
++
++done:
+ 	up_write(&ufile->hw_destroy_rwsem);
++	mutex_unlock(&ufile->ucontext_lock);
+ }
+ 
+ const struct uverbs_obj_type_class uverbs_fd_class = {
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@ -49,7 +49,8 @@ const struct uverbs_object_spec *uverbs_
+ const struct uverbs_method_spec *uverbs_get_method(const struct uverbs_object_spec *object,
+ 						   uint16_t method);
+ 
+-void uverbs_cleanup_ufile(struct ib_uverbs_file *ufile, bool device_removed);
++void uverbs_destroy_ufile_hw(struct ib_uverbs_file *ufile,
++			     enum rdma_remove_reason reason);
+ 
+ /*
+  * uverbs_uobject_get is called in order to increase the reference count on
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -136,9 +136,9 @@ struct ib_uverbs_completion_event_file {
+ 
+ struct ib_uverbs_file {
+ 	struct kref				ref;
+-	struct mutex				mutex;
+-	struct mutex                            cleanup_mutex; /* protect cleanup */
+ 	struct ib_uverbs_device		       *device;
++	/* Protects writing to ucontext */
++	struct mutex				ucontext_lock;
+ 	struct ib_ucontext		       *ucontext;
+ 	struct ib_event_handler			event_handler;
+ 	struct ib_uverbs_async_event_file       *async_file;
+@@ -155,8 +155,6 @@ struct ib_uverbs_file {
+ 	spinlock_t		uobjects_lock;
+ 	struct list_head	uobjects;
+ 
+-	enum rdma_remove_reason cleanup_reason;
+-
+ 	struct idr		idr;
+ 	/* spinlock protects write access to idr */
+ 	spinlock_t		idr_lock;
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -84,7 +84,7 @@ ssize_t ib_uverbs_get_context(struct ib_
+ 	if (copy_from_user(&cmd, buf, sizeof cmd))
+ 		return -EFAULT;
+ 
+-	mutex_lock(&file->mutex);
++	mutex_lock(&file->ucontext_lock);
+ 
+ 	if (file->ucontext) {
+ 		ret = -EINVAL;
+@@ -150,7 +150,7 @@ ssize_t ib_uverbs_get_context(struct ib_
+ 
+ 	fd_install(resp.async_fd, filp);
+ 
+-	mutex_unlock(&file->mutex);
++	mutex_unlock(&file->ucontext_lock);
+ 
+ 	return in_len;
+ 
+@@ -169,7 +169,7 @@ err_alloc:
+ 	ib_rdmacg_uncharge(&cg_obj, ib_dev, RDMACG_RESOURCE_HCA_HANDLE);
+ 
+ err:
+-	mutex_unlock(&file->mutex);
++	mutex_unlock(&file->ucontext_lock);
+ 	return ret;
+ }
+ 
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -41,8 +41,6 @@
+ #include <linux/fs.h>
+ #include <linux/poll.h>
+ #include <linux/sched.h>
+-#include <linux/sched/mm.h>
+-#include <linux/sched/task.h>
+ #include <linux/file.h>
+ #include <linux/cdev.h>
+ #include <linux/anon_inodes.h>
+@@ -227,21 +225,6 @@ void ib_uverbs_detach_umcast(struct ib_q
+ 	}
+ }
+ 
+-static int ib_uverbs_cleanup_ufile(struct ib_uverbs_file *file,
+-				   bool device_removed)
+-{
+-	struct ib_ucontext *context = file->ucontext;
+-
+-	context->closing = 1;
+-	uverbs_cleanup_ufile(file, device_removed);
+-	put_pid(context->tgid);
+-
+-	ib_rdmacg_uncharge(&context->cg_obj, context->device,
+-			   RDMACG_RESOURCE_HCA_HANDLE);
+-
+-	return context->device->dealloc_ucontext(context);
+-}
+-
+ static void ib_uverbs_comp_dev(struct ib_uverbs_device *dev)
+ {
+ 	complete(&dev->comp);
+@@ -892,8 +875,7 @@ static int ib_uverbs_open(struct inode *
+ 	spin_lock_init(&file->idr_lock);
+ 	idr_init(&file->idr);
+ 	kref_init(&file->ref);
+-	mutex_init(&file->mutex);
+-	mutex_init(&file->cleanup_mutex);
++	mutex_init(&file->ucontext_lock);
+ 
+ 	spin_lock_init(&file->uobjects_lock);
+ 	INIT_LIST_HEAD(&file->uobjects);
+@@ -923,12 +905,7 @@ static int ib_uverbs_close(struct inode
+ {
+ 	struct ib_uverbs_file *file = filp->private_data;
+ 
+-	mutex_lock(&file->cleanup_mutex);
+-	if (file->ucontext) {
+-		ib_uverbs_cleanup_ufile(file, false);
+-		file->ucontext = NULL;
+-	}
+-	mutex_unlock(&file->cleanup_mutex);
++	uverbs_destroy_ufile_hw(file, RDMA_REMOVE_CLOSE);
+ 	idr_destroy(&file->idr);
+ 
+ 	mutex_lock(&file->device->lists_mutex);
+@@ -1115,44 +1092,6 @@ err:
+ 	return;
+ }
+ 
+-static void ib_uverbs_disassociate_ucontext(struct ib_ucontext *ibcontext)
+-{
+-	struct ib_device *ib_dev = ibcontext->device;
+-	struct task_struct *owning_process  = NULL;
+-	struct mm_struct   *owning_mm       = NULL;
+-
+-	owning_process = get_pid_task(ibcontext->tgid, PIDTYPE_PID);
+-	if (!owning_process)
+-		return;
+-
+-	owning_mm = get_task_mm(owning_process);
+-	if (!owning_mm) {
+-		pr_info("no mm, disassociate ucontext is pending task termination\n");
+-		while (1) {
+-			put_task_struct(owning_process);
+-			usleep_range(1000, 2000);
+-			owning_process = get_pid_task(ibcontext->tgid,
+-						      PIDTYPE_PID);
+-			if (!owning_process ||
+-			    owning_process->state == TASK_DEAD) {
+-				pr_info("disassociate ucontext done, task was terminated\n");
+-				/* in case task was dead need to release the
+-				 * task struct.
+-				 */
+-				if (owning_process)
+-					put_task_struct(owning_process);
+-				return;
+-			}
+-		}
+-	}
+-
+-	down_write(&owning_mm->mmap_sem);
+-	ib_dev->disassociate_ucontext(ibcontext);
+-	up_write(&owning_mm->mmap_sem);
+-	mmput(owning_mm);
+-	put_task_struct(owning_process);
+-}
+-
+ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
+ 					struct ib_device *ib_dev)
+ {
+@@ -1168,39 +1107,24 @@ static void ib_uverbs_free_hw_resources(
+ 
+ 	mutex_lock(&uverbs_dev->lists_mutex);
+ 	while (!list_empty(&uverbs_dev->uverbs_file_list)) {
+-		struct ib_ucontext *ucontext;
+ 		file = list_first_entry(&uverbs_dev->uverbs_file_list,
+ 					struct ib_uverbs_file, list);
+ 		file->is_closed = 1;
+ 		list_del(&file->list);
+ 		kref_get(&file->ref);
+-		mutex_unlock(&uverbs_dev->lists_mutex);
+-
+-
+-		mutex_lock(&file->cleanup_mutex);
+-		ucontext = file->ucontext;
+-		file->ucontext = NULL;
+-		mutex_unlock(&file->cleanup_mutex);
+ 
+-		/* At this point ib_uverbs_close cannot be running
+-		 * ib_uverbs_cleanup_ufile
++		/* We must release the mutex before going ahead and calling
++		 * uverbs_cleanup_ufile, as it might end up indirectly calling
++		 * uverbs_close, for example due to freeing the resources (e.g
++		 * mmput).
+ 		 */
+-		if (ucontext) {
+-			/* We must release the mutex before going ahead and
+-			 * calling disassociate_ucontext. disassociate_ucontext
+-			 * might end up indirectly calling uverbs_close,
+-			 * for example due to freeing the resources
+-			 * (e.g mmput).
+-			 */
+-			ib_uverbs_event_handler(&file->event_handler, &event);
+-			ib_uverbs_disassociate_ucontext(ucontext);
+-			mutex_lock(&file->cleanup_mutex);
+-			ib_uverbs_cleanup_ufile(file, true);
+-			mutex_unlock(&file->cleanup_mutex);
+-		}
++		mutex_unlock(&uverbs_dev->lists_mutex);
+ 
+-		mutex_lock(&uverbs_dev->lists_mutex);
++		ib_uverbs_event_handler(&file->event_handler, &event);
++		uverbs_destroy_ufile_hw(file, RDMA_REMOVE_DRIVER_REMOVE);
+ 		kref_put(&file->ref, ib_uverbs_release_file);
++
++		mutex_lock(&uverbs_dev->lists_mutex);
+ 	}
+ 
+ 	while (!list_empty(&uverbs_dev->uverbs_events_file_list)) {
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -1478,6 +1478,11 @@ struct ib_rdmacg_object {
+ struct ib_ucontext {
+ 	struct ib_device       *device;
+ 	struct ib_uverbs_file  *ufile;
++	/*
++	 * 'closing' can be read by the driver only during a destroy callback,
++	 * it is set when we are closing the file descriptor and indicates
++	 * that mm_sem may be locked.
++	 */
+ 	int			closing;
+ 
+ 	bool cleanup_retryable;
