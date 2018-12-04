@@ -1,0 +1,288 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Wed, 25 Jul 2018 21:40:11 -0600
+Subject: IB/uverbs: Make the write path destroy methods use the same flow as
+ ioctl
+Patch-mainline: v4.19-rc1
+Git-commit: 32ed5c00ac5fdea49058fd49bf8707e101dc3dfe
+References: bsc#1103992 FATE#326009
+
+The ridiculous dance with uobj_remove_commit() is not needed, the write
+path can follow the same flow as ioctl - lock and destroy the HW object
+then use the data left over in the uobject to form the response to
+userspace.
+
+Two helpers are introduced to make this flow straightforward for the
+caller.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/rdma_core.c  |   53 +++++++++++++-----------
+ drivers/infiniband/core/uverbs_cmd.c |   77 ++++++-----------------------------
+ include/rdma/uverbs_std_types.h      |   16 +++++--
+ include/rdma/uverbs_types.h          |    1 
+ 4 files changed, 55 insertions(+), 92 deletions(-)
+
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@ -130,24 +130,44 @@ static int uverbs_try_lock_object(struct
+ }
+ 
+ /*
+- * Does both rdma_lookup_get_uobject() and rdma_remove_commit_uobject(), then
+- * returns success_res on success (negative errno on failure). For use by
+- * callers that do not need the uobj.
++ * uobj_get_destroy destroys the HW object and returns a handle to the uobj
++ * with a NULL object pointer. The caller must pair this with
++ * uverbs_put_destroy.
+  */
+-int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
+-			   struct ib_uverbs_file *ufile, int success_res)
++struct ib_uobject *__uobj_get_destroy(const struct uverbs_obj_type *type,
++				      u32 id, struct ib_uverbs_file *ufile)
+ {
+ 	struct ib_uobject *uobj;
+ 	int ret;
+ 
+ 	uobj = rdma_lookup_get_uobject(type, ufile, id, true);
+ 	if (IS_ERR(uobj))
+-		return PTR_ERR(uobj);
++		return uobj;
+ 
+-	ret = rdma_remove_commit_uobject(uobj);
+-	if (ret)
+-		return ret;
++	ret = rdma_explicit_destroy(uobj);
++	if (ret) {
++		rdma_lookup_put_uobject(uobj, true);
++		return ERR_PTR(ret);
++	}
+ 
++	return uobj;
++}
++
++/*
++ * Does both uobj_get_destroy() and uobj_put_destroy().  Returns success_res
++ * on success (negative errno on failure). For use by callers that do not need
++ * the uobj.
++ */
++int __uobj_perform_destroy(const struct uverbs_obj_type *type, u32 id,
++			   struct ib_uverbs_file *ufile, int success_res)
++{
++	struct ib_uobject *uobj;
++
++	uobj = __uobj_get_destroy(type, id, ufile);
++	if (IS_ERR(uobj))
++		return PTR_ERR(uobj);
++
++	rdma_lookup_put_uobject(uobj, true);
+ 	return success_res;
+ }
+ 
+@@ -449,21 +469,6 @@ static int __must_check _rdma_remove_com
+ 	return ret;
+ }
+ 
+-/* This is called only for user requested DESTROY reasons
+- * rdma_lookup_get_uobject(exclusive=true) must have been called to get uobj,
+- * and after this returns the corresponding put has been done, and the kref
+- * for uobj has been consumed.
+- */
+-int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj)
+-{
+-	int ret;
+-
+-	ret = rdma_explicit_destroy(uobj);
+-	/* Pairs with the lookup_get done by the caller */
+-	rdma_lookup_put_uobject(uobj, true);
+-	return ret;
+-}
+-
+ int rdma_explicit_destroy(struct ib_uobject *uobject)
+ {
+ 	int ret;
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -1304,37 +1304,22 @@ ssize_t ib_uverbs_destroy_cq(struct ib_u
+ 	struct ib_uverbs_destroy_cq      cmd;
+ 	struct ib_uverbs_destroy_cq_resp resp;
+ 	struct ib_uobject		*uobj;
+-	struct ib_cq               	*cq;
+ 	struct ib_ucq_object        	*obj;
+-	int                        	 ret = -EINVAL;
+ 
+ 	if (copy_from_user(&cmd, buf, sizeof cmd))
+ 		return -EFAULT;
+ 
+-	uobj = uobj_get_write(UVERBS_OBJECT_CQ, cmd.cq_handle, file);
++	uobj = uobj_get_destroy(UVERBS_OBJECT_CQ, cmd.cq_handle, file);
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
+-	/*
+-	 * Make sure we don't free the memory in remove_commit as we still
+-	 * needs the uobject memory to create the response.
+-	 */
+-	uverbs_uobject_get(uobj);
+-	cq      = uobj->object;
+-	obj     = container_of(cq->uobject, struct ib_ucq_object, uobject);
+-
++	obj = container_of(uobj, struct ib_ucq_object, uobject);
+ 	memset(&resp, 0, sizeof(resp));
+-
+-	ret = uobj_remove_commit(uobj);
+-	if (ret) {
+-		uverbs_uobject_put(uobj);
+-		return ret;
+-	}
+-
+ 	resp.comp_events_reported  = obj->comp_events_reported;
+ 	resp.async_events_reported = obj->async_events_reported;
+ 
+-	uverbs_uobject_put(uobj);
++	uobj_put_destroy(uobj);
++
+ 	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof resp))
+ 		return -EFAULT;
+ 
+@@ -2153,32 +2138,19 @@ ssize_t ib_uverbs_destroy_qp(struct ib_u
+ 	struct ib_uverbs_destroy_qp_resp resp;
+ 	struct ib_uobject		*uobj;
+ 	struct ib_uqp_object        	*obj;
+-	int                        	 ret = -EINVAL;
+ 
+ 	if (copy_from_user(&cmd, buf, sizeof cmd))
+ 		return -EFAULT;
+ 
+-	memset(&resp, 0, sizeof resp);
+-
+-	uobj = uobj_get_write(UVERBS_OBJECT_QP, cmd.qp_handle, file);
++	uobj = uobj_get_destroy(UVERBS_OBJECT_QP, cmd.qp_handle, file);
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
+ 	obj = container_of(uobj, struct ib_uqp_object, uevent.uobject);
+-	/*
+-	 * Make sure we don't free the memory in remove_commit as we still
+-	 * needs the uobject memory to create the response.
+-	 */
+-	uverbs_uobject_get(uobj);
+-
+-	ret = uobj_remove_commit(uobj);
+-	if (ret) {
+-		uverbs_uobject_put(uobj);
+-		return ret;
+-	}
+-
++	memset(&resp, 0, sizeof(resp));
+ 	resp.events_reported = obj->uevent.events_reported;
+-	uverbs_uobject_put(uobj);
++
++	uobj_put_destroy(uobj);
+ 
+ 	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof resp))
+ 		return -EFAULT;
+@@ -3247,22 +3219,14 @@ int ib_uverbs_ex_destroy_wq(struct ib_uv
+ 		return -EOPNOTSUPP;
+ 
+ 	resp.response_length = required_resp_len;
+-	uobj = uobj_get_write(UVERBS_OBJECT_WQ, cmd.wq_handle, file);
++	uobj = uobj_get_destroy(UVERBS_OBJECT_WQ, cmd.wq_handle, file);
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
+ 	obj = container_of(uobj, struct ib_uwq_object, uevent.uobject);
+-	/*
+-	 * Make sure we don't free the memory in remove_commit as we still
+-	 * needs the uobject memory to create the response.
+-	 */
+-	uverbs_uobject_get(uobj);
+-
+-	ret = uobj_remove_commit(uobj);
+ 	resp.events_reported = obj->uevent.events_reported;
+-	uverbs_uobject_put(uobj);
+-	if (ret)
+-		return ret;
++
++	uobj_put_destroy(uobj);
+ 
+ 	return ib_copy_to_udata(ucore, &resp, resp.response_length);
+ }
+@@ -3976,31 +3940,20 @@ ssize_t ib_uverbs_destroy_srq(struct ib_
+ 	struct ib_uverbs_destroy_srq_resp resp;
+ 	struct ib_uobject		 *uobj;
+ 	struct ib_uevent_object        	 *obj;
+-	int                         	  ret = -EINVAL;
+ 
+ 	if (copy_from_user(&cmd, buf, sizeof cmd))
+ 		return -EFAULT;
+ 
+-	uobj = uobj_get_write(UVERBS_OBJECT_SRQ, cmd.srq_handle, file);
++	uobj = uobj_get_destroy(UVERBS_OBJECT_SRQ, cmd.srq_handle, file);
+ 	if (IS_ERR(uobj))
+ 		return PTR_ERR(uobj);
+ 
+ 	obj = container_of(uobj, struct ib_uevent_object, uobject);
+-	/*
+-	 * Make sure we don't free the memory in remove_commit as we still
+-	 * needs the uobject memory to create the response.
+-	 */
+-	uverbs_uobject_get(uobj);
+-
+ 	memset(&resp, 0, sizeof(resp));
+-
+-	ret = uobj_remove_commit(uobj);
+-	if (ret) {
+-		uverbs_uobject_put(uobj);
+-		return ret;
+-	}
+ 	resp.events_reported = obj->events_reported;
+-	uverbs_uobject_put(uobj);
++
++	uobj_put_destroy(uobj);
++
+ 	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof(resp)))
+ 		return -EFAULT;
+ 
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@ -84,6 +84,17 @@ int __uobj_perform_destroy(const struct
+ 	__uobj_perform_destroy(uobj_get_type(_type), _uobj_check_id(_id),      \
+ 			       _ufile, _success_res)
+ 
++struct ib_uobject *__uobj_get_destroy(const struct uverbs_obj_type *type,
++				      u32 id, struct ib_uverbs_file *ufile);
++
++#define uobj_get_destroy(_type, _id, _ufile)                                   \
++	__uobj_get_destroy(uobj_get_type(_type), _uobj_check_id(_id), _ufile)
++
++static inline void uobj_put_destroy(struct ib_uobject *uobj)
++{
++	rdma_lookup_put_uobject(uobj, true);
++}
++
+ static inline void uobj_put_read(struct ib_uobject *uobj)
+ {
+ 	rdma_lookup_put_uobject(uobj, false);
+@@ -97,11 +108,6 @@ static inline void uobj_put_write(struct
+ 	rdma_lookup_put_uobject(uobj, true);
+ }
+ 
+-static inline int __must_check uobj_remove_commit(struct ib_uobject *uobj)
+-{
+-	return rdma_remove_commit_uobject(uobj);
+-}
+-
+ static inline int __must_check uobj_alloc_commit(struct ib_uobject *uobj,
+ 						 int success_res)
+ {
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@ -126,7 +126,6 @@ void rdma_lookup_put_uobject(struct ib_u
+ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_obj_type *type,
+ 					    struct ib_uverbs_file *ufile);
+ void rdma_alloc_abort_uobject(struct ib_uobject *uobj);
+-int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj);
+ int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj);
+ int rdma_explicit_destroy(struct ib_uobject *uobject);
+ 
