@@ -1,0 +1,593 @@
+From: =?UTF-8?q?Javier=20Gonz=C3=A1lez?= <javier@cnexlabs.com>
+Date: Fri, 13 Oct 2017 14:46:14 +0200
+Subject: [PATCH] lightnvm: pblk: simplify data validity check on GC
+Git-commit: d340121eb770de3b02bfc73c5f2b00f5345090c2
+Patch-mainline: v4.15-rc1
+References: bsc#1104967,FATE#325924
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a line is selected for recycling by the garbage collector (GC), the
+line state changes and the invalid bitmap is frozen, preventing
+invalidations from happening. Throughout the GC, the L2P map is checked
+to verify that not data being recycled has been updated. The last check
+is done before the new map is being stored on the L2P table. Though
+this algorithm works, it requires a number of corner cases to be checked
+each time the L2P table is being updated. This complicates readability
+and is error prone in case that the recycling algorithm is modified.
+
+Instead, this patch makes the invalid bitmap accessible even when the
+line is being recycled. When recycled data is being remapped, it is
+enough to check the invalid bitmap for the line before updating the L2P
+table.
+
+Signed-off-by: Javier González <javier@cnexlabs.com>
+Signed-off-by: Matias Bjørling <m@bjorling.me>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/lightnvm/pblk-cache.c | 20 +++++------
+ drivers/lightnvm/pblk-core.c  | 29 +++++++---------
+ drivers/lightnvm/pblk-gc.c    | 58 +++++++++++++++++--------------
+ drivers/lightnvm/pblk-rb.c    |  6 ++--
+ drivers/lightnvm/pblk-read.c  | 79 +++++++++++++++++++++++--------------------
+ drivers/lightnvm/pblk.h       | 23 ++++---------
+ 6 files changed, 109 insertions(+), 106 deletions(-)
+
+diff --git a/drivers/lightnvm/pblk-cache.c b/drivers/lightnvm/pblk-cache.c
+index 024a8fc93069..1d6b8e3585f1 100644
+--- a/drivers/lightnvm/pblk-cache.c
++++ b/drivers/lightnvm/pblk-cache.c
+@@ -73,12 +73,11 @@ int pblk_write_to_cache(struct pblk *pblk, struct bio *bio, unsigned long flags)
+  * On GC the incoming lbas are not necessarily sequential. Also, some of the
+  * lbas might not be valid entries, which are marked as empty by the GC thread
+  */
+-int pblk_write_gc_to_cache(struct pblk *pblk, void *data, u64 *lba_list,
+-			   unsigned int nr_entries, unsigned int nr_rec_entries,
+-			   struct pblk_line *gc_line, unsigned long flags)
++int pblk_write_gc_to_cache(struct pblk *pblk, struct pblk_gc_rq *gc_rq)
+ {
+ 	struct pblk_w_ctx w_ctx;
+ 	unsigned int bpos, pos;
++	void *data = gc_rq->data;
+ 	int i, valid_entries;
+ 
+ 	/* Update the write buffer head (mem) with the entries that we can
+@@ -86,28 +85,29 @@ int pblk_write_gc_to_cache(struct pblk *pblk, void *data, u64 *lba_list,
+ 	 * rollback from here on.
+ 	 */
+ retry:
+-	if (!pblk_rb_may_write_gc(&pblk->rwb, nr_rec_entries, &bpos)) {
++	if (!pblk_rb_may_write_gc(&pblk->rwb, gc_rq->secs_to_gc, &bpos)) {
+ 		io_schedule();
+ 		goto retry;
+ 	}
+ 
+-	w_ctx.flags = flags;
++	w_ctx.flags = PBLK_IOTYPE_GC;
+ 	pblk_ppa_set_empty(&w_ctx.ppa);
+ 
+-	for (i = 0, valid_entries = 0; i < nr_entries; i++) {
+-		if (lba_list[i] == ADDR_EMPTY)
++	for (i = 0, valid_entries = 0; i < gc_rq->nr_secs; i++) {
++		if (gc_rq->lba_list[i] == ADDR_EMPTY)
+ 			continue;
+ 
+-		w_ctx.lba = lba_list[i];
++		w_ctx.lba = gc_rq->lba_list[i];
+ 
+ 		pos = pblk_rb_wrap_pos(&pblk->rwb, bpos + valid_entries);
+-		pblk_rb_write_entry_gc(&pblk->rwb, data, w_ctx, gc_line, pos);
++		pblk_rb_write_entry_gc(&pblk->rwb, data, w_ctx, gc_rq->line,
++						gc_rq->paddr_list[i], pos);
+ 
+ 		data += PBLK_EXPOSED_PAGE_SIZE;
+ 		valid_entries++;
+ 	}
+ 
+-	WARN_ONCE(nr_rec_entries != valid_entries,
++	WARN_ONCE(gc_rq->secs_to_gc != valid_entries,
+ 					"pblk: inconsistent GC write\n");
+ 
+ #ifdef CONFIG_NVM_DEBUG
+diff --git a/drivers/lightnvm/pblk-core.c b/drivers/lightnvm/pblk-core.c
+index b6d7c6660149..6dd4866e579c 100644
+--- a/drivers/lightnvm/pblk-core.c
++++ b/drivers/lightnvm/pblk-core.c
+@@ -78,11 +78,7 @@ void __pblk_map_invalidate(struct pblk *pblk, struct pblk_line *line,
+ 	 * that newer updates are not overwritten.
+ 	 */
+ 	spin_lock(&line->lock);
+-	if (line->state == PBLK_LINESTATE_GC ||
+-					line->state == PBLK_LINESTATE_FREE) {
+-		spin_unlock(&line->lock);
+-		return;
+-	}
++	WARN_ON(line->state == PBLK_LINESTATE_FREE);
+ 
+ 	if (test_and_set_bit(paddr, line->invalid_bitmap)) {
+ 		WARN_ONCE(1, "pblk: double invalidate\n");
+@@ -99,8 +95,7 @@ void __pblk_map_invalidate(struct pblk *pblk, struct pblk_line *line,
+ 		spin_lock(&l_mg->gc_lock);
+ 		spin_lock(&line->lock);
+ 		/* Prevent moving a line that has just been chosen for GC */
+-		if (line->state == PBLK_LINESTATE_GC ||
+-					line->state == PBLK_LINESTATE_FREE) {
++		if (line->state == PBLK_LINESTATE_GC) {
+ 			spin_unlock(&line->lock);
+ 			spin_unlock(&l_mg->gc_lock);
+ 			return;
+@@ -1766,6 +1761,7 @@ void pblk_update_map(struct pblk *pblk, sector_t lba, struct ppa_addr ppa)
+ 
+ void pblk_update_map_cache(struct pblk *pblk, sector_t lba, struct ppa_addr ppa)
+ {
++
+ #ifdef CONFIG_NVM_DEBUG
+ 	/* Callers must ensure that the ppa points to a cache address */
+ 	BUG_ON(!pblk_addr_in_cache(ppa));
+@@ -1776,9 +1772,9 @@ void pblk_update_map_cache(struct pblk *pblk, sector_t lba, struct ppa_addr ppa)
+ }
+ 
+ int pblk_update_map_gc(struct pblk *pblk, sector_t lba, struct ppa_addr ppa_new,
+-		       struct pblk_line *gc_line)
++		       struct pblk_line *gc_line, u64 paddr_gc)
+ {
+-	struct ppa_addr ppa_l2p;
++	struct ppa_addr ppa_l2p, ppa_gc;
+ 	int ret = 1;
+ 
+ #ifdef CONFIG_NVM_DEBUG
+@@ -1795,10 +1791,13 @@ int pblk_update_map_gc(struct pblk *pblk, sector_t lba, struct ppa_addr ppa_new,
+ 
+ 	spin_lock(&pblk->trans_lock);
+ 	ppa_l2p = pblk_trans_map_get(pblk, lba);
++	ppa_gc = addr_to_gen_ppa(pblk, paddr_gc, gc_line->id);
+ 
+-	/* Prevent updated entries to be overwritten by GC */
+-	if (pblk_addr_in_cache(ppa_l2p) || pblk_ppa_empty(ppa_l2p) ||
+-				pblk_tgt_ppa_to_line(ppa_l2p) != gc_line->id) {
++	if (!pblk_ppa_comp(ppa_l2p, ppa_gc)) {
++		spin_lock(&gc_line->lock);
++		WARN(!test_bit(paddr_gc, gc_line->invalid_bitmap),
++						"pblk: corrupted GC update");
++		spin_unlock(&gc_line->lock);
+ 
+ 		ret = 0;
+ 		goto out;
+@@ -1870,15 +1869,13 @@ void pblk_lookup_l2p_seq(struct pblk *pblk, struct ppa_addr *ppas,
+ void pblk_lookup_l2p_rand(struct pblk *pblk, struct ppa_addr *ppas,
+ 			  u64 *lba_list, int nr_secs)
+ {
+-	sector_t lba;
++	u64 lba;
+ 	int i;
+ 
+ 	spin_lock(&pblk->trans_lock);
+ 	for (i = 0; i < nr_secs; i++) {
+ 		lba = lba_list[i];
+-		if (lba == ADDR_EMPTY) {
+-			ppas[i].ppa = ADDR_EMPTY;
+-		} else {
++		if (lba != ADDR_EMPTY) {
+ 			/* logic error: lba out-of-bounds. Ignore update */
+ 			if (!(lba < pblk->rl.nr_secs)) {
+ 				WARN(1, "pblk: corrupted L2P map request\n");
+diff --git a/drivers/lightnvm/pblk-gc.c b/drivers/lightnvm/pblk-gc.c
+index c21b2077432a..7ad0cfe58a21 100644
+--- a/drivers/lightnvm/pblk-gc.c
++++ b/drivers/lightnvm/pblk-gc.c
+@@ -20,7 +20,8 @@
+ 
+ static void pblk_gc_free_gc_rq(struct pblk_gc_rq *gc_rq)
+ {
+-	vfree(gc_rq->data);
++	if (gc_rq->data)
++		vfree(gc_rq->data);
+ 	kfree(gc_rq);
+ }
+ 
+@@ -41,10 +42,7 @@ static int pblk_gc_write(struct pblk *pblk)
+ 	spin_unlock(&gc->w_lock);
+ 
+ 	list_for_each_entry_safe(gc_rq, tgc_rq, &w_list, list) {
+-		pblk_write_gc_to_cache(pblk, gc_rq->data, gc_rq->lba_list,
+-				gc_rq->nr_secs, gc_rq->secs_to_gc,
+-				gc_rq->line, PBLK_IOTYPE_GC);
+-
++		pblk_write_gc_to_cache(pblk, gc_rq);
+ 		list_del(&gc_rq->list);
+ 		kref_put(&gc_rq->line->ref, pblk_line_put);
+ 		pblk_gc_free_gc_rq(gc_rq);
+@@ -69,27 +67,23 @@ static int pblk_gc_move_valid_secs(struct pblk *pblk, struct pblk_gc_rq *gc_rq)
+ 	struct pblk_gc *gc = &pblk->gc;
+ 	struct pblk_line *line = gc_rq->line;
+ 	void *data;
+-	unsigned int secs_to_gc;
+ 	int ret = 0;
+ 
+ 	data = vmalloc(gc_rq->nr_secs * geo->sec_size);
+ 	if (!data) {
+ 		ret = -ENOMEM;
+-		goto out;
++		goto fail;
+ 	}
+ 
+-	/* Read from GC victim block */
+-	if (pblk_submit_read_gc(pblk, gc_rq->lba_list, data, gc_rq->nr_secs,
+-							&secs_to_gc, line)) {
+-		ret = -EFAULT;
+-		goto free_data;
+-	}
++	gc_rq->data = data;
+ 
+-	if (!secs_to_gc)
+-		goto free_rq;
++	/* Read from GC victim block */
++	ret = pblk_submit_read_gc(pblk, gc_rq);
++	if (ret)
++		goto fail;
+ 
+-	gc_rq->data = data;
+-	gc_rq->secs_to_gc = secs_to_gc;
++	if (!gc_rq->secs_to_gc)
++		goto fail;
+ 
+ retry:
+ 	spin_lock(&gc->w_lock);
+@@ -107,11 +101,8 @@ static int pblk_gc_move_valid_secs(struct pblk *pblk, struct pblk_gc_rq *gc_rq)
+ 
+ 	return 0;
+ 
+-free_rq:
+-	kfree(gc_rq);
+-free_data:
+-	vfree(data);
+-out:
++fail:
++	pblk_gc_free_gc_rq(gc_rq);
+ 	kref_put(&line->ref, pblk_line_put);
+ 	return ret;
+ }
+@@ -167,14 +158,21 @@ static void pblk_gc_line_prepare_ws(struct work_struct *work)
+ 	struct pblk_line_ws *gc_rq_ws;
+ 	struct pblk_gc_rq *gc_rq;
+ 	__le64 *lba_list;
++	unsigned long *invalid_bitmap;
+ 	int sec_left, nr_secs, bit;
+ 	int ret;
+ 
++	invalid_bitmap = kmalloc(lm->sec_bitmap_len, GFP_KERNEL);
++	if (!invalid_bitmap) {
++		pr_err("pblk: could not allocate GC invalid bitmap\n");
++		goto fail_free_ws;
++	}
++
+ 	emeta_buf = pblk_malloc(lm->emeta_len[0], l_mg->emeta_alloc_type,
+ 								GFP_KERNEL);
+ 	if (!emeta_buf) {
+ 		pr_err("pblk: cannot use GC emeta\n");
+-		return;
++		goto fail_free_bitmap;
+ 	}
+ 
+ 	ret = pblk_line_read_emeta(pblk, line, emeta_buf);
+@@ -193,7 +191,11 @@ static void pblk_gc_line_prepare_ws(struct work_struct *work)
+ 		goto fail_free_emeta;
+ 	}
+ 
++	spin_lock(&line->lock);
++	bitmap_copy(invalid_bitmap, line->invalid_bitmap, lm->sec_per_line);
+ 	sec_left = pblk_line_vsc(line);
++	spin_unlock(&line->lock);
++
+ 	if (sec_left < 0) {
+ 		pr_err("pblk: corrupted GC line (%d)\n", line->id);
+ 		goto fail_free_emeta;
+@@ -207,11 +209,12 @@ static void pblk_gc_line_prepare_ws(struct work_struct *work)
+ 
+ 	nr_secs = 0;
+ 	do {
+-		bit = find_next_zero_bit(line->invalid_bitmap, lm->sec_per_line,
++		bit = find_next_zero_bit(invalid_bitmap, lm->sec_per_line,
+ 								bit + 1);
+ 		if (bit > line->emeta_ssec)
+ 			break;
+ 
++		gc_rq->paddr_list[nr_secs] = bit;
+ 		gc_rq->lba_list[nr_secs++] = le64_to_cpu(lba_list[bit]);
+ 	} while (nr_secs < pblk->max_write_pgs);
+ 
+@@ -244,6 +247,7 @@ static void pblk_gc_line_prepare_ws(struct work_struct *work)
+ out:
+ 	pblk_mfree(emeta_buf, l_mg->emeta_alloc_type);
+ 	kfree(line_ws);
++	kfree(invalid_bitmap);
+ 
+ 	kref_put(&line->ref, pblk_line_put);
+ 	atomic_dec(&gc->inflight_gc);
+@@ -254,9 +258,13 @@ static void pblk_gc_line_prepare_ws(struct work_struct *work)
+ 	kfree(gc_rq);
+ fail_free_emeta:
+ 	pblk_mfree(emeta_buf, l_mg->emeta_alloc_type);
++fail_free_bitmap:
++	kfree(invalid_bitmap);
++fail_free_ws:
++	kfree(line_ws);
++
+ 	pblk_put_line_back(pblk, line);
+ 	kref_put(&line->ref, pblk_line_put);
+-	kfree(line_ws);
+ 	atomic_dec(&gc->inflight_gc);
+ 
+ 	pr_err("pblk: Failed to GC line %d\n", line->id);
+diff --git a/drivers/lightnvm/pblk-rb.c b/drivers/lightnvm/pblk-rb.c
+index 9bc32578a766..74c768ce09ef 100644
+--- a/drivers/lightnvm/pblk-rb.c
++++ b/drivers/lightnvm/pblk-rb.c
+@@ -325,8 +325,8 @@ void pblk_rb_write_entry_user(struct pblk_rb *rb, void *data,
+ }
+ 
+ void pblk_rb_write_entry_gc(struct pblk_rb *rb, void *data,
+-			    struct pblk_w_ctx w_ctx, struct pblk_line *gc_line,
+-			    unsigned int ring_pos)
++			    struct pblk_w_ctx w_ctx, struct pblk_line *line,
++			    u64 paddr, unsigned int ring_pos)
+ {
+ 	struct pblk *pblk = container_of(rb, struct pblk, rwb);
+ 	struct pblk_rb_entry *entry;
+@@ -341,7 +341,7 @@ void pblk_rb_write_entry_gc(struct pblk_rb *rb, void *data,
+ 
+ 	__pblk_rb_write_entry(rb, data, w_ctx, entry);
+ 
+-	if (!pblk_update_map_gc(pblk, w_ctx.lba, entry->cacheline, gc_line))
++	if (!pblk_update_map_gc(pblk, w_ctx.lba, entry->cacheline, line, paddr))
+ 		entry->w_ctx.lba = ADDR_EMPTY;
+ 
+ 	flags = w_ctx.flags | PBLK_WRITTEN_DATA;
+diff --git a/drivers/lightnvm/pblk-read.c b/drivers/lightnvm/pblk-read.c
+index eaaf9d55ba97..c28d6509312e 100644
+--- a/drivers/lightnvm/pblk-read.c
++++ b/drivers/lightnvm/pblk-read.c
+@@ -388,34 +388,40 @@ int pblk_submit_read(struct pblk *pblk, struct bio *bio)
+ 
+ static int read_ppalist_rq_gc(struct pblk *pblk, struct nvm_rq *rqd,
+ 			      struct pblk_line *line, u64 *lba_list,
+-			      unsigned int nr_secs)
++			      u64 *paddr_list_gc, unsigned int nr_secs)
+ {
+-	struct ppa_addr ppas[PBLK_MAX_REQ_ADDRS];
++	struct ppa_addr ppa_list_l2p[PBLK_MAX_REQ_ADDRS];
++	struct ppa_addr ppa_gc;
+ 	int valid_secs = 0;
+ 	int i;
+ 
+-	pblk_lookup_l2p_rand(pblk, ppas, lba_list, nr_secs);
++	pblk_lookup_l2p_rand(pblk, ppa_list_l2p, lba_list, nr_secs);
+ 
+ 	for (i = 0; i < nr_secs; i++) {
+-		if (pblk_addr_in_cache(ppas[i]) || ppas[i].g.blk != line->id ||
+-						pblk_ppa_empty(ppas[i])) {
+-			lba_list[i] = ADDR_EMPTY;
++		if (lba_list[i] == ADDR_EMPTY)
++			continue;
++
++		ppa_gc = addr_to_gen_ppa(pblk, paddr_list_gc[i], line->id);
++		if (!pblk_ppa_comp(ppa_list_l2p[i], ppa_gc)) {
++			paddr_list_gc[i] = lba_list[i] = ADDR_EMPTY;
+ 			continue;
+ 		}
+ 
+-		rqd->ppa_list[valid_secs++] = ppas[i];
++		rqd->ppa_list[valid_secs++] = ppa_list_l2p[i];
+ 	}
+ 
+ #ifdef CONFIG_NVM_DEBUG
+ 	atomic_long_add(valid_secs, &pblk->inflight_reads);
+ #endif
++
+ 	return valid_secs;
+ }
+ 
+ static int read_rq_gc(struct pblk *pblk, struct nvm_rq *rqd,
+-		      struct pblk_line *line, sector_t lba)
++		      struct pblk_line *line, sector_t lba,
++		      u64 paddr_gc)
+ {
+-	struct ppa_addr ppa;
++	struct ppa_addr ppa_l2p, ppa_gc;
+ 	int valid_secs = 0;
+ 
+ 	if (lba == ADDR_EMPTY)
+@@ -428,15 +434,14 @@ static int read_rq_gc(struct pblk *pblk, struct nvm_rq *rqd,
+ 	}
+ 
+ 	spin_lock(&pblk->trans_lock);
+-	ppa = pblk_trans_map_get(pblk, lba);
++	ppa_l2p = pblk_trans_map_get(pblk, lba);
+ 	spin_unlock(&pblk->trans_lock);
+ 
+-	/* Ignore updated values until the moment */
+-	if (pblk_addr_in_cache(ppa) || ppa.g.blk != line->id ||
+-							pblk_ppa_empty(ppa))
++	ppa_gc = addr_to_gen_ppa(pblk, paddr_gc, line->id);
++	if (!pblk_ppa_comp(ppa_l2p, ppa_gc))
+ 		goto out;
+ 
+-	rqd->ppa_addr = ppa;
++	rqd->ppa_addr = ppa_l2p;
+ 	valid_secs = 1;
+ 
+ #ifdef CONFIG_NVM_DEBUG
+@@ -447,15 +452,14 @@ static int read_rq_gc(struct pblk *pblk, struct nvm_rq *rqd,
+ 	return valid_secs;
+ }
+ 
+-int pblk_submit_read_gc(struct pblk *pblk, u64 *lba_list, void *data,
+-			unsigned int nr_secs, unsigned int *secs_to_gc,
+-			struct pblk_line *line)
++int pblk_submit_read_gc(struct pblk *pblk, struct pblk_gc_rq *gc_rq)
+ {
+ 	struct nvm_tgt_dev *dev = pblk->dev;
+ 	struct nvm_geo *geo = &dev->geo;
+ 	struct bio *bio;
+ 	struct nvm_rq rqd;
+-	int ret, data_len;
++	int data_len;
++	int ret = NVM_IO_OK;
+ 	DECLARE_COMPLETION_ONSTACK(wait);
+ 
+ 	memset(&rqd, 0, sizeof(struct nvm_rq));
+@@ -463,25 +467,29 @@ int pblk_submit_read_gc(struct pblk *pblk, u64 *lba_list, void *data,
+ 	rqd.meta_list = nvm_dev_dma_alloc(dev->parent, GFP_KERNEL,
+ 							&rqd.dma_meta_list);
+ 	if (!rqd.meta_list)
+-		return NVM_IO_ERR;
++		return -ENOMEM;
+ 
+-	if (nr_secs > 1) {
++	if (gc_rq->nr_secs > 1) {
+ 		rqd.ppa_list = rqd.meta_list + pblk_dma_meta_size;
+ 		rqd.dma_ppa_list = rqd.dma_meta_list + pblk_dma_meta_size;
+ 
+-		*secs_to_gc = read_ppalist_rq_gc(pblk, &rqd, line, lba_list,
+-								nr_secs);
+-		if (*secs_to_gc == 1)
++		gc_rq->secs_to_gc = read_ppalist_rq_gc(pblk, &rqd, gc_rq->line,
++							gc_rq->lba_list,
++							gc_rq->paddr_list,
++							gc_rq->nr_secs);
++		if (gc_rq->secs_to_gc == 1)
+ 			rqd.ppa_addr = rqd.ppa_list[0];
+ 	} else {
+-		*secs_to_gc = read_rq_gc(pblk, &rqd, line, lba_list[0]);
++		gc_rq->secs_to_gc = read_rq_gc(pblk, &rqd, gc_rq->line,
++							gc_rq->lba_list[0],
++							gc_rq->paddr_list[0]);
+ 	}
+ 
+-	if (!(*secs_to_gc))
++	if (!(gc_rq->secs_to_gc))
+ 		goto out;
+ 
+-	data_len = (*secs_to_gc) * geo->sec_size;
+-	bio = pblk_bio_map_addr(pblk, data, *secs_to_gc, data_len,
++	data_len = (gc_rq->secs_to_gc) * geo->sec_size;
++	bio = pblk_bio_map_addr(pblk, gc_rq->data, gc_rq->secs_to_gc, data_len,
+ 						PBLK_VMALLOC_META, GFP_KERNEL);
+ 	if (IS_ERR(bio)) {
+ 		pr_err("pblk: could not allocate GC bio (%lu)\n", PTR_ERR(bio));
+@@ -494,13 +502,12 @@ int pblk_submit_read_gc(struct pblk *pblk, u64 *lba_list, void *data,
+ 	rqd.opcode = NVM_OP_PREAD;
+ 	rqd.end_io = pblk_end_io_sync;
+ 	rqd.private = &wait;
+-	rqd.nr_ppas = *secs_to_gc;
++	rqd.nr_ppas = gc_rq->secs_to_gc;
+ 	rqd.flags = pblk_set_read_mode(pblk, PBLK_READ_RANDOM);
+ 	rqd.bio = bio;
+ 
+-	ret = pblk_submit_read_io(pblk, &rqd);
+-	if (ret) {
+-		bio_endio(bio);
++	if (pblk_submit_read_io(pblk, &rqd)) {
++		ret = -EIO;
+ 		pr_err("pblk: GC read request failed\n");
+ 		goto err_free_bio;
+ 	}
+@@ -519,19 +526,19 @@ int pblk_submit_read_gc(struct pblk *pblk, u64 *lba_list, void *data,
+ 	}
+ 
+ #ifdef CONFIG_NVM_DEBUG
+-	atomic_long_add(*secs_to_gc, &pblk->sync_reads);
+-	atomic_long_add(*secs_to_gc, &pblk->recov_gc_reads);
+-	atomic_long_sub(*secs_to_gc, &pblk->inflight_reads);
++	atomic_long_add(gc_rq->secs_to_gc, &pblk->sync_reads);
++	atomic_long_add(gc_rq->secs_to_gc, &pblk->recov_gc_reads);
++	atomic_long_sub(gc_rq->secs_to_gc, &pblk->inflight_reads);
+ #endif
+ 
+ 	bio_put(bio);
+ out:
+ 	nvm_dev_dma_free(dev->parent, rqd.meta_list, rqd.dma_meta_list);
+-	return NVM_IO_OK;
++	return ret;
+ 
+ err_free_bio:
+ 	bio_put(bio);
+ err_free_dma:
+ 	nvm_dev_dma_free(dev->parent, rqd.meta_list, rqd.dma_meta_list);
+-	return NVM_IO_ERR;
++	return ret;
+ }
+diff --git a/drivers/lightnvm/pblk.h b/drivers/lightnvm/pblk.h
+index baa6a633990f..876b50f97234 100644
+--- a/drivers/lightnvm/pblk.h
++++ b/drivers/lightnvm/pblk.h
+@@ -206,6 +206,7 @@ struct pblk_lun {
+ struct pblk_gc_rq {
+ 	struct pblk_line *line;
+ 	void *data;
++	u64 paddr_list[PBLK_MAX_REQ_ADDRS];
+ 	u64 lba_list[PBLK_MAX_REQ_ADDRS];
+ 	int nr_secs;
+ 	int secs_to_gc;
+@@ -658,8 +659,8 @@ int pblk_rb_may_write_gc(struct pblk_rb *rb, unsigned int nr_entries,
+ void pblk_rb_write_entry_user(struct pblk_rb *rb, void *data,
+ 			      struct pblk_w_ctx w_ctx, unsigned int pos);
+ void pblk_rb_write_entry_gc(struct pblk_rb *rb, void *data,
+-			    struct pblk_w_ctx w_ctx, struct pblk_line *gc_line,
+-			    unsigned int pos);
++			    struct pblk_w_ctx w_ctx, struct pblk_line *line,
++			    u64 paddr, unsigned int pos);
+ struct pblk_w_ctx *pblk_rb_w_ctx(struct pblk_rb *rb, unsigned int pos);
+ void pblk_rb_flush(struct pblk_rb *rb);
+ 
+@@ -761,7 +762,7 @@ void pblk_update_map_cache(struct pblk *pblk, sector_t lba,
+ void pblk_update_map_dev(struct pblk *pblk, sector_t lba,
+ 			 struct ppa_addr ppa, struct ppa_addr entry_line);
+ int pblk_update_map_gc(struct pblk *pblk, sector_t lba, struct ppa_addr ppa,
+-		       struct pblk_line *gc_line);
++		       struct pblk_line *gc_line, u64 paddr);
+ void pblk_lookup_l2p_rand(struct pblk *pblk, struct ppa_addr *ppas,
+ 			  u64 *lba_list, int nr_secs);
+ void pblk_lookup_l2p_seq(struct pblk *pblk, struct ppa_addr *ppas,
+@@ -772,9 +773,7 @@ void pblk_lookup_l2p_seq(struct pblk *pblk, struct ppa_addr *ppas,
+  */
+ int pblk_write_to_cache(struct pblk *pblk, struct bio *bio,
+ 			unsigned long flags);
+-int pblk_write_gc_to_cache(struct pblk *pblk, void *data, u64 *lba_list,
+-			   unsigned int nr_entries, unsigned int nr_rec_entries,
+-			   struct pblk_line *gc_line, unsigned long flags);
++int pblk_write_gc_to_cache(struct pblk *pblk, struct pblk_gc_rq *gc_rq);
+ 
+ /*
+  * pblk map
+@@ -798,9 +797,7 @@ void pblk_write_should_kick(struct pblk *pblk);
+  */
+ extern struct bio_set *pblk_bio_set;
+ int pblk_submit_read(struct pblk *pblk, struct bio *bio);
+-int pblk_submit_read_gc(struct pblk *pblk, u64 *lba_list, void *data,
+-			unsigned int nr_secs, unsigned int *secs_to_gc,
+-			struct pblk_line *line);
++int pblk_submit_read_gc(struct pblk *pblk, struct pblk_gc_rq *gc_rq);
+ /*
+  * pblk recovery
+  */
+@@ -893,13 +890,7 @@ static inline void *emeta_to_vsc(struct pblk *pblk, struct line_emeta *emeta)
+ 
+ static inline int pblk_line_vsc(struct pblk_line *line)
+ {
+-	int vsc;
+-
+-	spin_lock(&line->lock);
+-	vsc = le32_to_cpu(*line->vsc);
+-	spin_unlock(&line->lock);
+-
+-	return vsc;
++	return le32_to_cpu(*line->vsc);
+ }
+ 
+ #define NVM_MEM_PAGE_WRITE (8)
+-- 
+2.12.3
+
