@@ -1,0 +1,225 @@
+From: Ingo Franzki <ifranzki@linux.ibm.com>
+Subject: s390/pkey: Introduce new API for transforming key blobs
+Git-commit: fb1136d6580c93af3ec33bf7a5621d980a711f24
+Patch-mainline: v4.20-rc1
+References: FATE#326366, LTC#169192, bsc#1113523
+
+Summary:     crypto: Add support for randomly generated protected keys
+Description: This feature enhances the paes_s390 and the pkey kernel modules
+             to allow using randomly generated protected keys. Such randomly
+             generated protected keys do not require an CryptoExpress adapter.
+             This is mainly useful for encrypted swap disks, or any other
+             cases where the keys are ephemeral, that their life time does not
+             extend over different boot, machine migrations or suspend/resume.
+
+Upstream-Description:
+
+             s390/pkey: Introduce new API for transforming key blobs
+
+             Introduce a new ioctl API and in-kernel API to transform
+             a variable length key blob of any supported type into a
+             protected key.
+
+             Transforming a secure key blob uses the already existing
+             function pkey_sec2protk().
+             Transforming a protected key blob also verifies if the
+             protected key is still valid. If not, -ENODEV is returned.
+
+             Both APIs are described in detail in the header files
+             arch/s390/include/asm/pkey.h and arch/s390/include/uapi/asm/pkey.h.
+
+             Signed-off-by: Ingo Franzki <ifranzki@linux.ibm.com>
+             Reviewed-by: Harald Freudenberger <freude@linux.ibm.com>
+             Reviewed-by: Hendrik Brueckner <brueckner@linux.ibm.com>
+             Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+Signed-off-by: Ingo Franzki <ifranzki@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ arch/s390/include/asm/pkey.h      |   10 +++
+ arch/s390/include/uapi/asm/pkey.h |   15 +++++
+ drivers/s390/crypto/pkey_api.c    |  110 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 135 insertions(+)
+
+--- a/arch/s390/include/asm/pkey.h
++++ b/arch/s390/include/asm/pkey.h
+@@ -124,4 +124,14 @@ int pkey_genprotkey(__u32 keytype, struc
+  */
+ int pkey_verifyprotkey(const struct pkey_protkey *protkey);
+ 
++/*
++ * In-kernel API: Transform an key blob (of any type) into a protected key.
++ * @param key pointer to a buffer containing the key blob
++ * @param keylen size of the key blob in bytes
++ * @param protkey pointer to buffer receiving the protected key
++ * @return 0 on success, negative errno value on failure
++ */
++int pkey_keyblob2pkey(const __u8 *key, __u32 keylen,
++		      struct pkey_protkey *protkey);
++
+ #endif /* _KAPI_PKEY_H */
+--- a/arch/s390/include/uapi/asm/pkey.h
++++ b/arch/s390/include/uapi/asm/pkey.h
+@@ -20,9 +20,13 @@
+ #define PKEY_IOCTL_MAGIC 'p'
+ 
+ #define SECKEYBLOBSIZE	64     /* secure key blob size is always 64 bytes */
++#define PROTKEYBLOBSIZE 80  /* protected key blob size is always 80 bytes */
+ #define MAXPROTKEYSIZE	64  /* a protected key blob may be up to 64 bytes */
+ #define MAXCLRKEYSIZE	32     /* a clear key value may be up to 32 bytes */
+ 
++#define MINKEYBLOBSIZE	SECKEYBLOBSIZE	    /* Minimum size of a key blob */
++#define MAXKEYBLOBSIZE	PROTKEYBLOBSIZE     /* Maximum size of a key blob */
++
+ /* defines for the type field within the pkey_protkey struct */
+ #define PKEY_KEYTYPE_AES_128  1
+ #define PKEY_KEYTYPE_AES_192  2
+@@ -147,4 +151,15 @@ struct pkey_verifyprotk {
+ 
+ #define PKEY_VERIFYPROTK _IOW(PKEY_IOCTL_MAGIC, 0x09, struct pkey_verifyprotk)
+ 
++/*
++ * Transform an key blob (of any type) into a protected key
++ */
++struct pkey_kblob2pkey {
++	__u8 __user *key;		/* in: the key blob	   */
++	__u32 keylen;			/* in: the key blob length */
++	struct pkey_protkey protkey;	/* out: the protected key  */
++};
++
++#define PKEY_KBLOB2PROTK _IOWR(PKEY_IOCTL_MAGIC, 0x0A, struct pkey_kblob2pkey)
++
+ #endif /* _UAPI_PKEY_H */
+--- a/drivers/s390/crypto/pkey_api.c
++++ b/drivers/s390/crypto/pkey_api.c
+@@ -71,6 +71,14 @@ static void __exit pkey_debug_exit(void)
+ /* For TOKTYPE_CCA_INTERNAL: */
+ #define TOKVER_CCA_AES		0x04 /* CCA AES key token */
+ 
++/* header part of a key token */
++struct keytoken_header {
++	u8  type;     /* one of the TOKTYPE values */
++	u8  res0[3];
++	u8  version;  /* one of the TOKVER values */
++	u8  res1[3];
++} __packed;
++
+ /* inside view of a secure key token (only type 0x01 version 0x04) */
+ struct secaeskeytoken {
+ 	u8  type;     /* 0x01 for internal key token */
+@@ -1166,6 +1174,80 @@ int pkey_verifyprotkey(const struct pkey
+ EXPORT_SYMBOL(pkey_verifyprotkey);
+ 
+ /*
++ * Transform a non-CCA key token into a protected key
++ */
++static int pkey_nonccatok2pkey(const __u8 *key, __u32 keylen,
++			       struct pkey_protkey *protkey)
++{
++	struct keytoken_header *hdr = (struct keytoken_header *)key;
++	struct protaeskeytoken *t;
++
++	switch (hdr->version) {
++	case TOKVER_PROTECTED_KEY:
++		if (keylen != sizeof(struct protaeskeytoken))
++			return -EINVAL;
++
++		t = (struct protaeskeytoken *)key;
++		protkey->len = t->len;
++		protkey->type = t->keytype;
++		memcpy(protkey->protkey, t->protkey,
++		       sizeof(protkey->protkey));
++
++		return pkey_verifyprotkey(protkey);
++	default:
++		DEBUG_ERR("%s unknown/unsupported non-CCA token version %d\n",
++			  __func__, hdr->version);
++		return -EINVAL;
++	}
++}
++
++/*
++ * Transform a CCA internal key token into a protected key
++ */
++static int pkey_ccainttok2pkey(const __u8 *key, __u32 keylen,
++			       struct pkey_protkey *protkey)
++{
++	struct keytoken_header *hdr = (struct keytoken_header *)key;
++
++	switch (hdr->version) {
++	case TOKVER_CCA_AES:
++		if (keylen != sizeof(struct secaeskeytoken))
++			return -EINVAL;
++
++		return pkey_skey2pkey((struct pkey_seckey *)key,
++				      protkey);
++	default:
++		DEBUG_ERR("%s unknown/unsupported CCA internal token version %d\n",
++			  __func__, hdr->version);
++		return -EINVAL;
++	}
++}
++
++/*
++ * Transform a key blob (of any type) into a protected key
++ */
++int pkey_keyblob2pkey(const __u8 *key, __u32 keylen,
++		      struct pkey_protkey *protkey)
++{
++	struct keytoken_header *hdr = (struct keytoken_header *)key;
++
++	if (keylen < sizeof(struct keytoken_header))
++		return -EINVAL;
++
++	switch (hdr->type) {
++	case TOKTYPE_NON_CCA:
++		return pkey_nonccatok2pkey(key, keylen, protkey);
++	case TOKTYPE_CCA_INTERNAL:
++		return pkey_ccainttok2pkey(key, keylen, protkey);
++	default:
++		DEBUG_ERR("%s unknown/unsupported blob type %d\n", __func__,
++			  hdr->type);
++		return -EINVAL;
++	}
++}
++EXPORT_SYMBOL(pkey_keyblob2pkey);
++
++/*
+  * File io functions
+  */
+ 
+@@ -1305,6 +1387,34 @@ static long pkey_unlocked_ioctl(struct f
+ 		DEBUG_DBG("%s pkey_verifyprotkey()=%d\n", __func__, rc);
+ 		break;
+ 	}
++	case PKEY_KBLOB2PROTK: {
++		struct pkey_kblob2pkey __user *utp = (void __user *) arg;
++		struct pkey_kblob2pkey ktp;
++		__u8 __user *ukey;
++		__u8 *kkey;
++
++		if (copy_from_user(&ktp, utp, sizeof(ktp)))
++			return -EFAULT;
++		if (ktp.keylen < MINKEYBLOBSIZE ||
++		    ktp.keylen > MAXKEYBLOBSIZE)
++			return -EINVAL;
++		ukey = ktp.key;
++		kkey = kmalloc(ktp.keylen, GFP_KERNEL);
++		if (kkey == NULL)
++			return -ENOMEM;
++		if (copy_from_user(kkey, ukey, ktp.keylen)) {
++			kfree(kkey);
++			return -EFAULT;
++		}
++		rc = pkey_keyblob2pkey(kkey, ktp.keylen, &ktp.protkey);
++		DEBUG_DBG("%s pkey_keyblob2pkey()=%d\n", __func__, rc);
++		kfree(kkey);
++		if (rc)
++			break;
++		if (copy_to_user(utp, &ktp, sizeof(ktp)))
++			return -EFAULT;
++		break;
++	}
+ 	default:
+ 		/* unknown/unsupported ioctl cmd */
+ 		return -ENOTTY;
