@@ -1,0 +1,409 @@
+From: Erik Schmauss <erik.schmauss@intel.com>
+Date: Wed, 14 Mar 2018 16:12:58 -0700
+Subject: ACPICA: Events: Add parallel GPE handling support to fix potential
+ redundant _Exx evaluations
+Patch-mainline: v4.17-rc1
+Git-commit: 8d5934952f26c25431dbc21aa8ae7614bb8f88c3
+References: bsc#1117419
+
+There is a risk that a GPE method/handler may be invoked twice. Let's
+consider a case, both GPE0(RAW_HANDLER) and GPE1(_Exx) is triggered.
+ =======================================+=============================
+ IRQ handler (top-half)                 |IRQ polling
+ =======================================+=============================
+ acpi_ev_detect_gpe()                   |
+   LOCK()                               |
+   READ (GPE0-7 enable/status registers)|
+   ^^^^^^^^^^^^ROOT CAUSE^^^^^^^^^^^^^^^|
+   Walk GPE0                            |
+     UNLOCK()                           |LOCK()
+     Invoke GPE0 RAW_HANDLER            |READ (GPE1 enable/status bit)
+                                        |acpi_ev_gpe_dispatch(irq=false)
+                                        |  CLEAR (GPE1 enable bit)
+                                        |  CLEAR (GPE1 status bit)
+     LOCK()                             |UNLOCK()
+   Walk GPE1                            +=============================
+     acpi_ev_gpe_dispatch(irq=true)     |IRQ polling (defer)
+       CLEAR (GPE1 enable bit)          +=============================
+       CLEAR (GPE1 status bit)          |acpi_ev_async_execute_gpe_method()
+   Walk others                          |  Evaluate GPE1 _Exx
+   fi                                   |  acpi_ev_async_enable_gpe()
+   UNLOCK()                             |    LOCK()
+ =======================================+    SET (GPE enable bit)
+ IRQ handler (bottom-half)              |    UNLOCK()
+ =======================================+
+ acpi_ev_async_execute_gpe_method()     |
+   Evaluate GPE1 _Exx                   |
+   acpi_ev_async_enable_gpe()           |
+     LOCK()                             |
+     SET (GPE1 enable bit)              |
+     UNLOCK()                           |
+ =======================================+=============================
+
+If acpi_ev_detect_gpe() is only invoked from the IRQ context, there won't be
+more than one _Lxx/_Exx evaluations for one status bit flagging if the IRQ
+handlers controlled by the underlying IRQ chip/driver (ex. APIC) are run in
+serial. Note that, this is a known potential gap and we had an approach,
+locking entire non-raw-handler processes in the top-half IRQ handler and
+handling all raw-handlers out of the locked loop to be friendly to those
+IRQ chip/driver. But the approach is too complicated while the issue is not
+so real, thus ACPICA treated such issue (if any) as a parallelism/quality
+issue of the underlying IRQ chip/driver to stop putting it on the radar.
+Bug in link #1 is suspiciously reflecting the same cause, and if so, it can
+also be fixed by this simpler approach.
+
+But it will be no excuse an ACPICA problem now if ACPICA starts to poll
+IRQs itself. In the changed scenario, _Exx will be evaluated from the task
+context due to new ACPICA provided "polling after enabling GPEs" mechanism.
+And the above figure uses edge-triggered GPEs demonstrating the possibility
+of evaluating _Exx twice for one status bit flagging.
+
+As a conclusion, there is now an increased chance of evaluating _Lxx/_Exx
+more than once for one status bit flagging.
+
+However this is still not a real problem if the _Lxx/_Exx checks the
+underlying hardware IRQ reasoning and finally just changes the 2nd and the
+follow-up evaluations into no-ops. Note that _Lxx should always be written
+in this way as a level-trigger GPE could have it's status wrongly
+duplicated by the underlying IRQ delivery mechanisms. But _Exx may have
+very low quality BIOS by BIOS to trigger real issues. For example, trigger
+duplicated button notifications.
+
+To solve this issue, we need to stop reading a bunch of enable/status
+register bits, but read only one GPE's enable/status bit. And GPE status
+register's W1C nature ensures that acknowledging one GPE won't affect
+another GPEs' status bits. Thus the hardware GPE architecture has already
+provided us with the mechanism of implementing such parallelism.
+
+So we can lock around one GPE handling process to achieve the parallelism:
+1. If we can incorporate GPE enable bit check in detection and ensure the
+   atomicity of the following process (top-half IRQ handler):
+    READ (enable/status bit)
+    if (enabled && raised)
+      CLEAR (enable bit)
+   and handle the GPE after this process, we can ensure that we will only
+   invoke GPE handler once for one status bit flagging.
+2. In addtion for edge-triggered GPEs, if we can ensure the atomicity of
+   the following process (top-half IRQ handler):
+    READ (enable/status bit)
+    if (enabled && raised)
+      CLEAR (enable bit)
+      CLEAR (status bit)
+   and handle the GPE after this process, we can ensure that we will only
+   invoke GPE handler once for one status bit flagging.
+
+By doing a cleanup in this way, we can remove duplicate GPE handling code
+and ensure that all logics are collected in 1 function. And the function
+will be safe for both IRQ interrupt and IRQ polling, and will be safe for
+us to release and re-acquire acpi_gbl_gpe_lock at any time rather than raw
+handler only during the top-half IRQ handler. Lv Zheng.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=196703 [#1]
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Erik Schmauss <erik.schmauss@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+---
+ drivers/acpi/acpica/acevents.h |    4 
+ drivers/acpi/acpica/evgpe.c    |  233 ++++++++++++++++++++++-------------------
+ 2 files changed, 132 insertions(+), 105 deletions(-)
+
+--- a/drivers/acpi/acpica/acevents.h
++++ b/drivers/acpi/acpica/acevents.h
+@@ -103,6 +103,10 @@ struct acpi_gpe_event_info *acpi_ev_low_
+ 
+ acpi_status acpi_ev_finish_gpe(struct acpi_gpe_event_info *gpe_event_info);
+ 
++u32
++acpi_ev_detect_gpe(struct acpi_namespace_node *gpe_device,
++		   struct acpi_gpe_event_info *gpe_event_info, u32 gpe_number);
++
+ /*
+  * evgpeblk - Upper-level GPE block support
+  */
+--- a/drivers/acpi/acpica/evgpe.c
++++ b/drivers/acpi/acpica/evgpe.c
+@@ -374,17 +374,12 @@ struct acpi_gpe_event_info *acpi_ev_get_
+ 
+ u32 acpi_ev_gpe_detect(struct acpi_gpe_xrupt_info *gpe_xrupt_list)
+ {
+-	acpi_status status;
+ 	struct acpi_gpe_block_info *gpe_block;
+ 	struct acpi_namespace_node *gpe_device;
+ 	struct acpi_gpe_register_info *gpe_register_info;
+ 	struct acpi_gpe_event_info *gpe_event_info;
+ 	u32 gpe_number;
+-	struct acpi_gpe_handler_info *gpe_handler_info;
+ 	u32 int_status = ACPI_INTERRUPT_NOT_HANDLED;
+-	u8 enabled_status_byte;
+-	u64 status_reg;
+-	u64 enable_reg;
+ 	acpi_cpu_flags flags;
+ 	u32 i;
+ 	u32 j;
+@@ -441,49 +436,11 @@ u32 acpi_ev_gpe_detect(struct acpi_gpe_x
+ 				continue;
+ 			}
+ 
+-			/* Read the Status Register */
+-
+-			status =
+-			    acpi_hw_read(&status_reg,
+-					 &gpe_register_info->status_address);
+-			if (ACPI_FAILURE(status)) {
+-				goto unlock_and_exit;
+-			}
+-
+-			/* Read the Enable Register */
+-
+-			status =
+-			    acpi_hw_read(&enable_reg,
+-					 &gpe_register_info->enable_address);
+-			if (ACPI_FAILURE(status)) {
+-				goto unlock_and_exit;
+-			}
+-
+-			ACPI_DEBUG_PRINT((ACPI_DB_INTERRUPTS,
+-					  "Read registers for GPE %02X-%02X: Status=%02X, Enable=%02X, "
+-					  "RunEnable=%02X, WakeEnable=%02X\n",
+-					  gpe_register_info->base_gpe_number,
+-					  gpe_register_info->base_gpe_number +
+-					  (ACPI_GPE_REGISTER_WIDTH - 1),
+-					  (u32)status_reg, (u32)enable_reg,
+-					  gpe_register_info->enable_for_run,
+-					  gpe_register_info->enable_for_wake));
+-
+-			/* Check if there is anything active at all in this register */
+-
+-			enabled_status_byte = (u8)(status_reg & enable_reg);
+-			if (!enabled_status_byte) {
+-
+-				/* No active GPEs in this register, move on */
+-
+-				continue;
+-			}
+-
+ 			/* Now look at the individual GPEs in this byte register */
+ 
+ 			for (j = 0; j < ACPI_GPE_REGISTER_WIDTH; j++) {
+ 
+-				/* Examine one GPE bit */
++				/* Detect and dispatch one GPE bit */
+ 
+ 				gpe_event_info =
+ 				    &gpe_block->
+@@ -491,71 +448,18 @@ u32 acpi_ev_gpe_detect(struct acpi_gpe_x
+ 						ACPI_GPE_REGISTER_WIDTH) + j];
+ 				gpe_number =
+ 				    j + gpe_register_info->base_gpe_number;
+-
+-				if (enabled_status_byte & (1 << j)) {
+-
+-					/* Invoke global event handler if present */
+-
+-					acpi_gpe_count++;
+-					if (acpi_gbl_global_event_handler) {
+-						acpi_gbl_global_event_handler
+-						    (ACPI_EVENT_TYPE_GPE,
+-						     gpe_device, gpe_number,
+-						     acpi_gbl_global_event_handler_context);
+-					}
+-
+-					/* Found an active GPE */
+-
+-					if (ACPI_GPE_DISPATCH_TYPE
+-					    (gpe_event_info->flags) ==
+-					    ACPI_GPE_DISPATCH_RAW_HANDLER) {
+-
+-						/* Dispatch the event to a raw handler */
+-
+-						gpe_handler_info =
+-						    gpe_event_info->dispatch.
+-						    handler;
+-
+-						/*
+-						 * There is no protection around the namespace node
+-						 * and the GPE handler to ensure a safe destruction
+-						 * because:
+-						 * 1. The namespace node is expected to always
+-						 *    exist after loading a table.
+-						 * 2. The GPE handler is expected to be flushed by
+-						 *    acpi_os_wait_events_complete() before the
+-						 *    destruction.
+-						 */
+-						acpi_os_release_lock
+-						    (acpi_gbl_gpe_lock, flags);
+-						int_status |=
+-						    gpe_handler_info->
+-						    address(gpe_device,
+-							    gpe_number,
+-							    gpe_handler_info->
+-							    context);
+-						flags =
+-						    acpi_os_acquire_lock
+-						    (acpi_gbl_gpe_lock);
+-					} else {
+-						/*
+-						 * Dispatch the event to a standard handler or
+-						 * method.
+-						 */
+-						int_status |=
+-						    acpi_ev_gpe_dispatch
+-						    (gpe_device, gpe_event_info,
+-						     gpe_number);
+-					}
+-				}
++				acpi_os_release_lock(acpi_gbl_gpe_lock, flags);
++				int_status |=
++				    acpi_ev_detect_gpe(gpe_device,
++						       gpe_event_info,
++						       gpe_number);
++				flags = acpi_os_acquire_lock(acpi_gbl_gpe_lock);
+ 			}
+ 		}
+ 
+ 		gpe_block = gpe_block->next;
+ 	}
+ 
+-unlock_and_exit:
+-
+ 	acpi_os_release_lock(acpi_gbl_gpe_lock, flags);
+ 	return (int_status);
+ }
+@@ -728,6 +632,127 @@ acpi_status acpi_ev_finish_gpe(struct ac
+ 
+ /*******************************************************************************
+  *
++ * FUNCTION:    acpi_ev_detect_gpe
++ *
++ * PARAMETERS:  gpe_device          - Device node. NULL for GPE0/GPE1
++ *              gpe_event_info      - Info for this GPE
++ *              gpe_number          - Number relative to the parent GPE block
++ *
++ * RETURN:      INTERRUPT_HANDLED or INTERRUPT_NOT_HANDLED
++ *
++ * DESCRIPTION: Detect and dispatch a General Purpose Event to either a function
++ *              (e.g. EC) or method (e.g. _Lxx/_Exx) handler.
++ * NOTE:        GPE is W1C, so it is possible to handle a single GPE from both
++ *              task and irq context in parallel as long as the process to
++ *              detect and mask the GPE is atomic.
++ *              However the atomicity of ACPI_GPE_DISPATCH_RAW_HANDLER is
++ *              dependent on the raw handler itself.
++ *
++ ******************************************************************************/
++
++u32
++acpi_ev_detect_gpe(struct acpi_namespace_node *gpe_device,
++		   struct acpi_gpe_event_info *gpe_event_info, u32 gpe_number)
++{
++	u32 int_status = ACPI_INTERRUPT_NOT_HANDLED;
++	u8 enabled_status_byte;
++	u64 status_reg;
++	u64 enable_reg;
++	u32 register_bit;
++	struct acpi_gpe_register_info *gpe_register_info;
++	struct acpi_gpe_handler_info *gpe_handler_info;
++	acpi_cpu_flags flags;
++	acpi_status status;
++
++	ACPI_FUNCTION_TRACE(ev_gpe_detect);
++
++	flags = acpi_os_acquire_lock(acpi_gbl_gpe_lock);
++
++	/* Get the info block for the entire GPE register */
++
++	gpe_register_info = gpe_event_info->register_info;
++
++	/* Get the register bitmask for this GPE */
++
++	register_bit = acpi_hw_get_gpe_register_bit(gpe_event_info);
++
++	/* GPE currently enabled (enable bit == 1)? */
++
++	status = acpi_hw_read(&enable_reg, &gpe_register_info->enable_address);
++	if (ACPI_FAILURE(status)) {
++		goto error_exit;
++	}
++
++	/* GPE currently active (status bit == 1)? */
++
++	status = acpi_hw_read(&status_reg, &gpe_register_info->status_address);
++	if (ACPI_FAILURE(status)) {
++		goto error_exit;
++	}
++
++	/* Check if there is anything active at all in this GPE */
++
++	ACPI_DEBUG_PRINT((ACPI_DB_INTERRUPTS,
++			  "Read registers for GPE %02X: Status=%02X, Enable=%02X, "
++			  "RunEnable=%02X, WakeEnable=%02X\n",
++			  gpe_number,
++			  (u32)(status_reg & register_bit),
++			  (u32)(enable_reg & register_bit),
++			  gpe_register_info->enable_for_run,
++			  gpe_register_info->enable_for_wake));
++
++	enabled_status_byte = (u8)(status_reg & enable_reg);
++	if (!(enabled_status_byte & register_bit)) {
++		goto error_exit;
++	}
++
++	/* Invoke global event handler if present */
++
++	acpi_gpe_count++;
++	if (acpi_gbl_global_event_handler) {
++		acpi_gbl_global_event_handler(ACPI_EVENT_TYPE_GPE,
++					      gpe_device, gpe_number,
++					      acpi_gbl_global_event_handler_context);
++	}
++
++	/* Found an active GPE */
++
++	if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) ==
++	    ACPI_GPE_DISPATCH_RAW_HANDLER) {
++
++		/* Dispatch the event to a raw handler */
++
++		gpe_handler_info = gpe_event_info->dispatch.handler;
++
++		/*
++		 * There is no protection around the namespace node
++		 * and the GPE handler to ensure a safe destruction
++		 * because:
++		 * 1. The namespace node is expected to always
++		 *    exist after loading a table.
++		 * 2. The GPE handler is expected to be flushed by
++		 *    acpi_os_wait_events_complete() before the
++		 *    destruction.
++		 */
++		acpi_os_release_lock(acpi_gbl_gpe_lock, flags);
++		int_status |=
++		    gpe_handler_info->address(gpe_device, gpe_number,
++					      gpe_handler_info->context);
++		flags = acpi_os_acquire_lock(acpi_gbl_gpe_lock);
++	} else {
++		/* Dispatch the event to a standard handler or method. */
++
++		int_status |= acpi_ev_gpe_dispatch(gpe_device,
++						   gpe_event_info, gpe_number);
++	}
++
++error_exit:
++	acpi_os_release_lock(acpi_gbl_gpe_lock, flags);
++	return (int_status);
++}
++
++/*******************************************************************************
++ *
+  * FUNCTION:    acpi_ev_gpe_dispatch
+  *
+  * PARAMETERS:  gpe_device          - Device node. NULL for GPE0/GPE1
+@@ -739,8 +764,6 @@ acpi_status acpi_ev_finish_gpe(struct ac
+  * DESCRIPTION: Dispatch a General Purpose Event to either a function (e.g. EC)
+  *              or method (e.g. _Lxx/_Exx) handler.
+  *
+- *              This function executes at interrupt level.
+- *
+  ******************************************************************************/
+ 
+ u32
