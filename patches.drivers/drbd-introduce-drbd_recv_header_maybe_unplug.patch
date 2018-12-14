@@ -1,0 +1,346 @@
+From: Lars Ellenberg <lars.ellenberg@linbit.com>
+Date: Tue, 29 Aug 2017 10:20:32 +0200
+Subject: [PATCH] drbd: introduce drbd_recv_header_maybe_unplug
+Git-commit: c51a0ef3747a412df4a7345d939190a99bc2a0cc
+Patch-mainline: v4.14-rc1
+References: bsc#1104967,FATE#325924
+
+Recently, drbd_recv_header() was changed to potentially
+implicitly "unplug" the backend device(s), in case there
+is currently nothing to receive.
+
+Be more explicit about it: re-introduce the original drbd_recv_header(),
+and introduce a new drbd_recv_header_maybe_unplug() for use by the
+receiver "main loop".
+
+Using explicit plugging via blk_start_plug(); blk_finish_plug();
+really helps the io-scheduler of the backend with merging requests.
+
+Wrap the receiver "main loop" with such a plug.
+Also catch unplug events on the Primary,
+and try to propagate.
+
+This is performance relevant.  Without this, if the receiving side does
+not merge requests, number of IOPS on the peer can me significantly
+higher than IOPS on the Primary, and can easily become the bottleneck.
+
+Together, both changes should help to reduce the number of IOPS
+as seen on the backend of the receiving side, by increasing
+the chance of merging mergable requests, without trading latency
+for more throughput.
+
+Signed-off-by: Philipp Reisner <philipp.reisner@linbit.com>
+Signed-off-by: Lars Ellenberg <lars.ellenberg@linbit.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/block/drbd/drbd_int.h      |  5 +++-
+ drivers/block/drbd/drbd_main.c     | 13 +++++++++
+ drivers/block/drbd/drbd_receiver.c | 47 +++++++++++++++++++++++++++++---
+ drivers/block/drbd/drbd_req.c      | 55 ++++++++++++++++++++++++++++++++++++++
+ drivers/block/drbd/drbd_req.h      |  6 +++++
+ drivers/block/drbd/drbd_worker.c   | 22 +++++++++++----
+ 6 files changed, 139 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/block/drbd/drbd_int.h b/drivers/block/drbd/drbd_int.h
+index 819f9d0bc875..74a7d0b70e2c 100644
+--- a/drivers/block/drbd/drbd_int.h
++++ b/drivers/block/drbd/drbd_int.h
+@@ -745,6 +745,8 @@ struct drbd_connection {
+ 	unsigned current_tle_writes;	/* writes seen within this tl epoch */
+ 
+ 	unsigned long last_reconnect_jif;
++	/* empty member on older kernels without blk_start_plug() */
++	struct blk_plug receiver_plug;
+ 	struct drbd_thread receiver;
+ 	struct drbd_thread worker;
+ 	struct drbd_thread ack_receiver;
+@@ -1131,7 +1133,8 @@ extern void conn_send_sr_reply(struct drbd_connection *connection, enum drbd_sta
+ extern int drbd_send_rs_deallocated(struct drbd_peer_device *, struct drbd_peer_request *);
+ extern void drbd_backing_dev_free(struct drbd_device *device, struct drbd_backing_dev *ldev);
+ extern void drbd_device_cleanup(struct drbd_device *device);
+-void drbd_print_uuids(struct drbd_device *device, const char *text);
++extern void drbd_print_uuids(struct drbd_device *device, const char *text);
++extern void drbd_queue_unplug(struct drbd_device *device);
+ 
+ extern void conn_md_sync(struct drbd_connection *connection);
+ extern void drbd_md_write(struct drbd_device *device, void *buffer);
+diff --git a/drivers/block/drbd/drbd_main.c b/drivers/block/drbd/drbd_main.c
+index e2ed28d45ce1..a3b2ee74bba9 100644
+--- a/drivers/block/drbd/drbd_main.c
++++ b/drivers/block/drbd/drbd_main.c
+@@ -1952,6 +1952,19 @@ static void drbd_release(struct gendisk *gd, fmode_t mode)
+ 	mutex_unlock(&drbd_main_mutex);
+ }
+ 
++/* need to hold resource->req_lock */
++void drbd_queue_unplug(struct drbd_device *device)
++{
++	if (device->state.pdsk >= D_INCONSISTENT && device->state.conn >= C_CONNECTED) {
++		D_ASSERT(device, device->state.role == R_PRIMARY);
++		if (test_and_clear_bit(UNPLUG_REMOTE, &device->flags)) {
++			drbd_queue_work_if_unqueued(
++				&first_peer_device(device)->connection->sender_work,
++				&device->unplug_work);
++		}
++	}
++}
++
+ static void drbd_set_defaults(struct drbd_device *device)
+ {
+ 	/* Beware! The actual layout differs
+diff --git a/drivers/block/drbd/drbd_receiver.c b/drivers/block/drbd/drbd_receiver.c
+index ece6e5d7dc3f..1b3f439a3b23 100644
+--- a/drivers/block/drbd/drbd_receiver.c
++++ b/drivers/block/drbd/drbd_receiver.c
+@@ -1194,6 +1194,14 @@ static int decode_header(struct drbd_connection *connection, void *header, struc
+ 	return 0;
+ }
+ 
++static void drbd_unplug_all_devices(struct drbd_connection *connection)
++{
++	if (current->plug == &connection->receiver_plug) {
++		blk_finish_plug(&connection->receiver_plug);
++		blk_start_plug(&connection->receiver_plug);
++	} /* else: maybe just schedule() ?? */
++}
++
+ static int drbd_recv_header(struct drbd_connection *connection, struct packet_info *pi)
+ {
+ 	void *buffer = connection->data.rbuf;
+@@ -1209,6 +1217,36 @@ static int drbd_recv_header(struct drbd_connection *connection, struct packet_in
+ 	return err;
+ }
+ 
++static int drbd_recv_header_maybe_unplug(struct drbd_connection *connection, struct packet_info *pi)
++{
++	void *buffer = connection->data.rbuf;
++	unsigned int size = drbd_header_size(connection);
++	int err;
++
++	err = drbd_recv_short(connection->data.socket, buffer, size, MSG_NOSIGNAL|MSG_DONTWAIT);
++	if (err != size) {
++		/* If we have nothing in the receive buffer now, to reduce
++		 * application latency, try to drain the backend queues as
++		 * quickly as possible, and let remote TCP know what we have
++		 * received so far. */
++		if (err == -EAGAIN) {
++			drbd_tcp_quickack(connection->data.socket);
++			drbd_unplug_all_devices(connection);
++		}
++		if (err > 0) {
++			buffer += err;
++			size -= err;
++		}
++		err = drbd_recv_all_warn(connection, buffer, size);
++		if (err)
++			return err;
++	}
++
++	err = decode_header(connection, connection->data.rbuf, pi);
++	connection->last_received = jiffies;
++
++	return err;
++}
+ /* This is blkdev_issue_flush, but asynchronous.
+  * We want to submit to all component volumes in parallel,
+  * then wait for all completions.
+@@ -4882,8 +4920,8 @@ static void drbdd(struct drbd_connection *connection)
+ 		struct data_cmd const *cmd;
+ 
+ 		drbd_thread_current_set_cpu(&connection->receiver);
+-		update_receiver_timing_details(connection, drbd_recv_header);
+-		if (drbd_recv_header(connection, &pi))
++		update_receiver_timing_details(connection, drbd_recv_header_maybe_unplug);
++		if (drbd_recv_header_maybe_unplug(connection, &pi))
+ 			goto err_out;
+ 
+ 		cmd = &drbd_cmd_handler[pi.cmd];
+@@ -5375,8 +5413,11 @@ int drbd_receiver(struct drbd_thread *thi)
+ 		}
+ 	} while (h == 0);
+ 
+-	if (h > 0)
++	if (h > 0) {
++		blk_start_plug(&connection->receiver_plug);
+ 		drbdd(connection);
++		blk_finish_plug(&connection->receiver_plug);
++	}
+ 
+ 	conn_disconnect(connection);
+ 
+diff --git a/drivers/block/drbd/drbd_req.c b/drivers/block/drbd/drbd_req.c
+index 447c975f5481..5cf43f13e7eb 100644
+--- a/drivers/block/drbd/drbd_req.c
++++ b/drivers/block/drbd/drbd_req.c
+@@ -1279,6 +1279,56 @@ static bool may_do_writes(struct drbd_device *device)
+ 	return s.disk == D_UP_TO_DATE || s.pdsk == D_UP_TO_DATE;
+ }
+ 
++struct drbd_plug_cb {
++	struct blk_plug_cb cb;
++	struct drbd_request *most_recent_req;
++	/* do we need more? */
++};
++
++static void drbd_unplug(struct blk_plug_cb *cb, bool from_schedule)
++{
++	struct drbd_plug_cb *plug = container_of(cb, struct drbd_plug_cb, cb);
++	struct drbd_resource *resource = plug->cb.data;
++	struct drbd_request *req = plug->most_recent_req;
++
++	if (!req)
++		return;
++
++	spin_lock_irq(&resource->req_lock);
++	/* In case the sender did not process it yet, raise the flag to
++	 * have it followed with P_UNPLUG_REMOTE just after. */
++	req->rq_state |= RQ_UNPLUG;
++	/* but also queue a generic unplug */
++	drbd_queue_unplug(req->device);
++	spin_unlock_irq(&resource->req_lock);
++	kref_put(&req->kref, drbd_req_destroy);
++}
++
++static struct drbd_plug_cb* drbd_check_plugged(struct drbd_resource *resource)
++{
++	/* A lot of text to say
++	 * return (struct drbd_plug_cb*)blk_check_plugged(); */
++	struct drbd_plug_cb *plug;
++	struct blk_plug_cb *cb = blk_check_plugged(drbd_unplug, resource, sizeof(*plug));
++
++	if (cb)
++		plug = container_of(cb, struct drbd_plug_cb, cb);
++	else
++		plug = NULL;
++	return plug;
++}
++
++static void drbd_update_plug(struct drbd_plug_cb *plug, struct drbd_request *req)
++{
++	struct drbd_request *tmp = plug->most_recent_req;
++	/* Will be sent to some peer.
++	 * Remember to tag it with UNPLUG_REMOTE on unplug */
++	kref_get(&req->kref);
++	plug->most_recent_req = req;
++	if (tmp)
++		kref_put(&tmp->kref, drbd_req_destroy);
++}
++
+ static void drbd_send_and_submit(struct drbd_device *device, struct drbd_request *req)
+ {
+ 	struct drbd_resource *resource = device->resource;
+@@ -1287,6 +1337,8 @@ static void drbd_send_and_submit(struct drbd_device *device, struct drbd_request
+ 	bool no_remote = false;
+ 	bool submit_private_bio = false;
+ 
++	struct drbd_plug_cb *plug = drbd_check_plugged(resource);
++
+ 	spin_lock_irq(&resource->req_lock);
+ 	if (rw == WRITE) {
+ 		/* This may temporarily give up the req_lock,
+@@ -1351,6 +1403,9 @@ static void drbd_send_and_submit(struct drbd_device *device, struct drbd_request
+ 			no_remote = true;
+ 	}
+ 
++	if (plug != NULL && no_remote == false)
++		drbd_update_plug(plug, req);
++
+ 	/* If it took the fast path in drbd_request_prepare, add it here.
+ 	 * The slow path has added it already. */
+ 	if (list_empty(&req->req_pending_master_completion))
+diff --git a/drivers/block/drbd/drbd_req.h b/drivers/block/drbd/drbd_req.h
+index 9e1866ab238f..a2254f825601 100644
+--- a/drivers/block/drbd/drbd_req.h
++++ b/drivers/block/drbd/drbd_req.h
+@@ -212,6 +212,11 @@ enum drbd_req_state_bits {
+ 	/* Should call drbd_al_complete_io() for this request... */
+ 	__RQ_IN_ACT_LOG,
+ 
++	/* This was the most recent request during some blk_finish_plug()
++	 * or its implicit from-schedule equivalent.
++	 * We may use it as hint to send a P_UNPLUG_REMOTE */
++	__RQ_UNPLUG,
++
+ 	/* The peer has sent a retry ACK */
+ 	__RQ_POSTPONED,
+ 
+@@ -249,6 +254,7 @@ enum drbd_req_state_bits {
+ #define RQ_WSAME           (1UL << __RQ_WSAME)
+ #define RQ_UNMAP           (1UL << __RQ_UNMAP)
+ #define RQ_IN_ACT_LOG      (1UL << __RQ_IN_ACT_LOG)
++#define RQ_UNPLUG          (1UL << __RQ_UNPLUG)
+ #define RQ_POSTPONED	   (1UL << __RQ_POSTPONED)
+ #define RQ_COMPLETION_SUSP (1UL << __RQ_COMPLETION_SUSP)
+ #define RQ_EXP_RECEIVE_ACK (1UL << __RQ_EXP_RECEIVE_ACK)
+diff --git a/drivers/block/drbd/drbd_worker.c b/drivers/block/drbd/drbd_worker.c
+index c268d886c4f0..2745db2255ed 100644
+--- a/drivers/block/drbd/drbd_worker.c
++++ b/drivers/block/drbd/drbd_worker.c
+@@ -1382,18 +1382,22 @@ static int drbd_send_barrier(struct drbd_connection *connection)
+ 	return conn_send_command(connection, sock, P_BARRIER, sizeof(*p), NULL, 0);
+ }
+ 
++static int pd_send_unplug_remote(struct drbd_peer_device *pd)
++{
++	struct drbd_socket *sock = &pd->connection->data;
++	if (!drbd_prepare_command(pd, sock))
++		return -EIO;
++	return drbd_send_command(pd, sock, P_UNPLUG_REMOTE, 0, NULL, 0);
++}
++
+ int w_send_write_hint(struct drbd_work *w, int cancel)
+ {
+ 	struct drbd_device *device =
+ 		container_of(w, struct drbd_device, unplug_work);
+-	struct drbd_socket *sock;
+ 
+ 	if (cancel)
+ 		return 0;
+-	sock = &first_peer_device(device)->connection->data;
+-	if (!drbd_prepare_command(first_peer_device(device), sock))
+-		return -EIO;
+-	return drbd_send_command(first_peer_device(device), sock, P_UNPLUG_REMOTE, 0, NULL, 0);
++	return pd_send_unplug_remote(first_peer_device(device));
+ }
+ 
+ static void re_init_if_first_write(struct drbd_connection *connection, unsigned int epoch)
+@@ -1455,6 +1459,7 @@ int w_send_dblock(struct drbd_work *w, int cancel)
+ 	struct drbd_device *device = req->device;
+ 	struct drbd_peer_device *const peer_device = first_peer_device(device);
+ 	struct drbd_connection *connection = peer_device->connection;
++	bool do_send_unplug = req->rq_state & RQ_UNPLUG;
+ 	int err;
+ 
+ 	if (unlikely(cancel)) {
+@@ -1470,6 +1475,9 @@ int w_send_dblock(struct drbd_work *w, int cancel)
+ 	err = drbd_send_dblock(peer_device, req);
+ 	req_mod(req, err ? SEND_FAILED : HANDED_OVER_TO_NETWORK);
+ 
++	if (do_send_unplug && !err)
++		pd_send_unplug_remote(peer_device);
++
+ 	return err;
+ }
+ 
+@@ -1484,6 +1492,7 @@ int w_send_read_req(struct drbd_work *w, int cancel)
+ 	struct drbd_device *device = req->device;
+ 	struct drbd_peer_device *const peer_device = first_peer_device(device);
+ 	struct drbd_connection *connection = peer_device->connection;
++	bool do_send_unplug = req->rq_state & RQ_UNPLUG;
+ 	int err;
+ 
+ 	if (unlikely(cancel)) {
+@@ -1501,6 +1510,9 @@ int w_send_read_req(struct drbd_work *w, int cancel)
+ 
+ 	req_mod(req, err ? SEND_FAILED : HANDED_OVER_TO_NETWORK);
+ 
++	if (do_send_unplug && !err)
++		pd_send_unplug_remote(peer_device);
++
+ 	return err;
+ }
+ 
+-- 
+2.16.4
+
