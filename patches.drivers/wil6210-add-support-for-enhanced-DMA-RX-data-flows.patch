@@ -1,0 +1,1482 @@
+From 7be13fc3e60fb51570288d4516a15266ed500dfd Mon Sep 17 00:00:00 2001
+From: Gidon Studinski <gidons@codeaurora.org>
+Date: Fri, 29 Jun 2018 16:28:33 +0300
+Subject: [PATCH] wil6210: add support for enhanced DMA RX data flows
+Git-commit: 7be13fc3e60fb51570288d4516a15266ed500dfd
+Patch-mainline: v4.19-rc1
+References: FATE#326906
+
+Enhanced DMA RX data path is handled using a single
+RX descriptor ring for all VIFs.
+Multiple RX status rings are supported, to allow RSS
+and multi MSI support.
+The driver gets the RX completions via the RX status rings.
+The RX status message includes the completed RX buffer ID,
+which points to the allocated SKB.
+
+The enhanced DMA RX data flow supports RX chaining, where
+multiple SKBs are merged into a single packet.
+
+Enhanced DMA HW supports RX HW reorder offload, enabled by
+default for Talyn-MB.
+
+amsdu_en debugfs entry was added to allow control MSDU aggregation.
+Use the following command to disable AMSDU (enabled by default):
+echo 0 > amsdu_en
+
+Signed-off-by: Gidon Studinski <gidons@codeaurora.org>
+Signed-off-by: Maya Erez <merez@codeaurora.org>
+Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/wireless/ath/wil6210/debugfs.c    |   1 +
+ drivers/net/wireless/ath/wil6210/interrupt.c  |  86 +++-
+ drivers/net/wireless/ath/wil6210/main.c       |   3 +
+ drivers/net/wireless/ath/wil6210/netdev.c     |  35 +-
+ drivers/net/wireless/ath/wil6210/pcie_bus.c   |   1 +
+ drivers/net/wireless/ath/wil6210/pm.c         |   6 +-
+ drivers/net/wireless/ath/wil6210/rx_reorder.c |  24 +-
+ drivers/net/wireless/ath/wil6210/trace.h      |  34 ++
+ drivers/net/wireless/ath/wil6210/txrx.c       |  53 +-
+ drivers/net/wireless/ath/wil6210/txrx.h       |   7 +
+ drivers/net/wireless/ath/wil6210/txrx_edma.c  | 456 ++++++++++++++++++
+ drivers/net/wireless/ath/wil6210/txrx_edma.h  | 189 ++++++++
+ drivers/net/wireless/ath/wil6210/wil6210.h    |  24 +-
+ drivers/net/wireless/ath/wil6210/wmi.c        |  59 ++-
+ drivers/net/wireless/ath/wil6210/wmi.h        |   1 +
+ 15 files changed, 939 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/wil6210/debugfs.c b/drivers/net/wireless/ath/wil6210/debugfs.c
+index 212baf46393a..8232fdd6ed09 100644
+--- a/drivers/net/wireless/ath/wil6210/debugfs.c
++++ b/drivers/net/wireless/ath/wil6210/debugfs.c
+@@ -1919,6 +1919,7 @@ static const struct dbg_off dbg_wil_off[] = {
+ 	WIL_FIELD(rx_status_ring_order, 0644,	doff_u32),
+ 	WIL_FIELD(tx_status_ring_order, 0644,	doff_u32),
+ 	WIL_FIELD(rx_buff_id_count, 0644,	doff_u32),
++	WIL_FIELD(amsdu_en, 0644,	doff_u8),
+ 	{},
+ };
+ 
+diff --git a/drivers/net/wireless/ath/wil6210/interrupt.c b/drivers/net/wireless/ath/wil6210/interrupt.c
+index 1603b9f7feb9..d7e112da6a8d 100644
+--- a/drivers/net/wireless/ath/wil6210/interrupt.c
++++ b/drivers/net/wireless/ath/wil6210/interrupt.c
+@@ -45,6 +45,7 @@
+ #define WIL6210_IMC_TX		(BIT_DMA_EP_TX_ICR_TX_DONE | \
+ 				BIT_DMA_EP_TX_ICR_TX_DONE_N(0))
+ #define WIL6210_IMC_TX_EDMA		BIT_TX_STATUS_IRQ
++#define WIL6210_IMC_RX_EDMA		BIT_RX_STATUS_IRQ
+ #define WIL6210_IMC_MISC_NO_HALP	(ISR_MISC_FW_READY | \
+ 					 ISR_MISC_MBOX_EVT | \
+ 					 ISR_MISC_FW_ERROR)
+@@ -100,6 +101,12 @@ static void wil6210_mask_irq_rx(struct wil6210_priv *wil)
+ 	      WIL6210_IRQ_DISABLE);
+ }
+ 
++static void wil6210_mask_irq_rx_edma(struct wil6210_priv *wil)
++{
++	wil_w(wil, RGF_INT_GEN_RX_ICR + offsetof(struct RGF_ICR, IMS),
++	      WIL6210_IRQ_DISABLE);
++}
++
+ static void wil6210_mask_irq_misc(struct wil6210_priv *wil, bool mask_halp)
+ {
+ 	wil_dbg_irq(wil, "mask_irq_misc: mask_halp(%s)\n",
+@@ -146,6 +153,12 @@ void wil6210_unmask_irq_rx(struct wil6210_priv *wil)
+ 	      unmask_rx_htrsh ? WIL6210_IMC_RX : WIL6210_IMC_RX_NO_RX_HTRSH);
+ }
+ 
++void wil6210_unmask_irq_rx_edma(struct wil6210_priv *wil)
++{
++	wil_w(wil, RGF_INT_GEN_RX_ICR + offsetof(struct RGF_ICR, IMC),
++	      WIL6210_IMC_RX_EDMA);
++}
++
+ static void wil6210_unmask_irq_misc(struct wil6210_priv *wil, bool unmask_halp)
+ {
+ 	wil_dbg_irq(wil, "unmask_irq_misc: unmask_halp(%s)\n",
+@@ -179,6 +192,7 @@ void wil_mask_irq(struct wil6210_priv *wil)
+ 	wil6210_mask_irq_tx(wil);
+ 	wil6210_mask_irq_tx_edma(wil);
+ 	wil6210_mask_irq_rx(wil);
++	wil6210_mask_irq_rx_edma(wil);
+ 	wil6210_mask_irq_misc(wil, true);
+ 	wil6210_mask_irq_pseudo(wil);
+ }
+@@ -195,10 +209,13 @@ void wil_unmask_irq(struct wil6210_priv *wil)
+ 	      WIL_ICR_ICC_MISC_VALUE);
+ 	wil_w(wil, RGF_INT_GEN_TX_ICR + offsetof(struct RGF_ICR, ICC),
+ 	      WIL_ICR_ICC_VALUE);
++	wil_w(wil, RGF_INT_GEN_RX_ICR + offsetof(struct RGF_ICR, ICC),
++	      WIL_ICR_ICC_VALUE);
+ 
+ 	wil6210_unmask_irq_pseudo(wil);
+ 	if (wil->use_enhanced_dma_hw) {
+ 		wil6210_unmask_irq_tx_edma(wil);
++		wil6210_unmask_irq_rx_edma(wil);
+ 	} else {
+ 		wil6210_unmask_irq_tx(wil);
+ 		wil6210_unmask_irq_rx(wil);
+@@ -335,6 +352,54 @@ static irqreturn_t wil6210_irq_rx(int irq, void *cookie)
+ 	return IRQ_HANDLED;
+ }
+ 
++static irqreturn_t wil6210_irq_rx_edma(int irq, void *cookie)
++{
++	struct wil6210_priv *wil = cookie;
++	u32 isr = wil_ioread32_and_clear(wil->csr +
++					 HOSTADDR(RGF_INT_GEN_RX_ICR) +
++					 offsetof(struct RGF_ICR, ICR));
++	bool need_unmask = true;
++
++	trace_wil6210_irq_rx(isr);
++	wil_dbg_irq(wil, "ISR RX 0x%08x\n", isr);
++
++	if (unlikely(!isr)) {
++		wil_err(wil, "spurious IRQ: RX\n");
++		return IRQ_NONE;
++	}
++
++	wil6210_mask_irq_rx_edma(wil);
++
++	if (likely(isr & BIT_RX_STATUS_IRQ)) {
++		wil_dbg_irq(wil, "RX status ring\n");
++		isr &= ~BIT_RX_STATUS_IRQ;
++		if (likely(test_bit(wil_status_fwready, wil->status))) {
++			if (likely(test_bit(wil_status_napi_en, wil->status))) {
++				wil_dbg_txrx(wil, "NAPI(Rx) schedule\n");
++				need_unmask = false;
++				napi_schedule(&wil->napi_rx);
++			} else {
++				wil_err(wil,
++					"Got Rx interrupt while stopping interface\n");
++			}
++		} else {
++			wil_err(wil, "Got Rx interrupt while in reset\n");
++		}
++	}
++
++	if (unlikely(isr))
++		wil_err(wil, "un-handled RX ISR bits 0x%08x\n", isr);
++
++	/* Rx IRQ will be enabled when NAPI processing finished */
++
++	atomic_inc(&wil->isr_count_rx);
++
++	if (unlikely(need_unmask))
++		wil6210_unmask_irq_rx_edma(wil);
++
++	return IRQ_HANDLED;
++}
++
+ static irqreturn_t wil6210_irq_tx_edma(int irq, void *cookie)
+ {
+ 	struct wil6210_priv *wil = cookie;
+@@ -594,12 +659,20 @@ static irqreturn_t wil6210_thread_irq(int irq, void *cookie)
+  */
+ static int wil6210_debug_irq_mask(struct wil6210_priv *wil, u32 pseudo_cause)
+ {
+-	u32 icm_rx = 0, icr_rx = 0, imv_rx = 0;
++	u32 icm_rx, icr_rx, imv_rx;
+ 	u32 icm_tx, icr_tx, imv_tx;
+ 	u32 icm_misc, icr_misc, imv_misc;
+ 
+ 	if (!test_bit(wil_status_irqen, wil->status)) {
+ 		if (wil->use_enhanced_dma_hw) {
++			icm_rx = wil_ioread32_and_clear(wil->csr +
++					HOSTADDR(RGF_INT_GEN_RX_ICR) +
++					offsetof(struct RGF_ICR, ICM));
++			icr_rx = wil_ioread32_and_clear(wil->csr +
++					HOSTADDR(RGF_INT_GEN_RX_ICR) +
++					offsetof(struct RGF_ICR, ICR));
++			imv_rx = wil_r(wil, RGF_INT_GEN_RX_ICR +
++				   offsetof(struct RGF_ICR, IMV));
+ 			icm_tx = wil_ioread32_and_clear(wil->csr +
+ 					HOSTADDR(RGF_INT_GEN_TX_ICR) +
+ 					offsetof(struct RGF_ICR, ICM));
+@@ -691,7 +764,7 @@ static irqreturn_t wil6210_hardirq(int irq, void *cookie)
+ 	 * voting for wake thread - need at least 1 vote
+ 	 */
+ 	if ((pseudo_cause & BIT_DMA_PSEUDO_CAUSE_RX) &&
+-	    (wil6210_irq_rx(irq, cookie) == IRQ_WAKE_THREAD))
++	    (wil->txrx_ops.irq_rx(irq, cookie) == IRQ_WAKE_THREAD))
+ 		rc = IRQ_WAKE_THREAD;
+ 
+ 	if ((pseudo_cause & BIT_DMA_PSEUDO_CAUSE_TX) &&
+@@ -723,6 +796,8 @@ void wil6210_clear_irq(struct wil6210_priv *wil)
+ 		    offsetof(struct RGF_ICR, ICR));
+ 	wil_clear32(wil->csr + HOSTADDR(RGF_DMA_EP_TX_ICR) +
+ 		    offsetof(struct RGF_ICR, ICR));
++	wil_clear32(wil->csr + HOSTADDR(RGF_INT_GEN_RX_ICR) +
++		    offsetof(struct RGF_ICR, ICR));
+ 	wil_clear32(wil->csr + HOSTADDR(RGF_INT_GEN_TX_ICR) +
+ 		    offsetof(struct RGF_ICR, ICR));
+ 	wil_clear32(wil->csr + HOSTADDR(RGF_DMA_EP_MISC_ICR) +
+@@ -753,10 +828,13 @@ int wil6210_init_irq(struct wil6210_priv *wil, int irq, bool use_msi)
+ 
+ 	wil_dbg_misc(wil, "init_irq: %s\n", use_msi ? "MSI" : "INTx");
+ 
+-	if (wil->use_enhanced_dma_hw)
++	if (wil->use_enhanced_dma_hw) {
+ 		wil->txrx_ops.irq_tx = wil6210_irq_tx_edma;
+-	else
++		wil->txrx_ops.irq_rx = wil6210_irq_rx_edma;
++	} else {
+ 		wil->txrx_ops.irq_tx = wil6210_irq_tx;
++		wil->txrx_ops.irq_rx = wil6210_irq_rx;
++	}
+ 	rc = request_threaded_irq(irq, wil6210_hardirq,
+ 				  wil6210_thread_irq,
+ 				  use_msi ? 0 : IRQF_SHARED,
+diff --git a/drivers/net/wireless/ath/wil6210/main.c b/drivers/net/wireless/ath/wil6210/main.c
+index c820c86918f0..e0072b6c7a44 100644
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -632,6 +632,7 @@ int wil_priv_init(struct wil6210_priv *wil)
+ 	/* edma configuration can be updated via debugfs before allocation */
+ 	wil->num_rx_status_rings = WIL_DEFAULT_NUM_RX_STATUS_RINGS;
+ 	wil->use_compressed_rx_status = true;
++	wil->use_rx_hw_reordering = true;
+ 	wil->tx_status_ring_order = WIL_TX_SRING_SIZE_ORDER_DEFAULT;
+ 
+ 	/* Rx status ring size should be bigger than the number of RX buffers
+@@ -645,6 +646,8 @@ int wil_priv_init(struct wil6210_priv *wil)
+ 	 */
+ 	wil->rx_buff_id_count = WIL_RX_BUFF_ARR_SIZE_DEFAULT;
+ 
++	wil->amsdu_en = 1;
++
+ 	return 0;
+ 
+ out_wmi_wq:
+diff --git a/drivers/net/wireless/ath/wil6210/netdev.c b/drivers/net/wireless/ath/wil6210/netdev.c
+index eeda2b618e6e..7a78a06bd356 100644
+--- a/drivers/net/wireless/ath/wil6210/netdev.c
++++ b/drivers/net/wireless/ath/wil6210/netdev.c
+@@ -120,6 +120,27 @@ static int wil6210_netdev_poll_rx(struct napi_struct *napi, int budget)
+ 	return done;
+ }
+ 
++static int wil6210_netdev_poll_rx_edma(struct napi_struct *napi, int budget)
++{
++	struct wil6210_priv *wil = container_of(napi, struct wil6210_priv,
++						napi_rx);
++	int quota = budget;
++	int done;
++
++	wil_rx_handle_edma(wil, &quota);
++	done = budget - quota;
++
++	if (done < budget) {
++		napi_complete_done(napi, done);
++		wil6210_unmask_irq_rx_edma(wil);
++		wil_dbg_txrx(wil, "NAPI RX complete\n");
++	}
++
++	wil_dbg_txrx(wil, "NAPI RX poll(%d) done %d\n", budget, done);
++
++	return done;
++}
++
+ static int wil6210_netdev_poll_tx(struct napi_struct *napi, int budget)
+ {
+ 	struct wil6210_priv *wil = container_of(napi, struct wil6210_priv,
+@@ -442,17 +463,21 @@ int wil_if_add(struct wil6210_priv *wil)
+ 	}
+ 
+ 	init_dummy_netdev(&wil->napi_ndev);
+-	netif_napi_add(&wil->napi_ndev, &wil->napi_rx, wil6210_netdev_poll_rx,
+-		       WIL6210_NAPI_BUDGET);
+-	if (wil->use_enhanced_dma_hw)
++	if (wil->use_enhanced_dma_hw) {
++		netif_napi_add(&wil->napi_ndev, &wil->napi_rx,
++			       wil6210_netdev_poll_rx_edma,
++			       WIL6210_NAPI_BUDGET);
+ 		netif_tx_napi_add(&wil->napi_ndev,
+ 				  &wil->napi_tx, wil6210_netdev_poll_tx_edma,
+ 				  WIL6210_NAPI_BUDGET);
+-	else
++	} else {
++		netif_napi_add(&wil->napi_ndev, &wil->napi_rx,
++			       wil6210_netdev_poll_rx,
++			       WIL6210_NAPI_BUDGET);
+ 		netif_tx_napi_add(&wil->napi_ndev,
+ 				  &wil->napi_tx, wil6210_netdev_poll_tx,
+ 				  WIL6210_NAPI_BUDGET);
+-
++	}
+ 
+ 	wil_update_net_queues_bh(wil, vif, NULL, true);
+ 
+diff --git a/drivers/net/wireless/ath/wil6210/pcie_bus.c b/drivers/net/wireless/ath/wil6210/pcie_bus.c
+index c01c5348b7e0..8b148cb91372 100644
+--- a/drivers/net/wireless/ath/wil6210/pcie_bus.c
++++ b/drivers/net/wireless/ath/wil6210/pcie_bus.c
+@@ -103,6 +103,7 @@ int wil_set_capabilities(struct wil6210_priv *wil)
+ 		wil->rgf_ucode_assert_code_addr = TALYN_RGF_UCODE_ASSERT_CODE;
+ 		set_bit(hw_capa_no_flash, wil->hw_capa);
+ 		wil->use_enhanced_dma_hw = true;
++		wil->use_rx_hw_reordering = true;
+ 		break;
+ 	default:
+ 		wil_err(wil, "Unknown board hardware, chip_id 0x%08x, chip_revision 0x%08x\n",
+diff --git a/drivers/net/wireless/ath/wil6210/pm.c b/drivers/net/wireless/ath/wil6210/pm.c
+index ba81fb3ac96f..3a4194779ddf 100644
+--- a/drivers/net/wireless/ath/wil6210/pm.c
++++ b/drivers/net/wireless/ath/wil6210/pm.c
+@@ -211,7 +211,7 @@ static int wil_suspend_keep_radio_on(struct wil6210_priv *wil)
+ 		goto reject_suspend;
+ 	}
+ 
+-	if (!wil_is_rx_idle(wil)) {
++	if (!wil->txrx_ops.is_rx_idle(wil)) {
+ 		wil_dbg_pm(wil, "Pending RX data, reject suspend\n");
+ 		wil->suspend_stats.rejected_by_host++;
+ 		goto reject_suspend;
+@@ -235,9 +235,9 @@ static int wil_suspend_keep_radio_on(struct wil6210_priv *wil)
+ 	start = jiffies;
+ 	data_comp_to = jiffies + msecs_to_jiffies(WIL_DATA_COMPLETION_TO_MS);
+ 	if (test_bit(wil_status_napi_en, wil->status)) {
+-		while (!wil_is_rx_idle(wil)) {
++		while (!wil->txrx_ops.is_rx_idle(wil)) {
+ 			if (time_after(jiffies, data_comp_to)) {
+-				if (wil_is_rx_idle(wil))
++				if (wil->txrx_ops.is_rx_idle(wil))
+ 					break;
+ 				wil_err(wil,
+ 					"TO waiting for idle RX, suspend failed\n");
+diff --git a/drivers/net/wireless/ath/wil6210/rx_reorder.c b/drivers/net/wireless/ath/wil6210/rx_reorder.c
+index a586929f72d4..22475a1ddb7f 100644
+--- a/drivers/net/wireless/ath/wil6210/rx_reorder.c
++++ b/drivers/net/wireless/ath/wil6210/rx_reorder.c
+@@ -95,17 +95,17 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ {
+ 	struct wil6210_vif *vif;
+ 	struct net_device *ndev;
+-	struct vring_rx_desc *d = wil_skb_rxdesc(skb);
+-	int tid = wil_rxdesc_tid(d);
+-	int cid = wil_rxdesc_cid(d);
+-	int mid = wil_rxdesc_mid(d);
+-	u16 seq = wil_rxdesc_seq(d);
+-	int mcast = wil_rxdesc_mcast(d);
+-	struct wil_sta_info *sta = &wil->sta[cid];
++	int tid, cid, mid, mcast;
++	u16 seq;
++	struct wil_sta_info *sta;
+ 	struct wil_tid_ampdu_rx *r;
+ 	u16 hseq;
+ 	int index;
+ 
++	wil->txrx_ops.get_reorder_params(wil, skb, &tid, &cid, &mid, &seq,
++					 &mcast);
++	sta = &wil->sta[cid];
++
+ 	wil_dbg_txrx(wil, "MID %d CID %d TID %d Seq 0x%03x mcast %01x\n",
+ 		     mid, cid, tid, seq, mcast);
+ 
+@@ -315,7 +315,10 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ 	 * bits 6..15: buffer size
+ 	 */
+ 	u16 req_agg_wsize = WIL_GET_BITS(param_set, 6, 15);
+-	bool agg_amsdu = !!(param_set & BIT(0));
++	bool agg_amsdu = wil->use_enhanced_dma_hw &&
++		wil->use_rx_hw_reordering &&
++		test_bit(WMI_FW_CAPABILITY_AMSDU, wil->fw_capabilities) &&
++		wil->amsdu_en && (param_set & BIT(0));
+ 	int ba_policy = param_set & BIT(1);
+ 	u16 status = WLAN_STATUS_SUCCESS;
+ 	u16 ssn = seq_ctrl >> 4;
+@@ -360,8 +363,9 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ 		}
+ 	}
+ 
+-	rc = wmi_addba_rx_resp(wil, mid, cid, tid, dialog_token, status,
+-			       agg_amsdu, agg_wsize, agg_timeout);
++	rc = wil->txrx_ops.wmi_addba_rx_resp(wil, mid, cid, tid, dialog_token,
++					     status, agg_amsdu, agg_wsize,
++					     agg_timeout);
+ 	if (rc || (status != WLAN_STATUS_SUCCESS)) {
+ 		wil_err(wil, "do not apply ba, rc(%d), status(%d)\n", rc,
+ 			status);
+diff --git a/drivers/net/wireless/ath/wil6210/trace.h b/drivers/net/wireless/ath/wil6210/trace.h
+index 6aed2461b0d4..853abc3a73e4 100644
+--- a/drivers/net/wireless/ath/wil6210/trace.h
++++ b/drivers/net/wireless/ath/wil6210/trace.h
+@@ -187,6 +187,40 @@ TRACE_EVENT(wil6210_rx,
+ 		  __entry->seq, __entry->type, __entry->subtype)
+ );
+ 
++TRACE_EVENT(wil6210_rx_status,
++	    TP_PROTO(struct wil6210_priv *wil, u8 use_compressed, u16 buff_id,
++		     void *msg),
++	    TP_ARGS(wil, use_compressed, buff_id, msg),
++	    TP_STRUCT__entry(__field(u8, use_compressed)
++			     __field(u16, buff_id)
++			     __field(unsigned int, len)
++			     __field(u8, mid)
++			     __field(u8, cid)
++			     __field(u8, tid)
++			     __field(u8, type)
++			     __field(u8, subtype)
++			     __field(u16, seq)
++			     __field(u8, mcs)
++	    ),
++	    TP_fast_assign(__entry->use_compressed = use_compressed;
++			   __entry->buff_id = buff_id;
++			   __entry->len = wil_rx_status_get_length(msg);
++			   __entry->mid = wil_rx_status_get_mid(msg);
++			   __entry->cid = wil_rx_status_get_cid(msg);
++			   __entry->tid = wil_rx_status_get_tid(msg);
++			   __entry->type = wil_rx_status_get_frame_type(wil,
++									msg);
++			   __entry->subtype = wil_rx_status_get_fc1(wil, msg);
++			   __entry->seq = wil_rx_status_get_seq(wil, msg);
++			   __entry->mcs = wil_rx_status_get_mcs(msg);
++	    ),
++	    TP_printk(
++		      "compressed %d buff_id %d len %d mid %d cid %d tid %d mcs %d seq 0x%03x type 0x%1x subtype 0x%1x",
++		      __entry->use_compressed, __entry->buff_id, __entry->len,
++		      __entry->mid, __entry->cid, __entry->tid, __entry->mcs,
++		      __entry->seq, __entry->type, __entry->subtype)
++);
++
+ TRACE_EVENT(wil6210_tx,
+ 	TP_PROTO(u8 vring, u16 index, unsigned int len, u8 frags),
+ 	TP_ARGS(vring, index, len, frags),
+diff --git a/drivers/net/wireless/ath/wil6210/txrx.c b/drivers/net/wireless/ath/wil6210/txrx.c
+index 12d509e7f29c..2098f3cc1cec 100644
+--- a/drivers/net/wireless/ath/wil6210/txrx.c
++++ b/drivers/net/wireless/ath/wil6210/txrx.c
+@@ -28,6 +28,7 @@
+ #include "wmi.h"
+ #include "txrx.h"
+ #include "trace.h"
++#include "txrx_edma.h"
+ 
+ static bool rtap_include_phy_info;
+ module_param(rtap_include_phy_info, bool, 0444);
+@@ -407,14 +408,7 @@ static void wil_rx_add_radiotap_header(struct wil6210_priv *wil,
+ 	}
+ }
+ 
+-/* similar to ieee80211_ version, but FC contain only 1-st byte */
+-static inline int wil_is_back_req(u8 fc)
+-{
+-	return (fc & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE)) ==
+-	       (IEEE80211_FTYPE_CTL | IEEE80211_STYPE_BACK_REQ);
+-}
+-
+-bool wil_is_rx_idle(struct wil6210_priv *wil)
++static bool wil_is_rx_idle(struct wil6210_priv *wil)
+ {
+ 	struct vring_rx_desc *_d;
+ 	struct wil_ring *ring = &wil->ring_rx;
+@@ -639,7 +633,7 @@ static int wil_rx_refill(struct wil6210_priv *wil, int count)
+  * Cut'n'paste from original memcmp (see lib/string.c)
+  * with minimal modifications
+  */
+-static int reverse_memcmp(const void *cs, const void *ct, size_t count)
++int reverse_memcmp(const void *cs, const void *ct, size_t count)
+ {
+ 	const unsigned char *su1, *su2;
+ 	int res = 0;
+@@ -684,6 +678,15 @@ static int wil_rx_crypto_check(struct wil6210_priv *wil, struct sk_buff *skb)
+ 	return 0;
+ }
+ 
++static void wil_get_netif_rx_params(struct sk_buff *skb, int *cid,
++				    int *security)
++{
++	struct vring_rx_desc *d = wil_skb_rxdesc(skb);
++
++	*cid = wil_rxdesc_cid(d); /* always 0..7, no need to check */
++	*security = wil_rxdesc_security(d);
++}
++
+ /*
+  * Pass Rx packet to the netif. Update statistics.
+  * Called in softirq context (NAPI poll).
+@@ -695,15 +698,14 @@ void wil_netif_rx_any(struct sk_buff *skb, struct net_device *ndev)
+ 	struct wil6210_priv *wil = ndev_to_wil(ndev);
+ 	struct wireless_dev *wdev = vif_to_wdev(vif);
+ 	unsigned int len = skb->len;
+-	struct vring_rx_desc *d = wil_skb_rxdesc(skb);
+-	int cid = wil_rxdesc_cid(d); /* always 0..7, no need to check */
+-	int security = wil_rxdesc_security(d);
++	int cid;
++	int security;
+ 	struct ethhdr *eth = (void *)skb->data;
+ 	/* here looking for DA, not A1, thus Rxdesc's 'mcast' indication
+ 	 * is not suitable, need to look at data
+ 	 */
+ 	int mcast = is_multicast_ether_addr(eth->h_dest);
+-	struct wil_net_stats *stats = &wil->sta[cid].stats;
++	struct wil_net_stats *stats;
+ 	struct sk_buff *xmit_skb = NULL;
+ 	static const char * const gro_res_str[] = {
+ 		[GRO_MERGED]		= "GRO_MERGED",
+@@ -713,6 +715,10 @@ void wil_netif_rx_any(struct sk_buff *skb, struct net_device *ndev)
+ 		[GRO_DROP]		= "GRO_DROP",
+ 	};
+ 
++	wil->txrx_ops.get_netif_rx_params(skb, &cid, &security);
++
++	stats = &wil->sta[cid].stats;
++
+ 	if (ndev->features & NETIF_F_RXHASH)
+ 		/* fake L4 to ensure it won't be re-calculated later
+ 		 * set hash to any non-zero value to activate rps
+@@ -723,7 +729,7 @@ void wil_netif_rx_any(struct sk_buff *skb, struct net_device *ndev)
+ 
+ 	skb_orphan(skb);
+ 
+-	if (security && (wil_rx_crypto_check(wil, skb) != 0)) {
++	if (security && (wil->txrx_ops.rx_crypto_check(wil, skb) != 0)) {
+ 		rc = GRO_DROP;
+ 		dev_kfree_skb(skb);
+ 		stats->rx_replay++;
+@@ -2172,6 +2178,19 @@ static inline int wil_tx_init(struct wil6210_priv *wil)
+ 
+ static inline void wil_tx_fini(struct wil6210_priv *wil) {}
+ 
++static void wil_get_reorder_params(struct wil6210_priv *wil,
++				   struct sk_buff *skb, int *tid, int *cid,
++				   int *mid, u16 *seq, int *mcast)
++{
++	struct vring_rx_desc *d = wil_skb_rxdesc(skb);
++
++	*tid = wil_rxdesc_tid(d);
++	*cid = wil_rxdesc_cid(d);
++	*mid = wil_rxdesc_mid(d);
++	*seq = wil_rxdesc_seq(d);
++	*mcast = wil_rxdesc_mcast(d);
++}
++
+ void wil_init_txrx_ops_legacy_dma(struct wil6210_priv *wil)
+ {
+ 	wil->txrx_ops.configure_interrupt_moderation =
+@@ -2187,5 +2206,11 @@ void wil_init_txrx_ops_legacy_dma(struct wil6210_priv *wil)
+ 	wil->txrx_ops.tx_fini = wil_tx_fini;
+ 	/* RX ops */
+ 	wil->txrx_ops.rx_init = wil_rx_init;
++	wil->txrx_ops.wmi_addba_rx_resp = wmi_addba_rx_resp;
++	wil->txrx_ops.get_reorder_params = wil_get_reorder_params;
++	wil->txrx_ops.get_netif_rx_params =
++		wil_get_netif_rx_params;
++	wil->txrx_ops.rx_crypto_check = wil_rx_crypto_check;
++	wil->txrx_ops.is_rx_idle = wil_is_rx_idle;
+ 	wil->txrx_ops.rx_fini = wil_rx_fini;
+ }
+diff --git a/drivers/net/wireless/ath/wil6210/txrx.h b/drivers/net/wireless/ath/wil6210/txrx.h
+index 62806c5bb930..f361423628f5 100644
+--- a/drivers/net/wireless/ath/wil6210/txrx.h
++++ b/drivers/net/wireless/ath/wil6210/txrx.h
+@@ -592,6 +592,13 @@ static inline int wil_get_min_tx_ring_id(struct wil6210_priv *wil)
+ 	return wil->use_enhanced_dma_hw ? 1 : 0;
+ }
+ 
++/* similar to ieee80211_ version, but FC contain only 1-st byte */
++static inline int wil_is_back_req(u8 fc)
++{
++	return (fc & (IEEE80211_FCTL_FTYPE | IEEE80211_FCTL_STYPE)) ==
++	       (IEEE80211_FTYPE_CTL | IEEE80211_STYPE_BACK_REQ);
++}
++
+ /* wil_val_in_range - check if value in [min,max) */
+ static inline bool wil_val_in_range(int val, int min, int max)
+ {
+diff --git a/drivers/net/wireless/ath/wil6210/txrx_edma.c b/drivers/net/wireless/ath/wil6210/txrx_edma.c
+index c449286823a9..95f38e65d969 100644
+--- a/drivers/net/wireless/ath/wil6210/txrx_edma.c
++++ b/drivers/net/wireless/ath/wil6210/txrx_edma.c
+@@ -208,6 +208,13 @@ static int wil_ring_alloc_skb_edma(struct wil6210_priv *wil,
+ 	return 0;
+ }
+ 
++static inline
++void wil_get_next_rx_status_msg(struct wil_status_ring *sring, void *msg)
++{
++	memcpy(msg, (void *)(sring->va + (sring->elem_size * sring->swhead)),
++	       sring->elem_size);
++}
++
+ static inline void wil_sring_advance_swhead(struct wil_status_ring *sring)
+ {
+ 	sring->swhead = (sring->swhead + 1) % sring->size;
+@@ -493,6 +500,96 @@ static int wil_init_rx_desc_ring(struct wil6210_priv *wil, u16 desc_ring_size,
+ 	return rc;
+ }
+ 
++static void wil_get_reorder_params_edma(struct wil6210_priv *wil,
++					struct sk_buff *skb, int *tid,
++					int *cid, int *mid, u16 *seq,
++					int *mcast)
++{
++	struct wil_rx_status_extended *s = wil_skb_rxstatus(skb);
++
++	*tid = wil_rx_status_get_tid(s);
++	*cid = wil_rx_status_get_cid(s);
++	*mid = wil_rx_status_get_mid(s);
++	*seq = le16_to_cpu(wil_rx_status_get_seq(wil, s));
++	*mcast = wil_rx_status_get_mcast(s);
++}
++
++static void wil_get_netif_rx_params_edma(struct sk_buff *skb, int *cid,
++					 int *security)
++{
++	struct wil_rx_status_extended *s = wil_skb_rxstatus(skb);
++
++	*cid = wil_rx_status_get_cid(s);
++	*security = wil_rx_status_get_security(s);
++}
++
++static int wil_rx_crypto_check_edma(struct wil6210_priv *wil,
++				    struct sk_buff *skb)
++{
++	struct wil_rx_status_extended *st;
++	int cid, tid, key_id, mc;
++	struct wil_sta_info *s;
++	struct wil_tid_crypto_rx *c;
++	struct wil_tid_crypto_rx_single *cc;
++	const u8 *pn;
++
++	/* In HW reorder, HW is responsible for crypto check */
++	if (wil->use_rx_hw_reordering)
++		return 0;
++
++	st = wil_skb_rxstatus(skb);
++
++	cid = wil_rx_status_get_cid(st);
++	tid = wil_rx_status_get_tid(st);
++	key_id = wil_rx_status_get_key_id(st);
++	mc = wil_rx_status_get_mcast(st);
++	s = &wil->sta[cid];
++	c = mc ? &s->group_crypto_rx : &s->tid_crypto_rx[tid];
++	cc = &c->key_id[key_id];
++	pn = (u8 *)&st->ext.pn_15_0;
++
++	if (!cc->key_set) {
++		wil_err_ratelimited(wil,
++				    "Key missing. CID %d TID %d MCast %d KEY_ID %d\n",
++				    cid, tid, mc, key_id);
++		return -EINVAL;
++	}
++
++	if (reverse_memcmp(pn, cc->pn, IEEE80211_GCMP_PN_LEN) <= 0) {
++		wil_err_ratelimited(wil,
++				    "Replay attack. CID %d TID %d MCast %d KEY_ID %d PN %6phN last %6phN\n",
++				    cid, tid, mc, key_id, pn, cc->pn);
++		return -EINVAL;
++	}
++	memcpy(cc->pn, pn, IEEE80211_GCMP_PN_LEN);
++
++	return 0;
++}
++
++static bool wil_is_rx_idle_edma(struct wil6210_priv *wil)
++{
++	struct wil_status_ring *sring;
++	struct wil_rx_status_extended msg1;
++	void *msg = &msg1;
++	u8 dr_bit;
++	int i;
++
++	for (i = 0; i < wil->num_rx_status_rings; i++) {
++		sring = &wil->srings[i];
++		if (!sring->va)
++			continue;
++
++		wil_get_next_rx_status_msg(sring, msg);
++		dr_bit = wil_rx_status_get_desc_rdy_bit(msg);
++
++		/* Check if there are unhandled RX status messages */
++		if (dr_bit == sring->desc_rdy_pol)
++			return false;
++	}
++
++	return true;
++}
++
+ static void wil_rx_buf_len_init_edma(struct wil6210_priv *wil)
+ {
+ 	wil->rx_buf_len = rx_large_buf ?
+@@ -510,6 +607,13 @@ static int wil_rx_init_edma(struct wil6210_priv *wil, u16 desc_ring_size)
+ 	int i;
+ 	u16 max_rx_pl_per_desc;
+ 
++	/* In SW reorder one must use extended status messages */
++	if (wil->use_compressed_rx_status && !wil->use_rx_hw_reordering) {
++		wil_err(wil,
++			"compressed RX status cannot be used with SW reorder\n");
++		return -EINVAL;
++	}
++
+ 	if (wil->rx_status_ring_order < WIL_SRING_SIZE_ORDER_MIN ||
+ 	    wil->rx_status_ring_order > WIL_SRING_SIZE_ORDER_MAX)
+ 		wil->rx_status_ring_order = WIL_RX_SRING_SIZE_ORDER_DEFAULT;
+@@ -634,6 +738,353 @@ static int wil_ring_init_tx_edma(struct wil6210_vif *vif, int ring_id,
+ 	return rc;
+ }
+ 
++/* This function is used only for RX SW reorder */
++static int wil_check_bar(struct wil6210_priv *wil, void *msg, int cid,
++			 struct sk_buff *skb, struct wil_net_stats *stats)
++{
++	u8 ftype;
++	u8 fc1;
++	int mid;
++	int tid;
++	u16 seq;
++	struct wil6210_vif *vif;
++
++	ftype = wil_rx_status_get_frame_type(wil, msg);
++	if (ftype == IEEE80211_FTYPE_DATA)
++		return 0;
++
++	fc1 = wil_rx_status_get_fc1(wil, msg);
++	mid = wil_rx_status_get_mid(msg);
++	tid = wil_rx_status_get_tid(msg);
++	seq = le16_to_cpu(wil_rx_status_get_seq(wil, msg));
++	vif = wil->vifs[mid];
++
++	if (unlikely(!vif)) {
++		wil_dbg_txrx(wil, "RX descriptor with invalid mid %d", mid);
++		return -EAGAIN;
++	}
++
++	wil_dbg_txrx(wil,
++		     "Non-data frame FC[7:0] 0x%02x MID %d CID %d TID %d Seq 0x%03x\n",
++		     fc1, mid, cid, tid, seq);
++	if (stats)
++		stats->rx_non_data_frame++;
++	if (wil_is_back_req(fc1)) {
++		wil_dbg_txrx(wil,
++			     "BAR: MID %d CID %d TID %d Seq 0x%03x\n",
++			     mid, cid, tid, seq);
++		wil_rx_bar(wil, vif, cid, tid, seq);
++	} else {
++		u32 sz = wil->use_compressed_rx_status ?
++			sizeof(struct wil_rx_status_compressed) :
++			sizeof(struct wil_rx_status_extended);
++
++		/* print again all info. One can enable only this
++		 * without overhead for printing every Rx frame
++		 */
++		wil_dbg_txrx(wil,
++			     "Unhandled non-data frame FC[7:0] 0x%02x MID %d CID %d TID %d Seq 0x%03x\n",
++			     fc1, mid, cid, tid, seq);
++		wil_hex_dump_txrx("RxS ", DUMP_PREFIX_NONE, 32, 4,
++				  (const void *)msg, sz, false);
++		wil_hex_dump_txrx("Rx ", DUMP_PREFIX_OFFSET, 16, 1,
++				  skb->data, skb_headlen(skb), false);
++	}
++
++	return -EAGAIN;
++}
++
++static int wil_rx_edma_check_errors(struct wil6210_priv *wil, void *msg,
++				    struct wil_net_stats *stats,
++				    struct sk_buff *skb)
++{
++	int error;
++	int l2_rx_status;
++	int l3_rx_status;
++	int l4_rx_status;
++
++	error = wil_rx_status_get_error(msg);
++	if (!error) {
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		return 0;
++	}
++
++	l2_rx_status = wil_rx_status_get_l2_rx_status(msg);
++	if (l2_rx_status != 0) {
++		wil_dbg_txrx(wil, "L2 RX error, l2_rx_status=0x%x\n",
++			     l2_rx_status);
++		/* Due to HW issue, KEY error will trigger a MIC error */
++		if (l2_rx_status & WIL_RX_EDMA_ERROR_MIC) {
++			wil_dbg_txrx(wil,
++				     "L2 MIC/KEY error, dropping packet\n");
++			stats->rx_mic_error++;
++		}
++		if (l2_rx_status & WIL_RX_EDMA_ERROR_KEY) {
++			wil_dbg_txrx(wil, "L2 KEY error, dropping packet\n");
++			stats->rx_key_error++;
++		}
++		if (l2_rx_status & WIL_RX_EDMA_ERROR_REPLAY) {
++			wil_dbg_txrx(wil,
++				     "L2 REPLAY error, dropping packet\n");
++			stats->rx_replay++;
++		}
++		if (l2_rx_status & WIL_RX_EDMA_ERROR_AMSDU) {
++			wil_dbg_txrx(wil,
++				     "L2 AMSDU error, dropping packet\n");
++			stats->rx_amsdu_error++;
++		}
++		return -EFAULT;
++	}
++
++	l3_rx_status = wil_rx_status_get_l3_rx_status(msg);
++	l4_rx_status = wil_rx_status_get_l4_rx_status(msg);
++	if (!l3_rx_status && !l4_rx_status)
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++	/* If HW reports bad checksum, let IP stack re-check it
++	 * For example, HW don't understand Microsoft IP stack that
++	 * mis-calculates TCP checksum - if it should be 0x0,
++	 * it writes 0xffff in violation of RFC 1624
++	 */
++
++	return 0;
++}
++
++static struct sk_buff *wil_sring_reap_rx_edma(struct wil6210_priv *wil,
++					      struct wil_status_ring *sring)
++{
++	struct device *dev = wil_to_dev(wil);
++	struct wil_rx_status_extended msg1;
++	void *msg = &msg1;
++	u16 buff_id;
++	struct sk_buff *skb;
++	dma_addr_t pa;
++	struct wil_ring_rx_data *rxdata = &sring->rx_data;
++	unsigned int sz = wil->rx_buf_len + ETH_HLEN +
++		WIL_EDMA_MAX_DATA_OFFSET;
++	struct wil_net_stats *stats = NULL;
++	u16 dmalen;
++	int cid;
++	int rc;
++	bool eop, headstolen;
++	int delta;
++	u8 dr_bit;
++	u8 data_offset;
++	struct wil_rx_status_extended *s;
++	u16 sring_idx = sring - wil->srings;
++
++	BUILD_BUG_ON(sizeof(struct wil_rx_status_extended) > sizeof(skb->cb));
++
++again:
++	wil_get_next_rx_status_msg(sring, msg);
++	dr_bit = wil_rx_status_get_desc_rdy_bit(msg);
++
++	/* Completed handling all the ready status messages */
++	if (dr_bit != sring->desc_rdy_pol)
++		return NULL;
++
++	/* Extract the buffer ID from the status message */
++	buff_id = le16_to_cpu(wil_rx_status_get_buff_id(msg));
++	if (unlikely(!wil_val_in_range(buff_id, 0, wil->rx_buff_mgmt.size))) {
++		wil_err(wil, "Corrupt buff_id=%d, sring->swhead=%d\n",
++			buff_id, sring->swhead);
++		wil_sring_advance_swhead(sring);
++		goto again;
++	}
++
++	wil_sring_advance_swhead(sring);
++
++	/* Extract the SKB from the rx_buff management array */
++	skb = wil->rx_buff_mgmt.buff_arr[buff_id].skb;
++	wil->rx_buff_mgmt.buff_arr[buff_id].skb = NULL;
++	if (!skb) {
++		wil_err(wil, "No Rx skb at buff_id %d\n", buff_id);
++		goto again;
++	}
++
++	memcpy(&pa, skb->cb, sizeof(pa));
++	dma_unmap_single(dev, pa, sz, DMA_FROM_DEVICE);
++	dmalen = le16_to_cpu(wil_rx_status_get_length(msg));
++
++	trace_wil6210_rx_status(wil, wil->use_compressed_rx_status, buff_id,
++				msg);
++	wil_dbg_txrx(wil, "Rx, buff_id=%u, sring_idx=%u, dmalen=%u bytes\n",
++		     buff_id, sring_idx, dmalen);
++	wil_hex_dump_txrx("RxS ", DUMP_PREFIX_NONE, 32, 4,
++			  (const void *)msg, wil->use_compressed_rx_status ?
++			  sizeof(struct wil_rx_status_compressed) :
++			  sizeof(struct wil_rx_status_extended), false);
++
++	/* Move the buffer from the active list to the free list */
++	list_move(&wil->rx_buff_mgmt.buff_arr[buff_id].list,
++		  &wil->rx_buff_mgmt.free);
++
++	eop = wil_rx_status_get_eop(msg);
++
++	cid = wil_rx_status_get_cid(msg);
++	if (unlikely(!wil_val_in_range(cid, 0, WIL6210_MAX_CID))) {
++		wil_err(wil, "Corrupt cid=%d, sring->swhead=%d\n",
++			cid, sring->swhead);
++		rxdata->skipping = true;
++		goto skipping;
++	}
++	stats = &wil->sta[cid].stats;
++
++	if (unlikely(skb->len < ETH_HLEN)) {
++		wil_dbg_txrx(wil, "Short frame, len = %d\n", skb->len);
++		stats->rx_short_frame++;
++		rxdata->skipping = true;
++		goto skipping;
++	}
++
++	/* Check and treat errors reported by HW */
++	rc = wil_rx_edma_check_errors(wil, msg, stats, skb);
++	if (rc) {
++		rxdata->skipping = true;
++		goto skipping;
++	}
++
++	if (unlikely(dmalen > sz)) {
++		wil_err(wil, "Rx size too large: %d bytes!\n", dmalen);
++		stats->rx_large_frame++;
++		rxdata->skipping = true;
++	}
++
++skipping:
++	/* skipping indicates if a certain SKB should be dropped.
++	 * It is set in case there is an error on the current SKB or in case
++	 * of RX chaining: as long as we manage to merge the SKBs it will
++	 * be false. once we have a bad SKB or we don't manage to merge SKBs
++	 * it will be set to the !EOP value of the current SKB.
++	 * This guarantees that all the following SKBs until EOP will also
++	 * get dropped.
++	 */
++	if (unlikely(rxdata->skipping)) {
++		kfree_skb(skb);
++		if (rxdata->skb) {
++			kfree_skb(rxdata->skb);
++			rxdata->skb = NULL;
++		}
++		rxdata->skipping = !eop;
++		goto again;
++	}
++
++	skb_trim(skb, dmalen);
++
++	prefetch(skb->data);
++
++	if (!rxdata->skb) {
++		rxdata->skb = skb;
++	} else {
++		if (likely(skb_try_coalesce(rxdata->skb, skb, &headstolen,
++					    &delta))) {
++			kfree_skb_partial(skb, headstolen);
++		} else {
++			wil_err(wil, "failed to merge skbs!\n");
++			kfree_skb(skb);
++			kfree_skb(rxdata->skb);
++			rxdata->skb = NULL;
++			rxdata->skipping = !eop;
++			goto again;
++		}
++	}
++
++	if (!eop)
++		goto again;
++
++	/* reaching here rxdata->skb always contains a full packet */
++	skb = rxdata->skb;
++	rxdata->skb = NULL;
++	rxdata->skipping = false;
++
++	if (stats) {
++		stats->last_mcs_rx = wil_rx_status_get_mcs(msg);
++		if (stats->last_mcs_rx < ARRAY_SIZE(stats->rx_per_mcs))
++			stats->rx_per_mcs[stats->last_mcs_rx]++;
++	}
++
++	if (!wil->use_rx_hw_reordering && !wil->use_compressed_rx_status &&
++	    wil_check_bar(wil, msg, cid, skb, stats) == -EAGAIN) {
++		kfree_skb(skb);
++		goto again;
++	}
++
++	/* Compensate for the HW data alignment according to the status
++	 * message
++	 */
++	data_offset = wil_rx_status_get_data_offset(msg);
++	if (data_offset == 0xFF ||
++	    data_offset > WIL_EDMA_MAX_DATA_OFFSET) {
++		wil_err(wil, "Unexpected data offset %d\n", data_offset);
++		kfree_skb(skb);
++		goto again;
++	}
++
++	skb_pull(skb, data_offset);
++
++	wil_hex_dump_txrx("Rx ", DUMP_PREFIX_OFFSET, 16, 1,
++			  skb->data, skb_headlen(skb), false);
++
++	/* Has to be done after dma_unmap_single as skb->cb is also
++	 * used for holding the pa
++	 */
++	s = wil_skb_rxstatus(skb);
++	memcpy(s, msg, sring->elem_size);
++
++	return skb;
++}
++
++void wil_rx_handle_edma(struct wil6210_priv *wil, int *quota)
++{
++	struct net_device *ndev;
++	struct wil_ring *ring = &wil->ring_rx;
++	struct wil_status_ring *sring;
++	struct sk_buff *skb;
++	int i;
++
++	if (unlikely(!ring->va)) {
++		wil_err(wil, "Rx IRQ while Rx not yet initialized\n");
++		return;
++	}
++	wil_dbg_txrx(wil, "rx_handle\n");
++
++	for (i = 0; i < wil->num_rx_status_rings; i++) {
++		sring = &wil->srings[i];
++		if (unlikely(!sring->va)) {
++			wil_err(wil,
++				"Rx IRQ while Rx status ring %d not yet initialized\n",
++				i);
++			continue;
++		}
++
++		while ((*quota > 0) &&
++		       (NULL != (skb =
++			wil_sring_reap_rx_edma(wil, sring)))) {
++			(*quota)--;
++			if (wil->use_rx_hw_reordering) {
++				void *msg = wil_skb_rxstatus(skb);
++				int mid = wil_rx_status_get_mid(msg);
++				struct wil6210_vif *vif = wil->vifs[mid];
++
++				if (unlikely(!vif)) {
++					wil_dbg_txrx(wil,
++						     "RX desc invalid mid %d",
++						     mid);
++					kfree_skb(skb);
++					continue;
++				}
++				ndev = vif_to_ndev(vif);
++				wil_netif_rx_any(skb, ndev);
++			} else {
++				wil_rx_reorder(wil, skb);
++			}
++		}
++
++		wil_w(wil, sring->hwtail, (sring->swhead - 1) % sring->size);
++	}
++
++	wil_rx_refill_edma(wil);
++}
++
+ static int wil_tx_desc_map_edma(union wil_tx_desc *desc,
+ 				dma_addr_t pa,
+ 				u32 len,
+@@ -1137,6 +1588,11 @@ void wil_init_txrx_ops_edma(struct wil6210_priv *wil)
+ 	wil->txrx_ops.tx_ring_tso = __wil_tx_ring_tso_edma;
+ 	/* RX ops */
+ 	wil->txrx_ops.rx_init = wil_rx_init_edma;
++	wil->txrx_ops.wmi_addba_rx_resp = wmi_addba_rx_resp_edma;
++	wil->txrx_ops.get_reorder_params = wil_get_reorder_params_edma;
++	wil->txrx_ops.get_netif_rx_params = wil_get_netif_rx_params_edma;
++	wil->txrx_ops.rx_crypto_check = wil_rx_crypto_check_edma;
++	wil->txrx_ops.is_rx_idle = wil_is_rx_idle_edma;
+ 	wil->txrx_ops.rx_fini = wil_rx_fini_edma;
+ }
+ 
+diff --git a/drivers/net/wireless/ath/wil6210/txrx_edma.h b/drivers/net/wireless/ath/wil6210/txrx_edma.h
+index 8eae181877b9..e86fc2dc0ce0 100644
+--- a/drivers/net/wireless/ath/wil6210/txrx_edma.h
++++ b/drivers/net/wireless/ath/wil6210/txrx_edma.h
+@@ -38,6 +38,27 @@
+ #define WIL_EDMA_IDLE_TIME_LIMIT_USEC (50)
+ #define WIL_EDMA_TIME_UNIT_CLK_CYCLES (330) /* fits 1 usec */
+ 
++/* Error field */
++#define WIL_RX_EDMA_ERROR_MIC	(1)
++#define WIL_RX_EDMA_ERROR_KEY	(2) /* Key missing */
++#define WIL_RX_EDMA_ERROR_REPLAY	(3)
++#define WIL_RX_EDMA_ERROR_AMSDU	(4)
++#define WIL_RX_EDMA_ERROR_FCS	(7)
++
++#define WIL_RX_EDMA_ERROR_L3_ERR	(BIT(0) | BIT(1))
++#define WIL_RX_EDMA_ERROR_L4_ERR	(BIT(0) | BIT(1))
++
++#define WIL_RX_EDMA_DLPF_LU_MISS_BIT		BIT(11)
++#define WIL_RX_EDMA_DLPF_LU_MISS_CID_TID_MASK	0x7
++#define WIL_RX_EDMA_DLPF_LU_HIT_CID_TID_MASK	0xf
++
++#define WIL_RX_EDMA_DLPF_LU_MISS_CID_POS	2
++#define WIL_RX_EDMA_DLPF_LU_HIT_CID_POS		4
++
++#define WIL_RX_EDMA_DLPF_LU_MISS_TID_POS	5
++
++#define WIL_RX_EDMA_MID_VALID_BIT		BIT(22)
++
+ #define WIL_EDMA_DESC_TX_MAC_CFG_0_QID_POS 16
+ #define WIL_EDMA_DESC_TX_MAC_CFG_0_QID_LEN 6
+ 
+@@ -329,6 +350,173 @@ struct wil_rx_status_extended {
+ 	struct wil_rx_status_extension ext;
+ } __packed;
+ 
++static inline void *wil_skb_rxstatus(struct sk_buff *skb)
++{
++	return (void *)skb->cb;
++}
++
++static inline __le16 wil_rx_status_get_length(void *msg)
++{
++	return ((struct wil_rx_status_compressed *)msg)->length;
++}
++
++static inline u8 wil_rx_status_get_mcs(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d1,
++			    16, 21);
++}
++
++static inline u16 wil_rx_status_get_flow_id(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    8, 19);
++}
++
++static inline u8 wil_rx_status_get_mcast(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    26, 26);
++}
++
++/**
++ * In case of DLPF miss the parsing of flow Id should be as follows:
++ * dest_id:2
++ * src_id :3 - cid
++ * tid:3
++ * Otherwise:
++ * tid:4
++ * cid:4
++ */
++
++static inline u8 wil_rx_status_get_cid(void *msg)
++{
++	u16 val = wil_rx_status_get_flow_id(msg);
++
++	if (val & WIL_RX_EDMA_DLPF_LU_MISS_BIT)
++		/* CID is in bits 2..4 */
++		return (val >> WIL_RX_EDMA_DLPF_LU_MISS_CID_POS) &
++			WIL_RX_EDMA_DLPF_LU_MISS_CID_TID_MASK;
++	else
++		/* CID is in bits 4..7 */
++		return (val >> WIL_RX_EDMA_DLPF_LU_HIT_CID_POS) &
++			WIL_RX_EDMA_DLPF_LU_HIT_CID_TID_MASK;
++}
++
++static inline u8 wil_rx_status_get_tid(void *msg)
++{
++	u16 val = wil_rx_status_get_flow_id(msg);
++
++	if (val & WIL_RX_EDMA_DLPF_LU_MISS_BIT)
++		/* TID is in bits 5..7 */
++		return (val >> WIL_RX_EDMA_DLPF_LU_MISS_TID_POS) &
++			WIL_RX_EDMA_DLPF_LU_MISS_CID_TID_MASK;
++	else
++		/* TID is in bits 0..3 */
++		return val & WIL_RX_EDMA_DLPF_LU_MISS_CID_TID_MASK;
++}
++
++static inline int wil_rx_status_get_desc_rdy_bit(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    31, 31);
++}
++
++static inline int wil_rx_status_get_eop(void *msg) /* EoP = End of Packet */
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    30, 30);
++}
++
++static inline __le16 wil_rx_status_get_buff_id(void *msg)
++{
++	return ((struct wil_rx_status_compressed *)msg)->buff_id;
++}
++
++static inline u8 wil_rx_status_get_data_offset(void *msg)
++{
++	u8 val = WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d1,
++			      24, 27);
++
++	switch (val) {
++	case 0: return 0;
++	case 3: return 2;
++	default: return 0xFF;
++	}
++}
++
++static inline int wil_rx_status_get_frame_type(struct wil6210_priv *wil,
++					       void *msg)
++{
++	if (wil->use_compressed_rx_status)
++		return IEEE80211_FTYPE_DATA;
++
++	return WIL_GET_BITS(((struct wil_rx_status_extended *)msg)->ext.d1,
++			    0, 1) << 2;
++}
++
++static inline int wil_rx_status_get_fc1(struct wil6210_priv *wil, void *msg)
++{
++	if (wil->use_compressed_rx_status)
++		return 0;
++
++	return WIL_GET_BITS(((struct wil_rx_status_extended *)msg)->ext.d1,
++			    0, 5) << 2;
++}
++
++static inline __le16 wil_rx_status_get_seq(struct wil6210_priv *wil, void *msg)
++{
++	if (wil->use_compressed_rx_status)
++		return 0;
++
++	return ((struct wil_rx_status_extended *)msg)->ext.seq_num;
++}
++
++static inline int wil_rx_status_get_mid(void *msg)
++{
++	if (!(((struct wil_rx_status_compressed *)msg)->d0 &
++	    WIL_RX_EDMA_MID_VALID_BIT))
++		return 0; /* use the default MID */
++
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    20, 21);
++}
++
++static inline int wil_rx_status_get_error(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    29, 29);
++}
++
++static inline int wil_rx_status_get_l2_rx_status(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    0, 2);
++}
++
++static inline int wil_rx_status_get_l3_rx_status(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    3, 4);
++}
++
++static inline int wil_rx_status_get_l4_rx_status(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    5, 6);
++}
++
++static inline int wil_rx_status_get_security(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d0,
++			    28, 28);
++}
++
++static inline u8 wil_rx_status_get_key_id(void *msg)
++{
++	return WIL_GET_BITS(((struct wil_rx_status_compressed *)msg)->d1,
++			    31, 31);
++}
++
+ static inline u8 wil_tx_status_get_mcs(struct wil_ring_tx_status *msg)
+ {
+ 	return WIL_GET_BITS(msg->d2, 0, 4);
+@@ -367,6 +555,7 @@ dma_addr_t wil_rx_desc_get_addr_edma(struct wil_ring_rx_enhanced_dma *dma)
+ void wil_configure_interrupt_moderation_edma(struct wil6210_priv *wil);
+ int wil_tx_sring_handler(struct wil6210_priv *wil,
+ 			 struct wil_status_ring *sring);
++void wil_rx_handle_edma(struct wil6210_priv *wil, int *quota);
+ void wil_init_txrx_ops_edma(struct wil6210_priv *wil);
+ 
+ #endif /* WIL6210_TXRX_EDMA_H */
+diff --git a/drivers/net/wireless/ath/wil6210/wil6210.h b/drivers/net/wireless/ath/wil6210/wil6210.h
+index f35c64e1ca22..f8d4a2d88d91 100644
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -323,9 +323,13 @@ struct RGF_ICR {
+ 	#define BIT_CONTROL_0			BIT(0)
+ 
+ /* eDMA status interrupts */
++#define RGF_INT_GEN_RX_ICR		(0x8bc0f4)
++	#define BIT_RX_STATUS_IRQ BIT(WIL_RX_STATUS_IRQ_IDX)
+ #define RGF_INT_GEN_TX_ICR		(0x8bc110)
+ 	#define BIT_TX_STATUS_IRQ BIT(WIL_TX_STATUS_IRQ_IDX)
++#define RGF_INT_CTRL_RX_INT_MASK	(0x8bc12c)
+ #define RGF_INT_CTRL_TX_INT_MASK	(0x8bc130)
++
+ #define RGF_INT_GEN_IDLE_TIME_LIMIT	(0x8bc134)
+ 
+ #define USER_EXT_USER_PMU_3		(0x88d00c)
+@@ -557,6 +561,17 @@ struct wil_txrx_ops {
+ 	/* RX ops */
+ 	int (*rx_init)(struct wil6210_priv *wil, u16 ring_size);
+ 	void (*rx_fini)(struct wil6210_priv *wil);
++	int (*wmi_addba_rx_resp)(struct wil6210_priv *wil, u8 mid, u8 cid,
++				 u8 tid, u8 token, u16 status, bool amsdu,
++				 u16 agg_wsize, u16 timeout);
++	void (*get_reorder_params)(struct wil6210_priv *wil,
++				   struct sk_buff *skb, int *tid, int *cid,
++				   int *mid, u16 *seq, int *mcast);
++	void (*get_netif_rx_params)(struct sk_buff *skb,
++				    int *cid, int *security);
++	int (*rx_crypto_check)(struct wil6210_priv *wil, struct sk_buff *skb);
++	bool (*is_rx_idle)(struct wil6210_priv *wil);
++	irqreturn_t (*irq_rx)(int irq, void *cookie);
+ };
+ 
+ /**
+@@ -952,6 +967,8 @@ struct wil6210_priv {
+ 	u32 rx_status_ring_order;
+ 	u32 tx_status_ring_order;
+ 	u32 rx_buff_id_count;
++	bool amsdu_en;
++	bool use_rx_hw_reordering;
+ };
+ 
+ #define wil_to_wiphy(i) (i->wiphy)
+@@ -1245,6 +1262,7 @@ void wil6210_unmask_irq_tx_edma(struct wil6210_priv *wil);
+ /* RX API */
+ void wil_rx_handle(struct wil6210_priv *wil, int *quota);
+ void wil6210_unmask_irq_rx(struct wil6210_priv *wil);
++void wil6210_unmask_irq_rx_edma(struct wil6210_priv *wil);
+ 
+ int wil_iftype_nl2wmi(enum nl80211_iftype type);
+ 
+@@ -1265,7 +1283,6 @@ bool wil_is_wmi_idle(struct wil6210_priv *wil);
+ int wmi_resume(struct wil6210_priv *wil);
+ int wmi_suspend(struct wil6210_priv *wil);
+ bool wil_is_tx_idle(struct wil6210_priv *wil);
+-bool wil_is_rx_idle(struct wil6210_priv *wil);
+ 
+ int wil_fw_copy_crash_dump(struct wil6210_priv *wil, void *dest, u32 size);
+ void wil_fw_core_dump(struct wil6210_priv *wil);
+@@ -1280,6 +1297,8 @@ int wmi_start_sched_scan(struct wil6210_priv *wil,
+ int wmi_stop_sched_scan(struct wil6210_priv *wil);
+ int wmi_mgmt_tx(struct wil6210_vif *vif, const u8 *buf, size_t len);
+ 
++int reverse_memcmp(const void *cs, const void *ct, size_t count);
++
+ /* WMI for enhanced DMA */
+ int wil_wmi_tx_sring_cfg(struct wil6210_priv *wil, int ring_id);
+ int wil_wmi_cfg_def_rx_offload(struct wil6210_priv *wil,
+@@ -1289,5 +1308,8 @@ int wil_wmi_rx_desc_ring_add(struct wil6210_priv *wil, int status_ring_id);
+ int wil_wmi_tx_desc_ring_add(struct wil6210_vif *vif, int ring_id, int cid,
+ 			     int tid);
+ int wil_wmi_bcast_desc_ring_add(struct wil6210_vif *vif, int ring_id);
++int wmi_addba_rx_resp_edma(struct wil6210_priv *wil, u8 mid, u8 cid,
++			   u8 tid, u8 token, u16 status, bool amsdu,
++			   u16 agg_wsize, u16 timeout);
+ 
+ #endif /* __WIL6210_H__ */
+diff --git a/drivers/net/wireless/ath/wil6210/wmi.c b/drivers/net/wireless/ath/wil6210/wmi.c
+index b2e966df57f5..0370b7e8dbb1 100644
+--- a/drivers/net/wireless/ath/wil6210/wmi.c
++++ b/drivers/net/wireless/ath/wil6210/wmi.c
+@@ -428,6 +428,8 @@ static const char *cmdid2name(u16 cmdid)
+ 		return "WMI_RCP_DELBA_CMD";
+ 	case WMI_RCP_ADDBA_RESP_CMDID:
+ 		return "WMI_RCP_ADDBA_RESP_CMD";
++	case WMI_RCP_ADDBA_RESP_EDMA_CMDID:
++		return "WMI_RCP_ADDBA_RESP_EDMA_CMD";
+ 	case WMI_PS_DEV_PROFILE_CFG_CMDID:
+ 		return "WMI_PS_DEV_PROFILE_CFG_CMD";
+ 	case WMI_SET_MGMT_RETRY_LIMIT_CMDID:
+@@ -2140,15 +2142,18 @@ int wmi_disconnect_sta(struct wil6210_vif *vif, const u8 *mac,
+ int wmi_addba(struct wil6210_priv *wil, u8 mid,
+ 	      u8 ringid, u8 size, u16 timeout)
+ {
++	u8 amsdu = wil->use_enhanced_dma_hw && wil->use_rx_hw_reordering &&
++		test_bit(WMI_FW_CAPABILITY_AMSDU, wil->fw_capabilities) &&
++		wil->amsdu_en;
+ 	struct wmi_ring_ba_en_cmd cmd = {
+ 		.ring_id = ringid,
+ 		.agg_max_wsize = size,
+ 		.ba_timeout = cpu_to_le16(timeout),
+-		.amsdu = 0,
++		.amsdu = amsdu,
+ 	};
+ 
+-	wil_dbg_wmi(wil, "addba: (ring %d size %d timeout %d)\n", ringid, size,
+-		    timeout);
++	wil_dbg_wmi(wil, "addba: (ring %d size %d timeout %d amsdu %d)\n",
++		    ringid, size, timeout, amsdu);
+ 
+ 	return wmi_send(wil, WMI_RING_BA_EN_CMDID, mid, &cmd, sizeof(cmd));
+ }
+@@ -2223,6 +2228,54 @@ int wmi_addba_rx_resp(struct wil6210_priv *wil,
+ 	return rc;
+ }
+ 
++int wmi_addba_rx_resp_edma(struct wil6210_priv *wil, u8 mid, u8 cid, u8 tid,
++			   u8 token, u16 status, bool amsdu, u16 agg_wsize,
++			   u16 timeout)
++{
++	int rc;
++	struct wmi_rcp_addba_resp_edma_cmd cmd = {
++		.cid = cid,
++		.tid = tid,
++		.dialog_token = token,
++		.status_code = cpu_to_le16(status),
++		/* bit 0: A-MSDU supported
++		 * bit 1: policy (should be 0 for us)
++		 * bits 2..5: TID
++		 * bits 6..15: buffer size
++		 */
++		.ba_param_set = cpu_to_le16((amsdu ? 1 : 0) | (tid << 2) |
++					    (agg_wsize << 6)),
++		.ba_timeout = cpu_to_le16(timeout),
++		/* route all the connections to status ring 0 */
++		.status_ring_id = WIL_DEFAULT_RX_STATUS_RING_ID,
++	};
++	struct {
++		struct wmi_cmd_hdr wmi;
++		struct wmi_rcp_addba_resp_sent_event evt;
++	} __packed reply = {
++		.evt = {.status = cpu_to_le16(WMI_FW_STATUS_FAILURE)},
++	};
++
++	wil_dbg_wmi(wil,
++		    "ADDBA response for CID %d TID %d size %d timeout %d status %d AMSDU%s, sring_id %d\n",
++		    cid, tid, agg_wsize, timeout, status, amsdu ? "+" : "-",
++		    WIL_DEFAULT_RX_STATUS_RING_ID);
++
++	rc = wmi_call(wil, WMI_RCP_ADDBA_RESP_EDMA_CMDID, mid, &cmd,
++		      sizeof(cmd), WMI_RCP_ADDBA_RESP_SENT_EVENTID, &reply,
++		      sizeof(reply), WIL_WMI_CALL_GENERAL_TO_MS);
++	if (rc)
++		return rc;
++
++	if (reply.evt.status) {
++		wil_err(wil, "ADDBA response failed with status %d\n",
++			le16_to_cpu(reply.evt.status));
++		rc = -EINVAL;
++	}
++
++	return rc;
++}
++
+ int wmi_ps_dev_profile_cfg(struct wil6210_priv *wil,
+ 			   enum wmi_ps_profile_type ps_profile)
+ {
+diff --git a/drivers/net/wireless/ath/wil6210/wmi.h b/drivers/net/wireless/ath/wil6210/wmi.h
+index 38e788000801..abf6f05c4801 100644
+--- a/drivers/net/wireless/ath/wil6210/wmi.h
++++ b/drivers/net/wireless/ath/wil6210/wmi.h
+@@ -86,6 +86,7 @@ enum wmi_fw_capability {
+ 	WMI_FW_CAPABILITY_PNO				= 15,
+ 	WMI_FW_CAPABILITY_REF_CLOCK_CONTROL		= 18,
+ 	WMI_FW_CAPABILITY_AP_SME_OFFLOAD_NONE		= 19,
++	WMI_FW_CAPABILITY_AMSDU				= 23,
+ 	WMI_FW_CAPABILITY_MAX,
+ };
+ 
+-- 
+2.19.2
+
