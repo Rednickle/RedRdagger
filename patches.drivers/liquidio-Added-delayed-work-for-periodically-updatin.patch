@@ -1,0 +1,200 @@
+From: Pradeep Nalla <pradeep.nalla@cavium.com>
+Date: Fri, 31 Aug 2018 17:44:07 -0700
+Subject: liquidio: Added delayed work for periodically updating the link
+ statistics.
+Patch-mainline: v4.20-rc1
+Git-commit: 35878618c92db85c4e077ada6c2c18ac79ccadb8
+References: bsc#1119406 FATE#326562
+
+Signed-off-by: Pradeep Nalla <pradeep.nalla@cavium.com>
+Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/cavium/liquidio/lio_core.c        |   24 ++++++++++++-----
+ drivers/net/ethernet/cavium/liquidio/lio_main.c        |    9 +++++-
+ drivers/net/ethernet/cavium/liquidio/lio_vf_main.c     |    8 ++++-
+ drivers/net/ethernet/cavium/liquidio/liquidio_common.h |    2 +
+ drivers/net/ethernet/cavium/liquidio/octeon_iq.h       |    3 ++
+ drivers/net/ethernet/cavium/liquidio/octeon_network.h  |    4 ++
+ 6 files changed, 40 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@ -1352,16 +1352,19 @@ octnet_nic_stats_callback(struct octeon_
+ 
+ 		resp->status = 1;
+ 	} else {
++		dev_err(&oct_dev->pci_dev->dev, "sc OPCODE_NIC_PORT_STATS command failed\n");
+ 		resp->status = -1;
+ 	}
+ }
+ 
+-int octnet_get_link_stats(struct net_device *netdev)
++void lio_fetch_stats(struct work_struct *work)
+ {
+-	struct lio *lio = GET_LIO(netdev);
++	struct cavium_wk *wk = (struct cavium_wk *)work;
++	struct lio *lio = wk->ctxptr;
+ 	struct octeon_device *oct_dev = lio->oct_dev;
+ 	struct octeon_soft_command *sc;
+ 	struct oct_nic_stats_resp *resp;
++	unsigned long time_in_jiffies;
+ 	int retval;
+ 
+ 	/* Alloc soft command */
+@@ -1371,8 +1374,10 @@ int octnet_get_link_stats(struct net_dev
+ 					  sizeof(struct oct_nic_stats_resp),
+ 					  0);
+ 
+-	if (!sc)
+-		return -ENOMEM;
++	if (!sc) {
++		dev_err(&oct_dev->pci_dev->dev, "Soft command allocation failed\n");
++		goto lio_fetch_stats_exit;
++	}
+ 
+ 	resp = (struct oct_nic_stats_resp *)sc->virtrptr;
+ 	memset(resp, 0, sizeof(struct oct_nic_stats_resp));
+@@ -1388,20 +1393,25 @@ int octnet_get_link_stats(struct net_dev
+ 	retval = octeon_send_soft_command(oct_dev, sc);
+ 	if (retval == IQ_SEND_FAILED) {
+ 		octeon_free_soft_command(oct_dev, sc);
+-		return -EINVAL;
++		goto lio_fetch_stats_exit;
+ 	}
+ 
+ 	retval = wait_for_sc_completion_timeout(oct_dev, sc,
+ 						(2 * LIO_SC_MAX_TMO_MS));
+ 	if (retval)  {
+ 		dev_err(&oct_dev->pci_dev->dev, "sc OPCODE_NIC_PORT_STATS command failed\n");
+-		return retval;
++		goto lio_fetch_stats_exit;
+ 	}
+ 
+ 	octnet_nic_stats_callback(oct_dev, sc->sc_status, sc);
+ 	WRITE_ONCE(sc->caller_is_done, true);
+ 
+-	return 0;
++lio_fetch_stats_exit:
++	time_in_jiffies = msecs_to_jiffies(LIQUIDIO_NDEV_STATS_POLL_TIME_MS);
++	if (ifstate_check(lio, LIO_IFSTATE_RUNNING))
++		schedule_delayed_work(&lio->stats_wk.work, time_in_jiffies);
++
++	return;
+ }
+ 
+ int liquidio_set_speed(struct lio *lio, int speed)
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -1841,6 +1841,12 @@ static int liquidio_open(struct net_devi
+ 	/* tell Octeon to start forwarding packets to host */
+ 	send_rx_ctrl_cmd(lio, 1);
+ 
++	/* start periodical statistics fetch */
++	INIT_DELAYED_WORK(&lio->stats_wk.work, lio_fetch_stats);
++	lio->stats_wk.ctxptr = lio;
++	schedule_delayed_work(&lio->stats_wk.work, msecs_to_jiffies
++					(LIQUIDIO_NDEV_STATS_POLL_TIME_MS));
++
+ 	dev_info(&oct->pci_dev->dev, "%s interface is opened\n",
+ 		 netdev->name);
+ 
+@@ -1881,6 +1887,8 @@ static int liquidio_stop(struct net_devi
+ 		cleanup_tx_poll_fn(netdev);
+ 	}
+ 
++	cancel_delayed_work_sync(&lio->stats_wk.work);
++
+ 	if (lio->ptp_clock) {
+ 		ptp_clock_unregister(lio->ptp_clock);
+ 		lio->ptp_clock = NULL;
+@@ -2081,7 +2089,6 @@ liquidio_get_stats64(struct net_device *
+ 	lstats->rx_packets = pkts;
+ 	lstats->rx_dropped = drop;
+ 
+-	octnet_get_link_stats(netdev);
+ 	lstats->multicast = oct->link_stats.fromwire.fw_total_mcast;
+ 	lstats->collisions = oct->link_stats.fromhost.total_collisions;
+ 
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -917,6 +917,11 @@ static int liquidio_open(struct net_devi
+ 	netif_info(lio, ifup, lio->netdev, "Interface Open, ready for traffic\n");
+ 	start_txqs(netdev);
+ 
++	INIT_DELAYED_WORK(&lio->stats_wk.work, lio_fetch_stats);
++	lio->stats_wk.ctxptr = lio;
++	schedule_delayed_work(&lio->stats_wk.work, msecs_to_jiffies
++					(LIQUIDIO_NDEV_STATS_POLL_TIME_MS));
++
+ 	/* tell Octeon to start forwarding packets to host */
+ 	send_rx_ctrl_cmd(lio, 1);
+ 
+@@ -964,6 +969,8 @@ static int liquidio_stop(struct net_devi
+ 		oct->droq[0]->ops.poll_mode = 0;
+ 	}
+ 
++	cancel_delayed_work_sync(&lio->stats_wk.work);
++
+ 	dev_info(&oct->pci_dev->dev, "%s interface is stopped\n", netdev->name);
+ 
+ 	return 0;
+@@ -1181,7 +1188,6 @@ liquidio_get_stats64(struct net_device *
+ 	lstats->rx_packets = pkts;
+ 	lstats->rx_dropped = drop;
+ 
+-	octnet_get_link_stats(netdev);
+ 	lstats->multicast = oct->link_stats.fromwire.fw_total_mcast;
+ 
+ 	/* detailed rx_errors: */
+--- a/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
++++ b/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
+@@ -250,6 +250,8 @@ static inline void add_sg_size(struct oc
+ #define   OCTNET_CMD_VLAN_FILTER_ENABLE 0x1
+ #define   OCTNET_CMD_VLAN_FILTER_DISABLE 0x0
+ 
++#define   OCTNET_CMD_FAIL 0x1
++
+ #define   SEAPI_CMD_SPEED_SET           0x2
+ #define   SEAPI_CMD_SPEED_GET           0x3
+ 
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_iq.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_iq.h
+@@ -378,6 +378,9 @@ int octeon_send_command(struct octeon_de
+ 			u32 force_db, void *cmd, void *buf,
+ 			u32 datasize, u32 reqtype);
+ 
++void octeon_dump_soft_command(struct octeon_device *oct,
++			      struct octeon_soft_command *sc);
++
+ void octeon_prepare_soft_command(struct octeon_device *oct,
+ 				 struct octeon_soft_command *sc,
+ 				 u8 opcode, u8 subcode,
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@ -42,6 +42,7 @@ struct liquidio_if_cfg_resp {
+ };
+ 
+ #define LIO_IFCFG_WAIT_TIME    3000 /* In milli seconds */
++#define LIQUIDIO_NDEV_STATS_POLL_TIME_MS 200
+ 
+ /* Structure of a node in list of gather components maintained by
+  * NIC driver for each network device.
+@@ -175,6 +176,7 @@ struct lio {
+ 	struct cavium_wq	sync_octeon_time_wq;
+ 
+ 	int netdev_uc_count;
++	struct cavium_wk stats_wk;
+ };
+ 
+ #define LIO_SIZE         (sizeof(struct lio))
+@@ -213,7 +215,7 @@ irqreturn_t liquidio_msix_intr_handler(i
+ 
+ int octeon_setup_interrupt(struct octeon_device *oct, u32 num_ioqs);
+ 
+-int octnet_get_link_stats(struct net_device *netdev);
++void lio_fetch_stats(struct work_struct *work);
+ 
+ int lio_wait_for_clean_oq(struct octeon_device *oct);
+ /**
