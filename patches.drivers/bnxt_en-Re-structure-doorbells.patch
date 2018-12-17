@@ -1,0 +1,506 @@
+From: Michael Chan <michael.chan@broadcom.com>
+Date: Sun, 14 Oct 2018 07:02:46 -0400
+Subject: bnxt_en: Re-structure doorbells.
+Patch-mainline: v4.20-rc1
+Git-commit: 697197e5a1735325c0e1ef85dde2b2986354beb9
+References: bsc#1104745 FATE#325918
+
+The 57500 series chips have a new 64-bit doorbell format.  Use a new
+bnxt_db_info structure to unify the new and the old 32-bit doorbells.
+Add a new bnxt_set_db() function to set up the doorbell addreses and
+doorbell keys ahead of time.  Modify and introduce new doorbell
+helpers to help abstract and unify the old and new doorbells.
+
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c         |  164 +++++++++++++++-------
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h         |   65 ++++++--
+ drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c |    2 
+ drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c     |    2 
+ 4 files changed, 171 insertions(+), 62 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -241,15 +241,46 @@ static bool bnxt_vf_pciid(enum board_idx
+ #define DB_CP_FLAGS		(DB_KEY_CP | DB_IDX_VALID | DB_IRQ_DIS)
+ #define DB_CP_IRQ_DIS_FLAGS	(DB_KEY_CP | DB_IRQ_DIS)
+ 
+-#define BNXT_CP_DB_REARM(db, raw_cons)					\
+-		writel(DB_CP_REARM_FLAGS | RING_CMP(raw_cons), db)
+-
+-#define BNXT_CP_DB(db, raw_cons)					\
+-		writel(DB_CP_FLAGS | RING_CMP(raw_cons), db)
+-
+ #define BNXT_CP_DB_IRQ_DIS(db)						\
+ 		writel(DB_CP_IRQ_DIS_FLAGS, db)
+ 
++#define BNXT_DB_CQ(db, idx)						\
++	writel(DB_CP_FLAGS | RING_CMP(idx), (db)->doorbell)
++
++#define BNXT_DB_NQ_P5(db, idx)						\
++	writeq((db)->db_key64 | DBR_TYPE_NQ | RING_CMP(idx), (db)->doorbell)
++
++#define BNXT_DB_CQ_ARM(db, idx)						\
++	writel(DB_CP_REARM_FLAGS | RING_CMP(idx), (db)->doorbell)
++
++#define BNXT_DB_NQ_ARM_P5(db, idx)					\
++	writeq((db)->db_key64 | DBR_TYPE_NQ_ARM | RING_CMP(idx), (db)->doorbell)
++
++static void bnxt_db_nq(struct bnxt *bp, struct bnxt_db_info *db, u32 idx)
++{
++	if (bp->flags & BNXT_FLAG_CHIP_P5)
++		BNXT_DB_NQ_P5(db, idx);
++	else
++		BNXT_DB_CQ(db, idx);
++}
++
++static void bnxt_db_nq_arm(struct bnxt *bp, struct bnxt_db_info *db, u32 idx)
++{
++	if (bp->flags & BNXT_FLAG_CHIP_P5)
++		BNXT_DB_NQ_ARM_P5(db, idx);
++	else
++		BNXT_DB_CQ_ARM(db, idx);
++}
++
++static void bnxt_db_cq(struct bnxt *bp, struct bnxt_db_info *db, u32 idx)
++{
++	if (bp->flags & BNXT_FLAG_CHIP_P5)
++		writeq(db->db_key64 | DBR_TYPE_CQ_ARMALL | RING_CMP(idx),
++		       db->doorbell);
++	else
++		BNXT_DB_CQ(db, idx);
++}
++
+ const u16 bnxt_lhint_arr[] = {
+ 	TX_BD_FLAGS_LHINT_512_AND_SMALLER,
+ 	TX_BD_FLAGS_LHINT_512_TO_1023,
+@@ -341,6 +372,7 @@ static netdev_tx_t bnxt_start_xmit(struc
+ 		struct tx_push_buffer *tx_push_buf = txr->tx_push;
+ 		struct tx_push_bd *tx_push = &tx_push_buf->push_bd;
+ 		struct tx_bd_ext *tx_push1 = &tx_push->txbd2;
++		void __iomem *db = txr->tx_db.doorbell;
+ 		void *pdata = tx_push_buf->data;
+ 		u64 *end;
+ 		int j, push_len;
+@@ -398,12 +430,11 @@ static netdev_tx_t bnxt_start_xmit(struc
+ 
+ 		push_len = (length + sizeof(*tx_push) + 7) / 8;
+ 		if (push_len > 16) {
+-			__iowrite64_copy(txr->tx_doorbell, tx_push_buf, 16);
+-			__iowrite32_copy(txr->tx_doorbell + 4, tx_push_buf + 1,
++			__iowrite64_copy(db, tx_push_buf, 16);
++			__iowrite32_copy(db + 4, tx_push_buf + 1,
+ 					 (push_len - 16) << 1);
+ 		} else {
+-			__iowrite64_copy(txr->tx_doorbell, tx_push_buf,
+-					 push_len);
++			__iowrite64_copy(db, tx_push_buf, push_len);
+ 		}
+ 
+ 		goto tx_done;
+@@ -505,7 +536,7 @@ normal_tx:
+ 	txr->tx_prod = prod;
+ 
+ 	if (!skb->xmit_more || netif_xmit_stopped(txq))
+-		bnxt_db_write(bp, txr->tx_doorbell, DB_KEY_TX | prod);
++		bnxt_db_write(bp, &txr->tx_db, prod);
+ 
+ tx_done:
+ 
+@@ -513,7 +544,7 @@ tx_done:
+ 
+ 	if (unlikely(bnxt_tx_avail(bp, txr) <= MAX_SKB_FRAGS + 1)) {
+ 		if (skb->xmit_more && !tx_buf->is_push)
+-			bnxt_db_write(bp, txr->tx_doorbell, DB_KEY_TX | prod);
++			bnxt_db_write(bp, &txr->tx_db, prod);
+ 
+ 		netif_tx_stop_queue(txq);
+ 
+@@ -1848,7 +1879,7 @@ static irqreturn_t bnxt_inta(int irq, vo
+ 	}
+ 
+ 	/* disable ring IRQ */
+-	BNXT_CP_DB_IRQ_DIS(cpr->cp_doorbell);
++	BNXT_CP_DB_IRQ_DIS(cpr->cp_db.doorbell);
+ 
+ 	/* Return here if interrupt is shared and is disabled. */
+ 	if (unlikely(atomic_read(&bp->intr_sem) != 0))
+@@ -1922,13 +1953,12 @@ static int bnxt_poll_work(struct bnxt *b
+ 
+ 	if (event & BNXT_TX_EVENT) {
+ 		struct bnxt_tx_ring_info *txr = bnapi->tx_ring;
+-		void __iomem *db = txr->tx_doorbell;
+ 		u16 prod = txr->tx_prod;
+ 
+ 		/* Sync BD data before updating doorbell */
+ 		wmb();
+ 
+-		bnxt_db_write_relaxed(bp, db, DB_KEY_TX | prod);
++		bnxt_db_write_relaxed(bp, &txr->tx_db, prod);
+ 	}
+ 
+ 	cpr->cp_raw_cons = raw_cons;
+@@ -1936,7 +1966,7 @@ static int bnxt_poll_work(struct bnxt *b
+ 	 * buffers in rx/agg rings to prevent overflowing the completion
+ 	 * ring.
+ 	 */
+-	BNXT_CP_DB(cpr->cp_doorbell, cpr->cp_raw_cons);
++	bnxt_db_cq(bp, &cpr->cp_db, cpr->cp_raw_cons);
+ 
+ 	if (tx_pkts)
+ 		bnapi->tx_int(bp, bnapi, tx_pkts);
+@@ -1944,10 +1974,9 @@ static int bnxt_poll_work(struct bnxt *b
+ 	if (event & BNXT_RX_EVENT) {
+ 		struct bnxt_rx_ring_info *rxr = bnapi->rx_ring;
+ 
+-		bnxt_db_write(bp, rxr->rx_doorbell, DB_KEY_RX | rxr->rx_prod);
++		bnxt_db_write(bp, &rxr->rx_db, rxr->rx_prod);
+ 		if (event & BNXT_AGG_EVENT)
+-			bnxt_db_write(bp, rxr->rx_agg_doorbell,
+-				      DB_KEY_RX | rxr->rx_agg_prod);
++			bnxt_db_write(bp, &rxr->rx_agg_db, rxr->rx_agg_prod);
+ 	}
+ 	return rx_pkts;
+ }
+@@ -2006,16 +2035,15 @@ static int bnxt_poll_nitroa0(struct napi
+ 	}
+ 
+ 	cpr->cp_raw_cons = raw_cons;
+-	BNXT_CP_DB(cpr->cp_doorbell, cpr->cp_raw_cons);
+-	bnxt_db_write(bp, rxr->rx_doorbell, DB_KEY_RX | rxr->rx_prod);
++	BNXT_DB_CQ(&cpr->cp_db, cpr->cp_raw_cons);
++	bnxt_db_write(bp, &rxr->rx_db, rxr->rx_prod);
+ 
+ 	if (event & BNXT_AGG_EVENT)
+-		bnxt_db_write(bp, rxr->rx_agg_doorbell,
+-			      DB_KEY_RX | rxr->rx_agg_prod);
++		bnxt_db_write(bp, &rxr->rx_agg_db, rxr->rx_agg_prod);
+ 
+ 	if (!bnxt_has_work(bp, cpr) && rx_pkts < budget) {
+ 		napi_complete_done(napi, rx_pkts);
+-		BNXT_CP_DB_REARM(cpr->cp_doorbell, cpr->cp_raw_cons);
++		BNXT_DB_CQ_ARM(&cpr->cp_db, cpr->cp_raw_cons);
+ 	}
+ 	return rx_pkts;
+ }
+@@ -2032,15 +2060,13 @@ static int bnxt_poll(struct napi_struct
+ 
+ 		if (work_done >= budget) {
+ 			if (!budget)
+-				BNXT_CP_DB_REARM(cpr->cp_doorbell,
+-						 cpr->cp_raw_cons);
++				BNXT_DB_CQ_ARM(&cpr->cp_db, cpr->cp_raw_cons);
+ 			break;
+ 		}
+ 
+ 		if (!bnxt_has_work(bp, cpr)) {
+ 			if (napi_complete_done(napi, work_done))
+-				BNXT_CP_DB_REARM(cpr->cp_doorbell,
+-						 cpr->cp_raw_cons);
++				BNXT_DB_CQ_ARM(&cpr->cp_db, cpr->cp_raw_cons);
+ 			break;
+ 		}
+ 	}
+@@ -3437,7 +3463,7 @@ static void bnxt_disable_int(struct bnxt
+ 		struct bnxt_ring_struct *ring = &cpr->cp_ring_struct;
+ 
+ 		if (ring->fw_ring_id != INVALID_HW_RING_ID)
+-			BNXT_CP_DB(cpr->cp_doorbell, cpr->cp_raw_cons);
++			bnxt_db_nq(bp, &cpr->cp_db, cpr->cp_raw_cons);
+ 	}
+ }
+ 
+@@ -3473,7 +3499,7 @@ static void bnxt_enable_int(struct bnxt
+ 		struct bnxt_napi *bnapi = bp->bnapi[i];
+ 		struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
+ 
+-		BNXT_CP_DB_REARM(cpr->cp_doorbell, cpr->cp_raw_cons);
++		bnxt_db_nq_arm(bp, &cpr->cp_db, cpr->cp_raw_cons);
+ 	}
+ }
+ 
+@@ -4468,22 +4494,64 @@ static int bnxt_hwrm_set_async_event_cr(
+ 	return rc;
+ }
+ 
++static void bnxt_set_db(struct bnxt *bp, struct bnxt_db_info *db, u32 ring_type,
++			u32 map_idx, u32 xid)
++{
++	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++		if (BNXT_PF(bp))
++			db->doorbell = bp->bar1 + 0x10000;
++		else
++			db->doorbell = bp->bar1 + 0x4000;
++		switch (ring_type) {
++		case HWRM_RING_ALLOC_TX:
++			db->db_key64 = DBR_PATH_L2 | DBR_TYPE_SQ;
++			break;
++		case HWRM_RING_ALLOC_RX:
++		case HWRM_RING_ALLOC_AGG:
++			db->db_key64 = DBR_PATH_L2 | DBR_TYPE_SRQ;
++			break;
++		case HWRM_RING_ALLOC_CMPL:
++			db->db_key64 = DBR_PATH_L2;
++			break;
++		case HWRM_RING_ALLOC_NQ:
++			db->db_key64 = DBR_PATH_L2;
++			break;
++		}
++		db->db_key64 |= (u64)xid << DBR_XID_SFT;
++	} else {
++		db->doorbell = bp->bar1 + map_idx * 0x80;
++		switch (ring_type) {
++		case HWRM_RING_ALLOC_TX:
++			db->db_key32 = DB_KEY_TX;
++			break;
++		case HWRM_RING_ALLOC_RX:
++		case HWRM_RING_ALLOC_AGG:
++			db->db_key32 = DB_KEY_RX;
++			break;
++		case HWRM_RING_ALLOC_CMPL:
++			db->db_key32 = DB_KEY_CP;
++			break;
++		}
++	}
++}
++
+ static int bnxt_hwrm_ring_alloc(struct bnxt *bp)
+ {
+ 	int i, rc = 0;
++	u32 type;
+ 
++	type = HWRM_RING_ALLOC_CMPL;
+ 	for (i = 0; i < bp->cp_nr_rings; i++) {
+ 		struct bnxt_napi *bnapi = bp->bnapi[i];
+ 		struct bnxt_cp_ring_info *cpr = &bnapi->cp_ring;
+ 		struct bnxt_ring_struct *ring = &cpr->cp_ring_struct;
+ 		u32 map_idx = ring->map_idx;
+ 
+-		cpr->cp_doorbell = bp->bar1 + map_idx * 0x80;
+-		rc = hwrm_ring_alloc_send_msg(bp, ring, HWRM_RING_ALLOC_CMPL,
+-					      map_idx);
++		rc = hwrm_ring_alloc_send_msg(bp, ring, type, map_idx);
+ 		if (rc)
+ 			goto err_out;
+-		BNXT_CP_DB(cpr->cp_doorbell, cpr->cp_raw_cons);
++		bnxt_set_db(bp, &cpr->cp_db, type, map_idx, ring->fw_ring_id);
++		bnxt_db_nq(bp, &cpr->cp_db, cpr->cp_raw_cons);
+ 		bp->grp_info[i].cp_fw_ring_id = ring->fw_ring_id;
+ 
+ 		if (!i) {
+@@ -4493,33 +4561,34 @@ static int bnxt_hwrm_ring_alloc(struct b
+ 		}
+ 	}
+ 
++	type = HWRM_RING_ALLOC_TX;
+ 	for (i = 0; i < bp->tx_nr_rings; i++) {
+ 		struct bnxt_tx_ring_info *txr = &bp->tx_ring[i];
+ 		struct bnxt_ring_struct *ring = &txr->tx_ring_struct;
+ 		u32 map_idx = i;
+ 
+-		rc = hwrm_ring_alloc_send_msg(bp, ring, HWRM_RING_ALLOC_TX,
+-					      map_idx);
++		rc = hwrm_ring_alloc_send_msg(bp, ring, type, map_idx);
+ 		if (rc)
+ 			goto err_out;
+-		txr->tx_doorbell = bp->bar1 + map_idx * 0x80;
++		bnxt_set_db(bp, &txr->tx_db, type, map_idx, ring->fw_ring_id);
+ 	}
+ 
++	type = HWRM_RING_ALLOC_RX;
+ 	for (i = 0; i < bp->rx_nr_rings; i++) {
+ 		struct bnxt_rx_ring_info *rxr = &bp->rx_ring[i];
+ 		struct bnxt_ring_struct *ring = &rxr->rx_ring_struct;
+ 		u32 map_idx = rxr->bnapi->index;
+ 
+-		rc = hwrm_ring_alloc_send_msg(bp, ring, HWRM_RING_ALLOC_RX,
+-					      map_idx);
++		rc = hwrm_ring_alloc_send_msg(bp, ring, type, map_idx);
+ 		if (rc)
+ 			goto err_out;
+-		rxr->rx_doorbell = bp->bar1 + map_idx * 0x80;
+-		writel(DB_KEY_RX | rxr->rx_prod, rxr->rx_doorbell);
++		bnxt_set_db(bp, &rxr->rx_db, type, map_idx, ring->fw_ring_id);
++		bnxt_db_write(bp, &rxr->rx_db, rxr->rx_prod);
+ 		bp->grp_info[map_idx].rx_fw_ring_id = ring->fw_ring_id;
+ 	}
+ 
+ 	if (bp->flags & BNXT_FLAG_AGG_RINGS) {
++		type = HWRM_RING_ALLOC_AGG;
+ 		for (i = 0; i < bp->rx_nr_rings; i++) {
+ 			struct bnxt_rx_ring_info *rxr = &bp->rx_ring[i];
+ 			struct bnxt_ring_struct *ring =
+@@ -4527,15 +4596,13 @@ static int bnxt_hwrm_ring_alloc(struct b
+ 			u32 grp_idx = ring->grp_idx;
+ 			u32 map_idx = grp_idx + bp->rx_nr_rings;
+ 
+-			rc = hwrm_ring_alloc_send_msg(bp, ring,
+-						      HWRM_RING_ALLOC_AGG,
+-						      map_idx);
++			rc = hwrm_ring_alloc_send_msg(bp, ring, type, map_idx);
+ 			if (rc)
+ 				goto err_out;
+ 
+-			rxr->rx_agg_doorbell = bp->bar1 + map_idx * 0x80;
+-			writel(DB_KEY_RX | rxr->rx_agg_prod,
+-			       rxr->rx_agg_doorbell);
++			bnxt_set_db(bp, &rxr->rx_agg_db, type, map_idx,
++				    ring->fw_ring_id);
++			bnxt_db_write(bp, &rxr->rx_agg_db, rxr->rx_agg_prod);
+ 			bp->grp_info[grp_idx].agg_fw_ring_id = ring->fw_ring_id;
+ 		}
+ 	}
+@@ -8439,6 +8506,9 @@ static int bnxt_init_board(struct pci_de
+ 	INIT_WORK(&bp->sp_task, bnxt_sp_task);
+ 
+ 	spin_lock_init(&bp->ntp_fltr_lock);
++#if BITS_PER_LONG == 32
++	spin_lock_init(&bp->db_lock);
++#endif
+ 
+ 	bp->rx_ring_size = BNXT_DEFAULT_RX_RING_SIZE;
+ 	bp->tx_ring_size = BNXT_DEFAULT_TX_RING_SIZE;
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -649,12 +649,20 @@ struct tx_push_buffer {
+ 	u32			data[25];
+ };
+ 
++struct bnxt_db_info {
++	void __iomem		*doorbell;
++	union {
++		u64		db_key64;
++		u32		db_key32;
++	};
++};
++
+ struct bnxt_tx_ring_info {
+ 	struct bnxt_napi	*bnapi;
+ 	u16			tx_prod;
+ 	u16			tx_cons;
+ 	u16			txq_index;
+-	void __iomem		*tx_doorbell;
++	struct bnxt_db_info	tx_db;
+ 
+ 	struct tx_bd		*tx_desc_ring[MAX_TX_PAGES];
+ 	struct bnxt_sw_tx_bd	*tx_buf_ring;
+@@ -751,8 +759,8 @@ struct bnxt_rx_ring_info {
+ 	u16			rx_agg_prod;
+ 	u16			rx_sw_agg_prod;
+ 	u16			rx_next_cons;
+-	void __iomem		*rx_doorbell;
+-	void __iomem		*rx_agg_doorbell;
++	struct bnxt_db_info	rx_db;
++	struct bnxt_db_info	rx_agg_db;
+ 
+ 	struct bpf_prog		*xdp_prog;
+ 
+@@ -780,7 +788,7 @@ struct bnxt_rx_ring_info {
+ 
+ struct bnxt_cp_ring_info {
+ 	u32			cp_raw_cons;
+-	void __iomem		*cp_doorbell;
++	struct bnxt_db_info	cp_db;
+ 
+ 	struct bnxt_coal	rx_ring_coal;
+ 	u64			rx_packets;
+@@ -836,6 +844,7 @@ struct bnxt_irq {
+ #define HWRM_RING_ALLOC_RX	0x2
+ #define HWRM_RING_ALLOC_AGG	0x4
+ #define HWRM_RING_ALLOC_CMPL	0x8
++#define HWRM_RING_ALLOC_NQ	0x10
+ 
+ #define INVALID_STATS_CTX_ID	-1
+ 
+@@ -1523,6 +1532,11 @@ struct bnxt {
+ 	struct mutex		sriov_lock;
+ #endif
+ 
++#if BITS_PER_LONG == 32
++	/* ensure atomic 64-bit doorbell writes on 32-bit systems. */
++	spinlock_t		db_lock;
++#endif
++
+ #define BNXT_NTP_FLTR_MAX_FLTR	4096
+ #define BNXT_NTP_FLTR_HASH_SIZE	512
+ #define BNXT_NTP_FLTR_HASH_MASK	(BNXT_NTP_FLTR_HASH_SIZE - 1)
+@@ -1595,21 +1609,46 @@ static inline u32 bnxt_tx_avail(struct b
+ 		((txr->tx_prod - txr->tx_cons) & bp->tx_ring_mask);
+ }
+ 
++#if BITS_PER_LONG == 32
++#define writeq(val64, db)			\
++do {						\
++	spin_lock(&bp->db_lock);		\
++	writel((val64) & 0xffffffff, db);	\
++	writel((val64) >> 32, (db) + 4);	\
++	spin_unlock(&bp->db_lock);		\
++} while (0)
++
++#define writeq_relaxed writeq
++#endif
++
+ /* For TX and RX ring doorbells with no ordering guarantee*/
+-static inline void bnxt_db_write_relaxed(struct bnxt *bp, void __iomem *db,
+-					 u32 val)
++static inline void bnxt_db_write_relaxed(struct bnxt *bp,
++					 struct bnxt_db_info *db, u32 idx)
+ {
+-	writel_relaxed(val, db);
+-	if (bp->flags & BNXT_FLAG_DOUBLE_DB)
+-		writel_relaxed(val, db);
++	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++		writeq_relaxed(db->db_key64 | idx, db->doorbell);
++	} else {
++		u32 db_val = db->db_key32 | idx;
++
++		writel_relaxed(db_val, db->doorbell);
++		if (bp->flags & BNXT_FLAG_DOUBLE_DB)
++			writel_relaxed(db_val, db->doorbell);
++	}
+ }
+ 
+ /* For TX and RX ring doorbells */
+-static inline void bnxt_db_write(struct bnxt *bp, void __iomem *db, u32 val)
++static inline void bnxt_db_write(struct bnxt *bp, struct bnxt_db_info *db,
++				 u32 idx)
+ {
+-	writel(val, db);
+-	if (bp->flags & BNXT_FLAG_DOUBLE_DB)
+-		writel(val, db);
++	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++		writeq(db->db_key64 | idx, db->doorbell);
++	} else {
++		u32 db_val = db->db_key32 | idx;
++
++		writel(db_val, db->doorbell);
++		if (bp->flags & BNXT_FLAG_DOUBLE_DB)
++			writel(db_val, db->doorbell);
++	}
+ }
+ 
+ extern const u16 bnxt_lhint_arr[];
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -2599,7 +2599,7 @@ static int bnxt_run_loopback(struct bnxt
+ 	/* Sync BD data before updating doorbell */
+ 	wmb();
+ 
+-	bnxt_db_write(bp, txr->tx_doorbell, DB_KEY_TX | txr->tx_prod);
++	bnxt_db_write(bp, &txr->tx_db, txr->tx_prod);
+ 	rc = bnxt_poll_loopback(bp, pkt_size);
+ 
+ 	dma_unmap_single(&bp->pdev->dev, map, pkt_size, PCI_DMA_TODEVICE);
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -63,7 +63,7 @@ void bnxt_tx_int_xdp(struct bnxt *bp, st
+ 		tx_buf = &txr->tx_buf_ring[last_tx_cons];
+ 		rx_prod = tx_buf->rx_prod;
+ 	}
+-	bnxt_db_write(bp, rxr->rx_doorbell, DB_KEY_RX | rx_prod);
++	bnxt_db_write(bp, &rxr->rx_db, rx_prod);
+ }
+ 
+ /* returns the following:
