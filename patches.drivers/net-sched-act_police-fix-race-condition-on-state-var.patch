@@ -1,0 +1,122 @@
+From: Davide Caratti <dcaratti@redhat.com>
+Date: Tue, 20 Nov 2018 22:18:44 +0100
+Subject: net/sched: act_police: fix race condition on state variables
+Patch-mainline: v4.20-rc4
+Git-commit: f2cbd485282014132851bf37cb2ca624a456275d
+References: bsc#1109837
+
+after 'police' configuration parameters were converted to use RCU instead
+of spinlock, the state variables used to compute the traffic rate (namely
+'tcfp_toks', 'tcfp_ptoks' and 'tcfp_t_c') are erroneously read/updated in
+the traffic path without any protection.
+
+Use a dedicated spinlock to avoid race conditions on these variables, and
+ensure proper cache-line alignment. In this way, 'police' is still faster
+than what we observed when 'tcf_lock' was used in the traffic path _ i.e.
+reverting commit 2d550dbad83c ("net/sched: act_police: don't use spinlock
+in the data path"). Moreover, we preserve the throughput improvement that
+was obtained after 'police' started using per-cpu counters, when 'avrate'
+is used instead of 'rate'.
+
+Changes since v1 (thanks to Eric Dumazet):
+- call ktime_get_ns() before acquiring the lock in the traffic path
+- use a dedicated spinlock instead of tcf_lock
+- improve cache-line usage
+
+Fixes: 2d550dbad83c ("net/sched: act_police: don't use spinlock in the data path")
+Reported-and-suggested-by: Eric Dumazet <eric.dumazet@gmail.com>
+Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ net/sched/act_police.c |   35 +++++++++++++++++++++--------------
+ 1 file changed, 21 insertions(+), 14 deletions(-)
+
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -27,10 +27,7 @@ struct tcf_police_params {
+ 	u32			tcfp_ewma_rate;
+ 	s64			tcfp_burst;
+ 	u32			tcfp_mtu;
+-	s64			tcfp_toks;
+-	s64			tcfp_ptoks;
+ 	s64			tcfp_mtu_ptoks;
+-	s64			tcfp_t_c;
+ 	struct psched_ratecfg	rate;
+ 	bool			rate_present;
+ 	struct psched_ratecfg	peak;
+@@ -41,6 +38,11 @@ struct tcf_police_params {
+ struct tcf_police {
+ 	struct tc_action	common;
+ 	struct tcf_police_params __rcu *params;
++
++	spinlock_t		tcfp_lock ____cacheline_aligned_in_smp;
++	s64			tcfp_toks;
++	s64			tcfp_ptoks;
++	s64			tcfp_t_c;
+ };
+ 
+ #define to_police(pc) ((struct tcf_police *)pc)
+@@ -186,12 +188,9 @@ static int tcf_police_init(struct net *n
+ 	}
+ 
+ 	new->tcfp_burst = PSCHED_TICKS2NS(parm->burst);
+-	new->tcfp_toks = new->tcfp_burst;
+-	if (new->peak_present) {
++	if (new->peak_present)
+ 		new->tcfp_mtu_ptoks = (s64)psched_l2t_ns(&new->peak,
+ 							 new->tcfp_mtu);
+-		new->tcfp_ptoks = new->tcfp_mtu_ptoks;
+-	}
+ 
+ 	if (tb[TCA_POLICE_AVRATE])
+ 		new->tcfp_ewma_rate = nla_get_u32(tb[TCA_POLICE_AVRATE]);
+@@ -207,7 +206,12 @@ static int tcf_police_init(struct net *n
+ 	}
+ 
+ 	spin_lock_bh(&police->tcf_lock);
+-	new->tcfp_t_c = ktime_get_ns();
++	spin_lock_bh(&police->tcfp_lock);
++	police->tcfp_t_c = ktime_get_ns();
++	police->tcfp_toks = new->tcfp_burst;
++	if (new->peak_present)
++		police->tcfp_ptoks = new->tcfp_mtu_ptoks;
++	spin_unlock_bh(&police->tcfp_lock);
+ 	police->tcf_action = parm->action;
+ 	rcu_swap_protected(police->params,
+ 			   new,
+@@ -257,25 +261,28 @@ static int tcf_police_act(struct sk_buff
+ 		}
+ 
+ 		now = ktime_get_ns();
+-		toks = min_t(s64, now - p->tcfp_t_c, p->tcfp_burst);
++		spin_lock_bh(&police->tcfp_lock);
++		toks = min_t(s64, now - police->tcfp_t_c, p->tcfp_burst);
+ 		if (p->peak_present) {
+-			ptoks = toks + p->tcfp_ptoks;
++			ptoks = toks + police->tcfp_ptoks;
+ 			if (ptoks > p->tcfp_mtu_ptoks)
+ 				ptoks = p->tcfp_mtu_ptoks;
+ 			ptoks -= (s64)psched_l2t_ns(&p->peak,
+ 						    qdisc_pkt_len(skb));
+ 		}
+-		toks += p->tcfp_toks;
++		toks += police->tcfp_toks;
+ 		if (toks > p->tcfp_burst)
+ 			toks = p->tcfp_burst;
+ 		toks -= (s64)psched_l2t_ns(&p->rate, qdisc_pkt_len(skb));
+ 		if ((toks|ptoks) >= 0) {
+-			p->tcfp_t_c = now;
+-			p->tcfp_toks = toks;
+-			p->tcfp_ptoks = ptoks;
++			police->tcfp_t_c = now;
++			police->tcfp_toks = toks;
++			police->tcfp_ptoks = ptoks;
++			spin_unlock_bh(&police->tcfp_lock);
+ 			ret = p->tcfp_result;
+ 			goto inc_drops;
+ 		}
++		spin_unlock_bh(&police->tcfp_lock);
+ 	}
+ 
+ inc_overlimits:
