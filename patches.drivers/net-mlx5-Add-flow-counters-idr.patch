@@ -1,0 +1,132 @@
+From: Vlad Buslov <vladbu@mellanox.com>
+Date: Tue, 24 Jul 2018 16:37:40 +0300
+Subject: net/mlx5: Add flow counters idr
+Patch-mainline: v4.20-rc1
+Git-commit: 12d6066c3b29c5606c4a2466f964fbd9ede803c5
+References: bsc#1103990 FATE#326006
+
+Previous patch in series changed flow counter storage structure from
+rb_tree to linked list in order to improve flow counter traversal
+performance. The drawback of such solution is that flow counter lookup by
+id becomes linear in complexity.
+
+Store pointers to flow counters in idr in order to improve lookup
+performance to logarithmic again. Idr is non-intrusive data structure and
+doesn't require extending flow counter struct with new elements. This means
+that idr can be used for lookup, while linked list from previous patch is
+used for traversal, and struct mlx5_fc size is <= 2 cache lines.
+
+Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+Acked-by: Amir Vadai <amir@vadai.me>
+Reviewed-by: Paul Blakey <paulb@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c |   37 ++++++++++++++++--
+ include/linux/mlx5/driver.h                           |    2 
+ 2 files changed, 35 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+@@ -77,13 +77,18 @@ static struct list_head *mlx5_fc_counter
+ 						      u32 id)
+ {
+ 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
++	unsigned long next_id = (unsigned long)id + 1;
+ 	struct mlx5_fc *counter;
+ 
+-	list_for_each_entry(counter, &fc_stats->counters, list)
+-		if (counter->id > id)
+-			return &counter->list;
++	rcu_read_lock();
++	/* skip counters that are in idr, but not yet in counters list */
++	while ((counter = idr_get_next_ul(&fc_stats->counters_idr,
++					  &next_id)) != NULL &&
++	       list_empty(&counter->list))
++		next_id++;
++	rcu_read_unlock();
+ 
+-	return &fc_stats->counters;
++	return counter ? &counter->list : &fc_stats->counters;
+ }
+ 
+ static void mlx5_fc_stats_insert(struct mlx5_core_dev *dev,
+@@ -214,15 +219,29 @@ struct mlx5_fc *mlx5_fc_create(struct ml
+ 	counter = kzalloc(sizeof(*counter), GFP_KERNEL);
+ 	if (!counter)
+ 		return ERR_PTR(-ENOMEM);
++	INIT_LIST_HEAD(&counter->list);
+ 
+ 	err = mlx5_cmd_fc_alloc(dev, &counter->id);
+ 	if (err)
+ 		goto err_out;
+ 
+ 	if (aging) {
++		u32 id = counter->id;
++
+ 		counter->cache.lastuse = jiffies;
+ 		counter->aging = true;
+ 
++		idr_preload(GFP_KERNEL);
++		spin_lock(&fc_stats->counters_idr_lock);
++
++		err = idr_alloc_u32(&fc_stats->counters_idr, counter, &id, id,
++				    GFP_NOWAIT);
++
++		spin_unlock(&fc_stats->counters_idr_lock);
++		idr_preload_end();
++		if (err)
++			goto err_out_alloc;
++
+ 		llist_add(&counter->addlist, &fc_stats->addlist);
+ 
+ 		mod_delayed_work(fc_stats->wq, &fc_stats->work, 0);
+@@ -230,6 +249,8 @@ struct mlx5_fc *mlx5_fc_create(struct ml
+ 
+ 	return counter;
+ 
++err_out_alloc:
++	mlx5_cmd_fc_free(dev, counter->id);
+ err_out:
+ 	kfree(counter);
+ 
+@@ -245,6 +266,10 @@ void mlx5_fc_destroy(struct mlx5_core_de
+ 		return;
+ 
+ 	if (counter->aging) {
++		spin_lock(&fc_stats->counters_idr_lock);
++		WARN_ON(!idr_remove(&fc_stats->counters_idr, counter->id));
++		spin_unlock(&fc_stats->counters_idr_lock);
++
+ 		llist_add(&counter->dellist, &fc_stats->dellist);
+ 		mod_delayed_work(fc_stats->wq, &fc_stats->work, 0);
+ 		return;
+@@ -258,6 +283,8 @@ int mlx5_init_fc_stats(struct mlx5_core_
+ {
+ 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
+ 
++	spin_lock_init(&fc_stats->counters_idr_lock);
++	idr_init(&fc_stats->counters_idr);
+ 	INIT_LIST_HEAD(&fc_stats->counters);
+ 	init_llist_head(&fc_stats->addlist);
+ 	init_llist_head(&fc_stats->dellist);
+@@ -283,6 +310,8 @@ void mlx5_cleanup_fc_stats(struct mlx5_c
+ 	destroy_workqueue(dev->priv.fc_stats.wq);
+ 	dev->priv.fc_stats.wq = NULL;
+ 
++	idr_destroy(&fc_stats->counters_idr);
++
+ 	tmplist = llist_del_all(&fc_stats->addlist);
+ 	llist_for_each_entry_safe(counter, tmp, tmplist, addlist)
+ 		mlx5_free_fc(dev, counter);
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -583,6 +583,8 @@ struct mlx5_irq_info {
+ };
+ 
+ struct mlx5_fc_stats {
++	spinlock_t counters_idr_lock; /* protects counters_idr */
++	struct idr counters_idr;
+ 	struct list_head counters;
+ 	struct llist_head addlist;
+ 	struct llist_head dellist;
