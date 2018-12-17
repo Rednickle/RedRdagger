@@ -1,0 +1,609 @@
+From: Weilin Chang <weilin.chang@cavium.com>
+Date: Fri, 4 May 2018 11:07:19 -0700
+Subject: liquidio: support use of ethtool to set link speed of CN23XX-225
+ cards
+Patch-mainline: v4.18-rc1
+Git-commit: 18b338f5f9539512e76fd9ebd4c6ca1a0e159e2b
+References: bsc#1119406 FATE#326562
+
+Support setting the link speed of CN23XX-225 cards (which can do 25Gbps or
+10Gbps) via ethtool_ops.set_link_ksettings.
+
+Also fix the function assigned to ethtool_ops.get_link_ksettings to use the
+new link_ksettings api completely (instead of partially via
+ethtool_convert_legacy_u32_to_link_mode).
+
+Signed-off-by: Weilin Chang <weilin.chang@cavium.com>
+Acked-by: Raghu Vatsavayi <raghu.vatsavayi@cavium.com>
+Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/cavium/liquidio/lio_core.c        |  196 +++++++++++++++++
+ drivers/net/ethernet/cavium/liquidio/lio_ethtool.c     |  195 ++++++++++++++--
+ drivers/net/ethernet/cavium/liquidio/lio_main.c        |   20 +
+ drivers/net/ethernet/cavium/liquidio/lio_vf_main.c     |    5 
+ drivers/net/ethernet/cavium/liquidio/liquidio_common.h |    4 
+ drivers/net/ethernet/cavium/liquidio/octeon_device.h   |   14 +
+ drivers/net/ethernet/cavium/liquidio/octeon_network.h  |   15 +
+ 7 files changed, 425 insertions(+), 24 deletions(-)
+
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@ -1481,3 +1481,199 @@ int octnet_get_link_stats(struct net_dev
+ 
+ 	return 0;
+ }
++
++static void liquidio_nic_seapi_ctl_callback(struct octeon_device *oct,
++					    u32 status,
++					    void *buf)
++{
++	struct liquidio_nic_seapi_ctl_context *ctx;
++	struct octeon_soft_command *sc = buf;
++
++	ctx = sc->ctxptr;
++
++	oct = lio_get_device(ctx->octeon_id);
++	if (status) {
++		dev_err(&oct->pci_dev->dev, "%s: instruction failed. Status: %llx\n",
++			__func__,
++			CVM_CAST64(status));
++	}
++	ctx->status = status;
++	complete(&ctx->complete);
++}
++
++int liquidio_set_speed(struct lio *lio, int speed)
++{
++	struct liquidio_nic_seapi_ctl_context *ctx;
++	struct octeon_device *oct = lio->oct_dev;
++	struct oct_nic_seapi_resp *resp;
++	struct octeon_soft_command *sc;
++	union octnet_cmd *ncmd;
++	u32 ctx_size;
++	int retval;
++	u32 var;
++
++	if (oct->speed_setting == speed)
++		return 0;
++
++	if (!OCTEON_CN23XX_PF(oct)) {
++		dev_err(&oct->pci_dev->dev, "%s: SET SPEED only for PF\n",
++			__func__);
++		return -EOPNOTSUPP;
++	}
++
++	ctx_size = sizeof(struct liquidio_nic_seapi_ctl_context);
++	sc = octeon_alloc_soft_command(oct, OCTNET_CMD_SIZE,
++				       sizeof(struct oct_nic_seapi_resp),
++				       ctx_size);
++	if (!sc)
++		return -ENOMEM;
++
++	ncmd = sc->virtdptr;
++	ctx  = sc->ctxptr;
++	resp = sc->virtrptr;
++	memset(resp, 0, sizeof(struct oct_nic_seapi_resp));
++
++	ctx->octeon_id = lio_get_device_id(oct);
++	ctx->status = 0;
++	init_completion(&ctx->complete);
++
++	ncmd->u64 = 0;
++	ncmd->s.cmd = SEAPI_CMD_SPEED_SET;
++	ncmd->s.param1 = speed;
++
++	octeon_swap_8B_data((u64 *)ncmd, (OCTNET_CMD_SIZE >> 3));
++
++	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
++
++	octeon_prepare_soft_command(oct, sc, OPCODE_NIC,
++				    OPCODE_NIC_UBOOT_CTL, 0, 0, 0);
++
++	sc->callback = liquidio_nic_seapi_ctl_callback;
++	sc->callback_arg = sc;
++	sc->wait_time = 5000;
++
++	retval = octeon_send_soft_command(oct, sc);
++	if (retval == IQ_SEND_FAILED) {
++		dev_info(&oct->pci_dev->dev, "Failed to send soft command\n");
++		retval = -EBUSY;
++	} else {
++		/* Wait for response or timeout */
++		if (wait_for_completion_timeout(&ctx->complete,
++						msecs_to_jiffies(10000)) == 0) {
++			dev_err(&oct->pci_dev->dev, "%s: sc timeout\n",
++				__func__);
++			octeon_free_soft_command(oct, sc);
++			return -EINTR;
++		}
++
++		retval = resp->status;
++
++		if (retval) {
++			dev_err(&oct->pci_dev->dev, "%s failed, retval=%d\n",
++				__func__, retval);
++			octeon_free_soft_command(oct, sc);
++			return -EIO;
++		}
++
++		var = be32_to_cpu((__force __be32)resp->speed);
++		if (var != speed) {
++			dev_err(&oct->pci_dev->dev,
++				"%s: setting failed speed= %x, expect %x\n",
++				__func__, var, speed);
++		}
++
++		oct->speed_setting = var;
++	}
++
++	octeon_free_soft_command(oct, sc);
++
++	return retval;
++}
++
++int liquidio_get_speed(struct lio *lio)
++{
++	struct liquidio_nic_seapi_ctl_context *ctx;
++	struct octeon_device *oct = lio->oct_dev;
++	struct oct_nic_seapi_resp *resp;
++	struct octeon_soft_command *sc;
++	union octnet_cmd *ncmd;
++	u32 ctx_size;
++	int retval;
++
++	ctx_size = sizeof(struct liquidio_nic_seapi_ctl_context);
++	sc = octeon_alloc_soft_command(oct, OCTNET_CMD_SIZE,
++				       sizeof(struct oct_nic_seapi_resp),
++				       ctx_size);
++	if (!sc)
++		return -ENOMEM;
++
++	ncmd = sc->virtdptr;
++	ctx  = sc->ctxptr;
++	resp = sc->virtrptr;
++	memset(resp, 0, sizeof(struct oct_nic_seapi_resp));
++
++	ctx->octeon_id = lio_get_device_id(oct);
++	ctx->status = 0;
++	init_completion(&ctx->complete);
++
++	ncmd->u64 = 0;
++	ncmd->s.cmd = SEAPI_CMD_SPEED_GET;
++
++	octeon_swap_8B_data((u64 *)ncmd, (OCTNET_CMD_SIZE >> 3));
++
++	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
++
++	octeon_prepare_soft_command(oct, sc, OPCODE_NIC,
++				    OPCODE_NIC_UBOOT_CTL, 0, 0, 0);
++
++	sc->callback = liquidio_nic_seapi_ctl_callback;
++	sc->callback_arg = sc;
++	sc->wait_time = 5000;
++
++	retval = octeon_send_soft_command(oct, sc);
++	if (retval == IQ_SEND_FAILED) {
++		dev_info(&oct->pci_dev->dev, "Failed to send soft command\n");
++		oct->no_speed_setting = 1;
++		oct->speed_setting = 25;
++
++		retval = -EBUSY;
++	} else {
++		if (wait_for_completion_timeout(&ctx->complete,
++						msecs_to_jiffies(10000)) == 0) {
++			dev_err(&oct->pci_dev->dev, "%s: sc timeout\n",
++				__func__);
++
++			oct->speed_setting = 25;
++			oct->no_speed_setting = 1;
++
++			octeon_free_soft_command(oct, sc);
++
++			return -EINTR;
++		}
++		retval = resp->status;
++		if (retval) {
++			dev_err(&oct->pci_dev->dev,
++				"%s failed retval=%d\n", __func__, retval);
++			oct->no_speed_setting = 1;
++			oct->speed_setting = 25;
++			octeon_free_soft_command(oct, sc);
++			retval = -EIO;
++		} else {
++			u32 var;
++
++			var = be32_to_cpu((__force __be32)resp->speed);
++			oct->speed_setting = var;
++			if (var == 0xffff) {
++				oct->no_speed_setting = 1;
++				/* unable to access boot variables
++				 * get the default value based on the NIC type
++				 */
++				oct->speed_setting = 25;
++			}
++		}
++	}
++
++	octeon_free_soft_command(oct, sc);
++
++	return retval;
++}
+--- a/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
+@@ -230,44 +230,145 @@ static int lio_get_link_ksettings(struct
+ 	struct lio *lio = GET_LIO(netdev);
+ 	struct octeon_device *oct = lio->oct_dev;
+ 	struct oct_link_info *linfo;
+-	u32 supported = 0, advertising = 0;
+ 
+ 	linfo = &lio->linfo;
+ 
++	ethtool_link_ksettings_zero_link_mode(ecmd, supported);
++	ethtool_link_ksettings_zero_link_mode(ecmd, advertising);
++
+ 	switch (linfo->link.s.phy_type) {
+ 	case LIO_PHY_PORT_TP:
+ 		ecmd->base.port = PORT_TP;
+-		supported = (SUPPORTED_10000baseT_Full |
+-			     SUPPORTED_TP | SUPPORTED_Pause);
+-		advertising = (ADVERTISED_10000baseT_Full | ADVERTISED_Pause);
+ 		ecmd->base.autoneg = AUTONEG_DISABLE;
++		ethtool_link_ksettings_add_link_mode(ecmd, supported, TP);
++		ethtool_link_ksettings_add_link_mode(ecmd, supported, Pause);
++		ethtool_link_ksettings_add_link_mode(ecmd, supported,
++						     10000baseT_Full);
++
++		ethtool_link_ksettings_add_link_mode(ecmd, advertising, Pause);
++		ethtool_link_ksettings_add_link_mode(ecmd, advertising,
++						     10000baseT_Full);
++
+ 		break;
+ 
+ 	case LIO_PHY_PORT_FIBRE:
+-		ecmd->base.port = PORT_FIBRE;
+-
+-		if (linfo->link.s.speed == SPEED_10000) {
+-			supported = SUPPORTED_10000baseT_Full;
+-			advertising = ADVERTISED_10000baseT_Full;
++		if (linfo->link.s.if_mode == INTERFACE_MODE_XAUI ||
++		    linfo->link.s.if_mode == INTERFACE_MODE_RXAUI ||
++		    linfo->link.s.if_mode == INTERFACE_MODE_XLAUI ||
++		    linfo->link.s.if_mode == INTERFACE_MODE_XFI) {
++			dev_dbg(&oct->pci_dev->dev, "ecmd->base.transceiver is XCVR_EXTERNAL\n");
++		} else {
++			dev_err(&oct->pci_dev->dev, "Unknown link interface mode: %d\n",
++				linfo->link.s.if_mode);
+ 		}
+ 
+-		supported |= SUPPORTED_FIBRE | SUPPORTED_Pause;
+-		advertising |= ADVERTISED_Pause;
++		ecmd->base.port = PORT_FIBRE;
+ 		ecmd->base.autoneg = AUTONEG_DISABLE;
+-		break;
+-	}
++		ethtool_link_ksettings_add_link_mode(ecmd, supported, FIBRE);
+ 
+-	if (linfo->link.s.if_mode == INTERFACE_MODE_XAUI ||
+-	    linfo->link.s.if_mode == INTERFACE_MODE_RXAUI ||
+-	    linfo->link.s.if_mode == INTERFACE_MODE_XLAUI ||
+-	    linfo->link.s.if_mode == INTERFACE_MODE_XFI) {
+-		ethtool_convert_legacy_u32_to_link_mode(
+-			ecmd->link_modes.supported, supported);
+-		ethtool_convert_legacy_u32_to_link_mode(
+-			ecmd->link_modes.advertising, advertising);
+-	} else {
+-		dev_err(&oct->pci_dev->dev, "Unknown link interface reported %d\n",
+-			linfo->link.s.if_mode);
++		ethtool_link_ksettings_add_link_mode(ecmd, supported, Pause);
++		ethtool_link_ksettings_add_link_mode(ecmd, advertising, Pause);
++		if (oct->subsystem_id == OCTEON_CN2350_25GB_SUBSYS_ID ||
++		    oct->subsystem_id == OCTEON_CN2360_25GB_SUBSYS_ID) {
++			if (OCTEON_CN23XX_PF(oct)) {
++				ethtool_link_ksettings_add_link_mode
++					(ecmd, supported, 25000baseSR_Full);
++				ethtool_link_ksettings_add_link_mode
++					(ecmd, supported, 25000baseKR_Full);
++				ethtool_link_ksettings_add_link_mode
++					(ecmd, supported, 25000baseCR_Full);
++
++				if (oct->no_speed_setting == 0)  {
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 10000baseSR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 10000baseKR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 10000baseCR_Full);
++				}
++
++				if (oct->no_speed_setting == 0)
++					liquidio_get_speed(lio);
++				else
++					oct->speed_setting = 25;
++
++				if (oct->speed_setting == 10) {
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 10000baseSR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 10000baseKR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 10000baseCR_Full);
++				}
++				if (oct->speed_setting == 25) {
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 25000baseSR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 25000baseKR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 25000baseCR_Full);
++				}
++			} else { /* VF */
++				if (linfo->link.s.speed == 10000) {
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 10000baseSR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 10000baseKR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 10000baseCR_Full);
++
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 10000baseSR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 10000baseKR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 10000baseCR_Full);
++				}
++
++				if (linfo->link.s.speed == 25000) {
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 25000baseSR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 25000baseKR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, supported,
++						 25000baseCR_Full);
++
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 25000baseSR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 25000baseKR_Full);
++					ethtool_link_ksettings_add_link_mode
++						(ecmd, advertising,
++						 25000baseCR_Full);
++				}
++			}
++		} else {
++			ethtool_link_ksettings_add_link_mode(ecmd, supported,
++							     10000baseT_Full);
++			ethtool_link_ksettings_add_link_mode(ecmd, advertising,
++							     10000baseT_Full);
++		}
++		break;
+ 	}
+ 
+ 	if (linfo->link.s.link_up) {
+@@ -281,6 +382,51 @@ static int lio_get_link_ksettings(struct
+ 	return 0;
+ }
+ 
++static int lio_set_link_ksettings(struct net_device *netdev,
++				  const struct ethtool_link_ksettings *ecmd)
++{
++	const int speed = ecmd->base.speed;
++	struct lio *lio = GET_LIO(netdev);
++	struct oct_link_info *linfo;
++	struct octeon_device *oct;
++	u32 is25G = 0;
++
++	oct = lio->oct_dev;
++
++	linfo = &lio->linfo;
++
++	if (oct->subsystem_id == OCTEON_CN2350_25GB_SUBSYS_ID ||
++	    oct->subsystem_id == OCTEON_CN2360_25GB_SUBSYS_ID) {
++		is25G = 1;
++	} else {
++		return -EOPNOTSUPP;
++	}
++
++	if (oct->no_speed_setting) {
++		dev_err(&oct->pci_dev->dev, "%s: Changing speed is not supported\n",
++			__func__);
++		return -EOPNOTSUPP;
++	}
++
++	if ((ecmd->base.duplex != DUPLEX_UNKNOWN &&
++	     ecmd->base.duplex != linfo->link.s.duplex) ||
++	     ecmd->base.autoneg != AUTONEG_DISABLE ||
++	    (ecmd->base.speed != 10000 && ecmd->base.speed != 25000 &&
++	     ecmd->base.speed != SPEED_UNKNOWN))
++		return -EOPNOTSUPP;
++
++	if ((oct->speed_boot == speed / 1000) &&
++	    oct->speed_boot == oct->speed_setting)
++		return 0;
++
++	liquidio_set_speed(lio, speed / 1000);
++
++	dev_dbg(&oct->pci_dev->dev, "Port speed is set to %dG\n",
++		oct->speed_setting);
++
++	return 0;
++}
++
+ static void
+ lio_get_drvinfo(struct net_device *netdev, struct ethtool_drvinfo *drvinfo)
+ {
+@@ -2966,6 +3112,7 @@ static int lio_set_priv_flags(struct net
+ 
+ static const struct ethtool_ops lio_ethtool_ops = {
+ 	.get_link_ksettings	= lio_get_link_ksettings,
++	.set_link_ksettings	= lio_set_link_ksettings,
+ 	.get_link		= ethtool_op_get_link,
+ 	.get_drvinfo		= lio_get_drvinfo,
+ 	.get_ringparam		= lio_ethtool_get_ringparam,
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -912,6 +912,9 @@ liquidio_probe(struct pci_dev *pdev,
+ 	/* set linux specific device pointer */
+ 	oct_dev->pci_dev = (void *)pdev;
+ 
++	oct_dev->subsystem_id = pdev->subsystem_vendor |
++		(pdev->subsystem_device << 16);
++
+ 	hs = &handshake[oct_dev->octeon_id];
+ 	init_completion(&hs->init);
+ 	init_completion(&hs->started);
+@@ -3664,6 +3667,23 @@ static int setup_nic_devices(struct octe
+ 			"NIC ifidx:%d Setup successful\n", i);
+ 
+ 		octeon_free_soft_command(octeon_dev, sc);
++
++		if (octeon_dev->subsystem_id ==
++			OCTEON_CN2350_25GB_SUBSYS_ID ||
++		    octeon_dev->subsystem_id ==
++			OCTEON_CN2360_25GB_SUBSYS_ID) {
++			liquidio_get_speed(lio);
++
++			if (octeon_dev->speed_setting == 0) {
++				octeon_dev->speed_setting = 25;
++				octeon_dev->no_speed_setting = 1;
++			}
++		} else {
++			octeon_dev->no_speed_setting = 1;
++			octeon_dev->speed_setting = 10;
++		}
++		octeon_dev->speed_boot = octeon_dev->speed_setting;
++
+ 	}
+ 
+ 	devlink = devlink_alloc(&liquidio_devlink_ops,
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -411,6 +411,9 @@ liquidio_vf_probe(struct pci_dev *pdev,
+ 	/* set linux specific device pointer */
+ 	oct_dev->pci_dev = pdev;
+ 
++	oct_dev->subsystem_id = pdev->subsystem_vendor |
++		(pdev->subsystem_device << 16);
++
+ 	if (octeon_device_init(oct_dev)) {
+ 		liquidio_vf_remove(pdev);
+ 		return -ENOMEM;
+@@ -2199,6 +2202,8 @@ static int setup_nic_devices(struct octe
+ 			"NIC ifidx:%d Setup successful\n", i);
+ 
+ 		octeon_free_soft_command(octeon_dev, sc);
++
++		octeon_dev->no_speed_setting = 1;
+ 	}
+ 
+ 	return 0;
+--- a/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
++++ b/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
+@@ -93,6 +93,7 @@ enum octeon_tag_type {
+ 
+ #define OPCODE_NIC_VF_REP_PKT          0x15
+ #define OPCODE_NIC_VF_REP_CMD          0x16
++#define OPCODE_NIC_UBOOT_CTL           0x17
+ 
+ #define CORE_DRV_TEST_SCATTER_OP    0xFFF5
+ 
+@@ -249,6 +250,9 @@ static inline void add_sg_size(struct oc
+ #define   OCTNET_CMD_VLAN_FILTER_ENABLE 0x1
+ #define   OCTNET_CMD_VLAN_FILTER_DISABLE 0x0
+ 
++#define   SEAPI_CMD_SPEED_SET           0x2
++#define   SEAPI_CMD_SPEED_GET           0x3
++
+ #define   LIO_CMD_WAIT_TM 100
+ 
+ /* RX(packets coming from wire) Checksum verification flags */
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_device.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_device.h
+@@ -43,6 +43,13 @@
+ #define  OCTEON_CN23XX_REV_1_1        0x01
+ #define  OCTEON_CN23XX_REV_2_0        0x80
+ 
++/**SubsystemId for the chips */
++#define	 OCTEON_CN2350_10GB_SUBSYS_ID_1	0X3177d
++#define	 OCTEON_CN2350_10GB_SUBSYS_ID_2	0X4177d
++#define	 OCTEON_CN2360_10GB_SUBSYS_ID	0X5177d
++#define	 OCTEON_CN2350_25GB_SUBSYS_ID	0X7177d
++#define	 OCTEON_CN2360_25GB_SUBSYS_ID	0X6177d
++
+ /** Endian-swap modes supported by Octeon. */
+ enum octeon_pci_swap_mode {
+ 	OCTEON_PCI_PASSTHROUGH = 0,
+@@ -430,6 +437,8 @@ struct octeon_device {
+ 
+ 	u16 rev_id;
+ 
++	u32 subsystem_id;
++
+ 	u16 pf_num;
+ 
+ 	u16 vf_num;
+@@ -584,6 +593,11 @@ struct octeon_device {
+ 	struct lio_vf_rep_list vf_rep_list;
+ 	struct devlink *devlink;
+ 	enum devlink_eswitch_mode eswitch_mode;
++
++	/* for 25G NIC speed change */
++	u8  speed_boot;
++	u8  speed_setting;
++	u8  no_speed_setting;
+ };
+ 
+ #define  OCT_DRV_ONLINE 1
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@ -81,6 +81,18 @@ struct oct_nic_stats_ctrl {
+ 	struct net_device *netdev;
+ };
+ 
++struct oct_nic_seapi_resp {
++	u64 rh;
++	u32 speed;
++	u64 status;
++};
++
++struct liquidio_nic_seapi_ctl_context {
++	int octeon_id;
++	u32 status;
++	struct completion complete;
++};
++
+ /** LiquidIO per-interface network private data */
+ struct lio {
+ 	/** State of the interface. Rx/Tx happens only in the RUNNING state.  */
+@@ -230,6 +242,9 @@ void lio_delete_glists(struct lio *lio);
+ 
+ int lio_setup_glists(struct octeon_device *oct, struct lio *lio, int num_qs);
+ 
++int liquidio_get_speed(struct lio *lio);
++int liquidio_set_speed(struct lio *lio, int speed);
++
+ /**
+  * \brief Net device change_mtu
+  * @param netdev network device
