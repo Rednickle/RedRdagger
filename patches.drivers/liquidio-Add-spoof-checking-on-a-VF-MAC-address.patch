@@ -1,0 +1,381 @@
+From: Weilin Chang <weilin.chang@cavium.com>
+Date: Wed, 5 Sep 2018 18:40:56 -0700
+Subject: liquidio: Add spoof checking on a VF MAC address
+Patch-mainline: v4.20-rc1
+Git-commit: 488752220b4a73ae131ca3e7c0c83b9f1bf092e4
+References: bsc#1119406 FATE#326562
+
+1. Provide the API to set/unset the spoof checking feature.
+2. Add a function to periodically provide the count of found
+   packets with spoof VF MAC address.
+3. Prevent VF MAC address changing while the spoofchk of the VF is
+   on unless the changing MAC address is issued from PF.
+
+Signed-off-by: Weilin Chang <weilin.chang@cavium.com>
+Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/cavium/liquidio/lio_core.c        |   74 +++++++++++++++++
+ drivers/net/ethernet/cavium/liquidio/lio_ethtool.c     |    3 
+ drivers/net/ethernet/cavium/liquidio/lio_main.c        |   63 ++++++++++++++
+ drivers/net/ethernet/cavium/liquidio/lio_vf_main.c     |    8 +
+ drivers/net/ethernet/cavium/liquidio/liquidio_common.h |   24 ++++-
+ drivers/net/ethernet/cavium/liquidio/octeon_device.h   |    5 +
+ drivers/net/ethernet/cavium/liquidio/octeon_network.h  |    6 +
+ drivers/net/ethernet/cavium/liquidio/octeon_nic.c      |   16 ++-
+ 8 files changed, 187 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@ -1357,6 +1357,69 @@ octnet_nic_stats_callback(struct octeon_
+ 	}
+ }
+ 
++int lio_fetch_vf_stats(struct lio *lio)
++{
++	struct octeon_device *oct_dev = lio->oct_dev;
++	struct octeon_soft_command *sc;
++	struct oct_nic_vf_stats_resp *resp;
++
++	int retval;
++
++	/* Alloc soft command */
++	sc = (struct octeon_soft_command *)
++		octeon_alloc_soft_command(oct_dev,
++					  0,
++					  sizeof(struct oct_nic_vf_stats_resp),
++					  0);
++
++	if (!sc) {
++		dev_err(&oct_dev->pci_dev->dev, "Soft command allocation failed\n");
++		retval = -ENOMEM;
++		goto lio_fetch_vf_stats_exit;
++	}
++
++	resp = (struct oct_nic_vf_stats_resp *)sc->virtrptr;
++	memset(resp, 0, sizeof(struct oct_nic_vf_stats_resp));
++
++	init_completion(&sc->complete);
++	sc->sc_status = OCTEON_REQUEST_PENDING;
++
++	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
++
++	octeon_prepare_soft_command(oct_dev, sc, OPCODE_NIC,
++				    OPCODE_NIC_VF_PORT_STATS, 0, 0, 0);
++
++	retval = octeon_send_soft_command(oct_dev, sc);
++	if (retval == IQ_SEND_FAILED) {
++		octeon_free_soft_command(oct_dev, sc);
++		goto lio_fetch_vf_stats_exit;
++	}
++
++	retval =
++		wait_for_sc_completion_timeout(oct_dev, sc,
++					       (2 * LIO_SC_MAX_TMO_MS));
++	if (retval)  {
++		dev_err(&oct_dev->pci_dev->dev,
++			"sc OPCODE_NIC_VF_PORT_STATS command failed\n");
++		goto lio_fetch_vf_stats_exit;
++	}
++
++	if (sc->sc_status != OCTEON_REQUEST_TIMEOUT && !resp->status) {
++		octeon_swap_8B_data((u64 *)&resp->spoofmac_cnt,
++				    (sizeof(u64)) >> 3);
++
++		if (resp->spoofmac_cnt != 0) {
++			dev_warn(&oct_dev->pci_dev->dev,
++				 "%llu Spoofed packets detected\n",
++				 resp->spoofmac_cnt);
++		}
++	}
++	WRITE_ONCE(sc->caller_is_done, 1);
++
++lio_fetch_vf_stats_exit:
++	return retval;
++}
++
+ void lio_fetch_stats(struct work_struct *work)
+ {
+ 	struct cavium_wk *wk = (struct cavium_wk *)work;
+@@ -1367,6 +1430,17 @@ void lio_fetch_stats(struct work_struct
+ 	unsigned long time_in_jiffies;
+ 	int retval;
+ 
++	if (OCTEON_CN23XX_PF(oct_dev)) {
++		/* report spoofchk every 2 seconds */
++		if (!(oct_dev->vfstats_poll % LIO_VFSTATS_POLL) &&
++		    (oct_dev->fw_info.app_cap_flags & LIQUIDIO_SPOOFCHK_CAP) &&
++		    oct_dev->sriov_info.num_vfs_alloced) {
++			lio_fetch_vf_stats(lio);
++		}
++
++		oct_dev->vfstats_poll++;
++	}
++
+ 	/* Alloc soft command */
+ 	sc = (struct octeon_soft_command *)
+ 		octeon_alloc_soft_command(oct_dev,
+--- a/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
+@@ -1713,7 +1713,8 @@ static void lio_vf_get_ethtool_stats(str
+ 	  */
+ 	data[i++] = lstats.rx_dropped;
+ 	/* sum of oct->instr_queue[iq_no]->stats.tx_dropped */
+-	data[i++] = lstats.tx_dropped;
++	data[i++] = lstats.tx_dropped +
++		oct_dev->link_stats.fromhost.fw_err_drop;
+ 
+ 	data[i++] = oct_dev->link_stats.fromwire.fw_total_mcast;
+ 	data[i++] = oct_dev->link_stats.fromhost.fw_total_mcast_sent;
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -2858,6 +2858,62 @@ static int liquidio_set_vf_mac(struct ne
+ 	return retval;
+ }
+ 
++static int liquidio_set_vf_spoofchk(struct net_device *netdev, int vfidx,
++				    bool enable)
++{
++	struct lio *lio = GET_LIO(netdev);
++	struct octeon_device *oct = lio->oct_dev;
++	struct octnic_ctrl_pkt nctrl;
++	int retval;
++
++	if (!(oct->fw_info.app_cap_flags & LIQUIDIO_SPOOFCHK_CAP)) {
++		netif_info(lio, drv, lio->netdev,
++			   "firmware does not support spoofchk\n");
++		return -EOPNOTSUPP;
++	}
++
++	if (vfidx < 0 || vfidx >= oct->sriov_info.num_vfs_alloced) {
++		netif_info(lio, drv, lio->netdev, "Invalid vfidx %d\n", vfidx);
++		return -EINVAL;
++	}
++
++	if (enable) {
++		if (oct->sriov_info.vf_spoofchk[vfidx])
++			return 0;
++	} else {
++		/* Clear */
++		if (!oct->sriov_info.vf_spoofchk[vfidx])
++			return 0;
++	}
++
++	memset(&nctrl, 0, sizeof(struct octnic_ctrl_pkt));
++	nctrl.ncmd.s.cmdgroup = OCTNET_CMD_GROUP1;
++	nctrl.ncmd.s.cmd = OCTNET_CMD_SET_VF_SPOOFCHK;
++	nctrl.ncmd.s.param1 =
++		vfidx + 1; /* vfidx is 0 based,
++			    * but vf_num (param1) is 1 based
++			    */
++	nctrl.ncmd.s.param2 = enable;
++	nctrl.ncmd.s.more = 0;
++	nctrl.iq_no = lio->linfo.txpciq[0].s.q_no;
++	nctrl.cb_fn = 0;
++
++	retval = octnet_send_nic_ctrl_pkt(oct, &nctrl);
++
++	if (retval) {
++		netif_info(lio, drv, lio->netdev,
++			   "Failed to set VF %d spoofchk %s\n", vfidx,
++			enable ? "on" : "off");
++		return -1;
++	}
++
++	oct->sriov_info.vf_spoofchk[vfidx] = enable;
++	netif_info(lio, drv, lio->netdev, "VF %u spoofchk is %s\n", vfidx,
++		   enable ? "on" : "off");
++
++	return 0;
++}
++
+ static int liquidio_set_vf_vlan(struct net_device *netdev, int vfidx,
+ 				u16 vlan, u8 qos, __be16 vlan_proto)
+ {
+@@ -2920,6 +2976,8 @@ static int liquidio_get_vf_config(struct
+ 	if (vfidx < 0 || vfidx >= oct->sriov_info.num_vfs_alloced)
+ 		return -EINVAL;
+ 
++	memset(ivi, 0, sizeof(struct ifla_vf_info));
++
+ 	ivi->vf = vfidx;
+ 	macaddr = 2 + (u8 *)&oct->sriov_info.vf_macaddr[vfidx];
+ 	ether_addr_copy(&ivi->mac[0], macaddr);
+@@ -2931,6 +2989,10 @@ static int liquidio_get_vf_config(struct
+ 	else
+ 		ivi->trusted = false;
+ 	ivi->linkstate = oct->sriov_info.vf_linkstate[vfidx];
++	ivi->spoofchk = oct->sriov_info.vf_spoofchk[vfidx];
++	ivi->max_tx_rate = lio->linfo.link.s.speed;
++	ivi->min_tx_rate = 0;
++
+ 	return 0;
+ }
+ 
+@@ -3180,6 +3242,7 @@ static const struct net_device_ops lione
+ 	.ndo_set_vf_mac		= liquidio_set_vf_mac,
+ 	.ndo_set_vf_vlan	= liquidio_set_vf_vlan,
+ 	.ndo_get_vf_config	= liquidio_get_vf_config,
++	.ndo_set_vf_spoofchk	= liquidio_set_vf_spoofchk,
+ 	.ndo_set_vf_trust	= liquidio_set_vf_trust,
+ 	.ndo_set_vf_link_state  = liquidio_set_vf_link_state,
+ 	.ndo_get_vf_stats	= liquidio_get_vf_stats,
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -1135,6 +1135,12 @@ static int liquidio_set_mac(struct net_d
+ 		return -ENOMEM;
+ 	}
+ 
++	if (nctrl.sc_status ==
++	    FIRMWARE_STATUS_CODE(OCTEON_REQUEST_NO_PERMISSION)) {
++		dev_err(&oct->pci_dev->dev, "MAC Address change failed: no permission\n");
++		return -EPERM;
++	}
++
+ 	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
+ 	ether_addr_copy(((u8 *)&lio->linfo.hw_addr) + 2, addr->sa_data);
+ 
+@@ -2049,6 +2055,8 @@ static int setup_nic_devices(struct octe
+ 		lio->linfo.link.u64 = resp->cfg_info.linfo.link.u64;
+ 		lio->linfo.macaddr_is_admin_asgnd =
+ 			resp->cfg_info.linfo.macaddr_is_admin_asgnd;
++		lio->linfo.macaddr_spoofchk =
++			resp->cfg_info.linfo.macaddr_spoofchk;
+ 
+ 		lio->msg_enable = netif_msg_init(debug, DEFAULT_MSG_ENABLE);
+ 
+--- a/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
++++ b/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
+@@ -118,6 +118,10 @@ enum octeon_tag_type {
+ /* App specific capabilities from firmware to pf driver */
+ #define LIQUIDIO_TIME_SYNC_CAP 0x1
+ #define LIQUIDIO_SWITCHDEV_CAP 0x2
++#define LIQUIDIO_SPOOFCHK_CAP  0x4
++
++/* error status return from firmware */
++#define OCTEON_REQUEST_NO_PERMISSION 0xc
+ 
+ static inline u32 incr_index(u32 index, u32 count, u32 max)
+ {
+@@ -241,6 +245,10 @@ static inline void add_sg_size(struct oc
+ 
+ #define   OCTNET_CMD_QUEUE_COUNT_CTL	0x1f
+ 
++#define   OCTNET_CMD_GROUP1             1
++#define   OCTNET_CMD_SET_VF_SPOOFCHK    0x1
++#define   OCTNET_GROUP1_LAST_CMD        OCTNET_CMD_SET_VF_SPOOFCHK
++
+ #define   OCTNET_CMD_VXLAN_PORT_ADD    0x0
+ #define   OCTNET_CMD_VXLAN_PORT_DEL    0x1
+ #define   OCTNET_CMD_RXCSUM_ENABLE     0x0
+@@ -255,6 +263,8 @@ static inline void add_sg_size(struct oc
+ #define   SEAPI_CMD_SPEED_SET           0x2
+ #define   SEAPI_CMD_SPEED_GET           0x3
+ 
++#define OPCODE_NIC_VF_PORT_STATS        0x22
++
+ #define   LIO_CMD_WAIT_TM 100
+ 
+ /* RX(packets coming from wire) Checksum verification flags */
+@@ -303,7 +313,8 @@ union octnet_cmd {
+ 
+ 		u64 more:6; /* How many udd words follow the command */
+ 
+-		u64 reserved:29;
++		u64 cmdgroup:8;
++		u64 reserved:21;
+ 
+ 		u64 param1:16;
+ 
+@@ -315,7 +326,8 @@ union octnet_cmd {
+ 
+ 		u64 param1:16;
+ 
+-		u64 reserved:29;
++		u64 reserved:21;
++		u64 cmdgroup:8;
+ 
+ 		u64 more:6;
+ 
+@@ -759,13 +771,17 @@ struct oct_link_info {
+ #ifdef __BIG_ENDIAN_BITFIELD
+ 	u64 gmxport:16;
+ 	u64 macaddr_is_admin_asgnd:1;
+-	u64 rsvd:31;
++	u64 rsvd:13;
++	u64 macaddr_spoofchk:1;
++	u64 rsvd1:17;
+ 	u64 num_txpciq:8;
+ 	u64 num_rxpciq:8;
+ #else
+ 	u64 num_rxpciq:8;
+ 	u64 num_txpciq:8;
+-	u64 rsvd:31;
++	u64 rsvd1:17;
++	u64 macaddr_spoofchk:1;
++	u64 rsvd:13;
+ 	u64 macaddr_is_admin_asgnd:1;
+ 	u64 gmxport:16;
+ #endif
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_device.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_device.h
+@@ -397,6 +397,8 @@ struct octeon_sriov_info {
+ 
+ 	int	vf_linkstate[MAX_POSSIBLE_VFS];
+ 
++	bool    vf_spoofchk[MAX_POSSIBLE_VFS];
++
+ 	u64	vf_drv_loaded_mask;
+ };
+ 
+@@ -607,6 +609,9 @@ struct octeon_device {
+ 	u8  speed_boot;
+ 	u8  speed_setting;
+ 	u8  no_speed_setting;
++
++	u32    vfstats_poll;
++#define LIO_VFSTATS_POLL 10
+ };
+ 
+ #define  OCT_DRV_ONLINE 1
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@ -71,6 +71,12 @@ struct oct_nic_stats_resp {
+ 	u64     status;
+ };
+ 
++struct oct_nic_vf_stats_resp {
++	u64     rh;
++	u64	spoofmac_cnt;
++	u64     status;
++};
++
+ struct oct_nic_stats_ctrl {
+ 	struct completion complete;
+ 	struct net_device *netdev;
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_nic.c
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_nic.c
+@@ -172,13 +172,15 @@ octnet_send_nic_ctrl_pkt(struct octeon_d
+ 
+ 	spin_unlock_bh(&oct->cmd_resp_wqlock);
+ 
+-	switch (nctrl->ncmd.s.cmd) {
+-		/* caller holds lock, can not sleep */
+-	case OCTNET_CMD_CHANGE_DEVFLAGS:
+-	case OCTNET_CMD_SET_MULTI_LIST:
+-	case OCTNET_CMD_SET_UC_LIST:
+-		WRITE_ONCE(sc->caller_is_done, true);
+-		return retval;
++	if (nctrl->ncmd.s.cmdgroup == 0) {
++		switch (nctrl->ncmd.s.cmd) {
++			/* caller holds lock, can not sleep */
++		case OCTNET_CMD_CHANGE_DEVFLAGS:
++		case OCTNET_CMD_SET_MULTI_LIST:
++		case OCTNET_CMD_SET_UC_LIST:
++			WRITE_ONCE(sc->caller_is_done, true);
++			return retval;
++		}
+ 	}
+ 
+ 	retval = wait_for_sc_completion_timeout(oct, sc, 0);
