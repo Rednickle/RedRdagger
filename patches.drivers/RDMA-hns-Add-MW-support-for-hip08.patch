@@ -1,0 +1,318 @@
+From: Yixian Liu <liuyixian@huawei.com>
+Date: Sun, 23 Sep 2018 17:20:46 +0800
+Subject: RDMA/hns: Add MW support for hip08
+Patch-mainline: v4.20-rc1
+Git-commit: c7c28191408bf33c1d9c83de1d5b91f58f1ddaf1
+References: bsc#1104427 FATE#326416
+
+This patch adds memory window (mw) support in the kernel space.
+
+Signed-off-by: Yixian Liu <liuyixian@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |   21 ++++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   45 ++++++++++
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.h  |   10 ++
+ drivers/infiniband/hw/hns/hns_roce_main.c   |    9 ++
+ drivers/infiniband/hw/hns/hns_roce_mr.c     |  120 ++++++++++++++++++++++++++++
+ 5 files changed, 205 insertions(+)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -193,6 +193,7 @@ enum {
+ 	HNS_ROCE_CAP_FLAG_RQ_INLINE		= BIT(2),
+ 	HNS_ROCE_CAP_FLAG_RECORD_DB		= BIT(3),
+ 	HNS_ROCE_CAP_FLAG_SQ_RECORD_DB		= BIT(4),
++	HNS_ROCE_CAP_FLAG_MW			= BIT(7),
+ 	HNS_ROCE_CAP_FLAG_ATOMIC		= BIT(10),
+ };
+ 
+@@ -286,6 +287,16 @@ struct hns_roce_mtt {
+ 	enum hns_roce_mtt_type	mtt_type;
+ };
+ 
++struct hns_roce_mw {
++	struct ib_mw		ibmw;
++	u32			pdn;
++	u32			rkey;
++	int			enabled; /* MW's active status */
++	u32			pbl_hop_num;
++	u32			pbl_ba_pg_sz;
++	u32			pbl_buf_pg_sz;
++};
++
+ /* Only support 4K page size for mr register */
+ #define MR_SIZE_4K 0
+ 
+@@ -759,6 +770,7 @@ struct hns_roce_hw {
+ 				struct hns_roce_mr *mr, int flags, u32 pdn,
+ 				int mr_access_flags, u64 iova, u64 size,
+ 				void *mb_buf);
++	int (*mw_write_mtpt)(void *mb_buf, struct hns_roce_mw *mw);
+ 	void (*write_cqc)(struct hns_roce_dev *hr_dev,
+ 			  struct hns_roce_cq *hr_cq, void *mb_buf, u64 *mtts,
+ 			  dma_addr_t dma_handle, int nent, u32 vector);
+@@ -858,6 +870,11 @@ static inline struct hns_roce_mr *to_hr_
+ 	return container_of(ibmr, struct hns_roce_mr, ibmr);
+ }
+ 
++static inline struct hns_roce_mw *to_hr_mw(struct ib_mw *ibmw)
++{
++	return container_of(ibmw, struct hns_roce_mw, ibmw);
++}
++
+ static inline struct hns_roce_qp *to_hr_qp(struct ib_qp *ibqp)
+ {
+ 	return container_of(ibqp, struct hns_roce_qp, ibqp);
+@@ -969,6 +986,10 @@ int hns_roce_hw2sw_mpt(struct hns_roce_d
+ 		       unsigned long mpt_index);
+ unsigned long key_to_hw_index(u32 key);
+ 
++struct ib_mw *hns_roce_alloc_mw(struct ib_pd *pd, enum ib_mw_type,
++				struct ib_udata *udata);
++int hns_roce_dealloc_mw(struct ib_mw *ibmw);
++
+ void hns_roce_buf_free(struct hns_roce_dev *hr_dev, u32 size,
+ 		       struct hns_roce_buf *buf);
+ int hns_roce_buf_alloc(struct hns_roce_dev *hr_dev, u32 size, u32 max_direct,
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -1259,6 +1259,10 @@ static int hns_roce_v2_profile(struct hn
+ 				  HNS_ROCE_CAP_FLAG_RQ_INLINE |
+ 				  HNS_ROCE_CAP_FLAG_RECORD_DB |
+ 				  HNS_ROCE_CAP_FLAG_SQ_RECORD_DB;
++
++	if (hr_dev->pci_dev->revision == 0x21)
++		caps->flags |= HNS_ROCE_CAP_FLAG_MW;
++
+ 	caps->pkey_table_len[0] = 1;
+ 	caps->gid_table_len[0] = HNS_ROCE_V2_GID_INDEX_NUM;
+ 	caps->ceqe_depth	= HNS_ROCE_V2_COMP_EQE_NUM;
+@@ -1825,6 +1829,46 @@ static int hns_roce_v2_rereg_write_mtpt(
+ 	return 0;
+ }
+ 
++static int hns_roce_v2_mw_write_mtpt(void *mb_buf, struct hns_roce_mw *mw)
++{
++	struct hns_roce_v2_mpt_entry *mpt_entry;
++
++	mpt_entry = mb_buf;
++	memset(mpt_entry, 0, sizeof(*mpt_entry));
++
++	roce_set_field(mpt_entry->byte_4_pd_hop_st, V2_MPT_BYTE_4_MPT_ST_M,
++		       V2_MPT_BYTE_4_MPT_ST_S, V2_MPT_ST_FREE);
++	roce_set_field(mpt_entry->byte_4_pd_hop_st, V2_MPT_BYTE_4_PD_M,
++		       V2_MPT_BYTE_4_PD_S, mw->pdn);
++	roce_set_field(mpt_entry->byte_4_pd_hop_st,
++		       V2_MPT_BYTE_4_PBL_HOP_NUM_M,
++		       V2_MPT_BYTE_4_PBL_HOP_NUM_S,
++		       mw->pbl_hop_num == HNS_ROCE_HOP_NUM_0 ?
++		       0 : mw->pbl_hop_num);
++	roce_set_field(mpt_entry->byte_4_pd_hop_st,
++		       V2_MPT_BYTE_4_PBL_BA_PG_SZ_M,
++		       V2_MPT_BYTE_4_PBL_BA_PG_SZ_S,
++		       mw->pbl_ba_pg_sz + PG_SHIFT_OFFSET);
++
++	roce_set_bit(mpt_entry->byte_8_mw_cnt_en, V2_MPT_BYTE_8_R_INV_EN_S, 1);
++	roce_set_bit(mpt_entry->byte_8_mw_cnt_en, V2_MPT_BYTE_8_L_INV_EN_S, 1);
++
++	roce_set_bit(mpt_entry->byte_12_mw_pa, V2_MPT_BYTE_12_PA_S, 0);
++	roce_set_bit(mpt_entry->byte_12_mw_pa, V2_MPT_BYTE_12_MR_MW_S, 1);
++	roce_set_bit(mpt_entry->byte_12_mw_pa, V2_MPT_BYTE_12_BPD_S, 1);
++	roce_set_bit(mpt_entry->byte_12_mw_pa, V2_MPT_BYTE_12_BQP_S,
++		     mw->ibmw.type == IB_MW_TYPE_1 ? 0 : 1);
++
++	roce_set_field(mpt_entry->byte_64_buf_pa1,
++		       V2_MPT_BYTE_64_PBL_BUF_PG_SZ_M,
++		       V2_MPT_BYTE_64_PBL_BUF_PG_SZ_S,
++		       mw->pbl_buf_pg_sz + PG_SHIFT_OFFSET);
++
++	mpt_entry->lkey = cpu_to_le32(mw->rkey);
++
++	return 0;
++}
++
+ static void *get_cqe_v2(struct hns_roce_cq *hr_cq, int n)
+ {
+ 	return hns_roce_buf_offset(&hr_cq->hr_buf.hr_buf,
+@@ -5175,6 +5219,7 @@ static const struct hns_roce_hw hns_roce
+ 	.set_mac = hns_roce_v2_set_mac,
+ 	.write_mtpt = hns_roce_v2_write_mtpt,
+ 	.rereg_write_mtpt = hns_roce_v2_rereg_write_mtpt,
++	.mw_write_mtpt = hns_roce_v2_mw_write_mtpt,
+ 	.write_cqc = hns_roce_v2_write_cqc,
+ 	.set_hem = hns_roce_v2_set_hem,
+ 	.clear_hem = hns_roce_v2_clear_hem,
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.h
+@@ -324,6 +324,7 @@ struct hns_roce_v2_cq_context {
+ 
+ enum{
+ 	V2_MPT_ST_VALID = 0x1,
++	V2_MPT_ST_FREE	= 0x2,
+ };
+ 
+ enum hns_roce_v2_qp_state {
+@@ -883,8 +884,17 @@ struct hns_roce_v2_mpt_entry {
+ 
+ #define V2_MPT_BYTE_8_LW_EN_S 7
+ 
++#define V2_MPT_BYTE_8_MW_CNT_S 8
++#define V2_MPT_BYTE_8_MW_CNT_M GENMASK(31, 8)
++
+ #define V2_MPT_BYTE_12_PA_S 1
+ 
++#define V2_MPT_BYTE_12_MR_MW_S 4
++
++#define V2_MPT_BYTE_12_BPD_S 5
++
++#define V2_MPT_BYTE_12_BQP_S 6
++
+ #define V2_MPT_BYTE_12_INNER_PA_VLD_S 7
+ 
+ #define V2_MPT_BYTE_12_MW_BIND_QPN_S 8
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@ -525,6 +525,15 @@ static int hns_roce_register_device(stru
+ 		ib_dev->uverbs_cmd_mask |= (1ULL << IB_USER_VERBS_CMD_REREG_MR);
+ 	}
+ 
++	/* MW */
++	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_MW) {
++		ib_dev->alloc_mw = hns_roce_alloc_mw;
++		ib_dev->dealloc_mw = hns_roce_dealloc_mw;
++		ib_dev->uverbs_cmd_mask |=
++					(1ULL << IB_USER_VERBS_CMD_ALLOC_MW) |
++					(1ULL << IB_USER_VERBS_CMD_DEALLOC_MW);
++	}
++
+ 	/* OTHERS */
+ 	ib_dev->get_port_immutable	= hns_roce_port_immutable;
+ 	ib_dev->disassociate_ucontext	= hns_roce_disassociate_ucontext;
+--- a/drivers/infiniband/hw/hns/hns_roce_mr.c
++++ b/drivers/infiniband/hw/hns/hns_roce_mr.c
+@@ -1201,3 +1201,123 @@ int hns_roce_dereg_mr(struct ib_mr *ibmr
+ 
+ 	return ret;
+ }
++
++static void hns_roce_mw_free(struct hns_roce_dev *hr_dev,
++			     struct hns_roce_mw *mw)
++{
++	struct device *dev = hr_dev->dev;
++	int ret;
++
++	if (mw->enabled) {
++		ret = hns_roce_hw2sw_mpt(hr_dev, NULL, key_to_hw_index(mw->rkey)
++					 & (hr_dev->caps.num_mtpts - 1));
++		if (ret)
++			dev_warn(dev, "MW HW2SW_MPT failed (%d)\n", ret);
++
++		hns_roce_table_put(hr_dev, &hr_dev->mr_table.mtpt_table,
++				   key_to_hw_index(mw->rkey));
++	}
++
++	hns_roce_bitmap_free(&hr_dev->mr_table.mtpt_bitmap,
++			     key_to_hw_index(mw->rkey), BITMAP_NO_RR);
++}
++
++static int hns_roce_mw_enable(struct hns_roce_dev *hr_dev,
++			      struct hns_roce_mw *mw)
++{
++	struct hns_roce_mr_table *mr_table = &hr_dev->mr_table;
++	struct hns_roce_cmd_mailbox *mailbox;
++	struct device *dev = hr_dev->dev;
++	unsigned long mtpt_idx = key_to_hw_index(mw->rkey);
++	int ret;
++
++	/* prepare HEM entry memory */
++	ret = hns_roce_table_get(hr_dev, &mr_table->mtpt_table, mtpt_idx);
++	if (ret)
++		return ret;
++
++	mailbox = hns_roce_alloc_cmd_mailbox(hr_dev);
++	if (IS_ERR(mailbox)) {
++		ret = PTR_ERR(mailbox);
++		goto err_table;
++	}
++
++	ret = hr_dev->hw->mw_write_mtpt(mailbox->buf, mw);
++	if (ret) {
++		dev_err(dev, "MW write mtpt fail!\n");
++		goto err_page;
++	}
++
++	ret = hns_roce_sw2hw_mpt(hr_dev, mailbox,
++				 mtpt_idx & (hr_dev->caps.num_mtpts - 1));
++	if (ret) {
++		dev_err(dev, "MW sw2hw_mpt failed (%d)\n", ret);
++		goto err_page;
++	}
++
++	mw->enabled = 1;
++
++	hns_roce_free_cmd_mailbox(hr_dev, mailbox);
++
++	return 0;
++
++err_page:
++	hns_roce_free_cmd_mailbox(hr_dev, mailbox);
++
++err_table:
++	hns_roce_table_put(hr_dev, &mr_table->mtpt_table, mtpt_idx);
++
++	return ret;
++}
++
++struct ib_mw *hns_roce_alloc_mw(struct ib_pd *ib_pd, enum ib_mw_type type,
++				struct ib_udata *udata)
++{
++	struct hns_roce_dev *hr_dev = to_hr_dev(ib_pd->device);
++	struct hns_roce_mw *mw;
++	unsigned long index = 0;
++	int ret;
++
++	mw = kmalloc(sizeof(*mw), GFP_KERNEL);
++	if (!mw)
++		return ERR_PTR(-ENOMEM);
++
++	/* Allocate a key for mw from bitmap */
++	ret = hns_roce_bitmap_alloc(&hr_dev->mr_table.mtpt_bitmap, &index);
++	if (ret)
++		goto err_bitmap;
++
++	mw->rkey = hw_index_to_key(index);
++
++	mw->ibmw.rkey = mw->rkey;
++	mw->ibmw.type = type;
++	mw->pdn = to_hr_pd(ib_pd)->pdn;
++	mw->pbl_hop_num = hr_dev->caps.pbl_hop_num;
++	mw->pbl_ba_pg_sz = hr_dev->caps.pbl_ba_pg_sz;
++	mw->pbl_buf_pg_sz = hr_dev->caps.pbl_buf_pg_sz;
++
++	ret = hns_roce_mw_enable(hr_dev, mw);
++	if (ret)
++		goto err_mw;
++
++	return &mw->ibmw;
++
++err_mw:
++	hns_roce_mw_free(hr_dev, mw);
++
++err_bitmap:
++	kfree(mw);
++
++	return ERR_PTR(ret);
++}
++
++int hns_roce_dealloc_mw(struct ib_mw *ibmw)
++{
++	struct hns_roce_dev *hr_dev = to_hr_dev(ibmw->device);
++	struct hns_roce_mw *mw = to_hr_mw(ibmw);
++
++	hns_roce_mw_free(hr_dev, mw);
++	kfree(mw);
++
++	return 0;
++}

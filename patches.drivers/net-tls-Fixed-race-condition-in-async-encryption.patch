@@ -1,0 +1,303 @@
+From: Vakul Garg <vakul.garg@nxp.com>
+Date: Mon, 24 Sep 2018 15:35:56 +0530
+Subject: net/tls: Fixed race condition in async encryption
+Patch-mainline: v4.20-rc1
+Git-commit: 9932a29ab1be1427a2ccbdf852a0f131f2849685
+References: bsc#1109837
+
+On processors with multi-engine crypto accelerators, it is possible that
+multiple records get encrypted in parallel and their encryption
+completion is notified to different cpus in multicore processor. This
+leads to the situation where tls_encrypt_done() starts executing in
+parallel on different cores. In current implementation, encrypted
+records are queued to tx_ready_list in tls_encrypt_done(). This requires
+addition to linked list 'tx_ready_list' to be protected. As
+tls_decrypt_done() could be executing in irq content, it is not possible
+to protect linked list addition operation using a lock.
+
+To fix the problem, we remove linked list addition operation from the
+irq context. We do tx_ready_list addition/removal operation from
+application context only and get rid of possible multiple access to
+the linked list. Before starting encryption on the record, we add it to
+the tail of tx_ready_list. To prevent tls_tx_records() from transmitting
+it, we mark the record with a new flag 'tx_ready' in 'struct tls_rec'.
+When record encryption gets completed, tls_encrypt_done() has to only
+update the 'tx_ready' flag to true & linked list add operation is not
+required.
+
+The changed logic brings some other side benefits. Since the records
+are always submitted in tls sequence number order for encryption, the
+tx_ready_list always remains sorted and addition of new records to it
+does not have to traverse the linked list.
+
+Lastly, we renamed tx_ready_list in 'struct tls_sw_context_tx' to
+'tx_list'. This is because now, the some of the records at the tail are
+not ready to transmit.
+
+Fixes: a42055e8d2c3 ("net/tls: Add support for async encryption")
+Signed-off-by: Vakul Garg <vakul.garg@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/tls.h  |   16 +++-------
+ net/tls/tls_main.c |    4 +-
+ net/tls/tls_sw.c   |   81 +++++++++++++++++++----------------------------------
+ 3 files changed, 37 insertions(+), 64 deletions(-)
+
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -99,6 +99,7 @@ enum {
+  */
+ struct tls_rec {
+ 	struct list_head list;
++	int tx_ready;
+ 	int tx_flags;
+ 	struct scatterlist sg_plaintext_data[MAX_SKB_FRAGS];
+ 	struct scatterlist sg_encrypted_data[MAX_SKB_FRAGS];
+@@ -128,7 +129,7 @@ struct tls_sw_context_tx {
+ 	struct crypto_wait async_wait;
+ 	struct tx_work tx_work;
+ 	struct tls_rec *open_rec;
+-	struct list_head tx_ready_list;
++	struct list_head tx_list;
+ 	atomic_t encrypt_pending;
+ 	int async_notify;
+ 
+@@ -220,7 +221,6 @@ struct tls_context {
+ 
+ 	struct scatterlist *partially_sent_record;
+ 	u16 partially_sent_offset;
+-	u64 tx_seq_number;	/* Next TLS seqnum to be transmitted */
+ 
+ 	unsigned long flags;
+ 	bool in_tcp_sendpages;
+@@ -341,21 +341,15 @@ static inline bool tls_is_pending_open_r
+ 	return tls_ctx->pending_open_record_frags;
+ }
+ 
+-static inline bool is_tx_ready(struct tls_context *tls_ctx,
+-			       struct tls_sw_context_tx *ctx)
++static inline bool is_tx_ready(struct tls_sw_context_tx *ctx)
+ {
+ 	struct tls_rec *rec;
+-	u64 seq;
+ 
+-	rec = list_first_entry(&ctx->tx_ready_list, struct tls_rec, list);
++	rec = list_first_entry(&ctx->tx_list, struct tls_rec, list);
+ 	if (!rec)
+ 		return false;
+ 
+-	seq = be64_to_cpup((const __be64 *)&rec->aad_space);
+-	if (seq == tls_ctx->tx_seq_number)
+-		return true;
+-	else
+-		return false;
++	return READ_ONCE(rec->tx_ready);
+ }
+ 
+ struct sk_buff *
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -212,7 +212,7 @@ int tls_push_pending_closed_record(struc
+ 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+ 
+ 	if (tls_is_partially_sent_record(tls_ctx) ||
+-	    !list_empty(&ctx->tx_ready_list))
++	    !list_empty(&ctx->tx_list))
+ 		return tls_tx_records(sk, flags);
+ 	else
+ 		return tls_ctx->push_pending_record(sk, flags);
+@@ -233,7 +233,7 @@ static void tls_write_space(struct sock
+ 	}
+ 
+ 	/* Schedule the transmission if tx list is ready */
+-	if (is_tx_ready(ctx, tx_ctx) && !sk->sk_write_pending) {
++	if (is_tx_ready(tx_ctx) && !sk->sk_write_pending) {
+ 		/* Schedule the transmission */
+ 		if (!test_and_set_bit(BIT_TX_SCHEDULED, &tx_ctx->tx_bitmask))
+ 			schedule_delayed_work(&tx_ctx->tx_work.work, 0);
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -329,29 +329,6 @@ static void tls_free_both_sg(struct sock
+ 		&rec->sg_plaintext_size);
+ }
+ 
+-static bool append_tx_ready_list(struct tls_context *tls_ctx,
+-				 struct tls_sw_context_tx *ctx,
+-				 struct tls_rec *enc_rec)
+-{
+-	u64 new_seq = be64_to_cpup((const __be64 *)&enc_rec->aad_space);
+-	struct list_head *pos;
+-
+-	/* Need to insert encrypted record in tx_ready_list sorted
+-	 * as per sequence number. Traverse linked list from tail.
+-	 */
+-	list_for_each_prev(pos, &ctx->tx_ready_list) {
+-		struct tls_rec *rec = (struct tls_rec *)pos;
+-		u64 seq = be64_to_cpup((const __be64 *)&rec->aad_space);
+-
+-		if (new_seq > seq)
+-			break;
+-	}
+-
+-	list_add((struct list_head *)&enc_rec->list, pos);
+-
+-	return is_tx_ready(tls_ctx, ctx);
+-}
+-
+ int tls_tx_records(struct sock *sk, int flags)
+ {
+ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
+@@ -360,7 +337,7 @@ int tls_tx_records(struct sock *sk, int
+ 	int tx_flags, rc = 0;
+ 
+ 	if (tls_is_partially_sent_record(tls_ctx)) {
+-		rec = list_first_entry(&ctx->tx_ready_list,
++		rec = list_first_entry(&ctx->tx_list,
+ 				       struct tls_rec, list);
+ 
+ 		if (flags == -1)
+@@ -373,18 +350,15 @@ int tls_tx_records(struct sock *sk, int
+ 			goto tx_err;
+ 
+ 		/* Full record has been transmitted.
+-		 * Remove the head of tx_ready_list
++		 * Remove the head of tx_list
+ 		 */
+-		tls_ctx->tx_seq_number++;
+ 		list_del(&rec->list);
+ 		kfree(rec);
+ 	}
+ 
+-	/* Tx all ready records which have expected sequence number */
+-	list_for_each_entry_safe(rec, tmp, &ctx->tx_ready_list, list) {
+-		u64 seq = be64_to_cpup((const __be64 *)&rec->aad_space);
+-
+-		if (seq == tls_ctx->tx_seq_number) {
++	/* Tx all ready records */
++	list_for_each_entry_safe(rec, tmp, &ctx->tx_list, list) {
++		if (READ_ONCE(rec->tx_ready)) {
+ 			if (flags == -1)
+ 				tx_flags = rec->tx_flags;
+ 			else
+@@ -396,7 +370,6 @@ int tls_tx_records(struct sock *sk, int
+ 			if (rc)
+ 				goto tx_err;
+ 
+-			tls_ctx->tx_seq_number++;
+ 			list_del(&rec->list);
+ 			kfree(rec);
+ 		} else {
+@@ -446,9 +419,18 @@ static void tls_encrypt_done(struct cryp
+ 		}
+ 	}
+ 
+-	/* Append the record in tx queue */
+-	if (rec)
+-		ready = append_tx_ready_list(tls_ctx, ctx, rec);
++	if (rec) {
++		struct tls_rec *first_rec;
++
++		/* Mark the record as ready for transmission */
++		smp_store_mb(rec->tx_ready, true);
++
++		/* If received record is at head of tx_list, schedule tx */
++		first_rec = list_first_entry(&ctx->tx_list,
++					     struct tls_rec, list);
++		if (rec == first_rec)
++			ready = true;
++	}
+ 
+ 	pending = atomic_dec_return(&ctx->encrypt_pending);
+ 
+@@ -484,6 +466,8 @@ static int tls_do_encryption(struct sock
+ 	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+ 				  tls_encrypt_done, sk);
+ 
++	/* Add the record in tx_list */
++	list_add_tail((struct list_head *)&rec->list, &ctx->tx_list);
+ 	atomic_inc(&ctx->encrypt_pending);
+ 
+ 	rc = crypto_aead_encrypt(aead_req);
+@@ -493,9 +477,12 @@ static int tls_do_encryption(struct sock
+ 		rec->sg_encrypted_data[0].length += tls_ctx->tx.prepend_size;
+ 	}
+ 
+-	/* Case of encryption failure */
+-	if (rc && rc != -EINPROGRESS)
++	if (!rc) {
++		WRITE_ONCE(rec->tx_ready, true);
++	} else if (rc != -EINPROGRESS) {
++		list_del(&rec->list);
+ 		return rc;
++	}
+ 
+ 	/* Unhook the record from context if encryption is not failure */
+ 	ctx->open_rec = NULL;
+@@ -544,13 +531,7 @@ static int tls_push_record(struct sock *
+ 		return rc;
+ 	}
+ 
+-	/* Put the record in tx_ready_list and start tx if permitted.
+-	 * This happens only when encryption is not asynchronous.
+-	 */
+-	if (append_tx_ready_list(tls_ctx, ctx, rec))
+-		return tls_tx_records(sk, flags);
+-
+-	return 0;
++	return tls_tx_records(sk, flags);
+ }
+ 
+ static int tls_sw_push_pending_record(struct sock *sk, int flags)
+@@ -1563,7 +1544,7 @@ void tls_sw_free_resources_tx(struct soc
+ 	/* Tx whatever records we can transmit and abandon the rest */
+ 	tls_tx_records(sk, -1);
+ 
+-	/* Free up un-sent records in tx_ready_list. First, free
++	/* Free up un-sent records in tx_list. First, free
+ 	 * the partially sent record if any at head of tx_list.
+ 	 */
+ 	if (tls_ctx->partially_sent_record) {
+@@ -1580,13 +1561,13 @@ void tls_sw_free_resources_tx(struct soc
+ 
+ 		tls_ctx->partially_sent_record = NULL;
+ 
+-		rec = list_first_entry(&ctx->tx_ready_list,
++		rec = list_first_entry(&ctx->tx_list,
+ 				       struct tls_rec, list);
+ 		list_del(&rec->list);
+ 		kfree(rec);
+ 	}
+ 
+-	list_for_each_entry_safe(rec, tmp, &ctx->tx_ready_list, list) {
++	list_for_each_entry_safe(rec, tmp, &ctx->tx_list, list) {
+ 		free_sg(sk, rec->sg_encrypted_data,
+ 			&rec->sg_encrypted_num_elem,
+ 			&rec->sg_encrypted_size);
+@@ -1630,7 +1611,7 @@ void tls_sw_free_resources_rx(struct soc
+ 	kfree(ctx);
+ }
+ 
+-/* The work handler to transmitt the encrypted records in tx_ready_list */
++/* The work handler to transmitt the encrypted records in tx_list */
+ static void tx_work_handler(struct work_struct *work)
+ {
+ 	struct delayed_work *delayed_work = to_delayed_work(work);
+@@ -1697,7 +1678,7 @@ int tls_set_sw_offload(struct sock *sk,
+ 		crypto_info = &ctx->crypto_send.info;
+ 		cctx = &ctx->tx;
+ 		aead = &sw_ctx_tx->aead_send;
+-		INIT_LIST_HEAD(&sw_ctx_tx->tx_ready_list);
++		INIT_LIST_HEAD(&sw_ctx_tx->tx_list);
+ 		INIT_DELAYED_WORK(&sw_ctx_tx->tx_work.work, tx_work_handler);
+ 		sw_ctx_tx->tx_work.sk = sk;
+ 	} else {
+@@ -1786,8 +1767,6 @@ int tls_set_sw_offload(struct sock *sk,
+ 		sw_ctx_rx->sk_poll = sk->sk_socket->ops->poll;
+ 
+ 		strp_check_rcv(&sw_ctx_rx->strp);
+-	} else {
+-		ctx->tx_seq_number = be64_to_cpup((const __be64 *)rec_seq);
+ 	}
+ 
+ 	goto out;

@@ -1,0 +1,128 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Tue, 16 Oct 2018 11:08:04 -0700
+Subject: bpf: sockmap, support for msg_peek in sk_msg with redirect ingress
+Patch-mainline: v4.20-rc1
+Git-commit: 02c558b2d5d679fbbcaa5b9689484c7e0f8abb7b
+References: bsc#1109837
+
+This adds support for the MSG_PEEK flag when doing redirect to ingress
+and receiving on the sk_msg psock queue. Previously the flag was
+being ignored which could confuse applications if they expected the
+flag to work as normal.
+
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/tcp.h  |    2 +-
+ net/ipv4/tcp_bpf.c |   41 +++++++++++++++++++++++++++--------------
+ net/tls/tls_sw.c   |    3 ++-
+ 3 files changed, 30 insertions(+), 16 deletions(-)
+
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2071,7 +2071,7 @@ int tcp_bpf_sendmsg_redir(struct sock *s
+ int tcp_bpf_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		    int nonblock, int flags, int *addr_len);
+ int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+-		      struct msghdr *msg, int len);
++		      struct msghdr *msg, int len, int flags);
+ 
+ /* Call BPF_SOCK_OPS program that returns an int. If the return value
+  * is < 0, then the BPF op failed (for example if the loaded BPF
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@ -39,17 +39,19 @@ static int tcp_bpf_wait_data(struct sock
+ }
+ 
+ int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+-		      struct msghdr *msg, int len)
++		      struct msghdr *msg, int len, int flags)
+ {
+ 	struct iov_iter *iter = &msg->msg_iter;
++	int peek = flags & MSG_PEEK;
+ 	int i, ret, copied = 0;
++	struct sk_msg *msg_rx;
++
++	msg_rx = list_first_entry_or_null(&psock->ingress_msg,
++					  struct sk_msg, list);
+ 
+ 	while (copied != len) {
+ 		struct scatterlist *sge;
+-		struct sk_msg *msg_rx;
+ 
+-		msg_rx = list_first_entry_or_null(&psock->ingress_msg,
+-						  struct sk_msg, list);
+ 		if (unlikely(!msg_rx))
+ 			break;
+ 
+@@ -70,21 +72,30 @@ int __tcp_bpf_recvmsg(struct sock *sk, s
+ 			}
+ 
+ 			copied += copy;
+-			sge->offset += copy;
+-			sge->length -= copy;
+-			sk_mem_uncharge(sk, copy);
+-			if (!sge->length) {
+-				i++;
+-				if (i == MAX_SKB_FRAGS)
+-					i = 0;
+-				if (!msg_rx->skb)
+-					put_page(page);
++			if (likely(!peek)) {
++				sge->offset += copy;
++				sge->length -= copy;
++				sk_mem_uncharge(sk, copy);
++				msg_rx->sg.size -= copy;
++
++				if (!sge->length) {
++					sk_msg_iter_var_next(i);
++					if (!msg_rx->skb)
++						put_page(page);
++				}
++			} else {
++				sk_msg_iter_var_next(i);
+ 			}
+ 
+ 			if (copied == len)
+ 				break;
+ 		} while (i != msg_rx->sg.end);
+ 
++		if (unlikely(peek)) {
++			msg_rx = list_next_entry(msg_rx, list);
++			continue;
++		}
++
+ 		msg_rx->sg.start = i;
+ 		if (!sge->length && msg_rx->sg.start == msg_rx->sg.end) {
+ 			list_del(&msg_rx->list);
+@@ -92,6 +103,8 @@ int __tcp_bpf_recvmsg(struct sock *sk, s
+ 				consume_skb(msg_rx->skb);
+ 			kfree(msg_rx);
+ 		}
++		msg_rx = list_first_entry_or_null(&psock->ingress_msg,
++						  struct sk_msg, list);
+ 	}
+ 
+ 	return copied;
+@@ -114,7 +127,7 @@ int tcp_bpf_recvmsg(struct sock *sk, str
+ 		return tcp_recvmsg(sk, msg, len, nonblock, flags, addr_len);
+ 	lock_sock(sk);
+ msg_bytes_ready:
+-	copied = __tcp_bpf_recvmsg(sk, psock, msg, len);
++	copied = __tcp_bpf_recvmsg(sk, psock, msg, len, flags);
+ 	if (!copied) {
+ 		int data, err = 0;
+ 		long timeo;
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -1478,7 +1478,8 @@ int tls_sw_recvmsg(struct sock *sk,
+ 		skb = tls_wait_data(sk, psock, flags, timeo, &err);
+ 		if (!skb) {
+ 			if (psock) {
+-				int ret = __tcp_bpf_recvmsg(sk, psock, msg, len);
++				int ret = __tcp_bpf_recvmsg(sk, psock,
++							    msg, len, flags);
+ 
+ 				if (ret > 0) {
+ 					copied += ret;

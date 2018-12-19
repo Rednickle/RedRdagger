@@ -1,0 +1,112 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Sun, 16 Sep 2018 20:48:10 +0300
+Subject: RDMA/umem: Handle a half-complete start/end sequence
+Patch-mainline: v4.20-rc1
+Git-commit: be7a57b41ad824dbc59d1ffa91160ee73f2999ee
+References: bsc#1103992 FATE#326009
+
+mmu_notifier_unregister() can race between a invalidate_start/end and
+cause the invalidate_end to be skipped. This causes an imbalance in the
+locking, which lockdep complains about.
+
+This is not actually a bug, as we immediately kfree the memory holding the
+lock, but it simple enough to fix.
+
+Mark when the notifier is being destroyed and abort the start callback.
+This can be done under the lock we already obtained, and can re-purpose
+the invalidate_range test we already have.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/umem_odp.c |   35 +++++++++++++++++++++++++----------
+ include/rdma/ib_umem_odp.h         |    1 +
+ 2 files changed, 26 insertions(+), 10 deletions(-)
+
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@ -96,14 +96,11 @@ static void ib_umem_notifier_release(str
+ 	struct ib_ucontext_per_mm *per_mm =
+ 		container_of(mn, struct ib_ucontext_per_mm, mn);
+ 
+-	if (!per_mm->context->invalidate_range)
+-		return;
+-
+ 	down_read(&per_mm->umem_rwsem);
+-	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, 0,
+-				      ULLONG_MAX,
+-				      ib_umem_notifier_release_trampoline,
+-				      NULL);
++	if (per_mm->active)
++		rbt_ib_umem_for_each_in_range(
++			&per_mm->umem_tree, 0, ULLONG_MAX,
++			ib_umem_notifier_release_trampoline, NULL);
+ 	up_read(&per_mm->umem_rwsem);
+ }
+ 
+@@ -149,10 +146,17 @@ static void ib_umem_notifier_invalidate_
+ 	struct ib_ucontext_per_mm *per_mm =
+ 		container_of(mn, struct ib_ucontext_per_mm, mn);
+ 
+-	if (!per_mm->context->invalidate_range)
++	down_read(&per_mm->umem_rwsem);
++	if (!per_mm->active) {
++		up_read(&per_mm->umem_rwsem);
++		/*
++		 * At this point active is permanently set and visible to this
++		 * CPU without a lock, that fact is relied on to skip the unlock
++		 * in range_end.
++		 */
+ 		return;
++	}
+ 
+-	down_read(&per_mm->umem_rwsem);
+ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start, end,
+ 				      invalidate_range_start_trampoline, NULL);
+ }
+@@ -172,7 +176,7 @@ static void ib_umem_notifier_invalidate_
+ 	struct ib_ucontext_per_mm *per_mm =
+ 		container_of(mn, struct ib_ucontext_per_mm, mn);
+ 
+-	if (!per_mm->context->invalidate_range)
++	if (unlikely(!per_mm->active))
+ 		return;
+ 
+ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start,
+@@ -228,6 +232,7 @@ static struct ib_ucontext_per_mm *alloc_
+ 	per_mm->mm = mm;
+ 	per_mm->umem_tree = RB_ROOT;
+ 	init_rwsem(&per_mm->umem_rwsem);
++	per_mm->active = ctx->invalidate_range;
+ 
+ 	rcu_read_lock();
+ 	per_mm->tgid = get_task_pid(current->group_leader, PIDTYPE_PID);
+@@ -298,6 +303,16 @@ void put_per_mm(struct ib_umem_odp *umem
+ 	if (!need_free)
+ 		return;
+ 
++	/*
++	 * NOTE! mmu_notifier_unregister() can happen between a start/end
++	 * callback, resulting in an start/end, and thus an unbalanced
++	 * lock. This doesn't really matter to us since we are about to kfree
++	 * the memory that holds the lock, however LOCKDEP doesn't like this.
++	 */
++	down_write(&per_mm->umem_rwsem);
++	per_mm->active = false;
++	up_write(&per_mm->umem_rwsem);
++
+ 	mmu_notifier_unregister(&per_mm->mn, per_mm->mm);
+ 	put_pid(per_mm->tgid);
+ 	kfree(per_mm);
+--- a/include/rdma/ib_umem_odp.h
++++ b/include/rdma/ib_umem_odp.h
+@@ -89,6 +89,7 @@ struct ib_ucontext_per_mm {
+ 	struct ib_ucontext *context;
+ 	struct mm_struct *mm;
+ 	struct pid *tgid;
++	bool active;
+ 
+ 	struct rb_root umem_tree;
+ 	/* Protects umem_tree */
