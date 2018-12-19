@@ -1,0 +1,1299 @@
+From 5bd6098252104f1007882805e9d7c36924ff6a81 Mon Sep 17 00:00:00 2001
+From: Lior David <liord@codeaurora.org>
+Date: Mon, 26 Feb 2018 20:12:17 +0200
+Subject: [PATCH] wil6210: multiple VIFs support for connections and data path
+Git-commit: 5bd6098252104f1007882805e9d7c36924ff6a81
+Patch-mainline: v4.17-rc1
+References: FATE#326906
+
+Track the connection status per-VIF.
+The data path code is also updated to support multiple VIFs.
+This includes RX and TX VRING management, NAPI poll loops,
+RX reordering and related code.
+Power management code used to check if the main interface
+is up or based on connection state of the main interface,
+adapt this code to take all VIFs into account.
+
+Signed-off-by: Lior David <liord@codeaurora.org>
+Signed-off-by: Maya Erez <merez@codeaurora.org>
+Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/wireless/ath/wil6210/cfg80211.c   |  32 ++---
+ drivers/net/wireless/ath/wil6210/debugfs.c    |  20 ++-
+ drivers/net/wireless/ath/wil6210/interrupt.c  |   2 +-
+ drivers/net/wireless/ath/wil6210/main.c       |  78 ++++++++---
+ drivers/net/wireless/ath/wil6210/netdev.c     |  46 +++++-
+ drivers/net/wireless/ath/wil6210/pcie_bus.c   |  18 ++-
+ drivers/net/wireless/ath/wil6210/pm.c         | 131 +++++++++++++-----
+ drivers/net/wireless/ath/wil6210/rx_reorder.c |  36 +++--
+ drivers/net/wireless/ath/wil6210/txrx.c       |  79 +++++++----
+ drivers/net/wireless/ath/wil6210/txrx.h       |  22 ++-
+ drivers/net/wireless/ath/wil6210/wil6210.h    |  25 ++--
+ drivers/net/wireless/ath/wil6210/wmi.c        |   9 +-
+ 12 files changed, 347 insertions(+), 151 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/wil6210/cfg80211.c b/drivers/net/wireless/ath/wil6210/cfg80211.c
+index 4afb38f8f6f2..cdbb393863f3 100644
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -319,7 +319,7 @@ int wil_cid_fill_sinfo(struct wil6210_vif *vif, int cid,
+ 	sinfo->tx_packets = stats->tx_packets;
+ 	sinfo->tx_failed = stats->tx_errors;
+ 
+-	if (test_bit(wil_status_fwconnected, wil->status)) {
++	if (test_bit(wil_vif_fwconnected, vif->status)) {
+ 		sinfo->filled |= BIT(NL80211_STA_INFO_SIGNAL);
+ 		if (test_bit(WMI_FW_CAPABILITY_RSSI_REPORTING,
+ 			     wil->fw_capabilities))
+@@ -490,11 +490,10 @@ wil_cfg80211_add_iface(struct wiphy *wiphy, const char *name,
+ 			return ERR_PTR(-EINVAL);
+ 		}
+ 
+-		vif = kzalloc(sizeof(*vif), GFP_KERNEL);
+-		if (!vif)
++		p2p_wdev = kzalloc(sizeof(*p2p_wdev), GFP_KERNEL);
++		if (!p2p_wdev)
+ 			return ERR_PTR(-ENOMEM);
+ 
+-		p2p_wdev = vif_to_wdev(vif);
+ 		p2p_wdev->iftype = type;
+ 		p2p_wdev->wiphy = wiphy;
+ 		/* use our primary ethernet address */
+@@ -904,8 +903,8 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
+ 	wil_dbg_misc(wil, "connect, mid=%d\n", vif->mid);
+ 	wil_print_connect_params(wil, sme);
+ 
+-	if (test_bit(wil_status_fwconnecting, wil->status) ||
+-	    test_bit(wil_status_fwconnected, wil->status))
++	if (test_bit(wil_vif_fwconnecting, vif->status) ||
++	    test_bit(wil_vif_fwconnected, vif->status))
+ 		return -EALREADY;
+ 
+ 	if (sme->ie_len > WMI_MAX_IE_LEN) {
+@@ -1009,18 +1008,19 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
+ 	ether_addr_copy(conn.bssid, bss->bssid);
+ 	ether_addr_copy(conn.dst_mac, bss->bssid);
+ 
+-	set_bit(wil_status_fwconnecting, wil->status);
++	set_bit(wil_vif_fwconnecting, vif->status);
+ 
+ 	rc = wmi_send(wil, WMI_CONNECT_CMDID, vif->mid, &conn, sizeof(conn));
+ 	if (rc == 0) {
+ 		netif_carrier_on(ndev);
+-		wil6210_bus_request(wil, WIL_MAX_BUS_REQUEST_KBPS);
++		if (!wil_has_other_active_ifaces(wil, ndev, false, true))
++			wil6210_bus_request(wil, WIL_MAX_BUS_REQUEST_KBPS);
+ 		vif->bss = bss;
+ 		/* Connect can take lots of time */
+ 		mod_timer(&vif->connect_timer,
+ 			  jiffies + msecs_to_jiffies(5000));
+ 	} else {
+-		clear_bit(wil_status_fwconnecting, wil->status);
++		clear_bit(wil_vif_fwconnecting, vif->status);
+ 	}
+ 
+  out:
+@@ -1040,8 +1040,8 @@ static int wil_cfg80211_disconnect(struct wiphy *wiphy,
+ 	wil_dbg_misc(wil, "disconnect: reason=%d, mid=%d\n",
+ 		     reason_code, vif->mid);
+ 
+-	if (!(test_bit(wil_status_fwconnecting, wil->status) ||
+-	      test_bit(wil_status_fwconnected, wil->status))) {
++	if (!(test_bit(wil_vif_fwconnecting, vif->status) ||
++	      test_bit(wil_vif_fwconnected, vif->status))) {
+ 		wil_err(wil, "Disconnect was called while disconnected\n");
+ 		return 0;
+ 	}
+@@ -1946,7 +1946,7 @@ static int wil_cfg80211_suspend(struct wiphy *wiphy,
+ 	mutex_lock(&wil->mutex);
+ 	mutex_lock(&wil->vif_mutex);
+ 	wil_p2p_stop_radio_operations(wil);
+-	wil_abort_scan(ndev_to_vif(wil->main_ndev), true);
++	wil_abort_scan_all_vifs(wil, true);
+ 	mutex_unlock(&wil->vif_mutex);
+ 	mutex_unlock(&wil->mutex);
+ 
+@@ -2234,7 +2234,6 @@ void wil_cfg80211_deinit(struct wil6210_priv *wil)
+ void wil_p2p_wdev_free(struct wil6210_priv *wil)
+ {
+ 	struct wireless_dev *p2p_wdev;
+-	struct wil6210_vif *vif;
+ 
+ 	mutex_lock(&wil->vif_mutex);
+ 	p2p_wdev = wil->p2p_wdev;
+@@ -2243,8 +2242,7 @@ void wil_p2p_wdev_free(struct wil6210_priv *wil)
+ 	mutex_unlock(&wil->vif_mutex);
+ 	if (p2p_wdev) {
+ 		cfg80211_unregister_wdev(p2p_wdev);
+-		vif = wdev_to_vif(wil, p2p_wdev);
+-		kfree(vif);
++		kfree(p2p_wdev);
+ 	}
+ }
+ 
+@@ -2538,7 +2536,7 @@ static int wil_rf_sector_get_selected(struct wiphy *wiphy,
+ 			return -ENOENT;
+ 		}
+ 	} else {
+-		if (test_bit(wil_status_fwconnected, wil->status)) {
++		if (test_bit(wil_vif_fwconnected, vif->status)) {
+ 			wil_err(wil, "must specify MAC address when connected\n");
+ 			return -EINVAL;
+ 		}
+@@ -2665,7 +2663,7 @@ static int wil_rf_sector_set_selected(struct wiphy *wiphy,
+ 			cid = -1;
+ 		}
+ 	} else {
+-		if (test_bit(wil_status_fwconnected, wil->status)) {
++		if (test_bit(wil_vif_fwconnected, vif->status)) {
+ 			wil_err(wil, "must specify MAC address when connected\n");
+ 			return -EINVAL;
+ 		}
+diff --git a/drivers/net/wireless/ath/wil6210/debugfs.c b/drivers/net/wireless/ath/wil6210/debugfs.c
+index 636da5e32ae1..93a99a1c8c92 100644
+--- a/drivers/net/wireless/ath/wil6210/debugfs.c
++++ b/drivers/net/wireless/ath/wil6210/debugfs.c
+@@ -1201,12 +1201,13 @@ static int wil_link_debugfs_show(struct seq_file *s, void *data)
+ {
+ 	struct wil6210_priv *wil = s->private;
+ 	struct station_info sinfo;
+-	struct wil6210_vif *vif = ndev_to_vif(wil->main_ndev);
+ 	int i, rc;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(wil->sta); i++) {
+ 		struct wil_sta_info *p = &wil->sta[i];
+ 		char *status = "unknown";
++		struct wil6210_vif *vif;
++		u8 mid;
+ 
+ 		switch (p->status) {
+ 		case wil_sta_unused:
+@@ -1219,9 +1220,15 @@ static int wil_link_debugfs_show(struct seq_file *s, void *data)
+ 			status = "connected";
+ 			break;
+ 		}
+-		seq_printf(s, "[%d] %pM %s\n", i, p->addr, status);
++		mid = (p->status != wil_sta_unused) ? p->mid : U8_MAX;
++		seq_printf(s, "[%d][MID %d] %pM %s\n",
++			   i, mid, p->addr, status);
+ 
+-		if (p->status == wil_sta_connected) {
++		if (p->status != wil_sta_connected)
++			continue;
++
++		vif = (mid < wil->max_vifs) ? wil->vifs[mid] : NULL;
++		if (vif) {
+ 			rc = wil_cid_fill_sinfo(vif, i, &sinfo);
+ 			if (rc)
+ 				return rc;
+@@ -1229,6 +1236,8 @@ static int wil_link_debugfs_show(struct seq_file *s, void *data)
+ 			seq_printf(s, "  Tx_mcs = %d\n", sinfo.txrate.mcs);
+ 			seq_printf(s, "  Rx_mcs = %d\n", sinfo.rxrate.mcs);
+ 			seq_printf(s, "  SQ     = %d\n", sinfo.signal);
++		} else {
++			seq_puts(s, "  INVALID MID\n");
+ 		}
+ 	}
+ 
+@@ -1420,6 +1429,7 @@ __acquires(&p->tid_rx_lock) __releases(&p->tid_rx_lock)
+ 		struct wil_sta_info *p = &wil->sta[i];
+ 		char *status = "unknown";
+ 		u8 aid = 0;
++		u8 mid;
+ 
+ 		switch (p->status) {
+ 		case wil_sta_unused:
+@@ -1433,7 +1443,9 @@ __acquires(&p->tid_rx_lock) __releases(&p->tid_rx_lock)
+ 			aid = p->aid;
+ 			break;
+ 		}
+-		seq_printf(s, "[%d] %pM %s AID %d\n", i, p->addr, status, aid);
++		mid = (p->status != wil_sta_unused) ? p->mid : U8_MAX;
++		seq_printf(s, "[%d] %pM %s MID %d AID %d\n", i, p->addr, status,
++			   mid, aid);
+ 
+ 		if (p->status == wil_sta_connected) {
+ 			spin_lock_bh(&p->tid_rx_lock);
+diff --git a/drivers/net/wireless/ath/wil6210/interrupt.c b/drivers/net/wireless/ath/wil6210/interrupt.c
+index ef8f9a769833..84e9840c1752 100644
+--- a/drivers/net/wireless/ath/wil6210/interrupt.c
++++ b/drivers/net/wireless/ath/wil6210/interrupt.c
+@@ -127,7 +127,7 @@ void wil6210_unmask_irq_tx(struct wil6210_priv *wil)
+ 
+ void wil6210_unmask_irq_rx(struct wil6210_priv *wil)
+ {
+-	bool unmask_rx_htrsh = test_bit(wil_status_fwconnected, wil->status);
++	bool unmask_rx_htrsh = atomic_read(&wil->connected_vifs) > 0;
+ 
+ 	wil_w(wil, RGF_DMA_EP_RX_ICR + offsetof(struct RGF_ICR, IMC),
+ 	      unmask_rx_htrsh ? WIL6210_IMC_RX : WIL6210_IMC_RX_NO_RX_HTRSH);
+diff --git a/drivers/net/wireless/ath/wil6210/main.c b/drivers/net/wireless/ath/wil6210/main.c
+index 9a2a8663b66a..a4b413e8d55a 100644
+--- a/drivers/net/wireless/ath/wil6210/main.c
++++ b/drivers/net/wireless/ath/wil6210/main.c
+@@ -175,6 +175,15 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ 		     cid, sta->mid, sta->status);
+ 	/* inform upper/lower layers */
+ 	if (sta->status != wil_sta_unused) {
++		if (vif->mid != sta->mid) {
++			wil_err(wil, "STA MID mismatch with VIF MID(%d)\n",
++				vif->mid);
++			/* let FW override sta->mid but be more strict with
++			 * user space requests
++			 */
++			if (!from_event)
++				return;
++		}
+ 		if (!from_event) {
+ 			bool del_sta = (wdev->iftype == NL80211_IFTYPE_AP) ?
+ 						disable_ap_sme : false;
+@@ -277,32 +286,35 @@ static void _wil6210_disconnect(struct wil6210_vif *vif, const u8 *bssid,
+ 	case NL80211_IFTYPE_STATION:
+ 	case NL80211_IFTYPE_P2P_CLIENT:
+ 		wil_bcast_fini(vif);
+-		wil_update_net_queues_bh(wil, NULL, true);
++		wil_update_net_queues_bh(wil, vif, NULL, true);
+ 		netif_carrier_off(ndev);
+-		wil6210_bus_request(wil, WIL_DEFAULT_BUS_REQUEST_KBPS);
++		if (!wil_has_other_active_ifaces(wil, ndev, false, true))
++			wil6210_bus_request(wil, WIL_DEFAULT_BUS_REQUEST_KBPS);
+ 
+-		if (test_bit(wil_status_fwconnected, wil->status)) {
+-			clear_bit(wil_status_fwconnected, wil->status);
++		if (test_and_clear_bit(wil_vif_fwconnected, vif->status)) {
++			atomic_dec(&wil->connected_vifs);
+ 			cfg80211_disconnected(ndev, reason_code,
+ 					      NULL, 0,
+ 					      vif->locally_generated_disc,
+ 					      GFP_KERNEL);
+ 			vif->locally_generated_disc = false;
+-		} else if (test_bit(wil_status_fwconnecting, wil->status)) {
++		} else if (test_bit(wil_vif_fwconnecting, vif->status)) {
+ 			cfg80211_connect_result(ndev, bssid, NULL, 0, NULL, 0,
+ 						WLAN_STATUS_UNSPECIFIED_FAILURE,
+ 						GFP_KERNEL);
+ 			vif->bss = NULL;
+ 		}
+-		clear_bit(wil_status_fwconnecting, wil->status);
++		clear_bit(wil_vif_fwconnecting, vif->status);
+ 		break;
+ 	case NL80211_IFTYPE_AP:
+ 	case NL80211_IFTYPE_P2P_GO:
+ 		if (!wil_vif_is_connected(wil, vif->mid)) {
+-			wil_update_net_queues_bh(wil, NULL, true);
+-			clear_bit(wil_status_fwconnected, wil->status);
++			wil_update_net_queues_bh(wil, vif, NULL, true);
++			if (test_and_clear_bit(wil_vif_fwconnected,
++					       vif->status))
++				atomic_dec(&wil->connected_vifs);
+ 		} else {
+-			wil_update_net_queues_bh(wil, NULL, false);
++			wil_update_net_queues_bh(wil, vif, NULL, false);
+ 		}
+ 		break;
+ 	default:
+@@ -322,11 +334,11 @@ void wil_disconnect_worker(struct work_struct *work)
+ 		struct wmi_disconnect_event evt;
+ 	} __packed reply;
+ 
+-	if (test_bit(wil_status_fwconnected, wil->status))
++	if (test_bit(wil_vif_fwconnected, vif->status))
+ 		/* connect succeeded after all */
+ 		return;
+ 
+-	if (!test_bit(wil_status_fwconnecting, wil->status))
++	if (!test_bit(wil_vif_fwconnecting, vif->status))
+ 		/* already disconnected */
+ 		return;
+ 
+@@ -338,11 +350,11 @@ void wil_disconnect_worker(struct work_struct *work)
+ 		return;
+ 	}
+ 
+-	wil_update_net_queues_bh(wil, NULL, true);
++	wil_update_net_queues_bh(wil, vif, NULL, true);
+ 	netif_carrier_off(ndev);
+ 	cfg80211_connect_result(ndev, NULL, NULL, 0, NULL, 0,
+ 				WLAN_STATUS_UNSPECIFIED_FAILURE, GFP_KERNEL);
+-	clear_bit(wil_status_fwconnecting, wil->status);
++	clear_bit(wil_vif_fwconnecting, vif->status);
+ }
+ 
+ static int wil_wait_for_recovery(struct wil6210_priv *wil)
+@@ -1087,6 +1099,20 @@ void wil_abort_scan(struct wil6210_vif *vif, bool sync)
+ 	}
+ }
+ 
++void wil_abort_scan_all_vifs(struct wil6210_priv *wil, bool sync)
++{
++	int i;
++
++	lockdep_assert_held(&wil->vif_mutex);
++
++	for (i = 0; i < wil->max_vifs; i++) {
++		struct wil6210_vif *vif = wil->vifs[i];
++
++		if (vif)
++			wil_abort_scan(vif, sync);
++	}
++}
++
+ int wil_ps_update(struct wil6210_priv *wil, enum wmi_ps_profile_type ps_profile)
+ {
+ 	int rc;
+@@ -1139,6 +1165,7 @@ static int wil_restore_vifs(struct wil6210_priv *wil)
+ 		vif = wil->vifs[i];
+ 		if (!vif)
+ 			continue;
++		vif->ap_isolate = 0;
+ 		if (vif->mid) {
+ 			ndev = vif_to_ndev(vif);
+ 			wdev = vif_to_wdev(vif);
+@@ -1162,10 +1189,10 @@ static int wil_restore_vifs(struct wil6210_priv *wil)
+  */
+ int wil_reset(struct wil6210_priv *wil, bool load_fw)
+ {
+-	int rc;
++	int rc, i;
+ 	unsigned long status_flags = BIT(wil_status_resetting);
+ 	int no_flash;
+-	struct wil6210_vif *vif = ndev_to_vif(wil->main_ndev);
++	struct wil6210_vif *vif;
+ 
+ 	wil_dbg_misc(wil, "reset\n");
+ 
+@@ -1214,17 +1241,23 @@ int wil_reset(struct wil6210_priv *wil, bool load_fw)
+ 		goto out;
+ 	}
+ 
+-	cancel_work_sync(&vif->disconnect_worker);
+-	wil6210_disconnect(vif, NULL, WLAN_REASON_DEAUTH_LEAVING, false);
++	mutex_lock(&wil->vif_mutex);
++	wil_abort_scan_all_vifs(wil, false);
++	mutex_unlock(&wil->vif_mutex);
++
++	for (i = 0; i < wil->max_vifs; i++) {
++		vif = wil->vifs[i];
++		if (vif) {
++			cancel_work_sync(&vif->disconnect_worker);
++			wil6210_disconnect(vif, NULL,
++					   WLAN_REASON_DEAUTH_LEAVING, false);
++		}
++	}
+ 	wil_bcast_fini_all(wil);
+ 
+ 	/* Disable device led before reset*/
+ 	wmi_led_cfg(wil, false);
+ 
+-	mutex_lock(&wil->vif_mutex);
+-	wil_abort_scan(vif, false);
+-	mutex_unlock(&wil->vif_mutex);
+-
+ 	/* prevent NAPI from being scheduled and prevent wmi commands */
+ 	mutex_lock(&wil->wmi_mutex);
+ 	if (test_bit(wil_status_suspending, wil->status))
+@@ -1294,7 +1327,6 @@ int wil_reset(struct wil6210_priv *wil, bool load_fw)
+ 	}
+ 
+ 	/* init after reset */
+-	vif->ap_isolate = 0;
+ 	reinit_completion(&wil->wmi_ready);
+ 	reinit_completion(&wil->wmi_call);
+ 	reinit_completion(&wil->halp.comp);
+@@ -1446,7 +1478,7 @@ int __wil_down(struct wil6210_priv *wil)
+ 
+ 	mutex_lock(&wil->vif_mutex);
+ 	wil_p2p_stop_radio_operations(wil);
+-	wil_abort_scan(ndev_to_vif(wil->main_ndev), false);
++	wil_abort_scan_all_vifs(wil, false);
+ 	mutex_unlock(&wil->vif_mutex);
+ 
+ 	return wil_reset(wil, false);
+diff --git a/drivers/net/wireless/ath/wil6210/netdev.c b/drivers/net/wireless/ath/wil6210/netdev.c
+index 87956c0f7c79..05e9408e7ea3 100644
+--- a/drivers/net/wireless/ath/wil6210/netdev.c
++++ b/drivers/net/wireless/ath/wil6210/netdev.c
+@@ -43,6 +43,7 @@ bool wil_has_other_active_ifaces(struct wil6210_priv *wil,
+ 
+ bool wil_has_active_ifaces(struct wil6210_priv *wil, bool up, bool ok)
+ {
++	/* use NULL ndev argument to check all interfaces */
+ 	return wil_has_other_active_ifaces(wil, NULL, up, ok);
+ }
+ 
+@@ -130,11 +131,19 @@ static int wil6210_netdev_poll_tx(struct napi_struct *napi, int budget)
+ 	for (i = 0; i < WIL6210_MAX_TX_RINGS; i++) {
+ 		struct vring *vring = &wil->vring_tx[i];
+ 		struct vring_tx_data *txdata = &wil->vring_tx_data[i];
++		struct wil6210_vif *vif;
+ 
+-		if (!vring->va || !txdata->enabled)
++		if (!vring->va || !txdata->enabled ||
++		    txdata->mid >= wil->max_vifs)
+ 			continue;
+ 
+-		tx_done += wil_tx_complete(wil, i);
++		vif = wil->vifs[txdata->mid];
++		if (unlikely(!vif)) {
++			wil_dbg_txrx(wil, "Invalid MID %d\n", txdata->mid);
++			continue;
++		}
++
++		tx_done += wil_tx_complete(vif, i);
+ 	}
+ 
+ 	if (tx_done < budget) {
+@@ -232,6 +241,8 @@ static void wil_vif_init(struct wil6210_vif *vif)
+ 	INIT_WORK(&vif->p2p.delayed_listen_work, wil_p2p_delayed_listen_work);
+ 
+ 	INIT_LIST_HEAD(&vif->probe_client_pending);
++
++	vif->net_queue_stopped = 1;
+ }
+ 
+ static u8 wil_vif_find_free_mid(struct wil6210_priv *wil)
+@@ -406,12 +417,14 @@ int wil_if_add(struct wil6210_priv *wil)
+ 		return rc;
+ 	}
+ 
+-	netif_napi_add(ndev, &wil->napi_rx, wil6210_netdev_poll_rx,
++	init_dummy_netdev(&wil->napi_ndev);
++	netif_napi_add(&wil->napi_ndev, &wil->napi_rx, wil6210_netdev_poll_rx,
+ 		       WIL6210_NAPI_BUDGET);
+-	netif_tx_napi_add(ndev, &wil->napi_tx, wil6210_netdev_poll_tx,
++	netif_tx_napi_add(&wil->napi_ndev,
++			  &wil->napi_tx, wil6210_netdev_poll_tx,
+ 			  WIL6210_NAPI_BUDGET);
+ 
+-	wil_update_net_queues_bh(wil, NULL, true);
++	wil_update_net_queues_bh(wil, vif, NULL, true);
+ 
+ 	rtnl_lock();
+ 	rc = wil_vif_add(wil, vif);
+@@ -450,10 +463,29 @@ void wil_vif_remove(struct wil6210_priv *wil, u8 mid)
+ 	 */
+ 	unregister_netdevice(ndev);
+ 
++	mutex_lock(&wil->mutex);
++	wil6210_disconnect(vif, NULL, WLAN_REASON_DEAUTH_LEAVING, false);
++	mutex_unlock(&wil->mutex);
++
+ 	if (any_active && vif->mid != 0)
+ 		wmi_port_delete(wil, vif->mid);
+ 
++	/* make sure no one is accessing the VIF before removing */
++	mutex_lock(&wil->vif_mutex);
+ 	wil->vifs[mid] = NULL;
++	/* ensure NAPI code will see the NULL VIF */
++	wmb();
++	if (test_bit(wil_status_napi_en, wil->status)) {
++		napi_synchronize(&wil->napi_rx);
++		napi_synchronize(&wil->napi_tx);
++	}
++	mutex_unlock(&wil->vif_mutex);
++
++	flush_work(&wil->wmi_event_worker);
++	del_timer_sync(&vif->connect_timer);
++	cancel_work_sync(&vif->disconnect_worker);
++	wil_probe_client_flush(vif);
++	cancel_work_sync(&vif->probe_client_worker);
+ 	/* for VIFs, ndev will be freed by destructor after RTNL is unlocked.
+ 	 * the main interface will be freed in wil_if_free, we need to keep it
+ 	 * a bit longer so logging macros will work.
+@@ -470,5 +502,9 @@ void wil_if_remove(struct wil6210_priv *wil)
+ 	rtnl_lock();
+ 	wil_vif_remove(wil, 0);
+ 	rtnl_unlock();
++
++	netif_napi_del(&wil->napi_tx);
++	netif_napi_del(&wil->napi_rx);
++
+ 	wiphy_unregister(wdev->wiphy);
+ }
+diff --git a/drivers/net/wireless/ath/wil6210/pcie_bus.c b/drivers/net/wireless/ath/wil6210/pcie_bus.c
+index 7d3ff3f318b7..19cbc6add637 100644
+--- a/drivers/net/wireless/ath/wil6210/pcie_bus.c
++++ b/drivers/net/wireless/ath/wil6210/pcie_bus.c
+@@ -450,12 +450,15 @@ static int wil6210_suspend(struct device *dev, bool is_runtime)
+ 	int rc = 0;
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct wil6210_priv *wil = pci_get_drvdata(pdev);
+-	struct net_device *ndev = wil->main_ndev;
+-	bool keep_radio_on = ndev->flags & IFF_UP &&
+-			     wil->keep_radio_on_during_sleep;
++	bool keep_radio_on, active_ifaces;
+ 
+ 	wil_dbg_pm(wil, "suspend: %s\n", is_runtime ? "runtime" : "system");
+ 
++	mutex_lock(&wil->vif_mutex);
++	active_ifaces = wil_has_active_ifaces(wil, true, false);
++	mutex_unlock(&wil->vif_mutex);
++	keep_radio_on = active_ifaces && wil->keep_radio_on_during_sleep;
++
+ 	rc = wil_can_suspend(wil, is_runtime);
+ 	if (rc)
+ 		goto out;
+@@ -482,12 +485,15 @@ static int wil6210_resume(struct device *dev, bool is_runtime)
+ 	int rc = 0;
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct wil6210_priv *wil = pci_get_drvdata(pdev);
+-	struct net_device *ndev = wil->main_ndev;
+-	bool keep_radio_on = ndev->flags & IFF_UP &&
+-			     wil->keep_radio_on_during_sleep;
++	bool keep_radio_on, active_ifaces;
+ 
+ 	wil_dbg_pm(wil, "resume: %s\n", is_runtime ? "runtime" : "system");
+ 
++	mutex_lock(&wil->vif_mutex);
++	active_ifaces = wil_has_active_ifaces(wil, true, false);
++	mutex_unlock(&wil->vif_mutex);
++	keep_radio_on = active_ifaces && wil->keep_radio_on_during_sleep;
++
+ 	/* In case radio stays on, platform device will control
+ 	 * PCIe master
+ 	 */
+diff --git a/drivers/net/wireless/ath/wil6210/pm.c b/drivers/net/wireless/ath/wil6210/pm.c
+index 12f6d78bcf63..ba81fb3ac96f 100644
+--- a/drivers/net/wireless/ath/wil6210/pm.c
++++ b/drivers/net/wireless/ath/wil6210/pm.c
+@@ -21,13 +21,72 @@
+ 
+ #define WIL6210_AUTOSUSPEND_DELAY_MS (1000)
+ 
++static void wil_pm_wake_connected_net_queues(struct wil6210_priv *wil)
++{
++	int i;
++
++	mutex_lock(&wil->vif_mutex);
++	for (i = 0; i < wil->max_vifs; i++) {
++		struct wil6210_vif *vif = wil->vifs[i];
++
++		if (vif && test_bit(wil_vif_fwconnected, vif->status))
++			wil_update_net_queues_bh(wil, vif, NULL, false);
++	}
++	mutex_unlock(&wil->vif_mutex);
++}
++
++static void wil_pm_stop_all_net_queues(struct wil6210_priv *wil)
++{
++	int i;
++
++	mutex_lock(&wil->vif_mutex);
++	for (i = 0; i < wil->max_vifs; i++) {
++		struct wil6210_vif *vif = wil->vifs[i];
++
++		if (vif)
++			wil_update_net_queues_bh(wil, vif, NULL, true);
++	}
++	mutex_unlock(&wil->vif_mutex);
++}
++
++static bool
++wil_can_suspend_vif(struct wil6210_priv *wil, struct wil6210_vif *vif,
++		    bool is_runtime)
++{
++	struct wireless_dev *wdev = vif_to_wdev(vif);
++
++	switch (wdev->iftype) {
++	case NL80211_IFTYPE_MONITOR:
++		wil_dbg_pm(wil, "Sniffer\n");
++		return false;
++
++	/* for STA-like interface, don't runtime suspend */
++	case NL80211_IFTYPE_STATION:
++	case NL80211_IFTYPE_P2P_CLIENT:
++		if (test_bit(wil_vif_fwconnecting, vif->status)) {
++			wil_dbg_pm(wil, "Delay suspend when connecting\n");
++			return false;
++		}
++		if (is_runtime) {
++			wil_dbg_pm(wil, "STA-like interface\n");
++			return false;
++		}
++		break;
++	/* AP-like interface - can't suspend */
++	default:
++		wil_dbg_pm(wil, "AP-like interface\n");
++		return false;
++	}
++
++	return true;
++}
++
+ int wil_can_suspend(struct wil6210_priv *wil, bool is_runtime)
+ {
+-	int rc = 0;
+-	struct net_device *ndev = wil->main_ndev;
+-	struct wireless_dev *wdev = ndev->ieee80211_ptr;
++	int rc = 0, i;
+ 	bool wmi_only = test_bit(WMI_FW_CAPABILITY_WMI_ONLY,
+ 				 wil->fw_capabilities);
++	bool active_ifaces;
+ 
+ 	wil_dbg_pm(wil, "can_suspend: %s\n", is_runtime ? "runtime" : "system");
+ 
+@@ -41,7 +100,12 @@ int wil_can_suspend(struct wil6210_priv *wil, bool is_runtime)
+ 		rc = -EBUSY;
+ 		goto out;
+ 	}
+-	if (!(ndev->flags & IFF_UP)) {
++
++	mutex_lock(&wil->vif_mutex);
++	active_ifaces = wil_has_active_ifaces(wil, true, false);
++	mutex_unlock(&wil->vif_mutex);
++
++	if (!active_ifaces) {
+ 		/* can always sleep when down */
+ 		wil_dbg_pm(wil, "Interface is down\n");
+ 		goto out;
+@@ -58,32 +122,19 @@ int wil_can_suspend(struct wil6210_priv *wil, bool is_runtime)
+ 	}
+ 
+ 	/* interface is running */
+-	switch (wdev->iftype) {
+-	case NL80211_IFTYPE_MONITOR:
+-		wil_dbg_pm(wil, "Sniffer\n");
+-		rc = -EBUSY;
+-		goto out;
+-	/* for STA-like interface, don't runtime suspend */
+-	case NL80211_IFTYPE_STATION:
+-	case NL80211_IFTYPE_P2P_CLIENT:
+-		if (test_bit(wil_status_fwconnecting, wil->status)) {
+-			wil_dbg_pm(wil, "Delay suspend when connecting\n");
+-			rc = -EBUSY;
+-			goto out;
+-		}
+-		/* Runtime pm not supported in case the interface is up */
+-		if (is_runtime) {
+-			wil_dbg_pm(wil, "STA-like interface\n");
++	mutex_lock(&wil->vif_mutex);
++	for (i = 0; i < wil->max_vifs; i++) {
++		struct wil6210_vif *vif = wil->vifs[i];
++
++		if (!vif)
++			continue;
++		if (!wil_can_suspend_vif(wil, vif, is_runtime)) {
+ 			rc = -EBUSY;
++			mutex_unlock(&wil->vif_mutex);
+ 			goto out;
+ 		}
+-		break;
+-	/* AP-like interface - can't suspend */
+-	default:
+-		wil_dbg_pm(wil, "AP-like interface\n");
+-		rc = -EBUSY;
+-		break;
+ 	}
++	mutex_unlock(&wil->vif_mutex);
+ 
+ out:
+ 	wil_dbg_pm(wil, "can_suspend: %s => %s (%d)\n",
+@@ -128,8 +179,7 @@ static int wil_resume_keep_radio_on(struct wil6210_priv *wil)
+ 	}
+ 
+ 	/* Wake all queues */
+-	if (test_bit(wil_status_fwconnected, wil->status))
+-		wil_update_net_queues_bh(wil, NULL, false);
++	wil_pm_wake_connected_net_queues(wil);
+ 
+ out:
+ 	if (rc)
+@@ -153,7 +203,7 @@ static int wil_suspend_keep_radio_on(struct wil6210_priv *wil)
+ 		wil->suspend_stats.rejected_by_host++;
+ 		return -EBUSY;
+ 	}
+-	wil_update_net_queues_bh(wil, NULL, true);
++	wil_pm_stop_all_net_queues(wil);
+ 
+ 	if (!wil_is_tx_idle(wil)) {
+ 		wil_dbg_pm(wil, "Pending TX data, reject suspend\n");
+@@ -244,22 +294,20 @@ static int wil_suspend_keep_radio_on(struct wil6210_priv *wil)
+ 	/* if resume succeeded, reject the suspend */
+ 	if (!rc) {
+ 		rc = -EBUSY;
+-		if (test_bit(wil_status_fwconnected, wil->status))
+-			wil_update_net_queues_bh(wil, NULL, false);
++		wil_pm_wake_connected_net_queues(wil);
+ 	}
+ 	return rc;
+ 
+ reject_suspend:
+ 	clear_bit(wil_status_suspending, wil->status);
+-	if (test_bit(wil_status_fwconnected, wil->status))
+-		wil_update_net_queues_bh(wil, NULL, false);
++	wil_pm_wake_connected_net_queues(wil);
+ 	return -EBUSY;
+ }
+ 
+ static int wil_suspend_radio_off(struct wil6210_priv *wil)
+ {
+ 	int rc = 0;
+-	struct net_device *ndev = wil->main_ndev;
++	bool active_ifaces;
+ 
+ 	wil_dbg_pm(wil, "suspend radio off\n");
+ 
+@@ -273,7 +321,11 @@ static int wil_suspend_radio_off(struct wil6210_priv *wil)
+ 	}
+ 
+ 	/* if netif up, hardware is alive, shut it down */
+-	if (ndev->flags & IFF_UP) {
++	mutex_lock(&wil->vif_mutex);
++	active_ifaces = wil_has_active_ifaces(wil, true, false);
++	mutex_unlock(&wil->vif_mutex);
++
++	if (active_ifaces) {
+ 		rc = wil_down(wil);
+ 		if (rc) {
+ 			wil_err(wil, "wil_down : %d\n", rc);
+@@ -307,16 +359,19 @@ static int wil_suspend_radio_off(struct wil6210_priv *wil)
+ static int wil_resume_radio_off(struct wil6210_priv *wil)
+ {
+ 	int rc = 0;
+-	struct net_device *ndev = wil->main_ndev;
++	bool active_ifaces;
+ 
+ 	wil_dbg_pm(wil, "Enabling PCIe IRQ\n");
+ 	wil_enable_irq(wil);
+-	/* if netif up, bring hardware up
++	/* if any netif up, bring hardware up
+ 	 * During open(), IFF_UP set after actual device method
+ 	 * invocation. This prevent recursive call to wil_up()
+ 	 * wil_status_suspended will be cleared in wil_reset
+ 	 */
+-	if (ndev->flags & IFF_UP)
++	mutex_lock(&wil->vif_mutex);
++	active_ifaces = wil_has_active_ifaces(wil, true, false);
++	mutex_unlock(&wil->vif_mutex);
++	if (active_ifaces)
+ 		rc = wil_up(wil);
+ 	else
+ 		clear_bit(wil_status_suspended, wil->status);
+diff --git a/drivers/net/wireless/ath/wil6210/rx_reorder.c b/drivers/net/wireless/ath/wil6210/rx_reorder.c
+index c2140b3d9496..14dcb0698dee 100644
+--- a/drivers/net/wireless/ath/wil6210/rx_reorder.c
++++ b/drivers/net/wireless/ath/wil6210/rx_reorder.c
+@@ -41,11 +41,10 @@ static inline int reorder_index(struct wil_tid_ampdu_rx *r, u16 seq)
+ 	return seq_sub(seq, r->ssn) % r->buf_size;
+ }
+ 
+-static void wil_release_reorder_frame(struct wil6210_priv *wil,
++static void wil_release_reorder_frame(struct net_device *ndev,
+ 				      struct wil_tid_ampdu_rx *r,
+ 				      int index)
+ {
+-	struct net_device *ndev = wil->main_ndev;
+ 	struct sk_buff *skb = r->reorder_buf[index];
+ 
+ 	if (!skb)
+@@ -60,7 +59,7 @@ static void wil_release_reorder_frame(struct wil6210_priv *wil,
+ 	r->head_seq_num = seq_inc(r->head_seq_num);
+ }
+ 
+-static void wil_release_reorder_frames(struct wil6210_priv *wil,
++static void wil_release_reorder_frames(struct net_device *ndev,
+ 				       struct wil_tid_ampdu_rx *r,
+ 				       u16 hseq)
+ {
+@@ -74,18 +73,18 @@ static void wil_release_reorder_frames(struct wil6210_priv *wil,
+ 	 */
+ 	while (seq_less(r->head_seq_num, hseq) && r->stored_mpdu_num) {
+ 		index = reorder_index(r, r->head_seq_num);
+-		wil_release_reorder_frame(wil, r, index);
++		wil_release_reorder_frame(ndev, r, index);
+ 	}
+ 	r->head_seq_num = hseq;
+ }
+ 
+-static void wil_reorder_release(struct wil6210_priv *wil,
++static void wil_reorder_release(struct net_device *ndev,
+ 				struct wil_tid_ampdu_rx *r)
+ {
+ 	int index = reorder_index(r, r->head_seq_num);
+ 
+ 	while (r->reorder_buf[index]) {
+-		wil_release_reorder_frame(wil, r, index);
++		wil_release_reorder_frame(ndev, r, index);
+ 		index = reorder_index(r, r->head_seq_num);
+ 	}
+ }
+@@ -94,7 +93,8 @@ static void wil_reorder_release(struct wil6210_priv *wil,
+ void wil_rx_reorder(struct wil6210_priv *wil, struct sk_buff *skb)
+ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ {
+-	struct net_device *ndev = wil->main_ndev;
++	struct wil6210_vif *vif;
++	struct net_device *ndev;
+ 	struct vring_rx_desc *d = wil_skb_rxdesc(skb);
+ 	int tid = wil_rxdesc_tid(d);
+ 	int cid = wil_rxdesc_cid(d);
+@@ -109,6 +109,14 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ 	wil_dbg_txrx(wil, "MID %d CID %d TID %d Seq 0x%03x mcast %01x\n",
+ 		     mid, cid, tid, seq, mcast);
+ 
++	vif = wil->vifs[mid];
++	if (unlikely(!vif)) {
++		wil_dbg_txrx(wil, "invalid VIF, mid %d\n", mid);
++		dev_kfree_skb(skb);
++		return;
++	}
++	ndev = vif_to_ndev(vif);
++
+ 	if (unlikely(mcast)) {
+ 		wil_netif_rx_any(skb, ndev);
+ 		return;
+@@ -169,7 +177,7 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ 	if (!seq_less(seq, r->head_seq_num + r->buf_size)) {
+ 		hseq = seq_inc(seq_sub(seq, r->buf_size));
+ 		/* release stored frames up to new head to stack */
+-		wil_release_reorder_frames(wil, r, hseq);
++		wil_release_reorder_frames(ndev, r, hseq);
+ 	}
+ 
+ 	/* Now the new frame is always in the range of the reordering buffer */
+@@ -200,16 +208,18 @@ __acquires(&sta->tid_rx_lock) __releases(&sta->tid_rx_lock)
+ 	r->reorder_buf[index] = skb;
+ 	r->reorder_time[index] = jiffies;
+ 	r->stored_mpdu_num++;
+-	wil_reorder_release(wil, r);
++	wil_reorder_release(ndev, r);
+ 
+ out:
+ 	spin_unlock(&sta->tid_rx_lock);
+ }
+ 
+ /* process BAR frame, called in NAPI context */
+-void wil_rx_bar(struct wil6210_priv *wil, u8 cid, u8 tid, u16 seq)
++void wil_rx_bar(struct wil6210_priv *wil, struct wil6210_vif *vif,
++		u8 cid, u8 tid, u16 seq)
+ {
+ 	struct wil_sta_info *sta = &wil->sta[cid];
++	struct net_device *ndev = vif_to_ndev(vif);
+ 	struct wil_tid_ampdu_rx *r;
+ 
+ 	spin_lock(&sta->tid_rx_lock);
+@@ -224,9 +234,9 @@ void wil_rx_bar(struct wil6210_priv *wil, u8 cid, u8 tid, u16 seq)
+ 			seq, r->head_seq_num);
+ 		goto out;
+ 	}
+-	wil_dbg_txrx(wil, "BAR: CID %d TID %d Seq 0x%03x head 0x%03x\n",
+-		     cid, tid, seq, r->head_seq_num);
+-	wil_release_reorder_frames(wil, r, seq);
++	wil_dbg_txrx(wil, "BAR: CID %d MID %d TID %d Seq 0x%03x head 0x%03x\n",
++		     cid, vif->mid, tid, seq, r->head_seq_num);
++	wil_release_reorder_frames(ndev, r, seq);
+ 
+ out:
+ 	spin_unlock(&sta->tid_rx_lock);
+diff --git a/drivers/net/wireless/ath/wil6210/txrx.c b/drivers/net/wireless/ath/wil6210/txrx.c
+index a53238647b95..b60b9fcaaebd 100644
+--- a/drivers/net/wireless/ath/wil6210/txrx.c
++++ b/drivers/net/wireless/ath/wil6210/txrx.c
+@@ -475,7 +475,8 @@ static struct sk_buff *wil_vring_reap_rx(struct wil6210_priv *wil,
+ 					 struct vring *vring)
+ {
+ 	struct device *dev = wil_to_dev(wil);
+-	struct net_device *ndev = wil->main_ndev;
++	struct wil6210_vif *vif;
++	struct net_device *ndev;
+ 	volatile struct vring_rx_desc *_d;
+ 	struct vring_rx_desc *d;
+ 	struct sk_buff *skb;
+@@ -484,7 +485,7 @@ static struct sk_buff *wil_vring_reap_rx(struct wil6210_priv *wil,
+ 	unsigned int sz = wil->rx_buf_len + ETH_HLEN + snaplen;
+ 	u16 dmalen;
+ 	u8 ftype;
+-	int cid;
++	int cid, mid;
+ 	int i;
+ 	struct wil_net_stats *stats;
+ 
+@@ -521,6 +522,16 @@ static struct sk_buff *wil_vring_reap_rx(struct wil6210_priv *wil,
+ 			  (const void *)d, sizeof(*d), false);
+ 
+ 	cid = wil_rxdesc_cid(d);
++	mid = wil_rxdesc_mid(d);
++	vif = wil->vifs[mid];
++
++	if (unlikely(!vif)) {
++		wil_dbg_txrx(wil, "skipped RX descriptor with invalid mid %d",
++			     mid);
++		kfree_skb(skb);
++		goto again;
++	}
++	ndev = vif_to_ndev(vif);
+ 	stats = &wil->sta[cid].stats;
+ 
+ 	if (unlikely(dmalen > sz)) {
+@@ -554,7 +565,6 @@ static struct sk_buff *wil_vring_reap_rx(struct wil6210_priv *wil,
+ 	ftype = wil_rxdesc_ftype(d) << 2;
+ 	if (unlikely(ftype != IEEE80211_FTYPE_DATA)) {
+ 		u8 fc1 = wil_rxdesc_fc1(d);
+-		int mid = wil_rxdesc_mid(d);
+ 		int tid = wil_rxdesc_tid(d);
+ 		u16 seq = wil_rxdesc_seq(d);
+ 
+@@ -566,7 +576,7 @@ static struct sk_buff *wil_vring_reap_rx(struct wil6210_priv *wil,
+ 			wil_dbg_txrx(wil,
+ 				     "BAR: MID %d CID %d TID %d Seq 0x%03x\n",
+ 				     mid, cid, tid, seq);
+-			wil_rx_bar(wil, cid, tid, seq);
++			wil_rx_bar(wil, vif, cid, tid, seq);
+ 		} else {
+ 			/* print again all info. One can enable only this
+ 			 * without overhead for printing every Rx frame
+@@ -622,6 +632,11 @@ static struct sk_buff *wil_vring_reap_rx(struct wil6210_priv *wil,
+ /**
+  * allocate and fill up to @count buffers in rx ring
+  * buffers posted at @swtail
++ * Note: we have a single RX queue for servicing all VIFs, but we
++ * allocate skbs with headroom according to main interface only. This
++ * means it will not work with monitor interface together with other VIFs.
++ * Currently we only support monitor interface on its own without other VIFs,
++ * and we will need to fix this code once we add support.
+  */
+ static int wil_rx_refill(struct wil6210_priv *wil, int count)
+ {
+@@ -789,8 +804,8 @@ void wil_netif_rx_any(struct sk_buff *skb, struct net_device *ndev)
+ 	}
+ 
+ 	if (skb) { /* deliver to local stack */
+-
+ 		skb->protocol = eth_type_trans(skb, ndev);
++		skb->dev = ndev;
+ 		rc = napi_gro_receive(&wil->napi_rx, skb);
+ 		wil_dbg_txrx(wil, "Rx complete %d bytes => %s\n",
+ 			     len, gro_res_str[rc]);
+@@ -1905,6 +1920,7 @@ static int wil_tx_vring(struct wil6210_priv *wil, struct wil6210_vif *vif,
+ 
+ /**
+  * Check status of tx vrings and stop/wake net queues if needed
++ * It will start/stop net queues of a specific VIF net_device.
+  *
+  * This function does one of two checks:
+  * In case check_stop is true, will check if net queues need to be stopped. If
+@@ -1920,28 +1936,32 @@ static int wil_tx_vring(struct wil6210_priv *wil, struct wil6210_vif *vif,
+  * availability and modified vring has high descriptor availability.
+  */
+ static inline void __wil_update_net_queues(struct wil6210_priv *wil,
++					   struct wil6210_vif *vif,
+ 					   struct vring *vring,
+ 					   bool check_stop)
+ {
+ 	int i;
+ 
++	if (unlikely(!vif))
++		return;
++
+ 	if (vring)
+-		wil_dbg_txrx(wil, "vring %d, check_stop=%d, stopped=%d",
+-			     (int)(vring - wil->vring_tx), check_stop,
+-			     wil->net_queue_stopped);
++		wil_dbg_txrx(wil, "vring %d, mid %d, check_stop=%d, stopped=%d",
++			     (int)(vring - wil->vring_tx), vif->mid, check_stop,
++			     vif->net_queue_stopped);
+ 	else
+-		wil_dbg_txrx(wil, "check_stop=%d, stopped=%d",
+-			     check_stop, wil->net_queue_stopped);
++		wil_dbg_txrx(wil, "check_stop=%d, mid=%d, stopped=%d",
++			     check_stop, vif->mid, vif->net_queue_stopped);
+ 
+-	if (check_stop == wil->net_queue_stopped)
++	if (check_stop == vif->net_queue_stopped)
+ 		/* net queues already in desired state */
+ 		return;
+ 
+ 	if (check_stop) {
+ 		if (!vring || unlikely(wil_vring_avail_low(vring))) {
+ 			/* not enough room in the vring */
+-			netif_tx_stop_all_queues(wil->main_ndev);
+-			wil->net_queue_stopped = true;
++			netif_tx_stop_all_queues(vif_to_ndev(vif));
++			vif->net_queue_stopped = true;
+ 			wil_dbg_txrx(wil, "netif_tx_stop called\n");
+ 		}
+ 		return;
+@@ -1957,7 +1977,8 @@ static inline void __wil_update_net_queues(struct wil6210_priv *wil,
+ 		struct vring *cur_vring = &wil->vring_tx[i];
+ 		struct vring_tx_data *txdata = &wil->vring_tx_data[i];
+ 
+-		if (!cur_vring->va || !txdata->enabled || cur_vring == vring)
++		if (txdata->mid != vif->mid || !cur_vring->va ||
++		    !txdata->enabled || cur_vring == vring)
+ 			continue;
+ 
+ 		if (wil_vring_avail_low(cur_vring)) {
+@@ -1970,24 +1991,24 @@ static inline void __wil_update_net_queues(struct wil6210_priv *wil,
+ 	if (!vring || wil_vring_avail_high(vring)) {
+ 		/* enough room in the vring */
+ 		wil_dbg_txrx(wil, "calling netif_tx_wake\n");
+-		netif_tx_wake_all_queues(wil->main_ndev);
+-		wil->net_queue_stopped = false;
++		netif_tx_wake_all_queues(vif_to_ndev(vif));
++		vif->net_queue_stopped = false;
+ 	}
+ }
+ 
+-void wil_update_net_queues(struct wil6210_priv *wil, struct vring *vring,
+-			   bool check_stop)
++void wil_update_net_queues(struct wil6210_priv *wil, struct wil6210_vif *vif,
++			   struct vring *vring, bool check_stop)
+ {
+ 	spin_lock(&wil->net_queue_lock);
+-	__wil_update_net_queues(wil, vring, check_stop);
++	__wil_update_net_queues(wil, vif, vring, check_stop);
+ 	spin_unlock(&wil->net_queue_lock);
+ }
+ 
+-void wil_update_net_queues_bh(struct wil6210_priv *wil, struct vring *vring,
+-			      bool check_stop)
++void wil_update_net_queues_bh(struct wil6210_priv *wil, struct wil6210_vif *vif,
++			      struct vring *vring, bool check_stop)
+ {
+ 	spin_lock_bh(&wil->net_queue_lock);
+-	__wil_update_net_queues(wil, vring, check_stop);
++	__wil_update_net_queues(wil, vif, vring, check_stop);
+ 	spin_unlock_bh(&wil->net_queue_lock);
+ }
+ 
+@@ -2009,8 +2030,9 @@ netdev_tx_t wil_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 		}
+ 		goto drop;
+ 	}
+-	if (unlikely(!test_bit(wil_status_fwconnected, wil->status))) {
+-		wil_dbg_ratelimited(wil, "FW not connected, packet dropped\n");
++	if (unlikely(!test_bit(wil_vif_fwconnected, vif->status))) {
++		wil_dbg_ratelimited(wil,
++				    "VIF not connected, packet dropped\n");
+ 		goto drop;
+ 	}
+ 	if (unlikely(vif->wdev.iftype == NL80211_IFTYPE_MONITOR)) {
+@@ -2051,7 +2073,7 @@ netdev_tx_t wil_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 	switch (rc) {
+ 	case 0:
+ 		/* shall we stop net queues? */
+-		wil_update_net_queues_bh(wil, vring, true);
++		wil_update_net_queues_bh(wil, vif, vring, true);
+ 		/* statistics will be updated on the tx_complete */
+ 		dev_kfree_skb_any(skb);
+ 		return NETDEV_TX_OK;
+@@ -2090,9 +2112,10 @@ static inline void wil_consume_skb(struct sk_buff *skb, bool acked)
+  *
+  * Safe to call from IRQ
+  */
+-int wil_tx_complete(struct wil6210_priv *wil, int ringid)
++int wil_tx_complete(struct wil6210_vif *vif, int ringid)
+ {
+-	struct net_device *ndev = wil->main_ndev;
++	struct wil6210_priv *wil = vif_to_wil(vif);
++	struct net_device *ndev = vif_to_ndev(vif);
+ 	struct device *dev = wil_to_dev(wil);
+ 	struct vring *vring = &wil->vring_tx[ringid];
+ 	struct vring_tx_data *txdata = &wil->vring_tx_data[ringid];
+@@ -2202,7 +2225,7 @@ int wil_tx_complete(struct wil6210_priv *wil, int ringid)
+ 
+ 	/* shall we wake net queues? */
+ 	if (done)
+-		wil_update_net_queues(wil, vring, false);
++		wil_update_net_queues(wil, vif, vring, false);
+ 
+ 	return done;
+ }
+diff --git a/drivers/net/wireless/ath/wil6210/txrx.h b/drivers/net/wireless/ath/wil6210/txrx.h
+index fcdffaa8251b..5f07717acc2c 100644
+--- a/drivers/net/wireless/ath/wil6210/txrx.h
++++ b/drivers/net/wireless/ath/wil6210/txrx.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2012-2016 Qualcomm Atheros, Inc.
++ * Copyright (c) 2018, The Linux Foundation. All rights reserved.
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -63,7 +64,9 @@ static inline void wil_desc_addr_set(struct vring_dma_addr *addr,
+  * [dword 1]
+  * bit  0.. 3 : pkt_mode:4
+  * bit      4 : pkt_mode_en:1
+- * bit  5..14 : reserved0:10
++ * bit      5 : mac_id_en:1
++ * bit   6..7 : mac_id:2
++ * bit  8..14 : reserved0:7
+  * bit     15 : ack_policy_en:1
+  * bit 16..19 : dst_index:4
+  * bit     20 : dst_index_en:1
+@@ -132,6 +135,14 @@ struct vring_tx_mac {
+ #define MAC_CFG_DESC_TX_1_PKT_MODE_EN_LEN 1
+ #define MAC_CFG_DESC_TX_1_PKT_MODE_EN_MSK 0x10
+ 
++#define MAC_CFG_DESC_TX_1_MAC_ID_EN_POS 5
++#define MAC_CFG_DESC_TX_1_MAC_ID_EN_LEN 1
++#define MAC_CFG_DESC_TX_1_MAC_ID_EN_MSK 0x20
++
++#define MAC_CFG_DESC_TX_1_MAC_ID_POS 6
++#define MAC_CFG_DESC_TX_1_MAC_ID_LEN 2
++#define MAC_CFG_DESC_TX_1_MAC_ID_MSK 0xc0
++
+ #define MAC_CFG_DESC_TX_1_ACK_POLICY_EN_POS 15
+ #define MAC_CFG_DESC_TX_1_ACK_POLICY_EN_LEN 1
+ #define MAC_CFG_DESC_TX_1_ACK_POLICY_EN_MSK 0x8000
+@@ -304,7 +315,7 @@ enum {
+  * bit  0.. 3 : tid:4 The QoS (b3-0) TID Field
+  * bit  4.. 6 : cid:3 The Source index that  was found during parsing the TA.
+  *		This field is used to define the source of the packet
+- * bit      7 : reserved:1
++ * bit      7 : MAC_id_valid:1, 1 if MAC virtual number is valid.
+  * bit  8.. 9 : mid:2 The MAC virtual number
+  * bit 10..11 : frame_type:2 : The FC (b3-2) - MPDU Type
+  *		(management, data, control and extension)
+@@ -395,6 +406,7 @@ struct vring_rx_mac {
+ #define RX_DMA_D0_CMD_DMA_EOP	BIT(8)
+ #define RX_DMA_D0_CMD_DMA_RT	BIT(9)  /* always 1 */
+ #define RX_DMA_D0_CMD_DMA_IT	BIT(10) /* interrupt */
++#define RX_MAC_D0_MAC_ID_VALID	BIT(7)
+ 
+ /* Error field */
+ #define RX_DMA_ERROR_FCS	BIT(0)
+@@ -451,7 +463,8 @@ static inline int wil_rxdesc_cid(struct vring_rx_desc *d)
+ 
+ static inline int wil_rxdesc_mid(struct vring_rx_desc *d)
+ {
+-	return WIL_GET_BITS(d->mac.d0, 8, 9);
++	return (d->mac.d0 & RX_MAC_D0_MAC_ID_VALID) ?
++		WIL_GET_BITS(d->mac.d0, 8, 9) : 0;
+ }
+ 
+ static inline int wil_rxdesc_ftype(struct vring_rx_desc *d)
+@@ -517,7 +530,8 @@ static inline struct vring_rx_desc *wil_skb_rxdesc(struct sk_buff *skb)
+ 
+ void wil_netif_rx_any(struct sk_buff *skb, struct net_device *ndev);
+ void wil_rx_reorder(struct wil6210_priv *wil, struct sk_buff *skb);
+-void wil_rx_bar(struct wil6210_priv *wil, u8 cid, u8 tid, u16 seq);
++void wil_rx_bar(struct wil6210_priv *wil, struct wil6210_vif *vif,
++		u8 cid, u8 tid, u16 seq);
+ struct wil_tid_ampdu_rx *wil_tid_ampdu_rx_alloc(struct wil6210_priv *wil,
+ 						int size, u16 ssn);
+ void wil_tid_ampdu_rx_free(struct wil6210_priv *wil,
+diff --git a/drivers/net/wireless/ath/wil6210/wil6210.h b/drivers/net/wireless/ath/wil6210/wil6210.h
+index 1da549acc1ef..f9c5155025bc 100644
+--- a/drivers/net/wireless/ath/wil6210/wil6210.h
++++ b/drivers/net/wireless/ath/wil6210/wil6210.h
+@@ -475,8 +475,6 @@ struct vring_tx_data {
+ 
+ enum { /* for wil6210_priv.status */
+ 	wil_status_fwready = 0, /* FW operational */
+-	wil_status_fwconnecting,
+-	wil_status_fwconnected,
+ 	wil_status_dontscan,
+ 	wil_status_mbox_ready, /* MBOX structures ready */
+ 	wil_status_irqen, /* interrupts enabled - for debug */
+@@ -676,11 +674,18 @@ extern struct blink_on_off_time led_blink_time[WIL_LED_TIME_LAST];
+ extern u8 led_id;
+ extern u8 led_polarity;
+ 
++enum wil6210_vif_status {
++	wil_vif_fwconnecting,
++	wil_vif_fwconnected,
++	wil_vif_status_last /* keep last */
++};
++
+ struct wil6210_vif {
+ 	struct wireless_dev wdev;
+ 	struct net_device *ndev;
+ 	struct wil6210_priv *wil;
+ 	u8 mid;
++	DECLARE_BITMAP(status, wil_vif_status_last);
+ 	u32 privacy; /* secure connection? */
+ 	u16 channel; /* relevant in AP mode */
+ 	u8 hidden_ssid; /* relevant in AP mode */
+@@ -699,6 +704,7 @@ struct wil6210_vif {
+ 	struct list_head probe_client_pending;
+ 	struct mutex probe_client_mutex; /* protect @probe_client_pending */
+ 	struct work_struct probe_client_worker;
++	int net_queue_stopped; /* netif_tx_stop_all_queues invoked */
+ };
+ 
+ struct wil6210_priv {
+@@ -726,6 +732,7 @@ struct wil6210_priv {
+ 	u8 max_vifs; /* maximum number of interfaces, including main */
+ 	struct wil6210_vif *vifs[WIL_MAX_VIFS];
+ 	struct mutex vif_mutex; /* protects access to VIF entries */
++	atomic_t connected_vifs;
+ 	/* profile */
+ 	struct cfg80211_chan_def monitor_chandef;
+ 	u32 monitor_flags;
+@@ -759,9 +766,10 @@ struct wil6210_priv {
+ 	 */
+ 	spinlock_t wmi_ev_lock;
+ 	spinlock_t net_queue_lock; /* guarding stop/wake netif queue */
+-	int net_queue_stopped; /* netif_tx_stop_all_queues invoked */
+ 	struct napi_struct napi_rx;
+ 	struct napi_struct napi_tx;
++	struct net_device napi_ndev; /* dummy net_device serving all VIFs */
++
+ 	/* DMA related */
+ 	struct vring vring_rx;
+ 	unsigned int rx_buf_len;
+@@ -1077,6 +1085,7 @@ int wmi_pcp_stop(struct wil6210_vif *vif);
+ int wmi_led_cfg(struct wil6210_priv *wil, bool enable);
+ int wmi_abort_scan(struct wil6210_vif *vif);
+ void wil_abort_scan(struct wil6210_vif *vif, bool sync);
++void wil_abort_scan_all_vifs(struct wil6210_priv *wil, bool sync);
+ void wil6210_bus_request(struct wil6210_priv *wil, u32 kbps);
+ void wil6210_disconnect(struct wil6210_vif *vif, const u8 *bssid,
+ 			u16 reason_code, bool from_event);
+@@ -1097,12 +1106,12 @@ int wil_bcast_init(struct wil6210_vif *vif);
+ void wil_bcast_fini(struct wil6210_vif *vif);
+ void wil_bcast_fini_all(struct wil6210_priv *wil);
+ 
+-void wil_update_net_queues(struct wil6210_priv *wil, struct vring *vring,
+-			   bool should_stop);
+-void wil_update_net_queues_bh(struct wil6210_priv *wil, struct vring *vring,
+-			      bool check_stop);
++void wil_update_net_queues(struct wil6210_priv *wil, struct wil6210_vif *vif,
++			   struct vring *vring, bool should_stop);
++void wil_update_net_queues_bh(struct wil6210_priv *wil, struct wil6210_vif *vif,
++			      struct vring *vring, bool check_stop);
+ netdev_tx_t wil_start_xmit(struct sk_buff *skb, struct net_device *ndev);
+-int wil_tx_complete(struct wil6210_priv *wil, int ringid);
++int wil_tx_complete(struct wil6210_vif *vif, int ringid);
+ void wil6210_unmask_irq_tx(struct wil6210_priv *wil);
+ 
+ /* RX API */
+diff --git a/drivers/net/wireless/ath/wil6210/wmi.c b/drivers/net/wireless/ath/wil6210/wmi.c
+index befeeb267de2..a3dda9a97c1f 100644
+--- a/drivers/net/wireless/ath/wil6210/wmi.c
++++ b/drivers/net/wireless/ath/wil6210/wmi.c
+@@ -886,7 +886,7 @@ static void wmi_evt_connect(struct wil6210_vif *vif, int id, void *d, int len)
+ 
+ 	if ((wdev->iftype == NL80211_IFTYPE_STATION) ||
+ 	    (wdev->iftype == NL80211_IFTYPE_P2P_CLIENT)) {
+-		if (!test_bit(wil_status_fwconnecting, wil->status)) {
++		if (!test_bit(wil_vif_fwconnecting, vif->status)) {
+ 			wil_err(wil, "Not in connecting state\n");
+ 			mutex_unlock(&wil->mutex);
+ 			return;
+@@ -965,15 +965,16 @@ static void wmi_evt_connect(struct wil6210_vif *vif, int id, void *d, int len)
+ 
+ 	wil->sta[evt->cid].status = wil_sta_connected;
+ 	wil->sta[evt->cid].aid = evt->aid;
+-	set_bit(wil_status_fwconnected, wil->status);
+-	wil_update_net_queues_bh(wil, NULL, false);
++	if (!test_and_set_bit(wil_vif_fwconnected, vif->status))
++		atomic_inc(&wil->connected_vifs);
++	wil_update_net_queues_bh(wil, vif, NULL, false);
+ 
+ out:
+ 	if (rc) {
+ 		wil->sta[evt->cid].status = wil_sta_unused;
+ 		wil->sta[evt->cid].mid = U8_MAX;
+ 	}
+-	clear_bit(wil_status_fwconnecting, wil->status);
++	clear_bit(wil_vif_fwconnecting, vif->status);
+ 	mutex_unlock(&wil->mutex);
+ }
+ 
+-- 
+2.19.2
+
