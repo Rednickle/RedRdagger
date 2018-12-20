@@ -1,0 +1,265 @@
+From: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Date: Tue, 7 Aug 2018 23:01:07 -0700
+Subject: [PATCH] nvmet: add ns write protect support
+Git-commit: dedf0be544614b6d9d395e78d72cc8c30d03e440
+Patch-mainline: v4.19-rc1
+References: bsc#1113673
+
+This patch implements the Namespace Write Protect feature described in
+"NVMe TP 4005a Namespace Write Protect". In this version, we implement
+No Write Protect and Write Protect states for target ns which can be
+toggled by set-features commands from the host side.
+
+For write-protect state transition, we need to flush the ns specified
+as a part of command so we also add helpers for carrying out synchronous
+flush operations.
+
+Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+[hch: fixed an incorrect endianess conversion, minor cleanups]
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/nvme/target/admin-cmd.c   | 76 +++++++++++++++++++++++++++++++++++++++
+ drivers/nvme/target/core.c        | 20 ++++++++++-
+ drivers/nvme/target/io-cmd-bdev.c |  7 ++++
+ drivers/nvme/target/io-cmd-file.c | 12 ++++---
+ drivers/nvme/target/nvmet.h       |  4 +++
+ 5 files changed, 114 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/nvme/target/admin-cmd.c b/drivers/nvme/target/admin-cmd.c
+index f517bc562d26..a21caea1e080 100644
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@ -372,6 +372,8 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
+ 	id->psd[0].entry_lat = cpu_to_le32(0x10);
+ 	id->psd[0].exit_lat = cpu_to_le32(0x4);
+ 
++	id->nwpc = 1 << 0; /* write protect and no write protect */
++
+ 	status = nvmet_copy_to_sgl(req, 0, id, sizeof(*id));
+ 
+ 	kfree(id);
+@@ -433,6 +435,8 @@ static void nvmet_execute_identify_ns(struct nvmet_req *req)
+ 
+ 	id->lbaf[0].ds = ns->blksize_shift;
+ 
++	if (ns->readonly)
++		id->nsattr |= (1 << 0);
+ 	nvmet_put_namespace(ns);
+ done:
+ 	status = nvmet_copy_to_sgl(req, 0, id, sizeof(*id));
+@@ -545,6 +549,52 @@ static void nvmet_execute_abort(struct nvmet_req *req)
+ 	nvmet_req_complete(req, 0);
+ }
+ 
++static u16 nvmet_write_protect_flush_sync(struct nvmet_req *req)
++{
++	u16 status;
++
++	if (req->ns->file)
++		status = nvmet_file_flush(req);
++	else
++		status = nvmet_bdev_flush(req);
++
++	if (status)
++		pr_err("write protect flush failed nsid: %u\n", req->ns->nsid);
++	return status;
++}
++
++static u16 nvmet_set_feat_write_protect(struct nvmet_req *req)
++{
++	u32 write_protect = le32_to_cpu(req->cmd->common.cdw10[1]);
++	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
++	u16 status = NVME_SC_FEATURE_NOT_CHANGEABLE;
++
++	req->ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->rw.nsid);
++	if (unlikely(!req->ns))
++		return status;
++
++	mutex_lock(&subsys->lock);
++	switch (write_protect) {
++	case NVME_NS_WRITE_PROTECT:
++		req->ns->readonly = true;
++		status = nvmet_write_protect_flush_sync(req);
++		if (status)
++			req->ns->readonly = false;
++		break;
++	case NVME_NS_NO_WRITE_PROTECT:
++		req->ns->readonly = false;
++		status = 0;
++		break;
++	default:
++		break;
++	}
++
++	if (!status)
++		nvmet_ns_changed(subsys, req->ns->nsid);
++	mutex_unlock(&subsys->lock);
++	return status;
++}
++
+ static void nvmet_execute_set_features(struct nvmet_req *req)
+ {
+ 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
+@@ -575,6 +625,9 @@ static void nvmet_execute_set_features(struct nvmet_req *req)
+ 	case NVME_FEAT_HOST_ID:
+ 		status = NVME_SC_CMD_SEQ_ERROR | NVME_SC_DNR;
+ 		break;
++	case NVME_FEAT_WRITE_PROTECT:
++		status = nvmet_set_feat_write_protect(req);
++		break;
+ 	default:
+ 		status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
+ 		break;
+@@ -583,6 +636,26 @@ static void nvmet_execute_set_features(struct nvmet_req *req)
+ 	nvmet_req_complete(req, status);
+ }
+ 
++static u16 nvmet_get_feat_write_protect(struct nvmet_req *req)
++{
++	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
++	u32 result;
++
++	req->ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->common.nsid);
++	if (!req->ns)
++		return NVME_SC_INVALID_NS | NVME_SC_DNR;
++
++	mutex_lock(&subsys->lock);
++	if (req->ns->readonly == true)
++		result = NVME_NS_WRITE_PROTECT;
++	else
++		result = NVME_NS_NO_WRITE_PROTECT;
++	nvmet_set_result(req, result);
++	mutex_unlock(&subsys->lock);
++
++	return 0;
++}
++
+ static void nvmet_execute_get_features(struct nvmet_req *req)
+ {
+ 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
+@@ -634,6 +707,9 @@ static void nvmet_execute_get_features(struct nvmet_req *req)
+ 		status = nvmet_copy_to_sgl(req, 0, &req->sq->ctrl->hostid,
+ 				sizeof(req->sq->ctrl->hostid));
+ 		break;
++	case NVME_FEAT_WRITE_PROTECT:
++		status = nvmet_get_feat_write_protect(req);
++		break;
+ 	default:
+ 		status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
+ 		break;
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index 3ceb7a03bb2a..14b4c4916a8e 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -180,7 +180,7 @@ static void nvmet_add_to_changed_ns_log(struct nvmet_ctrl *ctrl, __le32 nsid)
+ 	mutex_unlock(&ctrl->lock);
+ }
+ 
+-static void nvmet_ns_changed(struct nvmet_subsys *subsys, u32 nsid)
++void nvmet_ns_changed(struct nvmet_subsys *subsys, u32 nsid)
+ {
+ 	struct nvmet_ctrl *ctrl;
+ 
+@@ -609,6 +609,21 @@ static inline u16 nvmet_check_ana_state(struct nvmet_port *port,
+ 	return 0;
+ }
+ 
++static inline u16 nvmet_io_cmd_check_access(struct nvmet_req *req)
++{
++	if (unlikely(req->ns->readonly)) {
++		switch (req->cmd->common.opcode) {
++		case nvme_cmd_read:
++		case nvme_cmd_flush:
++			break;
++		default:
++			return NVME_SC_NS_WRITE_PROTECTED;
++		}
++	}
++
++	return 0;
++}
++
+ static u16 nvmet_parse_io_cmd(struct nvmet_req *req)
+ {
+ 	struct nvme_command *cmd = req->cmd;
+@@ -622,6 +637,9 @@ static u16 nvmet_parse_io_cmd(struct nvmet_req *req)
+ 	if (unlikely(!req->ns))
+ 		return NVME_SC_INVALID_NS | NVME_SC_DNR;
+ 	ret = nvmet_check_ana_state(req->port, req->ns);
++	if (unlikely(ret))
++		return ret;
++	ret = nvmet_io_cmd_check_access(req);
+ 	if (unlikely(ret))
+ 		return ret;
+ 
+diff --git a/drivers/nvme/target/io-cmd-bdev.c b/drivers/nvme/target/io-cmd-bdev.c
+index e0b0f7df70c2..7bc9f6240432 100644
+--- a/drivers/nvme/target/io-cmd-bdev.c
++++ b/drivers/nvme/target/io-cmd-bdev.c
+@@ -124,6 +124,13 @@ static void nvmet_bdev_execute_flush(struct nvmet_req *req)
+ 	submit_bio(bio);
+ }
+ 
++u16 nvmet_bdev_flush(struct nvmet_req *req)
++{
++	if (blkdev_issue_flush(req->ns->bdev, GFP_KERNEL, NULL))
++		return NVME_SC_INTERNAL | NVME_SC_DNR;
++	return 0;
++}
++
+ static u16 nvmet_bdev_discard_range(struct nvmet_ns *ns,
+ 		struct nvme_dsm_range *range, struct bio **bio)
+ {
+diff --git a/drivers/nvme/target/io-cmd-file.c b/drivers/nvme/target/io-cmd-file.c
+index c2d0d08b59c8..81a9dc5290a8 100644
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@ -211,14 +211,18 @@ static void nvmet_file_execute_rw_buffered_io(struct nvmet_req *req)
+ 	queue_work(buffered_io_wq, &req->f.work);
+ }
+ 
++u16 nvmet_file_flush(struct nvmet_req *req)
++{
++	if (vfs_fsync(req->ns->file, 1) < 0)
++		return NVME_SC_INTERNAL | NVME_SC_DNR;
++	return 0;
++}
++
+ static void nvmet_file_flush_work(struct work_struct *w)
+ {
+ 	struct nvmet_req *req = container_of(w, struct nvmet_req, f.work);
+-	int ret;
+-
+-	ret = vfs_fsync(req->ns->file, 1);
+ 
+-	nvmet_req_complete(req, ret < 0 ? NVME_SC_INTERNAL | NVME_SC_DNR : 0);
++	nvmet_req_complete(req, nvmet_file_flush(req));
+ }
+ 
+ static void nvmet_file_execute_flush(struct nvmet_req *req)
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 22941045f46e..ec9af4ee03b6 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -58,6 +58,7 @@ struct nvmet_ns {
+ 	struct percpu_ref	ref;
+ 	struct block_device	*bdev;
+ 	struct file		*file;
++	bool			readonly;
+ 	u32			nsid;
+ 	u32			blksize_shift;
+ 	loff_t			size;
+@@ -429,6 +430,9 @@ int nvmet_bdev_ns_enable(struct nvmet_ns *ns);
+ int nvmet_file_ns_enable(struct nvmet_ns *ns);
+ void nvmet_bdev_ns_disable(struct nvmet_ns *ns);
+ void nvmet_file_ns_disable(struct nvmet_ns *ns);
++u16 nvmet_bdev_flush(struct nvmet_req *req);
++u16 nvmet_file_flush(struct nvmet_req *req);
++void nvmet_ns_changed(struct nvmet_subsys *subsys, u32 nsid);
+ 
+ static inline u32 nvmet_rw_len(struct nvmet_req *req)
+ {
+-- 
+2.16.4
+
