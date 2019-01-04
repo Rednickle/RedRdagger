@@ -1,0 +1,575 @@
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Nov 2017 03:56:19 +1000
+Subject: drm/nouveau/mmu/gp100,gp10b: implement new vmm backend
+Git-commit: f9400afb1e11c33830bd99a0c9fafe3f4d07a7cc
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Adds support for:
+- 64KiB/2MiB big page sizes (128KiB not supported by HW with new PT layout).
+- System-memory PTs.
+- LPTE "invalid" state.
+- (Tegra) Use of video memory aperture.
+- Sparse PDEs/PTEs.
+- Additional blocklinear kinds.
+- 49-bit address-space.
+
+GP100 supports an entirely new 5-level page table layout that provides
+an expanded 49-bit address-space.  It also supports the layout present
+on previous generations, which we've been making do with until now.
+
+This commit implements support for the new layout, and enables it by
+default.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/nouveau/include/nvif/ifc00d.h      |   13 +
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gf100.c    |  123 ----------
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gp100.c    |    3 
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gp10b.c    |    3 
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/priv.h     |    7 
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h      |    2 
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgf100.c |    2 
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgp100.c |  258 +++++++++++++++++++++
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgp10b.c |    3 
+ 9 files changed, 281 insertions(+), 133 deletions(-)
+
+--- a/drivers/gpu/drm/nouveau/include/nvif/ifc00d.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/ifc00d.h
+@@ -5,4 +5,17 @@
+ struct gp100_vmm_vn {
+ 	/* nvif_vmm_vX ... */
+ };
++
++struct gp100_vmm_map_vn {
++	/* nvif_vmm_map_vX ... */
++};
++
++struct gp100_vmm_map_v0 {
++	/* nvif_vmm_map_vX ... */
++	__u8  version;
++	__u8  vol;
++	__u8  ro;
++	__u8  priv;
++	__u8  kind;
++};
+ #endif
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gf100.c
+@@ -23,10 +23,6 @@
+  */
+ #include "vmm.h"
+ 
+-#include <core/gpuobj.h>
+-#include <subdev/fb.h>
+-#include <subdev/timer.h>
+-
+ #include <nvif/class.h>
+ 
+ /* Map from compressed to corresponding uncompressed storage type.
+@@ -75,125 +71,6 @@ gf100_mmu_kind(struct nvkm_mmu *mmu, int
+ 	return gf100_pte_storage_type_map;
+ }
+ 
+-void
+-gf100_vm_map_pgt(struct nvkm_vmm *vmm, u32 index, struct nvkm_memory *pgt[2])
+-{
+-	struct nvkm_memory *pgd = vmm->pd->pt[0]->memory;
+-	u32 pde[2] = { 0, 0 };
+-
+-	if (pgt[0])
+-		pde[1] = 0x00000001 | (nvkm_memory_addr(pgt[0]) >> 8);
+-	if (pgt[1])
+-		pde[0] = 0x00000001 | (nvkm_memory_addr(pgt[1]) >> 8);
+-
+-	nvkm_kmap(pgd);
+-	nvkm_wo32(pgd, (index * 8) + 0, pde[0]);
+-	nvkm_wo32(pgd, (index * 8) + 4, pde[1]);
+-	nvkm_done(pgd);
+-}
+-
+-static inline u64
+-gf100_vm_addr(struct nvkm_vma *vma, u64 phys, u32 memtype, u32 target)
+-{
+-	phys >>= 8;
+-
+-	phys |= 0x00000001; /* present */
+-	if (vma->access & NV_MEM_ACCESS_SYS)
+-		phys |= 0x00000002;
+-
+-	phys |= ((u64)target  << 32);
+-	phys |= ((u64)memtype << 36);
+-	return phys;
+-}
+-
+-void
+-gf100_vm_map(struct nvkm_vma *vma, struct nvkm_memory *pgt,
+-	     struct nvkm_mem *mem, u32 pte, u32 cnt, u64 phys, u64 delta)
+-{
+-	u64 next = 1 << (vma->node->type - 8);
+-
+-	phys  = gf100_vm_addr(vma, phys, mem->memtype, 0);
+-	pte <<= 3;
+-
+-	if (mem->tag) {
+-		u32 tag = mem->tag->offset + (delta >> 17);
+-		phys |= (u64)tag << (32 + 12);
+-		next |= (u64)1   << (32 + 12);
+-	}
+-
+-	nvkm_kmap(pgt);
+-	while (cnt--) {
+-		nvkm_wo32(pgt, pte + 0, lower_32_bits(phys));
+-		nvkm_wo32(pgt, pte + 4, upper_32_bits(phys));
+-		phys += next;
+-		pte  += 8;
+-	}
+-	nvkm_done(pgt);
+-}
+-
+-void
+-gf100_vm_map_sg(struct nvkm_vma *vma, struct nvkm_memory *pgt,
+-		struct nvkm_mem *mem, u32 pte, u32 cnt, dma_addr_t *list)
+-{
+-	u32 target = (vma->access & NV_MEM_ACCESS_NOSNOOP) ? 7 : 5;
+-	/* compressed storage types are invalid for system memory */
+-	u32 memtype = gf100_pte_storage_type_map[mem->memtype & 0xff];
+-
+-	nvkm_kmap(pgt);
+-	pte <<= 3;
+-	while (cnt--) {
+-		u64 phys = gf100_vm_addr(vma, *list++, memtype, target);
+-		nvkm_wo32(pgt, pte + 0, lower_32_bits(phys));
+-		nvkm_wo32(pgt, pte + 4, upper_32_bits(phys));
+-		pte += 8;
+-	}
+-	nvkm_done(pgt);
+-}
+-
+-void
+-gf100_vm_unmap(struct nvkm_vma *vma, struct nvkm_memory *pgt, u32 pte, u32 cnt)
+-{
+-	nvkm_kmap(pgt);
+-	pte <<= 3;
+-	while (cnt--) {
+-		nvkm_wo32(pgt, pte + 0, 0x00000000);
+-		nvkm_wo32(pgt, pte + 4, 0x00000000);
+-		pte += 8;
+-	}
+-	nvkm_done(pgt);
+-}
+-
+-void
+-gf100_vm_flush(struct nvkm_vm *vm)
+-{
+-	struct nvkm_mmu *mmu = vm->mmu;
+-	struct nvkm_device *device = mmu->subdev.device;
+-	u32 type;
+-
+-	type = 0x00000001; /* PAGE_ALL */
+-	if (atomic_read(&vm->engref[NVKM_SUBDEV_BAR]))
+-		type |= 0x00000004; /* HUB_ONLY */
+-
+-	mutex_lock(&mmu->subdev.mutex);
+-	/* looks like maybe a "free flush slots" counter, the
+-	 * faster you write to 0x100cbc to more it decreases
+-	 */
+-	nvkm_msec(device, 2000,
+-		if (nvkm_rd32(device, 0x100c80) & 0x00ff0000)
+-			break;
+-	);
+-
+-	nvkm_wr32(device, 0x100cb8, vm->pd->pt[0]->addr >> 8);
+-	nvkm_wr32(device, 0x100cbc, 0x80000000 | type);
+-
+-	/* wait for flush to be queued? */
+-	nvkm_msec(device, 2000,
+-		if (nvkm_rd32(device, 0x100c80) & 0x00008000)
+-			break;
+-	);
+-	mutex_unlock(&mmu->subdev.mutex);
+-}
+-
+ static const struct nvkm_mmu_func
+ gf100_mmu = {
+ 	.limit = (1ULL << 40),
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gp100.c
+@@ -31,12 +31,13 @@ gp100_mmu = {
+ 	.dma_bits = 47,
+ 	.lpg_shift = 16,
+ 	.vmm = {{ -1, -1, NVIF_CLASS_VMM_GP100}, gp100_vmm_new },
++	.kind = gm200_mmu_kind,
+ };
+ 
+ int
+ gp100_mmu_new(struct nvkm_device *device, int index, struct nvkm_mmu **pmmu)
+ {
+-	if (!nvkm_boolopt(device->cfgopt, "GP100MmuLayout", false))
++	if (!nvkm_boolopt(device->cfgopt, "GP100MmuLayout", true))
+ 		return gm200_mmu_new(device, index, pmmu);
+ 	return nvkm_mmu_new_(&gp100_mmu, device, index, pmmu);
+ }
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gp10b.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/gp10b.c
+@@ -31,12 +31,13 @@ gp10b_mmu = {
+ 	.dma_bits = 47,
+ 	.lpg_shift = 16,
+ 	.vmm = {{ -1, -1, NVIF_CLASS_VMM_GP100}, gp10b_vmm_new },
++	.kind = gm200_mmu_kind,
+ };
+ 
+ int
+ gp10b_mmu_new(struct nvkm_device *device, int index, struct nvkm_mmu **pmmu)
+ {
+-	if (!nvkm_boolopt(device->cfgopt, "GP100MmuLayout", false))
++	if (!nvkm_boolopt(device->cfgopt, "GP100MmuLayout", true))
+ 		return gm20b_mmu_new(device, index, pmmu);
+ 	return nvkm_mmu_new_(&gp10b_mmu, device, index, pmmu);
+ }
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/priv.h
+@@ -45,13 +45,6 @@ extern const struct nvkm_mmu_func nv04_m
+ 
+ const u8 *nv50_mmu_kind(struct nvkm_mmu *, int *count);
+ 
+-void gf100_vm_map_pgt(struct nvkm_vmm *, u32, struct nvkm_memory **);
+-void gf100_vm_map(struct nvkm_vma *, struct nvkm_memory *, struct nvkm_mem *,
+-		  u32, u32, u64, u64);
+-void gf100_vm_map_sg(struct nvkm_vma *, struct nvkm_memory *, struct nvkm_mem *,
+-		     u32, u32, dma_addr_t *);
+-void gf100_vm_unmap(struct nvkm_vma *, struct nvkm_memory *, u32, u32);
+-void gf100_vm_flush(struct nvkm_vm *);
+ const u8 *gf100_mmu_kind(struct nvkm_mmu *, int *count);
+ 
+ const u8 *gm200_mmu_kind(struct nvkm_mmu *, int *);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h
+@@ -189,6 +189,8 @@ int gm200_vmm_join_(struct nvkm_vmm *, s
+ int gm200_vmm_join(struct nvkm_vmm *, struct nvkm_memory *);
+ 
+ int gp100_vmm_join(struct nvkm_vmm *, struct nvkm_memory *);
++int gp100_vmm_valid(struct nvkm_vmm *, void *, u32, struct nvkm_vmm_map *);
++void gp100_vmm_flush(struct nvkm_vmm *, int);
+ 
+ int nv04_vmm_new(struct nvkm_mmu *, u64, u64, void *, u32,
+ 		 struct lock_class_key *, const char *, struct nvkm_vmm **);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgf100.c
+@@ -182,7 +182,7 @@ gf100_vmm_flush_(struct nvkm_vmm *vmm, i
+ {
+ 	struct nvkm_subdev *subdev = &vmm->mmu->subdev;
+ 	struct nvkm_device *device = subdev->device;
+-	u32 type;
++	u32 type = depth << 24;
+ 
+ 	type = 0x00000001; /* PAGE_ALL */
+ 	if (atomic_read(&vmm->engref[NVKM_SUBDEV_BAR]))
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgp100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgp100.c
+@@ -21,20 +21,190 @@
+  */
+ #include "vmm.h"
+ 
++#include <subdev/fb.h>
++#include <subdev/ltc.h>
++
++#include <nvif/ifc00d.h>
++#include <nvif/unpack.h>
++
++static inline void
++gp100_vmm_pgt_pte(struct nvkm_vmm *vmm, struct nvkm_mmu_pt *pt,
++		  u32 ptei, u32 ptes, struct nvkm_vmm_map *map, u64 addr)
++{
++	u64 data = (addr >> 4) | map->type;
++
++	map->type += ptes * map->ctag;
++
++	while (ptes--) {
++		VMM_WO064(pt, vmm, ptei++ * 8, data);
++		data += map->next;
++	}
++}
++
++static void
++gp100_vmm_pgt_sgl(struct nvkm_vmm *vmm, struct nvkm_mmu_pt *pt,
++		  u32 ptei, u32 ptes, struct nvkm_vmm_map *map)
++{
++	VMM_MAP_ITER_SGL(vmm, pt, ptei, ptes, map, gp100_vmm_pgt_pte);
++}
++
++static void
++gp100_vmm_pgt_dma(struct nvkm_vmm *vmm, struct nvkm_mmu_pt *pt,
++		  u32 ptei, u32 ptes, struct nvkm_vmm_map *map)
++{
++	if (map->page->shift == PAGE_SHIFT) {
++		VMM_SPAM(vmm, "DMAA %08x %08x PTE(s)", ptei, ptes);
++		nvkm_kmap(pt->memory);
++		while (ptes--) {
++			const u64 data = (*map->dma++ >> 4) | map->type;
++			VMM_WO064(pt, vmm, ptei++ * 8, data);
++			map->type += map->ctag;
++		}
++		nvkm_done(pt->memory);
++		return;
++	}
++
++	VMM_MAP_ITER_DMA(vmm, pt, ptei, ptes, map, gp100_vmm_pgt_pte);
++}
++
++static void
++gp100_vmm_pgt_mem(struct nvkm_vmm *vmm, struct nvkm_mmu_pt *pt,
++		  u32 ptei, u32 ptes, struct nvkm_vmm_map *map)
++{
++	VMM_MAP_ITER_MEM(vmm, pt, ptei, ptes, map, gp100_vmm_pgt_pte);
++}
++
++static void
++gp100_vmm_pgt_sparse(struct nvkm_vmm *vmm,
++		     struct nvkm_mmu_pt *pt, u32 ptei, u32 ptes)
++{
++	/* VALID_FALSE + VOL tells the MMU to treat the PTE as sparse. */
++	VMM_FO064(pt, vmm, ptei * 8, BIT_ULL(3) /* VOL. */, ptes);
++}
++
+ static const struct nvkm_vmm_desc_func
+ gp100_vmm_desc_spt = {
++	.unmap = gf100_vmm_pgt_unmap,
++	.sparse = gp100_vmm_pgt_sparse,
++	.mem = gp100_vmm_pgt_mem,
++	.dma = gp100_vmm_pgt_dma,
++	.sgl = gp100_vmm_pgt_sgl,
+ };
+ 
++static void
++gp100_vmm_lpt_invalid(struct nvkm_vmm *vmm,
++		      struct nvkm_mmu_pt *pt, u32 ptei, u32 ptes)
++{
++	/* VALID_FALSE + PRIV tells the MMU to ignore corresponding SPTEs. */
++	VMM_FO064(pt, vmm, ptei * 8, BIT_ULL(5) /* PRIV. */, ptes);
++}
++
+ static const struct nvkm_vmm_desc_func
+ gp100_vmm_desc_lpt = {
++	.invalid = gp100_vmm_lpt_invalid,
++	.unmap = gf100_vmm_pgt_unmap,
++	.sparse = gp100_vmm_pgt_sparse,
++	.mem = gp100_vmm_pgt_mem,
+ };
+ 
++static inline void
++gp100_vmm_pd0_pte(struct nvkm_vmm *vmm, struct nvkm_mmu_pt *pt,
++		  u32 ptei, u32 ptes, struct nvkm_vmm_map *map, u64 addr)
++{
++	u64 data = (addr >> 4) | map->type;
++
++	map->type += ptes * map->ctag;
++
++	while (ptes--) {
++		VMM_WO128(pt, vmm, ptei++ * 0x10, data, 0ULL);
++		data += map->next;
++	}
++}
++
++static void
++gp100_vmm_pd0_mem(struct nvkm_vmm *vmm, struct nvkm_mmu_pt *pt,
++		  u32 ptei, u32 ptes, struct nvkm_vmm_map *map)
++{
++	VMM_MAP_ITER_MEM(vmm, pt, ptei, ptes, map, gp100_vmm_pd0_pte);
++}
++
++static inline bool
++gp100_vmm_pde(struct nvkm_mmu_pt *pt, u64 *data)
++{
++	switch (nvkm_memory_target(pt->memory)) {
++	case NVKM_MEM_TARGET_VRAM: *data |= 1ULL << 1; break;
++	case NVKM_MEM_TARGET_HOST: *data |= 2ULL << 1;
++		*data |= BIT_ULL(3); /* VOL. */
++		break;
++	case NVKM_MEM_TARGET_NCOH: *data |= 3ULL << 1; break;
++	default:
++		WARN_ON(1);
++		return false;
++	}
++	*data |= pt->addr >> 4;
++	return true;
++}
++
++static void
++gp100_vmm_pd0_pde(struct nvkm_vmm *vmm, struct nvkm_vmm_pt *pgd, u32 pdei)
++{
++	struct nvkm_vmm_pt *pgt = pgd->pde[pdei];
++	struct nvkm_mmu_pt *pd = pgd->pt[0];
++	u64 data[2] = {};
++
++	if (pgt->pt[0] && !gp100_vmm_pde(pgt->pt[0], &data[0]))
++		return;
++	if (pgt->pt[1] && !gp100_vmm_pde(pgt->pt[1], &data[1]))
++		return;
++
++	nvkm_kmap(pd->memory);
++	VMM_WO128(pd, vmm, pdei * 0x10, data[0], data[1]);
++	nvkm_done(pd->memory);
++}
++
++static void
++gp100_vmm_pd0_sparse(struct nvkm_vmm *vmm,
++		     struct nvkm_mmu_pt *pt, u32 pdei, u32 pdes)
++{
++	/* VALID_FALSE + VOL_BIG tells the MMU to treat the PDE as sparse. */
++	VMM_FO128(pt, vmm, pdei * 0x10, BIT_ULL(3) /* VOL_BIG. */, 0ULL, pdes);
++}
++
++static void
++gp100_vmm_pd0_unmap(struct nvkm_vmm *vmm,
++		    struct nvkm_mmu_pt *pt, u32 pdei, u32 pdes)
++{
++	VMM_FO128(pt, vmm, pdei * 0x10, 0ULL, 0ULL, pdes);
++}
++
+ static const struct nvkm_vmm_desc_func
+ gp100_vmm_desc_pd0 = {
++	.unmap = gp100_vmm_pd0_unmap,
++	.sparse = gp100_vmm_pd0_sparse,
++	.pde = gp100_vmm_pd0_pde,
++	.mem = gp100_vmm_pd0_mem,
+ };
+ 
++static void
++gp100_vmm_pd1_pde(struct nvkm_vmm *vmm, struct nvkm_vmm_pt *pgd, u32 pdei)
++{
++	struct nvkm_vmm_pt *pgt = pgd->pde[pdei];
++	struct nvkm_mmu_pt *pd = pgd->pt[0];
++	u64 data = 0;
++
++	if (!gp100_vmm_pde(pgt->pt[0], &data))
++		return;
++
++	nvkm_kmap(pd->memory);
++	VMM_WO064(pd, vmm, pdei * 8, data);
++	nvkm_done(pd->memory);
++}
++
+ static const struct nvkm_vmm_desc_func
+ gp100_vmm_desc_pd1 = {
++	.unmap = gf100_vmm_pgt_unmap,
++	.sparse = gp100_vmm_pgt_sparse,
++	.pde = gp100_vmm_pd1_pde,
+ };
+ 
+ const struct nvkm_vmm_desc
+@@ -58,6 +228,91 @@ gp100_vmm_desc_12[] = {
+ };
+ 
+ int
++gp100_vmm_valid(struct nvkm_vmm *vmm, void *argv, u32 argc,
++		struct nvkm_vmm_map *map)
++{
++	const enum nvkm_memory_target target = nvkm_memory_target(map->memory);
++	const struct nvkm_vmm_page *page = map->page;
++	union {
++		struct gp100_vmm_map_vn vn;
++		struct gp100_vmm_map_v0 v0;
++	} *args = argv;
++	struct nvkm_device *device = vmm->mmu->subdev.device;
++	struct nvkm_memory *memory = map->memory;
++	u8  kind, priv, ro, vol;
++	int kindn, aper, ret = -ENOSYS;
++	const u8 *kindm;
++
++	map->next = (1ULL << page->shift) >> 4;
++	map->type = 0;
++
++	if (!(ret = nvif_unpack(ret, &argv, &argc, args->v0, 0, 0, false))) {
++		vol  = !!args->v0.vol;
++		ro   = !!args->v0.ro;
++		priv = !!args->v0.priv;
++		kind =   args->v0.kind;
++	} else
++	if (!(ret = nvif_unvers(ret, &argv, &argc, args->vn))) {
++		vol  = target == NVKM_MEM_TARGET_HOST;
++		ro   = 0;
++		priv = 0;
++		kind = 0x00;
++	} else {
++		VMM_DEBUG(vmm, "args");
++		return ret;
++	}
++
++	aper = vmm->func->aper(target);
++	if (WARN_ON(aper < 0))
++		return aper;
++
++	kindm = vmm->mmu->func->kind(vmm->mmu, &kindn);
++	if (kind >= kindn || kindm[kind] == 0xff) {
++		VMM_DEBUG(vmm, "kind %02x", kind);
++		return -EINVAL;
++	}
++
++	if (kindm[kind] != kind) {
++		u64 tags = nvkm_memory_size(memory) >> 16;
++		if (aper != 0 || !(page->type & NVKM_VMM_PAGE_COMP)) {
++			VMM_DEBUG(vmm, "comp %d %02x", aper, page->type);
++			return -EINVAL;
++		}
++
++		ret = nvkm_memory_tags_get(memory, device, tags,
++					   nvkm_ltc_tags_clear,
++					   &map->tags);
++		if (ret) {
++			VMM_DEBUG(vmm, "comp %d", ret);
++			return ret;
++		}
++
++		if (map->tags->mn) {
++			tags = map->tags->mn->offset + (map->offset >> 16);
++			map->ctag |= ((1ULL << page->shift) >> 16) << 36;
++			map->type |= tags << 36;
++			map->next |= map->ctag;
++		} else {
++			kind = kindm[kind];
++		}
++	}
++
++	map->type |= BIT(0);
++	map->type |= (u64)aper << 1;
++	map->type |= (u64) vol << 3;
++	map->type |= (u64)priv << 5;
++	map->type |= (u64)  ro << 6;
++	map->type |= (u64)kind << 56;
++	return 0;
++}
++
++void
++gp100_vmm_flush(struct nvkm_vmm *vmm, int depth)
++{
++	gf100_vmm_flush_(vmm, 5 /* CACHE_LEVEL_UP_TO_PDE3 */ - depth);
++}
++
++int
+ gp100_vmm_join(struct nvkm_vmm *vmm, struct nvkm_memory *inst)
+ {
+ 	const u64 base = BIT_ULL(10) /* VER2 */ | BIT_ULL(11); /* 64KiB */
+@@ -68,6 +323,9 @@ static const struct nvkm_vmm_func
+ gp100_vmm = {
+ 	.join = gp100_vmm_join,
+ 	.part = gf100_vmm_part,
++	.aper = gf100_vmm_aper,
++	.valid = gp100_vmm_valid,
++	.flush = gp100_vmm_flush,
+ 	.page = {
+ 		{ 47, &gp100_vmm_desc_16[4], NVKM_VMM_PAGE_Sxxx },
+ 		{ 38, &gp100_vmm_desc_16[3], NVKM_VMM_PAGE_Sxxx },
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgp10b.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmmgp10b.c
+@@ -25,6 +25,9 @@ static const struct nvkm_vmm_func
+ gp10b_vmm = {
+ 	.join = gp100_vmm_join,
+ 	.part = gf100_vmm_part,
++	.aper = gk20a_vmm_aper,
++	.valid = gp100_vmm_valid,
++	.flush = gp100_vmm_flush,
+ 	.page = {
+ 		{ 47, &gp100_vmm_desc_16[4], NVKM_VMM_PAGE_Sxxx },
+ 		{ 38, &gp100_vmm_desc_16[3], NVKM_VMM_PAGE_Sxxx },
