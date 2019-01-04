@@ -1,0 +1,133 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 24 Jan 2018 11:36:08 +0000
+Subject: drm/i915: Shrink the GEM kmem_caches upon idling
+Git-commit: 84a1074920523430f9dc30ff907f4801b4820072
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+When we finally decide the gpu is idle, that is a good time to shrink
+our kmem_caches.
+
+v3: Defer until an rcu grace period after we idle.
+v4: Think about epoch wraparound and how likely that is.
+v5: Use I915_EPOCH_INVALID magic.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180124113608.14909-2-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c |   79 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3345,6 +3345,65 @@ i915_gem_retire_work_handler(struct work
+ 				   round_jiffies_up_relative(HZ));
+ }
+ 
++static void shrink_caches(struct drm_i915_private *i915)
++{
++	/*
++	 * kmem_cache_shrink() discards empty slabs and reorders partially
++	 * filled slabs to prioritise allocating from the mostly full slabs,
++	 * with the aim of reducing fragmentation.
++	 */
++	kmem_cache_shrink(i915->priorities);
++	kmem_cache_shrink(i915->dependencies);
++	kmem_cache_shrink(i915->requests);
++	kmem_cache_shrink(i915->luts);
++	kmem_cache_shrink(i915->vmas);
++	kmem_cache_shrink(i915->objects);
++}
++
++struct sleep_rcu_work {
++	union {
++		struct rcu_head rcu;
++		struct work_struct work;
++	};
++	struct drm_i915_private *i915;
++	unsigned int epoch;
++};
++
++static inline bool
++same_epoch(struct drm_i915_private *i915, unsigned int epoch)
++{
++	/*
++	 * There is a small chance that the epoch wrapped since we started
++	 * sleeping. If we assume that epoch is at least a u32, then it will
++	 * take at least 2^32 * 100ms for it to wrap, or about 326 years.
++	 */
++	return epoch == READ_ONCE(i915->gt.epoch);
++}
++
++static void __sleep_work(struct work_struct *work)
++{
++	struct sleep_rcu_work *s = container_of(work, typeof(*s), work);
++	struct drm_i915_private *i915 = s->i915;
++	unsigned int epoch = s->epoch;
++
++	kfree(s);
++	if (same_epoch(i915, epoch))
++		shrink_caches(i915);
++}
++
++static void __sleep_rcu(struct rcu_head *rcu)
++{
++	struct sleep_rcu_work *s = container_of(rcu, typeof(*s), rcu);
++	struct drm_i915_private *i915 = s->i915;
++
++	if (same_epoch(i915, s->epoch)) {
++		INIT_WORK(&s->work, __sleep_work);
++		queue_work(i915->wq, &s->work);
++	} else {
++		kfree(s);
++	}
++}
++
+ static inline bool
+ new_requests_since_last_retire(const struct drm_i915_private *i915)
+ {
+@@ -3357,6 +3416,7 @@ i915_gem_idle_work_handler(struct work_s
+ {
+ 	struct drm_i915_private *dev_priv =
+ 		container_of(work, typeof(*dev_priv), gt.idle_work.work);
++	unsigned int epoch = I915_EPOCH_INVALID;
+ 	bool rearm_hangcheck;
+ 	ktime_t end;
+ 
+@@ -3416,6 +3476,8 @@ i915_gem_idle_work_handler(struct work_s
+ 
+ 	GEM_BUG_ON(!dev_priv->gt.awake);
+ 	dev_priv->gt.awake = false;
++	epoch = dev_priv->gt.epoch;
++	GEM_BUG_ON(epoch == I915_EPOCH_INVALID);
+ 	rearm_hangcheck = false;
+ 
+ 	if (INTEL_GEN(dev_priv) >= 6)
+@@ -3432,6 +3494,23 @@ out_rearm:
+ 		GEM_BUG_ON(!dev_priv->gt.awake);
+ 		i915_queue_hangcheck(dev_priv);
+ 	}
++
++	/*
++	 * When we are idle, it is an opportune time to reap our caches.
++	 * However, we have many objects that utilise RCU and the ordered
++	 * i915->wq that this work is executing on. To try and flush any
++	 * pending frees now we are idle, we first wait for an RCU grace
++	 * period, and then queue a task (that will run last on the wq) to
++	 * shrink and re-optimize the caches.
++	 */
++	if (same_epoch(dev_priv, epoch)) {
++		struct sleep_rcu_work *s = kmalloc(sizeof(*s), GFP_KERNEL);
++		if (s) {
++			s->i915 = dev_priv;
++			s->epoch = epoch;
++			call_rcu(&s->rcu, __sleep_rcu);
++		}
++	}
+ }
+ 
+ void i915_gem_close_object(struct drm_gem_object *gem, struct drm_file *file)
