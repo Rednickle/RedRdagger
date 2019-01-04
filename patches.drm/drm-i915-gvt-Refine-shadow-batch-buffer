@@ -1,0 +1,293 @@
+From f52c380a48f527930c86ea6fd7242873c93ba682 Mon Sep 17 00:00:00 2001
+From: Zhi Wang <zhi.wang.linux@gmail.com>
+Date: Sun, 24 Sep 2017 21:53:03 +0800
+Subject: [PATCH] drm/i915/gvt: Refine shadow batch buffer
+Git-commit: f52c380a48f527930c86ea6fd7242873c93ba682
+Patch-mainline: v4.16-rc1
+References: FATE#322643 bsc#1055900
+
+1) Use standard i915 GEM object sequence to access the shadow batch buffer.
+2) Manage i915 vma life cycle to solve one FIXME.
+
+V2: 
+- Refine code structure.
+- Refine the usage of GEM APIs.
+- Add the missing lock/unlock in release_shadow_batch_buffer.
+
+Test on my SKL NuC.
+
+Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/cmd_parser.c |   76 +++++++++++++---------------
+ drivers/gpu/drm/i915/gvt/scheduler.c  |   90 ++++++++++++++++++++++------------
+ drivers/gpu/drm/i915/gvt/scheduler.h  |    7 +-
+ 3 files changed, 101 insertions(+), 72 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/cmd_parser.c
++++ b/drivers/gpu/drm/i915/gvt/cmd_parser.c
+@@ -1645,11 +1645,10 @@ static int find_bb_size(struct parser_ex
+ 
+ static int perform_bb_shadow(struct parser_exec_state *s)
+ {
+-	struct intel_shadow_bb_entry *entry_obj;
+ 	struct intel_vgpu *vgpu = s->vgpu;
++	struct intel_vgpu_shadow_bb *bb;
+ 	unsigned long gma = 0;
+ 	unsigned long bb_size;
+-	void *dst = NULL;
+ 	int ret = 0;
+ 
+ 	/* get the start gm address of the batch buffer */
+@@ -1657,51 +1656,51 @@ static int perform_bb_shadow(struct pars
+ 	if (gma == INTEL_GVT_INVALID_ADDR)
+ 		return -EFAULT;
+ 
+-	/* get the size of the batch buffer */
+ 	ret = find_bb_size(s, &bb_size);
+ 	if (ret)
+ 		return ret;
+ 
+-	/* allocate shadow batch buffer */
+-	entry_obj = kmalloc(sizeof(*entry_obj), GFP_KERNEL);
+-	if (entry_obj == NULL)
++	bb = kzalloc(sizeof(*bb), GFP_KERNEL);
++	if (!bb)
+ 		return -ENOMEM;
+ 
+-	entry_obj->obj =
+-		i915_gem_object_create(s->vgpu->gvt->dev_priv,
+-				       roundup(bb_size, PAGE_SIZE));
+-	if (IS_ERR(entry_obj->obj)) {
+-		ret = PTR_ERR(entry_obj->obj);
+-		goto free_entry;
++	bb->obj = i915_gem_object_create(s->vgpu->gvt->dev_priv,
++					 roundup(bb_size, PAGE_SIZE));
++	if (IS_ERR(bb->obj)) {
++		ret = PTR_ERR(bb->obj);
++		goto err_free_bb;
+ 	}
+-	entry_obj->len = bb_size;
+-	INIT_LIST_HEAD(&entry_obj->list);
+ 
+-	dst = i915_gem_object_pin_map(entry_obj->obj, I915_MAP_WB);
+-	if (IS_ERR(dst)) {
+-		ret = PTR_ERR(dst);
+-		goto put_obj;
+-	}
++	ret = i915_gem_obj_prepare_shmem_write(bb->obj, &bb->clflush);
++	if (ret)
++		goto err_free_obj;
+ 
+-	ret = i915_gem_object_set_to_cpu_domain(entry_obj->obj, false);
+-	if (ret) {
+-		gvt_vgpu_err("failed to set shadow batch to CPU\n");
+-		goto unmap_src;
++	bb->va = i915_gem_object_pin_map(bb->obj, I915_MAP_WB);
++	if (IS_ERR(bb->va)) {
++		ret = PTR_ERR(bb->va);
++		goto err_finish_shmem_access;
+ 	}
+ 
+-	entry_obj->va = dst;
+-	entry_obj->bb_start_cmd_va = s->ip_va;
++	if (bb->clflush & CLFLUSH_BEFORE) {
++		drm_clflush_virt_range(bb->va, bb->obj->base.size);
++		bb->clflush &= ~CLFLUSH_BEFORE;
++	}
+ 
+-	/* copy batch buffer to shadow batch buffer*/
+ 	ret = copy_gma_to_hva(s->vgpu, s->vgpu->gtt.ggtt_mm,
+ 			      gma, gma + bb_size,
+-			      dst);
++			      bb->va);
+ 	if (ret < 0) {
+ 		gvt_vgpu_err("fail to copy guest ring buffer\n");
+-		goto unmap_src;
++		ret = -EFAULT;
++		goto err_unmap;
+ 	}
+ 
+-	list_add(&entry_obj->list, &s->workload->shadow_bb);
++	INIT_LIST_HEAD(&bb->list);
++	list_add(&bb->list, &s->workload->shadow_bb);
++
++	bb->accessing = true;
++	bb->bb_start_cmd_va = s->ip_va;
++
+ 	/*
+ 	 * ip_va saves the virtual address of the shadow batch buffer, while
+ 	 * ip_gma saves the graphics address of the original batch buffer.
+@@ -1710,17 +1709,17 @@ static int perform_bb_shadow(struct pars
+ 	 * buffer's gma in pair. After all, we don't want to pin the shadow
+ 	 * buffer here (too early).
+ 	 */
+-	s->ip_va = dst;
++	s->ip_va = bb->va;
+ 	s->ip_gma = gma;
+-
+ 	return 0;
+-
+-unmap_src:
+-	i915_gem_object_unpin_map(entry_obj->obj);
+-put_obj:
+-	i915_gem_object_put(entry_obj->obj);
+-free_entry:
+-	kfree(entry_obj);
++err_unmap:
++	i915_gem_object_unpin_map(bb->obj);
++err_finish_shmem_access:
++	i915_gem_obj_finish_shmem_access(bb->obj);
++err_free_obj:
++	i915_gem_object_put(bb->obj);
++err_free_bb:
++	kfree(bb);
+ 	return ret;
+ }
+ 
+@@ -1762,7 +1761,6 @@ static int cmd_handler_mi_batch_buffer_s
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+-
+ 	return ret;
+ }
+ 
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -360,31 +360,46 @@ err_unpin:
+ 	return ret;
+ }
+ 
++static void release_shadow_batch_buffer(struct intel_vgpu_workload *workload);
++
+ static int prepare_shadow_batch_buffer(struct intel_vgpu_workload *workload)
+ {
+ 	struct intel_gvt *gvt = workload->vgpu->gvt;
+ 	const int gmadr_bytes = gvt->device_info.gmadr_bytes_in_cmd;
+-	struct intel_shadow_bb_entry *entry_obj;
++	struct intel_vgpu_shadow_bb *bb;
++	int ret;
+ 
+-	/* pin the gem object to ggtt */
+-	list_for_each_entry(entry_obj, &workload->shadow_bb, list) {
+-		struct i915_vma *vma;
+-
+-		vma = i915_gem_object_ggtt_pin(entry_obj->obj, NULL, 0, 4, 0);
+-		if (IS_ERR(vma))
+-			return PTR_ERR(vma);
+-
+-		/* FIXME: we are not tracking our pinned VMA leaving it
+-		 * up to the core to fix up the stray pin_count upon
+-		 * free.
+-		 */
++	list_for_each_entry(bb, &workload->shadow_bb, list) {
++		bb->vma = i915_gem_object_ggtt_pin(bb->obj, NULL, 0, 0, 0);
++		if (IS_ERR(bb->vma)) {
++			ret = PTR_ERR(bb->vma);
++			goto err;
++		}
+ 
+-		/* update the relocate gma with shadow batch buffer*/
+-		entry_obj->bb_start_cmd_va[1] = i915_ggtt_offset(vma);
++		/* relocate shadow batch buffer */
++		bb->bb_start_cmd_va[1] = i915_ggtt_offset(bb->vma);
+ 		if (gmadr_bytes == 8)
+-			entry_obj->bb_start_cmd_va[2] = 0;
++			bb->bb_start_cmd_va[2] = 0;
++
++		/* No one is going to touch shadow bb from now on. */
++		if (bb->clflush & CLFLUSH_AFTER) {
++			drm_clflush_virt_range(bb->va, bb->obj->base.size);
++			bb->clflush &= ~CLFLUSH_AFTER;
++		}
++
++		ret = i915_gem_object_set_to_gtt_domain(bb->obj, false);
++		if (ret)
++			goto err;
++
++		i915_gem_obj_finish_shmem_access(bb->obj);
++		bb->accessing = false;
++
++		i915_vma_move_to_active(bb->vma, workload->req, 0);
+ 	}
+ 	return 0;
++err:
++	release_shadow_batch_buffer(workload);
++	return ret;
+ }
+ 
+ static int update_wa_ctx_2_shadow_ctx(struct intel_shadow_wa_ctx *wa_ctx)
+@@ -445,22 +460,37 @@ static int prepare_shadow_wa_ctx(struct
+ 
+ static void release_shadow_batch_buffer(struct intel_vgpu_workload *workload)
+ {
+-	/* release all the shadow batch buffer */
+-	if (!list_empty(&workload->shadow_bb)) {
+-		struct intel_shadow_bb_entry *entry_obj =
+-			list_first_entry(&workload->shadow_bb,
+-					 struct intel_shadow_bb_entry,
+-					 list);
+-		struct intel_shadow_bb_entry *temp;
+-
+-		list_for_each_entry_safe(entry_obj, temp, &workload->shadow_bb,
+-					 list) {
+-			i915_gem_object_unpin_map(entry_obj->obj);
+-			i915_gem_object_put(entry_obj->obj);
+-			list_del(&entry_obj->list);
+-			kfree(entry_obj);
++	struct intel_vgpu *vgpu = workload->vgpu;
++	struct drm_i915_private *dev_priv = vgpu->gvt->dev_priv;
++	struct intel_vgpu_shadow_bb *bb, *pos;
++
++	if (list_empty(&workload->shadow_bb))
++		return;
++
++	bb = list_first_entry(&workload->shadow_bb,
++			struct intel_vgpu_shadow_bb, list);
++
++	mutex_lock(&dev_priv->drm.struct_mutex);
++
++	list_for_each_entry_safe(bb, pos, &workload->shadow_bb, list) {
++		if (bb->obj) {
++			if (bb->accessing)
++				i915_gem_obj_finish_shmem_access(bb->obj);
++
++			if (bb->va && !IS_ERR(bb->va))
++				i915_gem_object_unpin_map(bb->obj);
++
++			if (bb->vma && !IS_ERR(bb->vma)) {
++				i915_vma_unpin(bb->vma);
++				i915_vma_close(bb->vma);
++			}
++			__i915_gem_object_release_unless_active(bb->obj);
+ 		}
++		list_del(&bb->list);
++		kfree(bb);
+ 	}
++
++	mutex_unlock(&dev_priv->drm.struct_mutex);
+ }
+ 
+ static int prepare_workload(struct intel_vgpu_workload *workload)
+--- a/drivers/gpu/drm/i915/gvt/scheduler.h
++++ b/drivers/gpu/drm/i915/gvt/scheduler.h
+@@ -112,13 +112,14 @@ struct intel_vgpu_workload {
+ 	struct intel_shadow_wa_ctx wa_ctx;
+ };
+ 
+-/* Intel shadow batch buffer is a i915 gem object */
+-struct intel_shadow_bb_entry {
++struct intel_vgpu_shadow_bb {
+ 	struct list_head list;
+ 	struct drm_i915_gem_object *obj;
++	struct i915_vma *vma;
+ 	void *va;
+-	unsigned long len;
+ 	u32 *bb_start_cmd_va;
++	unsigned int clflush;
++	bool accessing;
+ };
+ 
+ #define workload_q_head(vgpu, ring_id) \
