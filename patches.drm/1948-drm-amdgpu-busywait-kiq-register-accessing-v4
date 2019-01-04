@@ -1,0 +1,243 @@
+From: pding <Pixel.Ding@amd.com>
+Date: Fri, 13 Oct 2017 15:38:35 +0800
+Subject: drm/amdgpu: busywait KIQ register accessing (v4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 43ca8efa46d9b1c4defa1b27c4dd1ef3866aaad9
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Register accessing is performed when IRQ is disabled. Never sleep in
+this function.
+
+Known issue: dead sleep in many use cases of index/data registers.
+
+v2:
+ - wrap polling fence functions.
+ - don't trigger IRQ for polling in case of wrongly fence signal.
+
+v3:
+ - handle wrap round gracefully.
+ - add comments for polling function
+
+v4:
+ - don't return negative timeout confused with error code
+
+Signed-off-by: pding <Pixel.Ding@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |    2 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |    8 +---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c  |   50 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c    |    2 -
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h   |    4 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c   |   30 +++++++----------
+ 6 files changed, 71 insertions(+), 25 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -879,7 +879,7 @@ struct amdgpu_mec {
+ struct amdgpu_kiq {
+ 	u64			eop_gpu_addr;
+ 	struct amdgpu_bo	*eop_obj;
+-	struct mutex		ring_mutex;
++	spinlock_t              ring_lock;
+ 	struct amdgpu_ring	ring;
+ 	struct amdgpu_irq_src	irq;
+ };
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -109,10 +109,8 @@ uint32_t amdgpu_mm_rreg(struct amdgpu_de
+ {
+ 	uint32_t ret;
+ 
+-	if (!(acc_flags & AMDGPU_REGS_NO_KIQ) && amdgpu_sriov_runtime(adev)) {
+-		BUG_ON(in_interrupt());
++	if (!(acc_flags & AMDGPU_REGS_NO_KIQ) && amdgpu_sriov_runtime(adev))
+ 		return amdgpu_virt_kiq_rreg(adev, reg);
+-	}
+ 
+ 	if ((reg * 4) < adev->rmmio_size && !(acc_flags & AMDGPU_REGS_IDX))
+ 		ret = readl(((void __iomem *)adev->rmmio) + (reg * 4));
+@@ -137,10 +135,8 @@ void amdgpu_mm_wreg(struct amdgpu_device
+ 		adev->last_mm_index = v;
+ 	}
+ 
+-	if (!(acc_flags & AMDGPU_REGS_NO_KIQ) && amdgpu_sriov_runtime(adev)) {
+-		BUG_ON(in_interrupt());
++	if (!(acc_flags & AMDGPU_REGS_NO_KIQ) && amdgpu_sriov_runtime(adev))
+ 		return amdgpu_virt_kiq_wreg(adev, reg, v);
+-	}
+ 
+ 	if ((reg * 4) < adev->rmmio_size && !(acc_flags & AMDGPU_REGS_IDX))
+ 		writel(v, ((void __iomem *)adev->rmmio) + (reg * 4));
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c
+@@ -169,6 +169,32 @@ int amdgpu_fence_emit(struct amdgpu_ring
+ }
+ 
+ /**
++ * amdgpu_fence_emit_polling - emit a fence on the requeste ring
++ *
++ * @ring: ring the fence is associated with
++ * @s: resulting sequence number
++ *
++ * Emits a fence command on the requested ring (all asics).
++ * Used For polling fence.
++ * Returns 0 on success, -ENOMEM on failure.
++ */
++int amdgpu_fence_emit_polling(struct amdgpu_ring *ring, uint32_t *s)
++{
++	uint32_t seq;
++
++	if (!s)
++		return -EINVAL;
++
++	seq = ++ring->fence_drv.sync_seq;
++	amdgpu_ring_emit_fence(ring, ring->fence_drv.gpu_addr,
++			       seq, AMDGPU_FENCE_FLAG_INT);
++
++	*s = seq;
++
++	return 0;
++}
++
++/**
+  * amdgpu_fence_schedule_fallback - schedule fallback check
+  *
+  * @ring: pointer to struct amdgpu_ring
+@@ -282,6 +308,30 @@ int amdgpu_fence_wait_empty(struct amdgp
+ }
+ 
+ /**
++ * amdgpu_fence_wait_polling - busy wait for givn sequence number
++ *
++ * @ring: ring index the fence is associated with
++ * @wait_seq: sequence number to wait
++ * @timeout: the timeout for waiting in usecs
++ *
++ * Wait for all fences on the requested ring to signal (all asics).
++ * Returns left time if no timeout, 0 or minus if timeout.
++ */
++signed long amdgpu_fence_wait_polling(struct amdgpu_ring *ring,
++				      uint32_t wait_seq,
++				      signed long timeout)
++{
++	uint32_t seq;
++
++	do {
++		seq = amdgpu_fence_read(ring);
++		udelay(5);
++		timeout -= 5;
++	} while ((int32_t)(wait_seq - seq) > 0 && timeout > 0);
++
++	return timeout > 0 ? timeout : 0;
++}
++/**
+  * amdgpu_fence_count_emitted - get the count of emitted fences
+  *
+  * @ring: ring the fence is associated with
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -201,7 +201,7 @@ int amdgpu_gfx_kiq_init_ring(struct amdg
+ 	struct amdgpu_kiq *kiq = &adev->gfx.kiq;
+ 	int r = 0;
+ 
+-	mutex_init(&kiq->ring_mutex);
++	spin_lock_init(&kiq->ring_lock);
+ 
+ 	r = amdgpu_wb_get(adev, &adev->virt.reg_val_offs);
+ 	if (r)
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ring.h
+@@ -90,8 +90,12 @@ int amdgpu_fence_driver_start_ring(struc
+ void amdgpu_fence_driver_suspend(struct amdgpu_device *adev);
+ void amdgpu_fence_driver_resume(struct amdgpu_device *adev);
+ int amdgpu_fence_emit(struct amdgpu_ring *ring, struct dma_fence **fence);
++int amdgpu_fence_emit_polling(struct amdgpu_ring *ring, uint32_t *s);
+ void amdgpu_fence_process(struct amdgpu_ring *ring);
+ int amdgpu_fence_wait_empty(struct amdgpu_ring *ring);
++signed long amdgpu_fence_wait_polling(struct amdgpu_ring *ring,
++				      uint32_t wait_seq,
++				      signed long timeout);
+ unsigned amdgpu_fence_count_emitted(struct amdgpu_ring *ring);
+ 
+ /*
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_virt.c
+@@ -22,7 +22,7 @@
+  */
+ 
+ #include "amdgpu.h"
+-#define MAX_KIQ_REG_WAIT	100000
++#define MAX_KIQ_REG_WAIT	100000000 /* in usecs */
+ 
+ int amdgpu_allocate_static_csa(struct amdgpu_device *adev)
+ {
+@@ -114,27 +114,24 @@ void amdgpu_virt_init_setting(struct amd
+ uint32_t amdgpu_virt_kiq_rreg(struct amdgpu_device *adev, uint32_t reg)
+ {
+ 	signed long r;
+-	uint32_t val;
+-	struct dma_fence *f;
++	uint32_t val, seq;
+ 	struct amdgpu_kiq *kiq = &adev->gfx.kiq;
+ 	struct amdgpu_ring *ring = &kiq->ring;
+ 
+ 	BUG_ON(!ring->funcs->emit_rreg);
+ 
+-	mutex_lock(&kiq->ring_mutex);
++	spin_lock(&kiq->ring_lock);
+ 	amdgpu_ring_alloc(ring, 32);
+ 	amdgpu_ring_emit_rreg(ring, reg);
+-	amdgpu_fence_emit(ring, &f);
++	amdgpu_fence_emit_polling(ring, &seq);
+ 	amdgpu_ring_commit(ring);
+-	mutex_unlock(&kiq->ring_mutex);
++	spin_unlock(&kiq->ring_lock);
+ 
+-	r = dma_fence_wait_timeout(f, false, msecs_to_jiffies(MAX_KIQ_REG_WAIT));
+-	dma_fence_put(f);
++	r = amdgpu_fence_wait_polling(ring, seq, MAX_KIQ_REG_WAIT);
+ 	if (r < 1) {
+-		DRM_ERROR("wait for kiq fence error: %ld.\n", r);
++		DRM_ERROR("wait for kiq fence error: %ld\n", r);
+ 		return ~0;
+ 	}
+-
+ 	val = adev->wb.wb[adev->virt.reg_val_offs];
+ 
+ 	return val;
+@@ -143,23 +140,22 @@ uint32_t amdgpu_virt_kiq_rreg(struct amd
+ void amdgpu_virt_kiq_wreg(struct amdgpu_device *adev, uint32_t reg, uint32_t v)
+ {
+ 	signed long r;
+-	struct dma_fence *f;
++	uint32_t seq;
+ 	struct amdgpu_kiq *kiq = &adev->gfx.kiq;
+ 	struct amdgpu_ring *ring = &kiq->ring;
+ 
+ 	BUG_ON(!ring->funcs->emit_wreg);
+ 
+-	mutex_lock(&kiq->ring_mutex);
++	spin_lock(&kiq->ring_lock);
+ 	amdgpu_ring_alloc(ring, 32);
+ 	amdgpu_ring_emit_wreg(ring, reg, v);
+-	amdgpu_fence_emit(ring, &f);
++	amdgpu_fence_emit_polling(ring, &seq);
+ 	amdgpu_ring_commit(ring);
+-	mutex_unlock(&kiq->ring_mutex);
++	spin_unlock(&kiq->ring_lock);
+ 
+-	r = dma_fence_wait_timeout(f, false, msecs_to_jiffies(MAX_KIQ_REG_WAIT));
++	r = amdgpu_fence_wait_polling(ring, seq, MAX_KIQ_REG_WAIT);
+ 	if (r < 1)
+-		DRM_ERROR("wait for kiq fence error: %ld.\n", r);
+-	dma_fence_put(f);
++		DRM_ERROR("wait for kiq fence error: %ld\n", r);
+ }
+ 
+ /**
