@@ -1,0 +1,254 @@
+From b0fd47adc6233e4c198a97e1ddb05accd31eeacb Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Sat, 15 Apr 2017 10:39:02 +0100
+Subject: [PATCH] drm/i915: Copy user requested buffers into the error state
+Git-commit: b0fd47adc6233e4c198a97e1ddb05accd31eeacb
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+Introduce a new execobject.flag (EXEC_OBJECT_CAPTURE) that userspace may
+use to indicate that it wants the contents of this buffer preserved in
+the error state (/sys/class/drm/cardN/error) following a GPU hang
+involving this batch.
+
+Use this at your discretion, the contents of the error state. although
+compressed, are allocated with GFP_ATOMIC (i.e. limited) and kept for all
+eternity (until the error state is destroyed).
+
+Based on an earlier patch by Ben Widawsky <ben@bwidawsk.net>
+
+Testcase: igt/gem_exec_capture
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Ben Widawsky <ben@bwidawsk.net>
+Cc: Matt Turner <mattst88@gmail.com>
+Acked-by: Ben Widawsky <ben@bwidawsk.net>
+Acked-by: Matt Turner <mattst88@gmail.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170415093902.22581-1-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.c            |    1 
+ drivers/gpu/drm/i915/i915_drv.h            |    3 ++
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   12 ++++++++
+ drivers/gpu/drm/i915/i915_gem_request.c    |   16 +++++++++++
+ drivers/gpu/drm/i915/i915_gem_request.h    |   11 +++++++
+ drivers/gpu/drm/i915/i915_gpu_error.c      |   40 ++++++++++++++++++++++++++++-
+ include/uapi/drm/i915_drm.h                |   15 ++++++++++
+ 7 files changed, 96 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -350,6 +350,7 @@ static int i915_getparam(struct drm_devi
+ 	case I915_PARAM_HAS_EXEC_SOFTPIN:
+ 	case I915_PARAM_HAS_EXEC_ASYNC:
+ 	case I915_PARAM_HAS_EXEC_FENCE:
++	case I915_PARAM_HAS_EXEC_CAPTURE:
+ 		/* For the time being all of these are always true;
+ 		 * if some supported hardware does not have one of these
+ 		 * features this value needs to be provided from
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1026,6 +1026,9 @@ struct i915_gpu_state {
+ 			u32 *pages[0];
+ 		} *ringbuffer, *batchbuffer, *wa_batchbuffer, *ctx, *hws_page;
+ 
++		struct drm_i915_error_object **user_bo;
++		long user_bo_count;
++
+ 		struct drm_i915_error_object *wa_ctx;
+ 
+ 		struct drm_i915_error_request {
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1125,6 +1125,18 @@ i915_gem_execbuffer_move_to_gpu(struct d
+ 	list_for_each_entry(vma, vmas, exec_list) {
+ 		struct drm_i915_gem_object *obj = vma->obj;
+ 
++		if (vma->exec_entry->flags & EXEC_OBJECT_CAPTURE) {
++			struct i915_gem_capture_list *capture;
++
++			capture = kmalloc(sizeof(*capture), GFP_KERNEL);
++			if (unlikely(!capture))
++				return -ENOMEM;
++
++			capture->next = req->capture_list;
++			capture->vma = vma;
++			req->capture_list = capture;
++		}
++
+ 		if (vma->exec_entry->flags & EXEC_OBJECT_ASYNC)
+ 			continue;
+ 
+--- a/drivers/gpu/drm/i915/i915_gem_request.c
++++ b/drivers/gpu/drm/i915/i915_gem_request.c
+@@ -292,6 +292,19 @@ static void advance_ring(struct drm_i915
+ 	request->ring->head = tail;
+ }
+ 
++static void free_capture_list(struct drm_i915_gem_request *request)
++{
++	struct i915_gem_capture_list *capture;
++
++	capture = request->capture_list;
++	while (capture) {
++		struct i915_gem_capture_list *next = capture->next;
++
++		kfree(capture);
++		capture = next;
++	}
++}
++
+ static void i915_gem_request_retire(struct drm_i915_gem_request *request)
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+@@ -317,6 +330,8 @@ static void i915_gem_request_retire(stru
+ 	unreserve_seqno(request->engine);
+ 	advance_ring(request);
+ 
++	free_capture_list(request);
++
+ 	/* Walk through the active list, calling retire on each. This allows
+ 	 * objects to track their GPU activity and mark themselves as idle
+ 	 * when their *last* active request is completed (updating state
+@@ -615,6 +630,7 @@ i915_gem_request_alloc(struct intel_engi
+ 	req->global_seqno = 0;
+ 	req->file_priv = NULL;
+ 	req->batch = NULL;
++	req->capture_list = NULL;
+ 
+ 	/*
+ 	 * Reserve space in the ring buffer for all the commands required to
+--- a/drivers/gpu/drm/i915/i915_gem_request.h
++++ b/drivers/gpu/drm/i915/i915_gem_request.h
+@@ -73,6 +73,11 @@ struct i915_priotree {
+ #define I915_PRIORITY_MIN (-I915_PRIORITY_MAX)
+ };
+ 
++struct i915_gem_capture_list {
++	struct i915_gem_capture_list *next;
++	struct i915_vma *vma;
++};
++
+ /**
+  * Request queue structure.
+  *
+@@ -167,6 +172,12 @@ struct drm_i915_gem_request {
+ 	 * error state dump only).
+ 	 */
+ 	struct i915_vma *batch;
++	/** Additional buffers requested by userspace to be captured upon
++	 * a GPU hang. The vma/obj on this list are protected by their
++	 * active reference - all objects on this list must also be
++	 * on the active_list (of their final request).
++	 */
++	struct i915_gem_capture_list *capture_list;
+ 	struct list_head active_list;
+ 
+ 	/** Time at which this request was emitted, in jiffies. */
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -712,6 +712,10 @@ int i915_error_state_to_str(struct drm_i
+ 			print_error_obj(m, dev_priv->engine[i], NULL, obj);
+ 		}
+ 
++		for (j = 0; j < ee->user_bo_count; j++)
++			print_error_obj(m, dev_priv->engine[i],
++					"user", ee->user_bo[j]);
++
+ 		if (ee->num_requests) {
+ 			err_printf(m, "%s --- %d requests\n",
+ 				   dev_priv->engine[i]->name,
+@@ -825,11 +829,15 @@ void __i915_gpu_state_free(struct kref *
+ {
+ 	struct i915_gpu_state *error =
+ 		container_of(error_ref, typeof(*error), ref);
+-	int i;
++	long i, j;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(error->engine); i++) {
+ 		struct drm_i915_error_engine *ee = &error->engine[i];
+ 
++		for (j = 0; j < ee->user_bo_count; j++)
++			i915_error_object_free(ee->user_bo[j]);
++		kfree(ee->user_bo);
++
+ 		i915_error_object_free(ee->batchbuffer);
+ 		i915_error_object_free(ee->wa_batchbuffer);
+ 		i915_error_object_free(ee->ringbuffer);
+@@ -1346,6 +1354,35 @@ static void record_context(struct drm_i9
+ 	e->active = ctx->active_count;
+ }
+ 
++static void request_record_user_bo(struct drm_i915_gem_request *request,
++				   struct drm_i915_error_engine *ee)
++{
++	struct i915_gem_capture_list *c;
++	struct drm_i915_error_object **bo;
++	long count;
++
++	count = 0;
++	for (c = request->capture_list; c; c = c->next)
++		count++;
++
++	bo = NULL;
++	if (count)
++		bo = kcalloc(count, sizeof(*bo), GFP_ATOMIC);
++	if (!bo)
++		return;
++
++	count = 0;
++	for (c = request->capture_list; c; c = c->next) {
++		bo[count] = i915_error_object_create(request->i915, c->vma);
++		if (!bo[count])
++			break;
++		count++;
++	}
++
++	ee->user_bo = bo;
++	ee->user_bo_count = count;
++}
++
+ static void i915_gem_record_rings(struct drm_i915_private *dev_priv,
+ 				  struct i915_gpu_state *error)
+ {
+@@ -1392,6 +1429,7 @@ static void i915_gem_record_rings(struct
+ 				ee->wa_batchbuffer =
+ 					i915_error_object_create(dev_priv,
+ 								 engine->scratch);
++			request_record_user_bo(request, ee);
+ 
+ 			ee->ctx =
+ 				i915_error_object_create(dev_priv,
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -412,6 +412,12 @@ typedef struct drm_i915_irq_wait {
+  */
+ #define I915_PARAM_HAS_EXEC_FENCE	 44
+ 
++/* Query whether DRM_I915_GEM_EXECBUFFER2 supports the ability to capture
++ * user specified bufffers for post-mortem debugging of GPU hangs. See
++ * EXEC_OBJECT_CAPTURE.
++ */
++#define I915_PARAM_HAS_EXEC_CAPTURE	 45
++
+ typedef struct drm_i915_getparam {
+ 	__s32 param;
+ 	/*
+@@ -775,8 +781,15 @@ struct drm_i915_gem_exec_object2 {
+  * I915_PARAM_HAS_EXEC_FENCE to order execbufs and execute them asynchronously.
+  */
+ #define EXEC_OBJECT_ASYNC		(1<<6)
++/* Request that the contents of this execobject be copied into the error
++ * state upon a GPU hang involving this batch for post-mortem debugging.
++ * These buffers are recorded in no particular order as "user" in
++ * /sys/class/drm/cardN/error. Query I915_PARAM_HAS_EXEC_CAPTURE to see
++ * if the kernel supports this flag.
++ */
++#define EXEC_OBJECT_CAPTURE		(1<<7)
+ /* All remaining bits are MBZ and RESERVED FOR FUTURE USE */
+-#define __EXEC_OBJECT_UNKNOWN_FLAGS -(EXEC_OBJECT_ASYNC<<1)
++#define __EXEC_OBJECT_UNKNOWN_FLAGS -(EXEC_OBJECT_CAPTURE<<1)
+ 	__u64 flags;
+ 
+ 	union {
