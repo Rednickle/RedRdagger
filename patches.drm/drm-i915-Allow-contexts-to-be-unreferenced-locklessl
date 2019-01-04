@@ -1,0 +1,326 @@
+From 5f09a9c8ab6b16eefbcf81635330d68481af1edc Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 20 Jun 2017 12:05:46 +0100
+Subject: [PATCH] drm/i915: Allow contexts to be unreferenced locklessly
+Git-commit: 5f09a9c8ab6b16eefbcf81635330d68481af1edc
+Patch-mainline: v4.14-rc1
+References: FATE#322643 bsc#1055900
+
+If we move the actual cleanup of the context to a worker, we can allow
+the final free to be called from any context and avoid undue latency in
+the caller.
+
+V2: Negotiate handling the delayed contexts free by flushing the
+workqueue before calling i915_gem_context_fini() and performing the final
+free of the kernel context directly
+V3: Flush deferred frees before new context allocations
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170620110547.15947-2-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/scheduler.c             |    2 
+ drivers/gpu/drm/i915/i915_drv.c                  |    2 
+ drivers/gpu/drm/i915/i915_drv.h                  |   23 --------
+ drivers/gpu/drm/i915/i915_gem_context.c          |   59 ++++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_gem_context.h          |   15 +++++
+ drivers/gpu/drm/i915/i915_perf.c                 |    4 -
+ drivers/gpu/drm/i915/selftests/i915_vma.c        |    8 ++-
+ drivers/gpu/drm/i915/selftests/mock_context.c    |    9 +++
+ drivers/gpu/drm/i915/selftests/mock_context.h    |    2 
+ drivers/gpu/drm/i915/selftests/mock_gem_device.c |    3 -
+ 10 files changed, 88 insertions(+), 39 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -617,7 +617,7 @@ err:
+ 
+ void intel_vgpu_clean_gvt_context(struct intel_vgpu *vgpu)
+ {
+-	i915_gem_context_put_unlocked(vgpu->shadow_ctx);
++	i915_gem_context_put(vgpu->shadow_ctx);
+ }
+ 
+ int intel_vgpu_init_gvt_context(struct intel_vgpu *vgpu)
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -585,6 +585,8 @@ static const struct vga_switcheroo_clien
+ 
+ static void i915_gem_fini(struct drm_i915_private *dev_priv)
+ {
++	flush_workqueue(dev_priv->wq);
++
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+ 	intel_uc_fini_hw(dev_priv);
+ 	i915_gem_cleanup_engines(dev_priv);
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2314,6 +2314,8 @@ struct drm_i915_private {
+ 
+ 	struct {
+ 		struct list_head list;
++		struct llist_head free_list;
++		struct work_struct free_work;
+ 
+ 		/* The hw wants to have a stable context identifier for the
+ 		 * lifetime of the context (for OA, PASID, faults, etc).
+@@ -3544,27 +3546,6 @@ i915_gem_context_lookup(struct drm_i915_
+ 	return ctx;
+ }
+ 
+-static inline struct i915_gem_context *
+-i915_gem_context_get(struct i915_gem_context *ctx)
+-{
+-	kref_get(&ctx->ref);
+-	return ctx;
+-}
+-
+-static inline void i915_gem_context_put(struct i915_gem_context *ctx)
+-{
+-	lockdep_assert_held(&ctx->i915->drm.struct_mutex);
+-	kref_put(&ctx->ref, i915_gem_context_free);
+-}
+-
+-static inline void i915_gem_context_put_unlocked(struct i915_gem_context *ctx)
+-{
+-	struct mutex *lock = &ctx->i915->drm.struct_mutex;
+-
+-	if (kref_put_mutex(&ctx->ref, i915_gem_context_free, lock))
+-		mutex_unlock(lock);
+-}
+-
+ static inline struct intel_timeline *
+ i915_gem_context_lookup_timeline(struct i915_gem_context *ctx,
+ 				 struct intel_engine_cs *engine)
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -158,13 +158,11 @@ static void vma_lut_free(struct i915_gem
+ 	kvfree(lut->ht);
+ }
+ 
+-void i915_gem_context_free(struct kref *ctx_ref)
++static void i915_gem_context_free(struct i915_gem_context *ctx)
+ {
+-	struct i915_gem_context *ctx = container_of(ctx_ref, typeof(*ctx), ref);
+ 	int i;
+ 
+ 	lockdep_assert_held(&ctx->i915->drm.struct_mutex);
+-	trace_i915_context_free(ctx);
+ 	GEM_BUG_ON(!i915_gem_context_is_closed(ctx));
+ 
+ 	vma_lut_free(ctx);
+@@ -192,6 +190,37 @@ void i915_gem_context_free(struct kref *
+ 	kfree(ctx);
+ }
+ 
++static void contexts_free(struct drm_i915_private *i915)
++{
++	struct llist_node *freed = llist_del_all(&i915->contexts.free_list);
++	struct i915_gem_context *ctx;
++
++	lockdep_assert_held(&i915->drm.struct_mutex);
++
++	llist_for_each_entry(ctx, freed, free_link)
++		i915_gem_context_free(ctx);
++}
++
++static void contexts_free_worker(struct work_struct *work)
++{
++	struct drm_i915_private *i915 =
++		container_of(work, typeof(*i915), contexts.free_work);
++
++	mutex_lock(&i915->drm.struct_mutex);
++	contexts_free(i915);
++	mutex_unlock(&i915->drm.struct_mutex);
++}
++
++void i915_gem_context_release(struct kref *ref)
++{
++	struct i915_gem_context *ctx = container_of(ref, typeof(*ctx), ref);
++	struct drm_i915_private *i915 = ctx->i915;
++
++	trace_i915_context_free(ctx);
++	if (llist_add(&ctx->free_link, &i915->contexts.free_list))
++		queue_work(i915->wq, &i915->contexts.free_work);
++}
++
+ static void context_close(struct i915_gem_context *ctx)
+ {
+ 	i915_gem_context_set_closed(ctx);
+@@ -428,6 +457,8 @@ int i915_gem_contexts_init(struct drm_i9
+ 		return 0;
+ 
+ 	INIT_LIST_HEAD(&dev_priv->contexts.list);
++	INIT_WORK(&dev_priv->contexts.free_work, contexts_free_worker);
++	init_llist_head(&dev_priv->contexts.free_list);
+ 
+ 	if (intel_vgpu_active(dev_priv) &&
+ 	    HAS_LOGICAL_RING_CONTEXTS(dev_priv)) {
+@@ -505,18 +536,20 @@ void i915_gem_contexts_lost(struct drm_i
+ 	}
+ }
+ 
+-void i915_gem_contexts_fini(struct drm_i915_private *dev_priv)
++void i915_gem_contexts_fini(struct drm_i915_private *i915)
+ {
+-	struct i915_gem_context *dctx = dev_priv->kernel_context;
+-
+-	lockdep_assert_held(&dev_priv->drm.struct_mutex);
++	struct i915_gem_context *ctx;
+ 
+-	GEM_BUG_ON(!i915_gem_context_is_kernel(dctx));
++	lockdep_assert_held(&i915->drm.struct_mutex);
+ 
+-	context_close(dctx);
+-	dev_priv->kernel_context = NULL;
++	/* Keep the context so that we can free it immediately ourselves */
++	ctx = i915_gem_context_get(fetch_and_zero(&i915->kernel_context));
++	GEM_BUG_ON(!i915_gem_context_is_kernel(ctx));
++	context_close(ctx);
++	i915_gem_context_free(ctx);
+ 
+-	ida_destroy(&dev_priv->contexts.hw_ida);
++	/* Must free all deferred contexts (via flush_workqueue) first */
++	ida_destroy(&i915->contexts.hw_ida);
+ }
+ 
+ static int context_idr_cleanup(int id, void *p, void *data)
+@@ -958,6 +991,10 @@ int i915_gem_context_create_ioctl(struct
+ 	if (ret)
+ 		return ret;
+ 
++	/* Reap stale contexts */
++	i915_gem_retire_requests(dev_priv);
++	contexts_free(dev_priv);
++
+ 	ctx = i915_gem_create_context(dev_priv, file_priv);
+ 	mutex_unlock(&dev->struct_mutex);
+ 	if (IS_ERR(ctx))
+--- a/drivers/gpu/drm/i915/i915_gem_context.h
++++ b/drivers/gpu/drm/i915/i915_gem_context.h
+@@ -86,6 +86,7 @@ struct i915_gem_context {
+ 
+ 	/** link: place with &drm_i915_private.context_list */
+ 	struct list_head link;
++	struct llist_node free_link;
+ 
+ 	/**
+ 	 * @ref: reference count
+@@ -284,7 +285,7 @@ void i915_gem_context_close(struct drm_f
+ int i915_switch_context(struct drm_i915_gem_request *req);
+ int i915_gem_switch_to_kernel_context(struct drm_i915_private *dev_priv);
+ 
+-void i915_gem_context_free(struct kref *ctx_ref);
++void i915_gem_context_release(struct kref *ctx_ref);
+ struct i915_gem_context *
+ i915_gem_context_create_gvt(struct drm_device *dev);
+ 
+@@ -299,4 +300,16 @@ int i915_gem_context_setparam_ioctl(stru
+ int i915_gem_context_reset_stats_ioctl(struct drm_device *dev, void *data,
+ 				       struct drm_file *file);
+ 
++static inline struct i915_gem_context *
++i915_gem_context_get(struct i915_gem_context *ctx)
++{
++	kref_get(&ctx->ref);
++	return ctx;
++}
++
++static inline void i915_gem_context_put(struct i915_gem_context *ctx)
++{
++	kref_put(&ctx->ref, i915_gem_context_release);
++}
++
+ #endif /* !__I915_GEM_CONTEXT_H__ */
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -2444,7 +2444,7 @@ static void i915_perf_destroy_locked(str
+ 	list_del(&stream->link);
+ 
+ 	if (stream->ctx)
+-		i915_gem_context_put_unlocked(stream->ctx);
++		i915_gem_context_put(stream->ctx);
+ 
+ 	kfree(stream);
+ }
+@@ -2633,7 +2633,7 @@ err_alloc:
+ 	kfree(stream);
+ err_ctx:
+ 	if (specific_ctx)
+-		i915_gem_context_put_unlocked(specific_ctx);
++		i915_gem_context_put(specific_ctx);
+ err:
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/i915/selftests/i915_vma.c
++++ b/drivers/gpu/drm/i915/selftests/i915_vma.c
+@@ -186,16 +186,20 @@ static int igt_vma_create(void *arg)
+ 				goto end;
+ 		}
+ 
+-		list_for_each_entry_safe(ctx, cn, &contexts, link)
++		list_for_each_entry_safe(ctx, cn, &contexts, link) {
++			list_del_init(&ctx->link);
+ 			mock_context_close(ctx);
++		}
+ 	}
+ 
+ end:
+ 	/* Final pass to lookup all created contexts */
+ 	err = create_vmas(i915, &objects, &contexts);
+ out:
+-	list_for_each_entry_safe(ctx, cn, &contexts, link)
++	list_for_each_entry_safe(ctx, cn, &contexts, link) {
++		list_del_init(&ctx->link);
+ 		mock_context_close(ctx);
++	}
+ 
+ 	list_for_each_entry_safe(obj, on, &objects, st_link)
+ 		i915_gem_object_put(obj);
+--- a/drivers/gpu/drm/i915/selftests/mock_context.c
++++ b/drivers/gpu/drm/i915/selftests/mock_context.c
+@@ -86,3 +86,12 @@ void mock_context_close(struct i915_gem_
+ 
+ 	i915_gem_context_put(ctx);
+ }
++
++void mock_init_contexts(struct drm_i915_private *i915)
++{
++	INIT_LIST_HEAD(&i915->contexts.list);
++	ida_init(&i915->contexts.hw_ida);
++
++	INIT_WORK(&i915->contexts.free_work, contexts_free_worker);
++	init_llist_head(&i915->contexts.free_list);
++}
+--- a/drivers/gpu/drm/i915/selftests/mock_context.h
++++ b/drivers/gpu/drm/i915/selftests/mock_context.h
+@@ -25,6 +25,8 @@
+ #ifndef __MOCK_CONTEXT_H
+ #define __MOCK_CONTEXT_H
+ 
++void mock_init_contexts(struct drm_i915_private *i915);
++
+ struct i915_gem_context *
+ mock_context(struct drm_i915_private *i915,
+ 	     const char *name);
+--- a/drivers/gpu/drm/i915/selftests/mock_gem_device.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+@@ -57,6 +57,7 @@ static void mock_device_release(struct d
+ 
+ 	cancel_delayed_work_sync(&i915->gt.retire_work);
+ 	cancel_delayed_work_sync(&i915->gt.idle_work);
++	flush_workqueue(i915->wq);
+ 
+ 	mutex_lock(&i915->drm.struct_mutex);
+ 	for_each_engine(engine, i915, id)
+@@ -160,7 +161,7 @@ struct drm_i915_private *mock_gem_device
+ 	INIT_LIST_HEAD(&i915->mm.unbound_list);
+ 	INIT_LIST_HEAD(&i915->mm.bound_list);
+ 
+-	ida_init(&i915->contexts.hw_ida);
++	mock_init_contexts(i915);
+ 
+ 	INIT_DELAYED_WORK(&i915->gt.retire_work, mock_retire_work_handler);
+ 	INIT_DELAYED_WORK(&i915->gt.idle_work, mock_idle_work_handler);
