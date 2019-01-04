@@ -1,0 +1,658 @@
+From: Lucas Stach <l.stach@pengutronix.de>
+Date: Mon, 4 Dec 2017 18:41:58 +0100
+Subject: drm/etnaviv: hook up DRM GPU scheduler
+Git-commit: e93b6deeb45a781489f4ceaa97f9545a3cbebb81
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This hooks in the DRM GPU scheduler. No improvement yet, as all the
+dependency handling is still done in etnaviv_gem_submit. This just
+replaces the actual GPU submit by passing through the scheduler.
+
+Allows to get rid of the retire worker, as this is now driven by the
+scheduler.
+
+Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/etnaviv/Kconfig              |    1 
+ drivers/gpu/drm/etnaviv/Makefile             |    3 
+ drivers/gpu/drm/etnaviv/etnaviv_drv.c        |   16 +++
+ drivers/gpu/drm/etnaviv/etnaviv_drv.h        |    7 -
+ drivers/gpu/drm/etnaviv/etnaviv_gem.h        |    1 
+ drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c |   11 +-
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.c        |  113 ++++++++----------------
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.h        |   14 ---
+ drivers/gpu/drm/etnaviv/etnaviv_sched.c      |  125 +++++++++++++++++++++++++++
+ drivers/gpu/drm/etnaviv/etnaviv_sched.h      |   35 +++++++
+ 10 files changed, 235 insertions(+), 91 deletions(-)
+
+--- a/drivers/gpu/drm/etnaviv/Kconfig
++++ b/drivers/gpu/drm/etnaviv/Kconfig
+@@ -11,6 +11,7 @@ config DRM_ETNAVIV
+ 	select WANT_DEV_COREDUMP
+ 	select CMA if HAVE_DMA_CONTIGUOUS
+ 	select DMA_CMA if HAVE_DMA_CONTIGUOUS
++	select DRM_SCHED
+ 	help
+ 	  DRM driver for Vivante GPUs.
+ 
+--- a/drivers/gpu/drm/etnaviv/Makefile
++++ b/drivers/gpu/drm/etnaviv/Makefile
+@@ -11,6 +11,7 @@ etnaviv-y := \
+ 	etnaviv_iommu_v2.o \
+ 	etnaviv_iommu.o \
+ 	etnaviv_mmu.o \
+-	etnaviv_perfmon.o
++	etnaviv_perfmon.o \
++	etnaviv_sched.o
+ 
+ obj-$(CONFIG_DRM_ETNAVIV)	+= etnaviv.o
+--- a/drivers/gpu/drm/etnaviv/etnaviv_drv.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_drv.c
+@@ -101,12 +101,25 @@ static void load_gpu(struct drm_device *
+ 
+ static int etnaviv_open(struct drm_device *dev, struct drm_file *file)
+ {
++	struct etnaviv_drm_private *priv = dev->dev_private;
+ 	struct etnaviv_file_private *ctx;
++	int i;
+ 
+ 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+ 		return -ENOMEM;
+ 
++	for (i = 0; i < ETNA_MAX_PIPES; i++) {
++		struct etnaviv_gpu *gpu = priv->gpu[i];
++
++		if (gpu) {
++			drm_sched_entity_init(&gpu->sched,
++				&ctx->sched_entity[i],
++				&gpu->sched.sched_rq[DRM_SCHED_PRIORITY_NORMAL],
++				32, NULL);
++			}
++	}
++
+ 	file->driver_priv = ctx;
+ 
+ 	return 0;
+@@ -126,6 +139,9 @@ static void etnaviv_postclose(struct drm
+ 			if (gpu->lastctx == ctx)
+ 				gpu->lastctx = NULL;
+ 			mutex_unlock(&gpu->lock);
++
++			drm_sched_entity_fini(&gpu->sched,
++					      &ctx->sched_entity[i]);
+ 		}
+ 	}
+ 
+--- a/drivers/gpu/drm/etnaviv/etnaviv_drv.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_drv.h
+@@ -34,6 +34,7 @@
+ #include <drm/drm_fb_helper.h>
+ #include <drm/drm_gem.h>
+ #include <drm/etnaviv_drm.h>
++#include <drm/gpu_scheduler.h>
+ 
+ struct etnaviv_cmdbuf;
+ struct etnaviv_gpu;
+@@ -42,11 +43,11 @@ struct etnaviv_gem_object;
+ struct etnaviv_gem_submit;
+ 
+ struct etnaviv_file_private {
+-	/* currently we don't do anything useful with this.. but when
+-	 * per-context address spaces are supported we'd keep track of
++	/*
++	 * When per-context address spaces are supported we'd keep track of
+ 	 * the context's page-tables here.
+ 	 */
+-	int dummy;
++	struct drm_sched_entity		sched_entity[ETNA_MAX_PIPES];
+ };
+ 
+ struct etnaviv_drm_private {
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem.h
+@@ -101,6 +101,7 @@ struct etnaviv_gem_submit_bo {
+  * make it easier to unwind when things go wrong, etc).
+  */
+ struct etnaviv_gem_submit {
++	struct drm_sched_job sched_job;
+ 	struct kref refcount;
+ 	struct etnaviv_gpu *gpu;
+ 	struct dma_fence *out_fence, *in_fence;
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
+@@ -22,6 +22,7 @@
+ #include "etnaviv_gpu.h"
+ #include "etnaviv_gem.h"
+ #include "etnaviv_perfmon.h"
++#include "etnaviv_sched.h"
+ 
+ /*
+  * Cmdstream submission:
+@@ -381,8 +382,13 @@ static void submit_cleanup(struct kref *
+ 
+ 	if (submit->in_fence)
+ 		dma_fence_put(submit->in_fence);
+-	if (submit->out_fence)
++	if (submit->out_fence) {
++		/* first remove from IDR, so fence can not be found anymore */
++		mutex_lock(&submit->gpu->fence_idr_lock);
++		idr_remove(&submit->gpu->fence_idr, submit->out_fence_id);
++		mutex_unlock(&submit->gpu->fence_idr_lock);
+ 		dma_fence_put(submit->out_fence);
++	}
+ 	kfree(submit->pmrs);
+ 	kfree(submit);
+ }
+@@ -395,6 +401,7 @@ void etnaviv_submit_put(struct etnaviv_g
+ int etnaviv_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		struct drm_file *file)
+ {
++	struct etnaviv_file_private *ctx = file->driver_priv;
+ 	struct etnaviv_drm_private *priv = dev->dev_private;
+ 	struct drm_etnaviv_gem_submit *args = data;
+ 	struct drm_etnaviv_gem_submit_reloc *relocs;
+@@ -541,7 +548,7 @@ int etnaviv_ioctl_gem_submit(struct drm_
+ 	memcpy(submit->cmdbuf.vaddr, stream, args->stream_size);
+ 	submit->cmdbuf.user_size = ALIGN(args->stream_size, 8);
+ 
+-	ret = etnaviv_gpu_submit(gpu, submit);
++	ret = etnaviv_sched_push_job(&ctx->sched_entity[args->pipe], submit);
+ 	if (ret)
+ 		goto err_submit_objects;
+ 
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+@@ -26,6 +26,7 @@
+ #include "etnaviv_gem.h"
+ #include "etnaviv_mmu.h"
+ #include "etnaviv_perfmon.h"
++#include "etnaviv_sched.h"
+ #include "common.xml.h"
+ #include "state.xml.h"
+ #include "state_hi.xml.h"
+@@ -961,9 +962,6 @@ static void recover_worker(struct work_s
+ 	mutex_unlock(&gpu->lock);
+ 	pm_runtime_mark_last_busy(gpu->dev);
+ 	pm_runtime_put_autosuspend(gpu->dev);
+-
+-	/* Retire the buffer objects in a work */
+-	queue_work(gpu->wq, &gpu->retire_work);
+ }
+ 
+ static void hangcheck_timer_reset(struct etnaviv_gpu *gpu)
+@@ -1016,7 +1014,6 @@ static void hangcheck_disable(struct etn
+ /* fence object management */
+ struct etnaviv_fence {
+ 	struct etnaviv_gpu *gpu;
+-	int id;
+ 	struct dma_fence base;
+ };
+ 
+@@ -1053,11 +1050,6 @@ static void etnaviv_fence_release(struct
+ {
+ 	struct etnaviv_fence *f = to_etnaviv_fence(fence);
+ 
+-	/* first remove from IDR, so fence can not be looked up anymore */
+-	mutex_lock(&f->gpu->lock);
+-	idr_remove(&f->gpu->fence_idr, f->id);
+-	mutex_unlock(&f->gpu->lock);
+-
+ 	kfree_rcu(f, base.rcu);
+ }
+ 
+@@ -1084,11 +1076,6 @@ static struct dma_fence *etnaviv_gpu_fen
+ 	if (!f)
+ 		return NULL;
+ 
+-	f->id = idr_alloc_cyclic(&gpu->fence_idr, &f->base, 0, INT_MAX, GFP_KERNEL);
+-	if (f->id < 0) {
+-		kfree(f);
+-		return NULL;
+-	}
+ 	f->gpu = gpu;
+ 
+ 	dma_fence_init(&f->base, &etnaviv_fence_ops, &gpu->fence_spinlock,
+@@ -1211,31 +1198,6 @@ static void event_free(struct etnaviv_gp
+ /*
+  * Cmdstream submission/retirement:
+  */
+-
+-static void retire_worker(struct work_struct *work)
+-{
+-	struct etnaviv_gpu *gpu = container_of(work, struct etnaviv_gpu,
+-					       retire_work);
+-	u32 fence = gpu->completed_fence;
+-	struct etnaviv_gem_submit *submit, *tmp;
+-	LIST_HEAD(retire_list);
+-
+-	mutex_lock(&gpu->lock);
+-	list_for_each_entry_safe(submit, tmp, &gpu->active_submit_list, node) {
+-		if (!dma_fence_is_signaled(submit->out_fence))
+-			break;
+-
+-		list_move(&submit->node, &retire_list);
+-	}
+-
+-	gpu->retired_fence = fence;
+-
+-	mutex_unlock(&gpu->lock);
+-
+-	list_for_each_entry_safe(submit, tmp, &retire_list, node)
+-		etnaviv_submit_put(submit);
+-}
+-
+ int etnaviv_gpu_wait_fence_interruptible(struct etnaviv_gpu *gpu,
+ 	u32 id, struct timespec *timeout)
+ {
+@@ -1243,18 +1205,15 @@ int etnaviv_gpu_wait_fence_interruptible
+ 	int ret;
+ 
+ 	/*
+-	 * Look up the fence and take a reference. The mutex only synchronizes
+-	 * the IDR lookup with the fence release. We might still find a fence
++	 * Look up the fence and take a reference. We might still find a fence
+ 	 * whose refcount has already dropped to zero. dma_fence_get_rcu
+ 	 * pretends we didn't find a fence in that case.
+ 	 */
+-	ret = mutex_lock_interruptible(&gpu->lock);
+-	if (ret)
+-		return ret;
++	rcu_read_lock();
+ 	fence = idr_find(&gpu->fence_idr, id);
+ 	if (fence)
+ 		fence = dma_fence_get_rcu(fence);
+-	mutex_unlock(&gpu->lock);
++	rcu_read_unlock();
+ 
+ 	if (!fence)
+ 		return 0;
+@@ -1279,7 +1238,7 @@ int etnaviv_gpu_wait_fence_interruptible
+ 
+ /*
+  * Wait for an object to become inactive.  This, on it's own, is not race
+- * free: the object is moved by the retire worker off the active list, and
++ * free: the object is moved by the scheduler off the active list, and
+  * then the iova is put.  Moreover, the object could be re-submitted just
+  * after we notice that it's become inactive.
+  *
+@@ -1368,15 +1327,16 @@ static void sync_point_perfmon_sample_po
+ 
+ 
+ /* add bo's to gpu's ring, and kick gpu: */
+-int etnaviv_gpu_submit(struct etnaviv_gpu *gpu,
+-	struct etnaviv_gem_submit *submit)
++struct dma_fence *etnaviv_gpu_submit(struct etnaviv_gem_submit *submit)
+ {
++	struct etnaviv_gpu *gpu = submit->gpu;
++	struct dma_fence *gpu_fence;
+ 	unsigned int i, nr_events = 1, event[3];
+ 	int ret;
+ 
+ 	ret = pm_runtime_get_sync(gpu->dev);
+ 	if (ret < 0)
+-		return ret;
++		return NULL;
+ 	submit->runtime_resumed = true;
+ 
+ 	/*
+@@ -1392,22 +1352,20 @@ int etnaviv_gpu_submit(struct etnaviv_gp
+ 	ret = event_alloc(gpu, nr_events, event);
+ 	if (ret) {
+ 		DRM_ERROR("no free events\n");
+-		return ret;
++		return NULL;
+ 	}
+ 
+ 	mutex_lock(&gpu->lock);
+ 
+-	submit->out_fence = etnaviv_gpu_fence_alloc(gpu);
+-	if (!submit->out_fence) {
++	gpu_fence = etnaviv_gpu_fence_alloc(gpu);
++	if (!gpu_fence) {
+ 		for (i = 0; i < nr_events; i++)
+ 			event_free(gpu, event[i]);
+ 
+-		ret = -ENOMEM;
+ 		goto out_unlock;
+ 	}
+-	submit->out_fence_id = to_etnaviv_fence(submit->out_fence)->id;
+ 
+-	gpu->active_fence = submit->out_fence->seqno;
++	gpu->active_fence = gpu_fence->seqno;
+ 
+ 	if (submit->nr_pmrs) {
+ 		gpu->event[event[1]].sync_point = &sync_point_perfmon_sample_pre;
+@@ -1416,8 +1374,7 @@ int etnaviv_gpu_submit(struct etnaviv_gp
+ 		etnaviv_sync_point_queue(gpu, event[1]);
+ 	}
+ 
+-	kref_get(&submit->refcount);
+-	gpu->event[event[0]].fence = submit->out_fence;
++	gpu->event[event[0]].fence = gpu_fence;
+ 	etnaviv_buffer_queue(gpu, submit->exec_state, event[0],
+ 			     &submit->cmdbuf);
+ 
+@@ -1428,15 +1385,12 @@ int etnaviv_gpu_submit(struct etnaviv_gp
+ 		etnaviv_sync_point_queue(gpu, event[2]);
+ 	}
+ 
+-	list_add_tail(&submit->node, &gpu->active_submit_list);
+-
+ 	hangcheck_timer_reset(gpu);
+-	ret = 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&gpu->lock);
+ 
+-	return ret;
++	return gpu_fence;
+ }
+ 
+ static void sync_point_worker(struct work_struct *work)
+@@ -1527,9 +1481,6 @@ static irqreturn_t irq_handler(int irq,
+ 			event_free(gpu, event);
+ 		}
+ 
+-		/* Retire the buffer objects in a work */
+-		queue_work(gpu->wq, &gpu->retire_work);
+-
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+@@ -1701,22 +1652,22 @@ static int etnaviv_gpu_bind(struct devic
+ 
+ 	gpu->wq = alloc_ordered_workqueue(dev_name(dev), 0);
+ 	if (!gpu->wq) {
+-		if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
+-			thermal_cooling_device_unregister(gpu->cooling);
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto out_thermal;
+ 	}
+ 
++	ret = etnaviv_sched_init(gpu);
++	if (ret)
++		goto out_workqueue;
++
+ #ifdef CONFIG_PM
+ 	ret = pm_runtime_get_sync(gpu->dev);
+ #else
+ 	ret = etnaviv_gpu_clk_enable(gpu);
+ #endif
+-	if (ret < 0) {
+-		destroy_workqueue(gpu->wq);
+-		if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
+-			thermal_cooling_device_unregister(gpu->cooling);
+-		return ret;
+-	}
++	if (ret < 0)
++		goto out_sched;
++
+ 
+ 	gpu->drm = drm;
+ 	gpu->fence_context = dma_fence_context_alloc(1);
+@@ -1724,7 +1675,6 @@ static int etnaviv_gpu_bind(struct devic
+ 	spin_lock_init(&gpu->fence_spinlock);
+ 
+ 	INIT_LIST_HEAD(&gpu->active_submit_list);
+-	INIT_WORK(&gpu->retire_work, retire_worker);
+ 	INIT_WORK(&gpu->sync_point_work, sync_point_worker);
+ 	INIT_WORK(&gpu->recover_work, recover_worker);
+ 	init_waitqueue_head(&gpu->fence_event);
+@@ -1737,6 +1687,18 @@ static int etnaviv_gpu_bind(struct devic
+ 	pm_runtime_put_autosuspend(gpu->dev);
+ 
+ 	return 0;
++
++out_sched:
++	etnaviv_sched_fini(gpu);
++
++out_workqueue:
++	destroy_workqueue(gpu->wq);
++
++out_thermal:
++	if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
++		thermal_cooling_device_unregister(gpu->cooling);
++
++	return ret;
+ }
+ 
+ static void etnaviv_gpu_unbind(struct device *dev, struct device *master,
+@@ -1751,6 +1713,8 @@ static void etnaviv_gpu_unbind(struct de
+ 	flush_workqueue(gpu->wq);
+ 	destroy_workqueue(gpu->wq);
+ 
++	etnaviv_sched_fini(gpu);
++
+ #ifdef CONFIG_PM
+ 	pm_runtime_get_sync(gpu->dev);
+ 	pm_runtime_put_sync_suspend(gpu->dev);
+@@ -1803,6 +1767,7 @@ static int etnaviv_gpu_platform_probe(st
+ 
+ 	gpu->dev = &pdev->dev;
+ 	mutex_init(&gpu->lock);
++	mutex_init(&gpu->fence_idr_lock);
+ 
+ 	/* Map registers: */
+ 	gpu->mmio = etnaviv_ioremap(pdev, NULL, dev_name(gpu->dev));
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+@@ -108,6 +108,7 @@ struct etnaviv_gpu {
+ 	struct etnaviv_chip_identity identity;
+ 	struct etnaviv_file_private *lastctx;
+ 	struct workqueue_struct *wq;
++	struct drm_gpu_scheduler sched;
+ 
+ 	/* 'ring'-buffer: */
+ 	struct etnaviv_cmdbuf buffer;
+@@ -128,18 +129,15 @@ struct etnaviv_gpu {
+ 	u32 idle_mask;
+ 
+ 	/* Fencing support */
++	struct mutex fence_idr_lock;
+ 	struct idr fence_idr;
+ 	u32 next_fence;
+ 	u32 active_fence;
+ 	u32 completed_fence;
+-	u32 retired_fence;
+ 	wait_queue_head_t fence_event;
+ 	u64 fence_context;
+ 	spinlock_t fence_spinlock;
+ 
+-	/* worker for handling active-list retiring: */
+-	struct work_struct retire_work;
+-
+ 	/* worker for handling 'sync' points: */
+ 	struct work_struct sync_point_work;
+ 	int sync_point_event;
+@@ -182,11 +180,6 @@ static inline bool fence_completed(struc
+ 	return fence_after_eq(gpu->completed_fence, fence);
+ }
+ 
+-static inline bool fence_retired(struct etnaviv_gpu *gpu, u32 fence)
+-{
+-	return fence_after_eq(gpu->retired_fence, fence);
+-}
+-
+ int etnaviv_gpu_get_param(struct etnaviv_gpu *gpu, u32 param, u64 *value);
+ 
+ int etnaviv_gpu_init(struct etnaviv_gpu *gpu);
+@@ -203,8 +196,7 @@ int etnaviv_gpu_wait_fence_interruptible
+ 	u32 fence, struct timespec *timeout);
+ int etnaviv_gpu_wait_obj_inactive(struct etnaviv_gpu *gpu,
+ 	struct etnaviv_gem_object *etnaviv_obj, struct timespec *timeout);
+-int etnaviv_gpu_submit(struct etnaviv_gpu *gpu,
+-	struct etnaviv_gem_submit *submit);
++struct dma_fence *etnaviv_gpu_submit(struct etnaviv_gem_submit *submit);
+ int etnaviv_gpu_pm_get_sync(struct etnaviv_gpu *gpu);
+ void etnaviv_gpu_pm_put(struct etnaviv_gpu *gpu);
+ int etnaviv_gpu_wait_idle(struct etnaviv_gpu *gpu, unsigned int timeout_ms);
+--- /dev/null
++++ b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+@@ -0,0 +1,125 @@
++/*
++ * Copyright (C) 2017 Etnaviv Project
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <drm/gpu_scheduler.h>
++#include <linux/kthread.h>
++
++#include "etnaviv_drv.h"
++#include "etnaviv_gem.h"
++#include "etnaviv_gpu.h"
++
++static int etnaviv_job_hang_limit = 0;
++module_param_named(job_hang_limit, etnaviv_job_hang_limit, int , 0444);
++static int etnaviv_hw_jobs_limit = 2;
++module_param_named(hw_job_limit, etnaviv_hw_jobs_limit, int , 0444);
++
++static inline
++struct etnaviv_gem_submit *to_etnaviv_submit(struct drm_sched_job *sched_job)
++{
++	return container_of(sched_job, struct etnaviv_gem_submit, sched_job);
++}
++
++struct dma_fence *etnaviv_sched_dependency(struct drm_sched_job *sched_job,
++					   struct drm_sched_entity *entity)
++{
++	return NULL;
++}
++
++struct dma_fence *etnaviv_sched_run_job(struct drm_sched_job *sched_job)
++{
++	struct etnaviv_gem_submit *submit = to_etnaviv_submit(sched_job);
++	struct dma_fence *fence;
++
++	mutex_lock(&submit->gpu->lock);
++	list_add_tail(&submit->node, &submit->gpu->active_submit_list);
++	mutex_unlock(&submit->gpu->lock);
++
++	fence = etnaviv_gpu_submit(submit);
++	if (!fence) {
++		etnaviv_submit_put(submit);
++		return NULL;
++	}
++
++	return fence;
++}
++
++static void etnaviv_sched_timedout_job(struct drm_sched_job *sched_job)
++{
++	/* this replaces the hangcheck */
++}
++
++static void etnaviv_sched_free_job(struct drm_sched_job *sched_job)
++{
++	struct etnaviv_gem_submit *submit = to_etnaviv_submit(sched_job);
++
++	mutex_lock(&submit->gpu->lock);
++	list_del(&submit->node);
++	mutex_unlock(&submit->gpu->lock);
++
++	etnaviv_submit_put(submit);
++}
++
++static const struct drm_sched_backend_ops etnaviv_sched_ops = {
++	.dependency = etnaviv_sched_dependency,
++	.run_job = etnaviv_sched_run_job,
++	.timedout_job = etnaviv_sched_timedout_job,
++	.free_job = etnaviv_sched_free_job,
++};
++
++int etnaviv_sched_push_job(struct drm_sched_entity *sched_entity,
++			   struct etnaviv_gem_submit *submit)
++{
++	int ret;
++
++	ret = drm_sched_job_init(&submit->sched_job, &submit->gpu->sched,
++				 sched_entity, submit->cmdbuf.ctx);
++	if (ret)
++		return ret;
++
++	submit->out_fence = dma_fence_get(&submit->sched_job.s_fence->finished);
++	mutex_lock(&submit->gpu->fence_idr_lock);
++	submit->out_fence_id = idr_alloc_cyclic(&submit->gpu->fence_idr,
++						submit->out_fence, 0,
++						INT_MAX, GFP_KERNEL);
++	mutex_unlock(&submit->gpu->fence_idr_lock);
++	if (submit->out_fence_id < 0)
++		return -ENOMEM;
++
++	/* the scheduler holds on to the job now */
++	kref_get(&submit->refcount);
++
++	drm_sched_entity_push_job(&submit->sched_job, sched_entity);
++
++	return 0;
++}
++
++int etnaviv_sched_init(struct etnaviv_gpu *gpu)
++{
++	int ret;
++
++	ret = drm_sched_init(&gpu->sched, &etnaviv_sched_ops,
++			     etnaviv_hw_jobs_limit, etnaviv_job_hang_limit,
++			     msecs_to_jiffies(500), dev_name(gpu->dev));
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++void etnaviv_sched_fini(struct etnaviv_gpu *gpu)
++{
++	drm_sched_fini(&gpu->sched);
++}
+--- /dev/null
++++ b/drivers/gpu/drm/etnaviv/etnaviv_sched.h
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (C) 2017 Etnaviv Project
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef __ETNAVIV_SCHED_H__
++#define __ETNAVIV_SCHED_H__
++
++#include <drm/gpu_scheduler.h>
++
++struct etnaviv_gpu;
++
++static inline
++struct etnaviv_gem_submit *to_etnaviv_submit(struct drm_sched_job *sched_job)
++{
++	return container_of(sched_job, struct etnaviv_gem_submit, sched_job);
++}
++
++int etnaviv_sched_init(struct etnaviv_gpu *gpu);
++void etnaviv_sched_fini(struct etnaviv_gpu *gpu);
++int etnaviv_sched_push_job(struct drm_sched_entity *sched_entity,
++			   struct etnaviv_gem_submit *submit);
++
++#endif /* __ETNAVIV_SCHED_H__ */
