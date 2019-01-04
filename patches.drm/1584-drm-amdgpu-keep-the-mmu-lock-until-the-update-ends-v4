@@ -1,0 +1,140 @@
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Tue, 5 Sep 2017 17:30:46 +0200
+Subject: drm/amdgpu: keep the MMU lock until the update ends v4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 1ed3d2567c800eca053ef86fdd3fc27b72d0192e
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This is quite controversial because it adds another lock which is held during
+page table updates, but I don't see much other option.
+
+v2: allow multiple updates to be in flight at the same time
+v3: simplify the patch, take the read side only once
+v4: correctly fix rebase conflict
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h    |    4 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c |   55 +++++++++++++++++++++++++++++++--
+ 2 files changed, 55 insertions(+), 4 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -1204,11 +1204,11 @@ void amdgpu_test_moves(struct amdgpu_dev
+  * MMU Notifier
+  */
+ #if defined(CONFIG_MMU_NOTIFIER)
++void amdgpu_mn_lock(struct amdgpu_mn *mn);
++void amdgpu_mn_unlock(struct amdgpu_mn *mn);
+ struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev);
+ int amdgpu_mn_register(struct amdgpu_bo *bo, unsigned long addr);
+ void amdgpu_mn_unregister(struct amdgpu_bo *bo);
+-void amdgpu_mn_lock(struct amdgpu_mn *mn);
+-void amdgpu_mn_unlock(struct amdgpu_mn *mn);
+ #else
+ static inline void amdgpu_mn_lock(struct amdgpu_mn *mn) {}
+ static inline void amdgpu_mn_unlock(struct amdgpu_mn *mn) {}
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+@@ -52,6 +52,8 @@ struct amdgpu_mn {
+ 	/* objects protected by lock */
+ 	struct rw_semaphore	lock;
+ 	struct rb_root		objects;
++	struct mutex		read_lock;
++	atomic_t		recursion;
+ };
+ 
+ struct amdgpu_mn_node {
+@@ -126,6 +128,34 @@ void amdgpu_mn_unlock(struct amdgpu_mn *
+ }
+ 
+ /**
++ * amdgpu_mn_read_lock - take the rmn read lock
++ *
++ * @rmn: our notifier
++ *
++ * Take the rmn read side lock.
++ */
++static void amdgpu_mn_read_lock(struct amdgpu_mn *rmn)
++{
++	mutex_lock(&rmn->read_lock);
++	if (atomic_inc_return(&rmn->recursion) == 1)
++		down_read_non_owner(&rmn->lock);
++	mutex_unlock(&rmn->read_lock);
++}
++
++/**
++ * amdgpu_mn_read_unlock - drop the rmn read lock
++ *
++ * @rmn: our notifier
++ *
++ * Drop the rmn read side lock.
++ */
++static void amdgpu_mn_read_unlock(struct amdgpu_mn *rmn)
++{
++	if (atomic_dec_return(&rmn->recursion) == 0)
++		up_read_non_owner(&rmn->lock);
++}
++
++/**
+  * amdgpu_mn_invalidate_node - unmap all BOs of a node
+  *
+  * @node: the node with the BOs to unmap
+@@ -176,7 +206,7 @@ static void amdgpu_mn_invalidate_range_s
+ 	/* notification is exclusive, but interval is inclusive */
+ 	end -= 1;
+ 
+-	down_read(&rmn->lock);
++	amdgpu_mn_read_lock(rmn);
+ 
+ 	it = interval_tree_iter_first(&rmn->objects, start, end);
+ 	while (it) {
+@@ -187,13 +217,32 @@ static void amdgpu_mn_invalidate_range_s
+ 
+ 		amdgpu_mn_invalidate_node(node, start, end);
+ 	}
++}
++
++/**
++ * amdgpu_mn_invalidate_range_end - callback to notify about mm change
++ *
++ * @mn: our notifier
++ * @mn: the mm this callback is about
++ * @start: start of updated range
++ * @end: end of updated range
++ *
++ * Release the lock again to allow new command submissions.
++ */
++static void amdgpu_mn_invalidate_range_end(struct mmu_notifier *mn,
++					   struct mm_struct *mm,
++					   unsigned long start,
++					   unsigned long end)
++{
++	struct amdgpu_mn *rmn = container_of(mn, struct amdgpu_mn, mn);
+ 
+-	up_read(&rmn->lock);
++	amdgpu_mn_read_unlock(rmn);
+ }
+ 
+ static const struct mmu_notifier_ops amdgpu_mn_ops = {
+ 	.release = amdgpu_mn_release,
+ 	.invalidate_range_start = amdgpu_mn_invalidate_range_start,
++	.invalidate_range_end = amdgpu_mn_invalidate_range_end,
+ };
+ 
+ /**
+@@ -230,6 +279,8 @@ struct amdgpu_mn *amdgpu_mn_get(struct a
+ 	rmn->mn.ops = &amdgpu_mn_ops;
+ 	init_rwsem(&rmn->lock);
+ 	rmn->objects = RB_ROOT;
++	mutex_init(&rmn->read_lock);
++	atomic_set(&rmn->recursion, 0);
+ 
+ 	r = __mmu_notifier_register(&rmn->mn, mm);
+ 	if (r)
