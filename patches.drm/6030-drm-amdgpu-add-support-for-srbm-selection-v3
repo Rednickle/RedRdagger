@@ -1,0 +1,318 @@
+From: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Date: Thu, 29 Mar 2018 09:09:39 -0400
+Subject: drm/amdgpu: Add support for SRBM selection v3
+Git-commit: f7a9ee81a88b83915e7c15895c507abede44b0c5
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Also remove code duplication in write and read regs functions.
+This also fixes potential missing unlock in amdgpu_debugfs_regs_write
+in case get_user would fail.
+
+v2: Add SRBM mutex locking.
+v3: Fix TO counter and fix comment location.
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |    2 
+ drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c |  117 +++++++++-------------------
+ drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c       |    7 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c       |    7 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c       |    7 +
+ drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c       |   11 ++
+ 6 files changed, 72 insertions(+), 79 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -890,6 +890,7 @@ struct amdgpu_gfx_funcs {
+ 	void (*read_wave_data)(struct amdgpu_device *adev, uint32_t simd, uint32_t wave, uint32_t *dst, int *no_fields);
+ 	void (*read_wave_vgprs)(struct amdgpu_device *adev, uint32_t simd, uint32_t wave, uint32_t thread, uint32_t start, uint32_t size, uint32_t *dst);
+ 	void (*read_wave_sgprs)(struct amdgpu_device *adev, uint32_t simd, uint32_t wave, uint32_t start, uint32_t size, uint32_t *dst);
++	void (*select_me_pipe_q)(struct amdgpu_device *adev, u32 me, u32 pipe, u32 queue);
+ };
+ 
+ struct amdgpu_ngg_buf {
+@@ -1812,6 +1813,7 @@ amdgpu_get_sdma_instance(struct amdgpu_r
+ #define amdgpu_gfx_select_se_sh(adev, se, sh, instance) (adev)->gfx.funcs->select_se_sh((adev), (se), (sh), (instance))
+ #define amdgpu_gds_switch(adev, r, v, d, w, a) (adev)->gds.funcs->patch_gds_switch((r), (v), (d), (w), (a))
+ #define amdgpu_psp_check_fw_loading_status(adev, i) (adev)->firmware.funcs->check_fw_loading_status((adev), (i))
++#define amdgpu_gfx_select_me_pipe_q(adev, me, pipe, q) (adev)->gfx.funcs->select_me_pipe_q((adev), (me), (pipe), (q))
+ 
+ /* Common functions */
+ int amdgpu_device_gpu_recover(struct amdgpu_device *adev,
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_debugfs.c
+@@ -64,16 +64,21 @@ int amdgpu_debugfs_add_files(struct amdg
+ 
+ #if defined(CONFIG_DEBUG_FS)
+ 
+-static ssize_t amdgpu_debugfs_regs_read(struct file *f, char __user *buf,
+-					size_t size, loff_t *pos)
++
++static int  amdgpu_debugfs_process_reg_op(bool read, struct file *f,
++		char __user *buf, size_t size, loff_t *pos)
+ {
+ 	struct amdgpu_device *adev = file_inode(f)->i_private;
+ 	ssize_t result = 0;
+ 	int r;
+-	bool pm_pg_lock, use_bank;
+-	unsigned instance_bank, sh_bank, se_bank;
++	bool pm_pg_lock, use_bank, use_ring;
++	unsigned instance_bank, sh_bank, se_bank, me, pipe, queue;
+ 
+-	if (size & 0x3 || *pos & 0x3)
++	pm_pg_lock = use_bank = use_ring = false;
++	instance_bank = sh_bank = se_bank = me = pipe = queue = 0;
++
++	if (size & 0x3 || *pos & 0x3 ||
++			((*pos & (1ULL << 62)) && (*pos & (1ULL << 61))))
+ 		return -EINVAL;
+ 
+ 	/* are we reading registers for which a PG lock is necessary? */
+@@ -91,8 +96,15 @@ static ssize_t amdgpu_debugfs_regs_read(
+ 		if (instance_bank == 0x3FF)
+ 			instance_bank = 0xFFFFFFFF;
+ 		use_bank = 1;
++	} else if (*pos & (1ULL << 61)) {
++
++		me = (*pos & GENMASK_ULL(33, 24)) >> 24;
++		pipe = (*pos & GENMASK_ULL(43, 34)) >> 34;
++		queue = (*pos & GENMASK_ULL(53, 44)) >> 44;
++
++		use_ring = 1;
+ 	} else {
+-		use_bank = 0;
++		use_bank = use_ring = 0;
+ 	}
+ 
+ 	*pos &= (1UL << 22) - 1;
+@@ -104,6 +116,9 @@ static ssize_t amdgpu_debugfs_regs_read(
+ 		mutex_lock(&adev->grbm_idx_mutex);
+ 		amdgpu_gfx_select_se_sh(adev, se_bank,
+ 					sh_bank, instance_bank);
++	} else if (use_ring) {
++		mutex_lock(&adev->srbm_mutex);
++		amdgpu_gfx_select_me_pipe_q(adev, me, pipe, queue);
+ 	}
+ 
+ 	if (pm_pg_lock)
+@@ -115,8 +130,14 @@ static ssize_t amdgpu_debugfs_regs_read(
+ 		if (*pos > adev->rmmio_size)
+ 			goto end;
+ 
+-		value = RREG32(*pos >> 2);
+-		r = put_user(value, (uint32_t *)buf);
++		if (read) {
++			value = RREG32(*pos >> 2);
++			r = put_user(value, (uint32_t *)buf);
++		} else {
++			r = get_user(value, (uint32_t *)buf);
++			if (!r)
++				WREG32(*pos >> 2, value);
++		}
+ 		if (r) {
+ 			result = r;
+ 			goto end;
+@@ -132,6 +153,9 @@ end:
+ 	if (use_bank) {
+ 		amdgpu_gfx_select_se_sh(adev, 0xffffffff, 0xffffffff, 0xffffffff);
+ 		mutex_unlock(&adev->grbm_idx_mutex);
++	} else if (use_ring) {
++		amdgpu_gfx_select_me_pipe_q(adev, 0, 0, 0);
++		mutex_unlock(&adev->srbm_mutex);
+ 	}
+ 
+ 	if (pm_pg_lock)
+@@ -140,78 +164,17 @@ end:
+ 	return result;
+ }
+ 
++
++static ssize_t amdgpu_debugfs_regs_read(struct file *f, char __user *buf,
++					size_t size, loff_t *pos)
++{
++	return amdgpu_debugfs_process_reg_op(true, f, buf, size, pos);
++}
++
+ static ssize_t amdgpu_debugfs_regs_write(struct file *f, const char __user *buf,
+ 					 size_t size, loff_t *pos)
+ {
+-	struct amdgpu_device *adev = file_inode(f)->i_private;
+-	ssize_t result = 0;
+-	int r;
+-	bool pm_pg_lock, use_bank;
+-	unsigned instance_bank, sh_bank, se_bank;
+-
+-	if (size & 0x3 || *pos & 0x3)
+-		return -EINVAL;
+-
+-	/* are we reading registers for which a PG lock is necessary? */
+-	pm_pg_lock = (*pos >> 23) & 1;
+-
+-	if (*pos & (1ULL << 62)) {
+-		se_bank = (*pos & GENMASK_ULL(33, 24)) >> 24;
+-		sh_bank = (*pos & GENMASK_ULL(43, 34)) >> 34;
+-		instance_bank = (*pos & GENMASK_ULL(53, 44)) >> 44;
+-
+-		if (se_bank == 0x3FF)
+-			se_bank = 0xFFFFFFFF;
+-		if (sh_bank == 0x3FF)
+-			sh_bank = 0xFFFFFFFF;
+-		if (instance_bank == 0x3FF)
+-			instance_bank = 0xFFFFFFFF;
+-		use_bank = 1;
+-	} else {
+-		use_bank = 0;
+-	}
+-
+-	*pos &= (1UL << 22) - 1;
+-
+-	if (use_bank) {
+-		if ((sh_bank != 0xFFFFFFFF && sh_bank >= adev->gfx.config.max_sh_per_se) ||
+-		    (se_bank != 0xFFFFFFFF && se_bank >= adev->gfx.config.max_shader_engines))
+-			return -EINVAL;
+-		mutex_lock(&adev->grbm_idx_mutex);
+-		amdgpu_gfx_select_se_sh(adev, se_bank,
+-					sh_bank, instance_bank);
+-	}
+-
+-	if (pm_pg_lock)
+-		mutex_lock(&adev->pm.mutex);
+-
+-	while (size) {
+-		uint32_t value;
+-
+-		if (*pos > adev->rmmio_size)
+-			return result;
+-
+-		r = get_user(value, (uint32_t *)buf);
+-		if (r)
+-			return r;
+-
+-		WREG32(*pos >> 2, value);
+-
+-		result += 4;
+-		buf += 4;
+-		*pos += 4;
+-		size -= 4;
+-	}
+-
+-	if (use_bank) {
+-		amdgpu_gfx_select_se_sh(adev, 0xffffffff, 0xffffffff, 0xffffffff);
+-		mutex_unlock(&adev->grbm_idx_mutex);
+-	}
+-
+-	if (pm_pg_lock)
+-		mutex_unlock(&adev->pm.mutex);
+-
+-	return result;
++	return amdgpu_debugfs_process_reg_op(false, f, (char __user *)buf, size, pos);
+ }
+ 
+ static ssize_t amdgpu_debugfs_regs_pcie_read(struct file *f, char __user *buf,
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v6_0.c
+@@ -3061,11 +3061,18 @@ static void gfx_v6_0_read_wave_sgprs(str
+ 		start + SQIND_WAVE_SGPRS_OFFSET, size, dst);
+ }
+ 
++static void gfx_v6_0_select_me_pipe_q(struct amdgpu_device *adev,
++				  u32 me, u32 pipe, u32 q)
++{
++	DRM_INFO("Not implemented\n");
++}
++
+ static const struct amdgpu_gfx_funcs gfx_v6_0_gfx_funcs = {
+ 	.get_gpu_clock_counter = &gfx_v6_0_get_gpu_clock_counter,
+ 	.select_se_sh = &gfx_v6_0_select_se_sh,
+ 	.read_wave_data = &gfx_v6_0_read_wave_data,
+ 	.read_wave_sgprs = &gfx_v6_0_read_wave_sgprs,
++	.select_me_pipe_q = &gfx_v6_0_select_me_pipe_q
+ };
+ 
+ static int gfx_v6_0_early_init(void *handle)
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v7_0.c
+@@ -4270,11 +4270,18 @@ static void gfx_v7_0_read_wave_sgprs(str
+ 		start + SQIND_WAVE_SGPRS_OFFSET, size, dst);
+ }
+ 
++static void gfx_v7_0_select_me_pipe_q(struct amdgpu_device *adev,
++				  u32 me, u32 pipe, u32 q)
++{
++	cik_srbm_select(adev, me, pipe, q, 0);
++}
++
+ static const struct amdgpu_gfx_funcs gfx_v7_0_gfx_funcs = {
+ 	.get_gpu_clock_counter = &gfx_v7_0_get_gpu_clock_counter,
+ 	.select_se_sh = &gfx_v7_0_select_se_sh,
+ 	.read_wave_data = &gfx_v7_0_read_wave_data,
+ 	.read_wave_sgprs = &gfx_v7_0_read_wave_sgprs,
++	.select_me_pipe_q = &gfx_v7_0_select_me_pipe_q
+ };
+ 
+ static const struct amdgpu_rlc_funcs gfx_v7_0_rlc_funcs = {
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v8_0.c
+@@ -3475,6 +3475,12 @@ static void gfx_v8_0_select_se_sh(struct
+ 	WREG32(mmGRBM_GFX_INDEX, data);
+ }
+ 
++static void gfx_v8_0_select_me_pipe_q(struct amdgpu_device *adev,
++				  u32 me, u32 pipe, u32 q)
++{
++	vi_srbm_select(adev, me, pipe, q, 0);
++}
++
+ static u32 gfx_v8_0_get_rb_active_bitmap(struct amdgpu_device *adev)
+ {
+ 	u32 data, mask;
+@@ -5442,6 +5448,7 @@ static const struct amdgpu_gfx_funcs gfx
+ 	.select_se_sh = &gfx_v8_0_select_se_sh,
+ 	.read_wave_data = &gfx_v8_0_read_wave_data,
+ 	.read_wave_sgprs = &gfx_v8_0_read_wave_sgprs,
++	.select_me_pipe_q = &gfx_v8_0_select_me_pipe_q
+ };
+ 
+ static int gfx_v8_0_early_init(void *handle)
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+@@ -998,12 +998,19 @@ static void gfx_v9_0_read_wave_vgprs(str
+ 		start + SQIND_WAVE_VGPRS_OFFSET, size, dst);
+ }
+ 
++static void gfx_v9_0_select_me_pipe_q(struct amdgpu_device *adev,
++				  u32 me, u32 pipe, u32 q)
++{
++	soc15_grbm_select(adev, me, pipe, q, 0);
++}
++
+ static const struct amdgpu_gfx_funcs gfx_v9_0_gfx_funcs = {
+ 	.get_gpu_clock_counter = &gfx_v9_0_get_gpu_clock_counter,
+ 	.select_se_sh = &gfx_v9_0_select_se_sh,
+ 	.read_wave_data = &gfx_v9_0_read_wave_data,
+ 	.read_wave_sgprs = &gfx_v9_0_read_wave_sgprs,
+ 	.read_wave_vgprs = &gfx_v9_0_read_wave_vgprs,
++	.select_me_pipe_q = &gfx_v9_0_select_me_pipe_q
+ };
+ 
+ static void gfx_v9_0_gpu_early_init(struct amdgpu_device *adev)
+@@ -2773,13 +2780,13 @@ static int gfx_v9_0_kiq_fini_register(st
+ 			udelay(1);
+ 		}
+ 
+-		if (adev->usec_timeout == AMDGPU_MAX_USEC_TIMEOUT) {
++		if (j == AMDGPU_MAX_USEC_TIMEOUT) {
+ 			DRM_DEBUG("KIQ dequeue request failed.\n");
+ 
++			/* Manual disable if dequeue request times out */
+ 			WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
+ 		}
+ 
+-		/* Manual disable if dequeue request times out */
+ 		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST,
+ 		      0);
+ 	}
