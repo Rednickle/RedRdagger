@@ -1,0 +1,316 @@
+From: Lucas Stach <l.stach@pengutronix.de>
+Date: Fri, 24 Nov 2017 12:02:38 +0100
+Subject: drm/etnaviv: move PMRs to submit object
+Git-commit: ef146c00e2c29c5f926c6a7e9dc354c0cbeb2818
+Patch-mainline: v4.16-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+To make them available to the event worker even after the actual
+command stream execution has finished.
+
+Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/etnaviv/etnaviv_cmdbuf.c     |   14 ---------
+ drivers/gpu/drm/etnaviv/etnaviv_cmdbuf.h     |    5 ---
+ drivers/gpu/drm/etnaviv/etnaviv_gem.h        |    5 ++-
+ drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c |   40 +++++++++++++++------------
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.c        |   27 ++++++++++--------
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.h        |    2 -
+ 6 files changed, 44 insertions(+), 49 deletions(-)
+
+--- a/drivers/gpu/drm/etnaviv/etnaviv_cmdbuf.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_cmdbuf.c
+@@ -88,10 +88,9 @@ void etnaviv_cmdbuf_suballoc_destroy(str
+ 
+ struct etnaviv_cmdbuf *
+ etnaviv_cmdbuf_new(struct etnaviv_cmdbuf_suballoc *suballoc, u32 size,
+-		   size_t nr_bos, size_t nr_pmrs)
++		   size_t nr_bos)
+ {
+ 	struct etnaviv_cmdbuf *cmdbuf;
+-	struct etnaviv_perfmon_request *pmrs;
+ 	size_t sz = size_vstruct(nr_bos, sizeof(cmdbuf->bo_map[0]),
+ 				 sizeof(*cmdbuf));
+ 	int granule_offs, order, ret;
+@@ -100,12 +99,6 @@ etnaviv_cmdbuf_new(struct etnaviv_cmdbuf
+ 	if (!cmdbuf)
+ 		return NULL;
+ 
+-	sz = sizeof(*pmrs) * nr_pmrs;
+-	pmrs = kzalloc(sz, GFP_KERNEL);
+-	if (!pmrs)
+-		goto out_free_cmdbuf;
+-
+-	cmdbuf->pmrs = pmrs;
+ 	cmdbuf->suballoc = suballoc;
+ 	cmdbuf->size = size;
+ 
+@@ -132,10 +125,6 @@ retry:
+ 	cmdbuf->vaddr = suballoc->vaddr + cmdbuf->suballoc_offset;
+ 
+ 	return cmdbuf;
+-
+-out_free_cmdbuf:
+-	kfree(cmdbuf);
+-	return NULL;
+ }
+ 
+ void etnaviv_cmdbuf_free(struct etnaviv_cmdbuf *cmdbuf)
+@@ -151,7 +140,6 @@ void etnaviv_cmdbuf_free(struct etnaviv_
+ 	suballoc->free_space = 1;
+ 	mutex_unlock(&suballoc->lock);
+ 	wake_up_all(&suballoc->free_event);
+-	kfree(cmdbuf->pmrs);
+ 	kfree(cmdbuf);
+ }
+ 
+--- a/drivers/gpu/drm/etnaviv/etnaviv_cmdbuf.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_cmdbuf.h
+@@ -39,9 +39,6 @@ struct etnaviv_cmdbuf {
+ 	u32 exec_state;
+ 	/* per GPU in-flight list */
+ 	struct list_head node;
+-	/* perfmon requests */
+-	unsigned int nr_pmrs;
+-	struct etnaviv_perfmon_request *pmrs;
+ 	/* BOs attached to this command buffer */
+ 	unsigned int nr_bos;
+ 	struct etnaviv_vram_mapping *bo_map[0];
+@@ -53,7 +50,7 @@ void etnaviv_cmdbuf_suballoc_destroy(str
+ 
+ struct etnaviv_cmdbuf *
+ etnaviv_cmdbuf_new(struct etnaviv_cmdbuf_suballoc *suballoc, u32 size,
+-		   size_t nr_bos, size_t nr_pmrs);
++		   size_t nr_bos);
+ void etnaviv_cmdbuf_free(struct etnaviv_cmdbuf *cmdbuf);
+ 
+ u32 etnaviv_cmdbuf_get_va(struct etnaviv_cmdbuf *buf);
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem.h
+@@ -97,14 +97,15 @@ struct etnaviv_gem_submit_bo {
+ 
+ /* Created per submit-ioctl, to track bo's and cmdstream bufs, etc,
+  * associated with the cmdstream submission for synchronization (and
+- * make it easier to unwind when things go wrong, etc).  This only
+- * lasts for the duration of the submit-ioctl.
++ * make it easier to unwind when things go wrong, etc).
+  */
+ struct etnaviv_gem_submit {
+ 	struct kref refcount;
+ 	struct etnaviv_gpu *gpu;
+ 	struct dma_fence *out_fence, *in_fence;
+ 	u32 flags;
++	unsigned int nr_pmrs;
++	struct etnaviv_perfmon_request *pmrs;
+ 	unsigned int nr_bos;
+ 	struct etnaviv_gem_submit_bo bos[0];
+ 	/* No new members here, the previous one is variable-length! */
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
+@@ -33,15 +33,23 @@
+ #define BO_PINNED   0x2000
+ 
+ static struct etnaviv_gem_submit *submit_create(struct drm_device *dev,
+-		struct etnaviv_gpu *gpu, size_t nr)
++		struct etnaviv_gpu *gpu, size_t nr_bos, size_t nr_pmrs)
+ {
+ 	struct etnaviv_gem_submit *submit;
+-	size_t sz = size_vstruct(nr, sizeof(submit->bos[0]), sizeof(*submit));
++	size_t sz = size_vstruct(nr_bos, sizeof(submit->bos[0]), sizeof(*submit));
+ 
+ 	submit = kzalloc(sz, GFP_KERNEL);
+ 	if (!submit)
+ 		return NULL;
+ 
++	submit->pmrs = kcalloc(nr_pmrs, sizeof(struct etnaviv_perfmon_request),
++			       GFP_KERNEL);
++	if (!submit->pmrs) {
++		kfree(submit);
++		return NULL;
++	}
++	submit->nr_pmrs = nr_pmrs;
++
+ 	submit->gpu = gpu;
+ 	kref_init(&submit->refcount);
+ 
+@@ -295,13 +303,11 @@ static int submit_reloc(struct etnaviv_g
+ }
+ 
+ static int submit_perfmon_validate(struct etnaviv_gem_submit *submit,
+-		struct etnaviv_cmdbuf *cmdbuf,
+-		const struct drm_etnaviv_gem_submit_pmr *pmrs,
+-		u32 nr_pms)
++		u32 exec_state, const struct drm_etnaviv_gem_submit_pmr *pmrs)
+ {
+ 	u32 i;
+ 
+-	for (i = 0; i < nr_pms; i++) {
++	for (i = 0; i < submit->nr_pmrs; i++) {
+ 		const struct drm_etnaviv_gem_submit_pmr *r = pmrs + i;
+ 		struct etnaviv_gem_submit_bo *bo;
+ 		int ret;
+@@ -326,17 +332,17 @@ static int submit_perfmon_validate(struc
+ 			return -EINVAL;
+ 		}
+ 
+-		if (etnaviv_pm_req_validate(r, cmdbuf->exec_state)) {
++		if (etnaviv_pm_req_validate(r, exec_state)) {
+ 			DRM_ERROR("perfmon request: domain or signal not valid");
+ 			return -EINVAL;
+ 		}
+ 
+-		cmdbuf->pmrs[i].flags = r->flags;
+-		cmdbuf->pmrs[i].domain = r->domain;
+-		cmdbuf->pmrs[i].signal = r->signal;
+-		cmdbuf->pmrs[i].sequence = r->sequence;
+-		cmdbuf->pmrs[i].offset = r->read_offset;
+-		cmdbuf->pmrs[i].bo_vma = etnaviv_gem_vmap(&bo->obj->base);
++		submit->pmrs[i].flags = r->flags;
++		submit->pmrs[i].domain = r->domain;
++		submit->pmrs[i].signal = r->signal;
++		submit->pmrs[i].sequence = r->sequence;
++		submit->pmrs[i].offset = r->read_offset;
++		submit->pmrs[i].bo_vma = etnaviv_gem_vmap(&bo->obj->base);
+ 	}
+ 
+ 	return 0;
+@@ -367,6 +373,7 @@ static void submit_cleanup(struct kref *
+ 		dma_fence_put(submit->in_fence);
+ 	if (submit->out_fence)
+ 		dma_fence_put(submit->out_fence);
++	kfree(submit->pmrs);
+ 	kfree(submit);
+ }
+ 
+@@ -427,7 +434,7 @@ int etnaviv_ioctl_gem_submit(struct drm_
+ 	stream = kvmalloc_array(1, args->stream_size, GFP_KERNEL);
+ 	cmdbuf = etnaviv_cmdbuf_new(gpu->cmdbuf_suballoc,
+ 				    ALIGN(args->stream_size, 8) + 8,
+-				    args->nr_bos, args->nr_pmrs);
++				    args->nr_bos);
+ 	if (!bos || !relocs || !pmrs || !stream || !cmdbuf) {
+ 		ret = -ENOMEM;
+ 		goto err_submit_cmds;
+@@ -456,7 +463,6 @@ int etnaviv_ioctl_gem_submit(struct drm_
+ 		ret = -EFAULT;
+ 		goto err_submit_cmds;
+ 	}
+-	cmdbuf->nr_pmrs = args->nr_pmrs;
+ 
+ 	ret = copy_from_user(stream, u64_to_user_ptr(args->stream),
+ 			     args->stream_size);
+@@ -475,7 +481,7 @@ int etnaviv_ioctl_gem_submit(struct drm_
+ 
+ 	ww_acquire_init(&ticket, &reservation_ww_class);
+ 
+-	submit = submit_create(dev, gpu, args->nr_bos);
++	submit = submit_create(dev, gpu, args->nr_bos, args->nr_pmrs);
+ 	if (!submit) {
+ 		ret = -ENOMEM;
+ 		goto err_submit_ww_acquire;
+@@ -518,7 +524,7 @@ int etnaviv_ioctl_gem_submit(struct drm_
+ 	if (ret)
+ 		goto err_submit_objects;
+ 
+-	ret = submit_perfmon_validate(submit, cmdbuf, pmrs, args->nr_pmrs);
++	ret = submit_perfmon_validate(submit, args->exec_state, pmrs);
+ 	if (ret)
+ 		goto err_submit_objects;
+ 
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+@@ -717,7 +717,7 @@ int etnaviv_gpu_init(struct etnaviv_gpu
+ 	}
+ 
+ 	/* Create buffer: */
+-	gpu->buffer = etnaviv_cmdbuf_new(gpu->cmdbuf_suballoc, PAGE_SIZE, 0, 0);
++	gpu->buffer = etnaviv_cmdbuf_new(gpu->cmdbuf_suballoc, PAGE_SIZE, 0);
+ 	if (!gpu->buffer) {
+ 		ret = -ENOMEM;
+ 		dev_err(gpu->dev, "could not create command buffer\n");
+@@ -1317,11 +1317,11 @@ void etnaviv_gpu_pm_put(struct etnaviv_g
+ static void sync_point_perfmon_sample(struct etnaviv_gpu *gpu,
+ 	struct etnaviv_event *event, unsigned int flags)
+ {
+-	const struct etnaviv_cmdbuf *cmdbuf = event->cmdbuf;
++	const struct etnaviv_gem_submit *submit = event->submit;
+ 	unsigned int i;
+ 
+-	for (i = 0; i < cmdbuf->nr_pmrs; i++) {
+-		const struct etnaviv_perfmon_request *pmr = cmdbuf->pmrs + i;
++	for (i = 0; i < submit->nr_pmrs; i++) {
++		const struct etnaviv_perfmon_request *pmr = submit->pmrs + i;
+ 
+ 		if (pmr->flags == flags)
+ 			etnaviv_perfmon_process(gpu, pmr);
+@@ -1349,14 +1349,14 @@ static void sync_point_perfmon_sample_pr
+ static void sync_point_perfmon_sample_post(struct etnaviv_gpu *gpu,
+ 	struct etnaviv_event *event)
+ {
+-	const struct etnaviv_cmdbuf *cmdbuf = event->cmdbuf;
++	const struct etnaviv_gem_submit *submit = event->submit;
+ 	unsigned int i;
+ 	u32 val;
+ 
+ 	sync_point_perfmon_sample(gpu, event, ETNA_PM_PROCESS_POST);
+ 
+-	for (i = 0; i < cmdbuf->nr_pmrs; i++) {
+-		const struct etnaviv_perfmon_request *pmr = cmdbuf->pmrs + i;
++	for (i = 0; i < submit->nr_pmrs; i++) {
++		const struct etnaviv_perfmon_request *pmr = submit->pmrs + i;
+ 
+ 		*pmr->bo_vma = pmr->sequence;
+ 	}
+@@ -1392,7 +1392,7 @@ int etnaviv_gpu_submit(struct etnaviv_gp
+ 	 * - a sync point to re-configure gpu, process ETNA_PM_PROCESS_POST requests
+ 	 *   and update the sequence number for userspace.
+ 	 */
+-	if (cmdbuf->nr_pmrs)
++	if (submit->nr_pmrs)
+ 		nr_events = 3;
+ 
+ 	ret = event_alloc(gpu, nr_events, event);
+@@ -1416,17 +1416,19 @@ int etnaviv_gpu_submit(struct etnaviv_gp
+ 	submit->out_fence = dma_fence_get(fence);
+ 	gpu->active_fence = submit->out_fence->seqno;
+ 
+-	if (cmdbuf->nr_pmrs) {
++	if (submit->nr_pmrs) {
+ 		gpu->event[event[1]].sync_point = &sync_point_perfmon_sample_pre;
+-		gpu->event[event[1]].cmdbuf = cmdbuf;
++		kref_get(&submit->refcount);
++		gpu->event[event[1]].submit = submit;
+ 		etnaviv_sync_point_queue(gpu, event[1]);
+ 	}
+ 
+ 	etnaviv_buffer_queue(gpu, event[0], cmdbuf);
+ 
+-	if (cmdbuf->nr_pmrs) {
++	if (submit->nr_pmrs) {
+ 		gpu->event[event[2]].sync_point = &sync_point_perfmon_sample_post;
+-		gpu->event[event[2]].cmdbuf = cmdbuf;
++		kref_get(&submit->refcount);
++		gpu->event[event[2]].submit = submit;
+ 		etnaviv_sync_point_queue(gpu, event[2]);
+ 	}
+ 
+@@ -1465,6 +1467,7 @@ static void sync_point_worker(struct wor
+ 	u32 addr = gpu_read(gpu, VIVS_FE_DMA_ADDRESS);
+ 
+ 	event->sync_point(gpu, event);
++	etnaviv_submit_put(event->submit);
+ 	event_free(gpu, gpu->sync_point_event);
+ 
+ 	/* restart FE last to avoid GPU and IRQ racing against this worker */
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+@@ -89,7 +89,7 @@ struct etnaviv_chip_identity {
+ 
+ struct etnaviv_event {
+ 	struct dma_fence *fence;
+-	struct etnaviv_cmdbuf *cmdbuf;
++	struct etnaviv_gem_submit *submit;
+ 
+ 	void (*sync_point)(struct etnaviv_gpu *gpu, struct etnaviv_event *event);
+ };
