@@ -1,0 +1,167 @@
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <christian.koenig@amd.com>
+Date: Thu, 3 Aug 2017 11:44:01 -0400
+Subject: drm/amdgpu: only move VM BOs in the LRU during validation v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: b636922553ee2c47b9e3955c5665b8996dfcdbd7
+Patch-mainline: v4.14-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This should save us a bunch of command submission overhead.
+
+v2: move the LRU move to the right place to avoid the move for the root BO
+    and handle the shadow BOs as well. This turned out to be a bug fix because
+    the move needs to happen before the kmap.
+
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Chunming Zhou <david1.zhou@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c |   15 ++------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c |   58 ++++++---------------------------
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h |    2 -
+ 3 files changed, 16 insertions(+), 59 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -673,10 +673,8 @@ static int amdgpu_cs_parser_bos(struct a
+ 	}
+ 
+ error_validate:
+-	if (r) {
+-		amdgpu_vm_move_pt_bos_in_lru(p->adev, &fpriv->vm);
++	if (r)
+ 		ttm_eu_backoff_reservation(&p->ticket, &p->validated);
+-	}
+ 
+ error_free_pages:
+ 
+@@ -724,21 +722,18 @@ static int amdgpu_cs_sync_rings(struct a
+  * If error is set than unvalidate buffer, otherwise just free memory
+  * used by parsing context.
+  **/
+-static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error, bool backoff)
++static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser, int error,
++				  bool backoff)
+ {
+-	struct amdgpu_fpriv *fpriv = parser->filp->driver_priv;
+ 	unsigned i;
+ 
+-	if (!error) {
+-		amdgpu_vm_move_pt_bos_in_lru(parser->adev, &fpriv->vm);
+-
++	if (!error)
+ 		ttm_eu_fence_buffer_objects(&parser->ticket,
+ 					    &parser->validated,
+ 					    parser->fence);
+-	} else if (backoff) {
++	else if (backoff)
+ 		ttm_eu_backoff_reservation(&parser->ticket,
+ 					   &parser->validated);
+-	}
+ 
+ 	for (i = 0; i < parser->num_post_dep_syncobjs; i++)
+ 		drm_syncobj_put(parser->post_dep_syncobjs[i]);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -159,7 +159,8 @@ void amdgpu_vm_get_pd_bo(struct amdgpu_v
+  */
+ static int amdgpu_vm_validate_level(struct amdgpu_vm_pt *parent,
+ 				    int (*validate)(void *, struct amdgpu_bo *),
+-				    void *param, bool use_cpu_for_update)
++				    void *param, bool use_cpu_for_update,
++				    struct ttm_bo_global *glob)
+ {
+ 	unsigned i;
+ 	int r;
+@@ -183,12 +184,18 @@ static int amdgpu_vm_validate_level(stru
+ 		if (r)
+ 			return r;
+ 
++		spin_lock(&glob->lru_lock);
++		ttm_bo_move_to_lru_tail(&entry->bo->tbo);
++		if (entry->bo->shadow)
++			ttm_bo_move_to_lru_tail(&entry->bo->shadow->tbo);
++		spin_unlock(&glob->lru_lock);
++
+ 		/*
+ 		 * Recurse into the sub directory. This is harmless because we
+ 		 * have only a maximum of 5 layers.
+ 		 */
+ 		r = amdgpu_vm_validate_level(entry, validate, param,
+-					     use_cpu_for_update);
++					     use_cpu_for_update, glob);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -220,54 +227,11 @@ int amdgpu_vm_validate_pt_bos(struct amd
+ 		return 0;
+ 
+ 	return amdgpu_vm_validate_level(&vm->root, validate, param,
+-					vm->use_cpu_for_update);
+-}
+-
+-/**
+- * amdgpu_vm_move_level_in_lru - move one level of PT BOs to the LRU tail
+- *
+- * @adev: amdgpu device instance
+- * @vm: vm providing the BOs
+- *
+- * Move the PT BOs to the tail of the LRU.
+- */
+-static void amdgpu_vm_move_level_in_lru(struct amdgpu_vm_pt *parent)
+-{
+-	unsigned i;
+-
+-	if (!parent->entries)
+-		return;
+-
+-	for (i = 0; i <= parent->last_entry_used; ++i) {
+-		struct amdgpu_vm_pt *entry = &parent->entries[i];
+-
+-		if (!entry->bo)
+-			continue;
+-
+-		ttm_bo_move_to_lru_tail(&entry->bo->tbo);
+-		amdgpu_vm_move_level_in_lru(entry);
+-	}
++					vm->use_cpu_for_update,
++					adev->mman.bdev.glob);
+ }
+ 
+ /**
+- * amdgpu_vm_move_pt_bos_in_lru - move the PT BOs to the LRU tail
+- *
+- * @adev: amdgpu device instance
+- * @vm: vm providing the BOs
+- *
+- * Move the PT BOs to the tail of the LRU.
+- */
+-void amdgpu_vm_move_pt_bos_in_lru(struct amdgpu_device *adev,
+-				  struct amdgpu_vm *vm)
+-{
+-	struct ttm_bo_global *glob = adev->mman.bdev.glob;
+-
+-	spin_lock(&glob->lru_lock);
+-	amdgpu_vm_move_level_in_lru(&vm->root);
+-	spin_unlock(&glob->lru_lock);
+-}
+-
+- /**
+  * amdgpu_vm_alloc_levels - allocate the PD/PT levels
+  *
+  * @adev: amdgpu_device pointer
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -223,8 +223,6 @@ void amdgpu_vm_get_pd_bo(struct amdgpu_v
+ int amdgpu_vm_validate_pt_bos(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+ 			      int (*callback)(void *p, struct amdgpu_bo *bo),
+ 			      void *param);
+-void amdgpu_vm_move_pt_bos_in_lru(struct amdgpu_device *adev,
+-				  struct amdgpu_vm *vm);
+ int amdgpu_vm_alloc_pts(struct amdgpu_device *adev,
+ 			struct amdgpu_vm *vm,
+ 			uint64_t saddr, uint64_t size);
