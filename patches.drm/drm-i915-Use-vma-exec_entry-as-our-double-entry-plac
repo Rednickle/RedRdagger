@@ -1,0 +1,218 @@
+From d55495b4dcce2efb4656edfe211eb0bfb27c3387 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 15 Jun 2017 09:14:34 +0100
+Subject: [PATCH] drm/i915: Use vma->exec_entry as our double-entry placeholder
+Git-commit: d55495b4dcce2efb4656edfe211eb0bfb27c3387
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+This has the benefit of not requiring us to manipulate the
+vma->exec_link list when tearing down the execbuffer, and is a
+marginally cheaper test to detect the user error.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170615081435.17699-2-chris@chris-wilson.co.uk
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_gem_evict.c      |   17 +-----
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   77 +++++++++++++++--------------
+ drivers/gpu/drm/i915/i915_vma.c            |    1 
+ 3 files changed, 44 insertions(+), 51 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -59,9 +59,6 @@ mark_free(struct drm_mm_scan *scan,
+ 	if (i915_vma_is_pinned(vma))
+ 		return false;
+ 
+-	if (WARN_ON(!list_empty(&vma->exec_list)))
+-		return false;
+-
+ 	if (flags & PIN_NONFAULT && !list_empty(&vma->obj->userfault_link))
+ 		return false;
+ 
+@@ -160,8 +157,6 @@ search_again:
+ 	list_for_each_entry_safe(vma, next, &eviction_list, exec_list) {
+ 		ret = drm_mm_scan_remove_block(&scan, &vma->node);
+ 		BUG_ON(ret);
+-
+-		INIT_LIST_HEAD(&vma->exec_list);
+ 	}
+ 
+ 	/* Can we unpin some objects such as idle hw contents,
+@@ -209,17 +204,12 @@ found:
+ 		if (drm_mm_scan_remove_block(&scan, &vma->node))
+ 			__i915_vma_pin(vma);
+ 		else
+-			list_del_init(&vma->exec_list);
++			list_del(&vma->exec_list);
+ 	}
+ 
+ 	/* Unbinding will emit any required flushes */
+ 	ret = 0;
+-	while (!list_empty(&eviction_list)) {
+-		vma = list_first_entry(&eviction_list,
+-				       struct i915_vma,
+-				       exec_list);
+-
+-		list_del_init(&vma->exec_list);
++	list_for_each_entry_safe(vma, next, &eviction_list, exec_list) {
+ 		__i915_vma_unpin(vma);
+ 		if (ret == 0)
+ 			ret = i915_vma_unbind(vma);
+@@ -315,7 +305,7 @@ int i915_gem_evict_for_node(struct i915_
+ 		}
+ 
+ 		/* Overlap of objects in the same batch? */
+-		if (i915_vma_is_pinned(vma) || !list_empty(&vma->exec_list)) {
++		if (i915_vma_is_pinned(vma)) {
+ 			ret = -ENOSPC;
+ 			if (vma->exec_entry &&
+ 			    vma->exec_entry->flags & EXEC_OBJECT_PINNED)
+@@ -336,7 +326,6 @@ int i915_gem_evict_for_node(struct i915_
+ 	}
+ 
+ 	list_for_each_entry_safe(vma, next, &eviction_list, exec_list) {
+-		list_del_init(&vma->exec_list);
+ 		__i915_vma_unpin(vma);
+ 		if (ret == 0)
+ 			ret = i915_vma_unbind(vma);
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -108,13 +108,40 @@ static int eb_create(struct i915_execbuf
+ 		eb->and = -eb->args->buffer_count;
+ 	}
+ 
+-	INIT_LIST_HEAD(&eb->vmas);
+ 	return 0;
+ }
+ 
++static inline void
++__eb_unreserve_vma(struct i915_vma *vma,
++		   const struct drm_i915_gem_exec_object2 *entry)
++{
++	if (unlikely(entry->flags & __EXEC_OBJECT_HAS_FENCE))
++		i915_vma_unpin_fence(vma);
++
++	if (entry->flags & __EXEC_OBJECT_HAS_PIN)
++		__i915_vma_unpin(vma);
++}
++
++static void
++eb_unreserve_vma(struct i915_vma *vma)
++{
++	struct drm_i915_gem_exec_object2 *entry = vma->exec_entry;
++
++	__eb_unreserve_vma(vma, entry);
++	entry->flags &= ~(__EXEC_OBJECT_HAS_FENCE | __EXEC_OBJECT_HAS_PIN);
++}
++
+ static void
+ eb_reset(struct i915_execbuffer *eb)
+ {
++	struct i915_vma *vma;
++
++	list_for_each_entry(vma, &eb->vmas, exec_list) {
++		eb_unreserve_vma(vma);
++		i915_vma_put(vma);
++		vma->exec_entry = NULL;
++	}
++
+ 	if (eb->and >= 0)
+ 		memset(eb->buckets, 0, (eb->and+1)*sizeof(struct hlist_head));
+ }
+@@ -146,6 +173,8 @@ eb_lookup_vmas(struct i915_execbuffer *e
+ 	struct list_head objects;
+ 	int i, ret;
+ 
++	INIT_LIST_HEAD(&eb->vmas);
++
+ 	INIT_LIST_HEAD(&objects);
+ 	spin_lock(&eb->file->table_lock);
+ 	/* Grab a reference to the object and release the lock so we can lookup
+@@ -252,40 +281,23 @@ static struct i915_vma *eb_get_vma(struc
+ 	}
+ }
+ 
+-static void
+-eb_unreserve_vma(struct i915_vma *vma)
+-{
+-	struct drm_i915_gem_exec_object2 *entry;
+-
+-	if (!drm_mm_node_allocated(&vma->node))
+-		return;
+-
+-	entry = vma->exec_entry;
+-
+-	if (entry->flags & __EXEC_OBJECT_HAS_FENCE)
+-		i915_vma_unpin_fence(vma);
+-
+-	if (entry->flags & __EXEC_OBJECT_HAS_PIN)
+-		__i915_vma_unpin(vma);
+-
+-	entry->flags &= ~(__EXEC_OBJECT_HAS_FENCE | __EXEC_OBJECT_HAS_PIN);
+-}
+-
+ static void eb_destroy(struct i915_execbuffer *eb)
+ {
+-	i915_gem_context_put(eb->ctx);
++	struct i915_vma *vma;
+ 
+-	while (!list_empty(&eb->vmas)) {
+-		struct i915_vma *vma;
++	list_for_each_entry(vma, &eb->vmas, exec_list) {
++		if (!vma->exec_entry)
++			continue;
+ 
+-		vma = list_first_entry(&eb->vmas,
+-				       struct i915_vma,
+-				       exec_list);
+-		list_del_init(&vma->exec_list);
+-		eb_unreserve_vma(vma);
++		__eb_unreserve_vma(vma, vma->exec_entry);
+ 		vma->exec_entry = NULL;
+ 		i915_vma_put(vma);
+ 	}
++
++	i915_gem_context_put(eb->ctx);
++
++	if (eb->buckets)
++		kfree(eb->buckets);
+ }
+ 
+ static inline int use_cpu_reloc(struct drm_i915_gem_object *obj)
+@@ -985,13 +997,7 @@ eb_relocate_slow(struct i915_execbuffer
+ 	int i, total, ret;
+ 
+ 	/* We may process another execbuffer during the unlock... */
+-	while (!list_empty(&eb->vmas)) {
+-		vma = list_first_entry(&eb->vmas, struct i915_vma, exec_list);
+-		list_del_init(&vma->exec_list);
+-		eb_unreserve_vma(vma);
+-		i915_vma_put(vma);
+-	}
+-
++	eb_reset(eb);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	total = 0;
+@@ -1052,7 +1058,6 @@ eb_relocate_slow(struct i915_execbuffer
+ 	}
+ 
+ 	/* reacquire the objects */
+-	eb_reset(eb);
+ 	ret = eb_lookup_vmas(eb);
+ 	if (ret)
+ 		goto err;
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -85,7 +85,6 @@ vma_create(struct drm_i915_gem_object *o
+ 	if (vma == NULL)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	INIT_LIST_HEAD(&vma->exec_list);
+ 	for (i = 0; i < ARRAY_SIZE(vma->last_read); i++)
+ 		init_request_active(&vma->last_read[i], i915_vma_retire);
+ 	init_request_active(&vma->last_fence, NULL);
