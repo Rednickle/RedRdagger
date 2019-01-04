@@ -1,0 +1,160 @@
+From: Lucas Stach <l.stach@pengutronix.de>
+Date: Fri, 17 Nov 2017 17:43:37 +0100
+Subject: drm/etnaviv: move workqueue to be per GPU
+Git-commit: a7790d78092e5904beb4de71e1ea43b260d2092a
+Patch-mainline: v4.16-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+While the etnaviv workqueue needs to be ordered, as we rely on work items
+being executed in queuing order, this is only true for a single GPU.
+Having a shared workqueue for all GPUs in the system limits concurrency
+artificially.
+
+Getting each GPU its own ordered workqueue still meets our ordering
+expectations and enables retire workers to run concurrently.
+
+Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
+Reviewed-by: Philipp Zabel <p.zabel@pengutronix.de>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/etnaviv/etnaviv_drv.c |   12 ------------
+ drivers/gpu/drm/etnaviv/etnaviv_drv.h |   10 ----------
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.c |   19 +++++++++++++++----
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.h |    1 +
+ 4 files changed, 16 insertions(+), 26 deletions(-)
+
+--- a/drivers/gpu/drm/etnaviv/etnaviv_drv.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_drv.c
+@@ -580,12 +580,6 @@ static int etnaviv_bind(struct device *d
+ 	}
+ 	drm->dev_private = priv;
+ 
+-	priv->wq = alloc_ordered_workqueue("etnaviv", 0);
+-	if (!priv->wq) {
+-		ret = -ENOMEM;
+-		goto out_wq;
+-	}
+-
+ 	mutex_init(&priv->gem_lock);
+ 	INIT_LIST_HEAD(&priv->gem_list);
+ 	priv->num_gpus = 0;
+@@ -607,9 +601,6 @@ static int etnaviv_bind(struct device *d
+ out_register:
+ 	component_unbind_all(dev, drm);
+ out_bind:
+-	flush_workqueue(priv->wq);
+-	destroy_workqueue(priv->wq);
+-out_wq:
+ 	kfree(priv);
+ out_unref:
+ 	drm_dev_unref(drm);
+@@ -624,9 +615,6 @@ static void etnaviv_unbind(struct device
+ 
+ 	drm_dev_unregister(drm);
+ 
+-	flush_workqueue(priv->wq);
+-	destroy_workqueue(priv->wq);
+-
+ 	component_unbind_all(dev, drm);
+ 
+ 	drm->dev_private = NULL;
+--- a/drivers/gpu/drm/etnaviv/etnaviv_drv.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_drv.h
+@@ -56,18 +56,8 @@ struct etnaviv_drm_private {
+ 	/* list of GEM objects: */
+ 	struct mutex gem_lock;
+ 	struct list_head gem_list;
+-
+-	struct workqueue_struct *wq;
+ };
+ 
+-static inline void etnaviv_queue_work(struct drm_device *dev,
+-	struct work_struct *w)
+-{
+-	struct etnaviv_drm_private *priv = dev->dev_private;
+-
+-	queue_work(priv->wq, w);
+-}
+-
+ int etnaviv_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		struct drm_file *file);
+ 
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+@@ -958,7 +958,7 @@ static void recover_worker(struct work_s
+ 	pm_runtime_put_autosuspend(gpu->dev);
+ 
+ 	/* Retire the buffer objects in a work */
+-	etnaviv_queue_work(gpu->drm, &gpu->retire_work);
++	queue_work(gpu->wq, &gpu->retire_work);
+ }
+ 
+ static void hangcheck_timer_reset(struct etnaviv_gpu *gpu)
+@@ -994,7 +994,7 @@ static void hangcheck_handler(struct tim
+ 		dev_err(gpu->dev, "     completed fence: %u\n", fence);
+ 		dev_err(gpu->dev, "     active fence: %u\n",
+ 			gpu->active_fence);
+-		etnaviv_queue_work(gpu->drm, &gpu->recover_work);
++		queue_work(gpu->wq, &gpu->recover_work);
+ 	}
+ 
+ 	/* if still more pending work, reset the hangcheck timer: */
+@@ -1526,7 +1526,7 @@ static irqreturn_t irq_handler(int irq,
+ 
+ 			if (gpu->event[event].sync_point) {
+ 				gpu->sync_point_event = event;
+-				etnaviv_queue_work(gpu->drm, &gpu->sync_point_work);
++				queue_work(gpu->wq, &gpu->sync_point_work);
+ 			}
+ 
+ 			fence = gpu->event[event].fence;
+@@ -1552,7 +1552,7 @@ static irqreturn_t irq_handler(int irq,
+ 		}
+ 
+ 		/* Retire the buffer objects in a work */
+-		etnaviv_queue_work(gpu->drm, &gpu->retire_work);
++		queue_work(gpu->wq, &gpu->retire_work);
+ 
+ 		ret = IRQ_HANDLED;
+ 	}
+@@ -1721,12 +1721,20 @@ static int etnaviv_gpu_bind(struct devic
+ 			return PTR_ERR(gpu->cooling);
+ 	}
+ 
++	gpu->wq = alloc_ordered_workqueue(dev_name(dev), 0);
++	if (!gpu->wq) {
++		if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
++			thermal_cooling_device_unregister(gpu->cooling);
++		return -ENOMEM;
++	}
++
+ #ifdef CONFIG_PM
+ 	ret = pm_runtime_get_sync(gpu->dev);
+ #else
+ 	ret = etnaviv_gpu_clk_enable(gpu);
+ #endif
+ 	if (ret < 0) {
++		destroy_workqueue(gpu->wq);
+ 		if (IS_ENABLED(CONFIG_DRM_ETNAVIV_THERMAL))
+ 			thermal_cooling_device_unregister(gpu->cooling);
+ 		return ret;
+@@ -1761,6 +1769,9 @@ static void etnaviv_gpu_unbind(struct de
+ 
+ 	hangcheck_disable(gpu);
+ 
++	flush_workqueue(gpu->wq);
++	destroy_workqueue(gpu->wq);
++
+ #ifdef CONFIG_PM
+ 	pm_runtime_get_sync(gpu->dev);
+ 	pm_runtime_put_sync_suspend(gpu->dev);
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+@@ -106,6 +106,7 @@ struct etnaviv_gpu {
+ 	struct mutex lock;
+ 	struct etnaviv_chip_identity identity;
+ 	struct etnaviv_file_private *lastctx;
++	struct workqueue_struct *wq;
+ 
+ 	/* 'ring'-buffer: */
+ 	struct etnaviv_cmdbuf *buffer;
