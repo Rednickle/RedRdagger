@@ -1,0 +1,172 @@
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Thu, 26 Apr 2018 09:48:55 +0200
+Subject: drm/vmwgfx: Clean up fbdev modeset locking
+Git-commit: 21fbd085e62ff9a11318f5a9aba55e56e8503173
+Patch-mainline: v4.17-rc4
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+At least since the atomic port, the vmwgfx fbdev code is taking
+a number of unnecessary modeset locks. In particular the
+kms_set_config() function will grab its own locks, leading to
+locking retries. So avoid drm_modeset_lock_all() and instead
+provide a local acquire context for kms_set_config(). Also have the
+vmw_kms_fbdev_init data itself grab the lock that it needs.
+
+This also fixed a long standing problem that vmw_fb_close() didn't
+provide an acquire context for kms_set_config(), causing potential
+warnings and hangs during driver unload. This problem was uncovered by the
+recent commit "drm/vmwgfx: Improve on hibernation"
+
+Testing done:
+Repeated driver load and unload on Ubuntu 16.04.2
+
+Fixes: c3b9b1657344 ("drm/vmwgfx: Improve on hibernation")
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Deepak Rawat <drawat@vmware.com>
+Reviewed-by: Sinclair Yeh <syeh@vmware.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_fb.c  |   31 ++++++++++---------------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c |   13 ++++++++++---
+ 2 files changed, 20 insertions(+), 24 deletions(-)
+
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+@@ -441,11 +441,11 @@ static int vmwgfx_set_config_internal(st
+ 	struct drm_crtc *crtc = set->crtc;
+ 	struct drm_framebuffer *fb;
+ 	struct drm_crtc *tmp;
+-	struct drm_modeset_acquire_ctx *ctx;
+ 	struct drm_device *dev = set->crtc->dev;
++	struct drm_modeset_acquire_ctx ctx;
+ 	int ret;
+ 
+-	ctx = dev->mode_config.acquire_ctx;
++	drm_modeset_acquire_init(&ctx, 0);
+ 
+ restart:
+ 	/*
+@@ -458,7 +458,7 @@ restart:
+ 
+ 	fb = set->fb;
+ 
+-	ret = crtc->funcs->set_config(set, ctx);
++	ret = crtc->funcs->set_config(set, &ctx);
+ 	if (ret == 0) {
+ 		crtc->primary->crtc = crtc;
+ 		crtc->primary->fb = fb;
+@@ -473,20 +473,13 @@ restart:
+ 	}
+ 
+ 	if (ret == -EDEADLK) {
+-		dev->mode_config.acquire_ctx = NULL;
+-
+-retry_locking:
+-		drm_modeset_backoff(ctx);
+-
+-		ret = drm_modeset_lock_all_ctx(dev, ctx);
+-		if (ret)
+-			goto retry_locking;
+-
+-		dev->mode_config.acquire_ctx = ctx;
+-
++		drm_modeset_backoff(&ctx);
+ 		goto restart;
+ 	}
+ 
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++
+ 	return ret;
+ }
+ 
+@@ -624,7 +617,6 @@ static int vmw_fb_set_par(struct fb_info
+ 	}
+ 
+ 	mutex_lock(&par->bo_mutex);
+-	drm_modeset_lock_all(vmw_priv->dev);
+ 	ret = vmw_fb_kms_framebuffer(info);
+ 	if (ret)
+ 		goto out_unlock;
+@@ -657,7 +649,6 @@ out_unlock:
+ 		drm_mode_destroy(vmw_priv->dev, old_mode);
+ 	par->set_mode = mode;
+ 
+-	drm_modeset_unlock_all(vmw_priv->dev);
+ 	mutex_unlock(&par->bo_mutex);
+ 
+ 	return ret;
+@@ -713,18 +704,14 @@ int vmw_fb_init(struct vmw_private *vmw_
+ 	par->max_width = fb_width;
+ 	par->max_height = fb_height;
+ 
+-	drm_modeset_lock_all(vmw_priv->dev);
+ 	ret = vmw_kms_fbdev_init_data(vmw_priv, 0, par->max_width,
+ 				      par->max_height, &par->con,
+ 				      &par->crtc, &init_mode);
+-	if (ret) {
+-		drm_modeset_unlock_all(vmw_priv->dev);
++	if (ret)
+ 		goto err_kms;
+-	}
+ 
+ 	info->var.xres = init_mode->hdisplay;
+ 	info->var.yres = init_mode->vdisplay;
+-	drm_modeset_unlock_all(vmw_priv->dev);
+ 
+ 	/*
+ 	 * Create buffers and alloc memory
+@@ -832,7 +819,9 @@ int vmw_fb_close(struct vmw_private *vmw
+ 	cancel_delayed_work_sync(&par->local_work);
+ 	unregister_framebuffer(info);
+ 
++	mutex_lock(&par->bo_mutex);
+ 	(void) vmw_fb_kms_detach(par, true, true);
++	mutex_unlock(&par->bo_mutex);
+ 
+ 	vfree(par->vmalloc);
+ 	framebuffer_release(info);
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -2680,7 +2680,9 @@ int vmw_kms_fbdev_init_data(struct vmw_p
+ 	struct vmw_display_unit *du;
+ 	struct drm_display_mode *mode;
+ 	int i = 0;
++	int ret = 0;
+ 
++	mutex_lock(&dev_priv->dev->mode_config.mutex);
+ 	list_for_each_entry(con, &dev_priv->dev->mode_config.connector_list,
+ 			    head) {
+ 		if (i == unit)
+@@ -2691,7 +2693,8 @@ int vmw_kms_fbdev_init_data(struct vmw_p
+ 
+ 	if (i != unit) {
+ 		DRM_ERROR("Could not find initial display unit.\n");
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto out_unlock;
+ 	}
+ 
+ 	if (list_empty(&con->modes))
+@@ -2699,7 +2702,8 @@ int vmw_kms_fbdev_init_data(struct vmw_p
+ 
+ 	if (list_empty(&con->modes)) {
+ 		DRM_ERROR("Could not find initial display mode.\n");
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto out_unlock;
+ 	}
+ 
+ 	du = vmw_connector_to_du(con);
+@@ -2720,7 +2724,10 @@ int vmw_kms_fbdev_init_data(struct vmw_p
+ 					   head);
+ 	}
+ 
+-	return 0;
++ out_unlock:
++	mutex_unlock(&dev_priv->dev->mode_config.mutex);
++
++	return ret;
+ }
+ 
+ /**
