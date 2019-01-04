@@ -1,0 +1,576 @@
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Thu, 24 Aug 2017 08:06:28 +0200
+Subject: drm/vmwgfx: Move irq bottom half processing to threads
+Git-commit: ef369904aaf717e0390b483efd47daba9ba8ddf2
+Patch-mainline: v4.14-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This gets rid of the irq bottom half tasklets and instead performs the
+work needed in process context. We also convert irq-disabling spinlocks to
+ordinary spinlocks.
+
+This should decrease system latency for other system components, like
+sound for example but has the potential to increase latency for processes
+that wait on the GPU.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Sinclair Yeh <syeh@vmware.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c |   58 +++++++++-------------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h    |   20 +++++----
+ drivers/gpu/drm/vmwgfx/vmwgfx_fence.c  |   57 +++++++++++----------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_irq.c    |   68 +++++++++++++++++++++++++++------
+ 4 files changed, 112 insertions(+), 91 deletions(-)
+
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c
+@@ -85,7 +85,6 @@ struct vmw_cmdbuf_context {
+  * Internal protection.
+  * @dheaders: Pool of DMA memory for device command buffer headers with trailing
+  * space for inline data. Internal protection.
+- * @tasklet: Tasklet struct for irq processing. Immutable.
+  * @alloc_queue: Wait queue for processes waiting to allocate command buffer
+  * space.
+  * @idle_queue: Wait queue for processes waiting for command buffer idle.
+@@ -117,7 +116,6 @@ struct vmw_cmdbuf_man {
+ 	spinlock_t lock;
+ 	struct dma_pool *headers;
+ 	struct dma_pool *dheaders;
+-	struct tasklet_struct tasklet;
+ 	wait_queue_head_t alloc_queue;
+ 	wait_queue_head_t idle_queue;
+ 	bool irq_on;
+@@ -278,9 +276,9 @@ void vmw_cmdbuf_header_free(struct vmw_c
+ 		vmw_cmdbuf_header_inline_free(header);
+ 		return;
+ 	}
+-	spin_lock_bh(&man->lock);
++	spin_lock(&man->lock);
+ 	__vmw_cmdbuf_header_free(header);
+-	spin_unlock_bh(&man->lock);
++	spin_unlock(&man->lock);
+ }
+ 
+ 
+@@ -468,20 +466,17 @@ static void vmw_cmdbuf_ctx_add(struct vm
+ }
+ 
+ /**
+- * vmw_cmdbuf_man_tasklet - The main part of the command buffer interrupt
+- * handler implemented as a tasklet.
++ * vmw_cmdbuf_irqthread - The main part of the command buffer interrupt
++ * handler implemented as a threaded irq task.
+  *
+- * @data: Tasklet closure. A pointer to the command buffer manager cast to
+- * an unsigned long.
++ * @man: Pointer to the command buffer manager.
+  *
+- * The bottom half (tasklet) of the interrupt handler simply calls into the
++ * The bottom half of the interrupt handler simply calls into the
+  * command buffer processor to free finished buffers and submit any
+  * queued buffers to hardware.
+  */
+-static void vmw_cmdbuf_man_tasklet(unsigned long data)
++void vmw_cmdbuf_irqthread(struct vmw_cmdbuf_man *man)
+ {
+-	struct vmw_cmdbuf_man *man = (struct vmw_cmdbuf_man *) data;
+-
+ 	spin_lock(&man->lock);
+ 	vmw_cmdbuf_man_process(man);
+ 	spin_unlock(&man->lock);
+@@ -504,7 +499,7 @@ static void vmw_cmdbuf_work_func(struct
+ 	uint32_t dummy;
+ 	bool restart = false;
+ 
+-	spin_lock_bh(&man->lock);
++	spin_lock(&man->lock);
+ 	list_for_each_entry_safe(entry, next, &man->error, list) {
+ 		restart = true;
+ 		DRM_ERROR("Command buffer error.\n");
+@@ -513,7 +508,7 @@ static void vmw_cmdbuf_work_func(struct
+ 		__vmw_cmdbuf_header_free(entry);
+ 		wake_up_all(&man->idle_queue);
+ 	}
+-	spin_unlock_bh(&man->lock);
++	spin_unlock(&man->lock);
+ 
+ 	if (restart && vmw_cmdbuf_startstop(man, true))
+ 		DRM_ERROR("Failed restarting command buffer context 0.\n");
+@@ -536,7 +531,7 @@ static bool vmw_cmdbuf_man_idle(struct v
+ 	bool idle = false;
+ 	int i;
+ 
+-	spin_lock_bh(&man->lock);
++	spin_lock(&man->lock);
+ 	vmw_cmdbuf_man_process(man);
+ 	for_each_cmdbuf_ctx(man, i, ctx) {
+ 		if (!list_empty(&ctx->submitted) ||
+@@ -548,7 +543,7 @@ static bool vmw_cmdbuf_man_idle(struct v
+ 	idle = list_empty(&man->error);
+ 
+ out_unlock:
+-	spin_unlock_bh(&man->lock);
++	spin_unlock(&man->lock);
+ 
+ 	return idle;
+ }
+@@ -571,7 +566,7 @@ static void __vmw_cmdbuf_cur_flush(struc
+ 	if (!cur)
+ 		return;
+ 
+-	spin_lock_bh(&man->lock);
++	spin_lock(&man->lock);
+ 	if (man->cur_pos == 0) {
+ 		__vmw_cmdbuf_header_free(cur);
+ 		goto out_unlock;
+@@ -580,7 +575,7 @@ static void __vmw_cmdbuf_cur_flush(struc
+ 	man->cur->cb_header->length = man->cur_pos;
+ 	vmw_cmdbuf_ctx_add(man, man->cur, SVGA_CB_CONTEXT_0);
+ out_unlock:
+-	spin_unlock_bh(&man->lock);
++	spin_unlock(&man->lock);
+ 	man->cur = NULL;
+ 	man->cur_pos = 0;
+ }
+@@ -673,14 +668,14 @@ static bool vmw_cmdbuf_try_alloc(struct
+ 		return true;
+  
+ 	memset(info->node, 0, sizeof(*info->node));
+-	spin_lock_bh(&man->lock);
++	spin_lock(&man->lock);
+ 	ret = drm_mm_insert_node(&man->mm, info->node, info->page_size);
+ 	if (ret) {
+ 		vmw_cmdbuf_man_process(man);
+ 		ret = drm_mm_insert_node(&man->mm, info->node, info->page_size);
+ 	}
+ 
+-	spin_unlock_bh(&man->lock);
++	spin_unlock(&man->lock);
+ 	info->done = !ret;
+ 
+ 	return info->done;
+@@ -801,9 +796,9 @@ static int vmw_cmdbuf_space_pool(struct
+ 	return 0;
+ 
+ out_no_cb_header:
+-	spin_lock_bh(&man->lock);
++	spin_lock(&man->lock);
+ 	drm_mm_remove_node(&header->node);
+-	spin_unlock_bh(&man->lock);
++	spin_unlock(&man->lock);
+ 
+ 	return ret;
+ }
+@@ -1023,18 +1018,6 @@ void vmw_cmdbuf_commit(struct vmw_cmdbuf
+ 	vmw_cmdbuf_cur_unlock(man);
+ }
+ 
+-/**
+- * vmw_cmdbuf_tasklet_schedule - Schedule the interrupt handler bottom half.
+- *
+- * @man: The command buffer manager.
+- */
+-void vmw_cmdbuf_tasklet_schedule(struct vmw_cmdbuf_man *man)
+-{
+-	if (!man)
+-		return;
+-
+-	tasklet_schedule(&man->tasklet);
+-}
+ 
+ /**
+  * vmw_cmdbuf_send_device_command - Send a command through the device context.
+@@ -1059,9 +1042,9 @@ static int vmw_cmdbuf_send_device_comman
+ 	memcpy(cmd, command, size);
+ 	header->cb_header->length = size;
+ 	header->cb_context = SVGA_CB_CONTEXT_DEVICE;
+-	spin_lock_bh(&man->lock);
++	spin_lock(&man->lock);
+ 	status = vmw_cmdbuf_header_submit(header);
+-	spin_unlock_bh(&man->lock);
++	spin_unlock(&man->lock);
+ 	vmw_cmdbuf_header_free(header);
+ 
+ 	if (status != SVGA_CB_STATUS_COMPLETED) {
+@@ -1226,8 +1209,6 @@ struct vmw_cmdbuf_man *vmw_cmdbuf_man_cr
+ 	spin_lock_init(&man->lock);
+ 	mutex_init(&man->cur_mutex);
+ 	mutex_init(&man->space_mutex);
+-	tasklet_init(&man->tasklet, vmw_cmdbuf_man_tasklet,
+-		     (unsigned long) man);
+ 	man->default_size = VMW_CMDBUF_INLINE_SIZE;
+ 	init_waitqueue_head(&man->alloc_queue);
+ 	init_waitqueue_head(&man->idle_queue);
+@@ -1297,7 +1278,6 @@ void vmw_cmdbuf_man_destroy(struct vmw_c
+ 
+ 	vmw_generic_waiter_remove(man->dev_priv, SVGA_IRQFLAG_ERROR,
+ 				  &man->dev_priv->error_waiters);
+-	tasklet_kill(&man->tasklet);
+ 	(void) cancel_work_sync(&man->work);
+ 	dma_pool_destroy(man->dheaders);
+ 	dma_pool_destroy(man->headers);
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -352,6 +352,12 @@ struct vmw_otable_batch {
+ 	struct ttm_buffer_object *otable_bo;
+ };
+ 
++enum {
++	VMW_IRQTHREAD_FENCE,
++	VMW_IRQTHREAD_CMDBUF,
++	VMW_IRQTHREAD_MAX
++};
++
+ struct vmw_private {
+ 	struct ttm_bo_device bdev;
+ 	struct ttm_bo_global_ref bo_global_ref;
+@@ -530,6 +536,7 @@ struct vmw_private {
+ 	struct vmw_otable_batch otable_batch;
+ 
+ 	struct vmw_cmdbuf_man *cman;
++	DECLARE_BITMAP(irqthread_pending, VMW_IRQTHREAD_MAX);
+ };
+ 
+ static inline struct vmw_surface *vmw_res_to_srf(struct vmw_resource *res)
+@@ -562,24 +569,21 @@ static inline struct vmw_master *vmw_mas
+ static inline void vmw_write(struct vmw_private *dev_priv,
+ 			     unsigned int offset, uint32_t value)
+ {
+-	unsigned long irq_flags;
+-
+-	spin_lock_irqsave(&dev_priv->hw_lock, irq_flags);
++	spin_lock(&dev_priv->hw_lock);
+ 	outl(offset, dev_priv->io_start + VMWGFX_INDEX_PORT);
+ 	outl(value, dev_priv->io_start + VMWGFX_VALUE_PORT);
+-	spin_unlock_irqrestore(&dev_priv->hw_lock, irq_flags);
++	spin_unlock(&dev_priv->hw_lock);
+ }
+ 
+ static inline uint32_t vmw_read(struct vmw_private *dev_priv,
+ 				unsigned int offset)
+ {
+-	unsigned long irq_flags;
+ 	u32 val;
+ 
+-	spin_lock_irqsave(&dev_priv->hw_lock, irq_flags);
++	spin_lock(&dev_priv->hw_lock);
+ 	outl(offset, dev_priv->io_start + VMWGFX_INDEX_PORT);
+ 	val = inl(dev_priv->io_start + VMWGFX_VALUE_PORT);
+-	spin_unlock_irqrestore(&dev_priv->hw_lock, irq_flags);
++	spin_unlock(&dev_priv->hw_lock);
+ 
+ 	return val;
+ }
+@@ -1149,13 +1153,13 @@ extern void *vmw_cmdbuf_reserve(struct v
+ extern void vmw_cmdbuf_commit(struct vmw_cmdbuf_man *man, size_t size,
+ 			      struct vmw_cmdbuf_header *header,
+ 			      bool flush);
+-extern void vmw_cmdbuf_tasklet_schedule(struct vmw_cmdbuf_man *man);
+ extern void *vmw_cmdbuf_alloc(struct vmw_cmdbuf_man *man,
+ 			      size_t size, bool interruptible,
+ 			      struct vmw_cmdbuf_header **p_header);
+ extern void vmw_cmdbuf_header_free(struct vmw_cmdbuf_header *header);
+ extern int vmw_cmdbuf_cur_flush(struct vmw_cmdbuf_man *man,
+ 				bool interruptible);
++extern void vmw_cmdbuf_irqthread(struct vmw_cmdbuf_man *man);
+ 
+ 
+ /**
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fence.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fence.c
+@@ -114,12 +114,11 @@ static void vmw_fence_obj_destroy(struct
+ 		container_of(f, struct vmw_fence_obj, base);
+ 
+ 	struct vmw_fence_manager *fman = fman_from_fence(fence);
+-	unsigned long irq_flags;
+ 
+-	spin_lock_irqsave(&fman->lock, irq_flags);
++	spin_lock(&fman->lock);
+ 	list_del_init(&fence->head);
+ 	--fman->num_fence_objects;
+-	spin_unlock_irqrestore(&fman->lock, irq_flags);
++	spin_unlock(&fman->lock);
+ 	fence->destroy(fence);
+ }
+ 
+@@ -252,10 +251,10 @@ static void vmw_fence_work_func(struct w
+ 		INIT_LIST_HEAD(&list);
+ 		mutex_lock(&fman->goal_irq_mutex);
+ 
+-		spin_lock_irq(&fman->lock);
++		spin_lock(&fman->lock);
+ 		list_splice_init(&fman->cleanup_list, &list);
+ 		seqno_valid = fman->seqno_valid;
+-		spin_unlock_irq(&fman->lock);
++		spin_unlock(&fman->lock);
+ 
+ 		if (!seqno_valid && fman->goal_irq_on) {
+ 			fman->goal_irq_on = false;
+@@ -305,15 +304,14 @@ struct vmw_fence_manager *vmw_fence_mana
+ 
+ void vmw_fence_manager_takedown(struct vmw_fence_manager *fman)
+ {
+-	unsigned long irq_flags;
+ 	bool lists_empty;
+ 
+ 	(void) cancel_work_sync(&fman->work);
+ 
+-	spin_lock_irqsave(&fman->lock, irq_flags);
++	spin_lock(&fman->lock);
+ 	lists_empty = list_empty(&fman->fence_list) &&
+ 		list_empty(&fman->cleanup_list);
+-	spin_unlock_irqrestore(&fman->lock, irq_flags);
++	spin_unlock(&fman->lock);
+ 
+ 	BUG_ON(!lists_empty);
+ 	kfree(fman);
+@@ -323,7 +321,6 @@ static int vmw_fence_obj_init(struct vmw
+ 			      struct vmw_fence_obj *fence, u32 seqno,
+ 			      void (*destroy) (struct vmw_fence_obj *fence))
+ {
+-	unsigned long irq_flags;
+ 	int ret = 0;
+ 
+ 	dma_fence_init(&fence->base, &vmw_fence_ops, &fman->lock,
+@@ -331,7 +328,7 @@ static int vmw_fence_obj_init(struct vmw
+ 	INIT_LIST_HEAD(&fence->seq_passed_actions);
+ 	fence->destroy = destroy;
+ 
+-	spin_lock_irqsave(&fman->lock, irq_flags);
++	spin_lock(&fman->lock);
+ 	if (unlikely(fman->fifo_down)) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+@@ -340,7 +337,7 @@ static int vmw_fence_obj_init(struct vmw
+ 	++fman->num_fence_objects;
+ 
+ out_unlock:
+-	spin_unlock_irqrestore(&fman->lock, irq_flags);
++	spin_unlock(&fman->lock);
+ 	return ret;
+ 
+ }
+@@ -489,11 +486,9 @@ rerun:
+ 
+ void vmw_fences_update(struct vmw_fence_manager *fman)
+ {
+-	unsigned long irq_flags;
+-
+-	spin_lock_irqsave(&fman->lock, irq_flags);
++	spin_lock(&fman->lock);
+ 	__vmw_fences_update(fman);
+-	spin_unlock_irqrestore(&fman->lock, irq_flags);
++	spin_unlock(&fman->lock);
+ }
+ 
+ bool vmw_fence_obj_signaled(struct vmw_fence_obj *fence)
+@@ -663,14 +658,14 @@ void vmw_fence_fifo_down(struct vmw_fenc
+ 	 * restart when we've released the fman->lock.
+ 	 */
+ 
+-	spin_lock_irq(&fman->lock);
++	spin_lock(&fman->lock);
+ 	fman->fifo_down = true;
+ 	while (!list_empty(&fman->fence_list)) {
+ 		struct vmw_fence_obj *fence =
+ 			list_entry(fman->fence_list.prev, struct vmw_fence_obj,
+ 				   head);
+ 		dma_fence_get(&fence->base);
+-		spin_unlock_irq(&fman->lock);
++		spin_unlock(&fman->lock);
+ 
+ 		ret = vmw_fence_obj_wait(fence, false, false,
+ 					 VMW_FENCE_WAIT_TIMEOUT);
+@@ -686,18 +681,16 @@ void vmw_fence_fifo_down(struct vmw_fenc
+ 
+ 		BUG_ON(!list_empty(&fence->head));
+ 		dma_fence_put(&fence->base);
+-		spin_lock_irq(&fman->lock);
++		spin_lock(&fman->lock);
+ 	}
+-	spin_unlock_irq(&fman->lock);
++	spin_unlock(&fman->lock);
+ }
+ 
+ void vmw_fence_fifo_up(struct vmw_fence_manager *fman)
+ {
+-	unsigned long irq_flags;
+-
+-	spin_lock_irqsave(&fman->lock, irq_flags);
++	spin_lock(&fman->lock);
+ 	fman->fifo_down = false;
+-	spin_unlock_irqrestore(&fman->lock, irq_flags);
++	spin_unlock(&fman->lock);
+ }
+ 
+ 
+@@ -812,9 +805,9 @@ int vmw_fence_obj_signaled_ioctl(struct
+ 	arg->signaled = vmw_fence_obj_signaled(fence);
+ 
+ 	arg->signaled_flags = arg->flags;
+-	spin_lock_irq(&fman->lock);
++	spin_lock(&fman->lock);
+ 	arg->passed_seqno = dev_priv->last_read_seqno;
+-	spin_unlock_irq(&fman->lock);
++	spin_unlock(&fman->lock);
+ 
+ 	ttm_base_object_unref(&base);
+ 
+@@ -841,8 +834,7 @@ int vmw_fence_obj_unref_ioctl(struct drm
+  *
+  * This function is called when the seqno of the fence where @action is
+  * attached has passed. It queues the event on the submitter's event list.
+- * This function is always called from atomic context, and may be called
+- * from irq context.
++ * This function is always called from atomic context.
+  */
+ static void vmw_event_fence_action_seq_passed(struct vmw_fence_action *action)
+ {
+@@ -851,13 +843,13 @@ static void vmw_event_fence_action_seq_p
+ 	struct drm_device *dev = eaction->dev;
+ 	struct drm_pending_event *event = eaction->event;
+ 	struct drm_file *file_priv;
+-	unsigned long irq_flags;
++
+ 
+ 	if (unlikely(event == NULL))
+ 		return;
+ 
+ 	file_priv = event->file_priv;
+-	spin_lock_irqsave(&dev->event_lock, irq_flags);
++	spin_lock_irq(&dev->event_lock);
+ 
+ 	if (likely(eaction->tv_sec != NULL)) {
+ 		struct timeval tv;
+@@ -869,7 +861,7 @@ static void vmw_event_fence_action_seq_p
+ 
+ 	drm_send_event_locked(dev, eaction->event);
+ 	eaction->event = NULL;
+-	spin_unlock_irqrestore(&dev->event_lock, irq_flags);
++	spin_unlock_irq(&dev->event_lock);
+ }
+ 
+ /**
+@@ -904,11 +896,10 @@ static void vmw_fence_obj_add_action(str
+ 			      struct vmw_fence_action *action)
+ {
+ 	struct vmw_fence_manager *fman = fman_from_fence(fence);
+-	unsigned long irq_flags;
+ 	bool run_update = false;
+ 
+ 	mutex_lock(&fman->goal_irq_mutex);
+-	spin_lock_irqsave(&fman->lock, irq_flags);
++	spin_lock(&fman->lock);
+ 
+ 	fman->pending_actions[action->type]++;
+ 	if (dma_fence_is_signaled_locked(&fence->base)) {
+@@ -927,7 +918,7 @@ static void vmw_fence_obj_add_action(str
+ 		run_update = vmw_fence_goal_check_locked(fence);
+ 	}
+ 
+-	spin_unlock_irqrestore(&fman->lock, irq_flags);
++	spin_unlock(&fman->lock);
+ 
+ 	if (run_update) {
+ 		if (!fman->goal_irq_on) {
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c
+@@ -30,11 +30,56 @@
+ 
+ #define VMW_FENCE_WRAP (1 << 24)
+ 
++/**
++ * vmw_thread_fn - Deferred (process context) irq handler
++ *
++ * @irq: irq number
++ * @arg: Closure argument. Pointer to a struct drm_device cast to void *
++ *
++ * This function implements the deferred part of irq processing.
++ * The function is guaranteed to run at least once after the
++ * vmw_irq_handler has returned with IRQ_WAKE_THREAD.
++ *
++ */
++static irqreturn_t vmw_thread_fn(int irq, void *arg)
++{
++	struct drm_device *dev = (struct drm_device *)arg;
++	struct vmw_private *dev_priv = vmw_priv(dev);
++	irqreturn_t ret = IRQ_NONE;
++
++	if (test_and_clear_bit(VMW_IRQTHREAD_FENCE,
++			       dev_priv->irqthread_pending)) {
++		vmw_fences_update(dev_priv->fman);
++		wake_up_all(&dev_priv->fence_queue);
++		ret = IRQ_HANDLED;
++	}
++
++	if (test_and_clear_bit(VMW_IRQTHREAD_CMDBUF,
++			       dev_priv->irqthread_pending)) {
++		vmw_cmdbuf_irqthread(dev_priv->cman);
++		ret = IRQ_HANDLED;
++	}
++
++	return ret;
++}
++
++/**
++ * vmw_irq_handler irq handler
++ *
++ * @irq: irq number
++ * @arg: Closure argument. Pointer to a struct drm_device cast to void *
++ *
++ * This function implements the quick part of irq processing.
++ * The function performs fast actions like clearing the device interrupt
++ * flags and also reasonably quick actions like waking processes waiting for
++ * FIFO space. Other IRQ actions are deferred to the IRQ thread.
++ */
+ static irqreturn_t vmw_irq_handler(int irq, void *arg)
+ {
+ 	struct drm_device *dev = (struct drm_device *)arg;
+ 	struct vmw_private *dev_priv = vmw_priv(dev);
+ 	uint32_t status, masked_status;
++	irqreturn_t ret = IRQ_HANDLED;
+ 
+ 	status = inl(dev_priv->io_start + VMWGFX_IRQSTATUS_PORT);
+ 	masked_status = status & READ_ONCE(dev_priv->irq_mask);
+@@ -45,20 +90,21 @@ static irqreturn_t vmw_irq_handler(int i
+ 	if (!status)
+ 		return IRQ_NONE;
+ 
+-	if (masked_status & (SVGA_IRQFLAG_ANY_FENCE |
+-			     SVGA_IRQFLAG_FENCE_GOAL)) {
+-		vmw_fences_update(dev_priv->fman);
+-		wake_up_all(&dev_priv->fence_queue);
+-	}
+-
+ 	if (masked_status & SVGA_IRQFLAG_FIFO_PROGRESS)
+ 		wake_up_all(&dev_priv->fifo_queue);
+ 
+-	if (masked_status & (SVGA_IRQFLAG_COMMAND_BUFFER |
+-			     SVGA_IRQFLAG_ERROR))
+-		vmw_cmdbuf_tasklet_schedule(dev_priv->cman);
++	if ((masked_status & (SVGA_IRQFLAG_ANY_FENCE |
++			      SVGA_IRQFLAG_FENCE_GOAL)) &&
++	    !test_and_set_bit(VMW_IRQTHREAD_FENCE, dev_priv->irqthread_pending))
++		ret = IRQ_WAKE_THREAD;
++
++	if ((masked_status & (SVGA_IRQFLAG_COMMAND_BUFFER |
++			      SVGA_IRQFLAG_ERROR)) &&
++	    !test_and_set_bit(VMW_IRQTHREAD_CMDBUF,
++			      dev_priv->irqthread_pending))
++		ret = IRQ_WAKE_THREAD;
+ 
+-	return IRQ_HANDLED;
++	return ret;
+ }
+ 
+ static bool vmw_fifo_idle(struct vmw_private *dev_priv, uint32_t seqno)
+@@ -326,7 +372,7 @@ int vmw_irq_install(struct drm_device *d
+ 
+ 	vmw_irq_preinstall(dev);
+ 
+-	ret = request_threaded_irq(irq, vmw_irq_handler, NULL,
++	ret = request_threaded_irq(irq, vmw_irq_handler, vmw_thread_fn,
+ 				   IRQF_SHARED, VMWGFX_DRIVER_NAME, dev);
+ 	if (ret < 0)
+ 		return ret;
