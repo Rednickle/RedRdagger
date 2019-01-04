@@ -1,0 +1,222 @@
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Thu, 22 Mar 2018 10:15:23 +0100
+Subject: drm/vmwgfx: Fix multiple command buffer context use
+Git-commit: dc366364c4ef809dccd063919314301f8ba01ac2
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+The start / stop and preempt commands don't honor the context argument
+but rather acts on all available contexts.
+
+Also add detection for context 1 availability.
+
+Note that currently there's no driver interface for submitting buffers
+using the high-priority command queue (context 1).
+
+Testing done:
+Change the default context for command submission to 1 instead of 0,
+verify basic desktop functionality including faulty command injection and
+recovery.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Brian Paul <brianp@vmware.com>
+Reviewed-by: Deepak Rawat <drawat@vmware.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/device_include/svga_reg.h |   12 ++++
+ drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c           |   57 ++++++++++-------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c              |    2 
+ 3 files changed, 38 insertions(+), 33 deletions(-)
+
+--- a/drivers/gpu/drm/vmwgfx/device_include/svga_reg.h
++++ b/drivers/gpu/drm/vmwgfx/device_include/svga_reg.h
+@@ -372,6 +372,14 @@ SVGAGuestPtr;
+  * PA, not biased by the offset.  When the command buffer is finished
+  * the guest should not read the offset field as there is no guarantee
+  * what it will set to.
++ *
++ * When the SVGA_CAP_HP_CMD_QUEUE cap bit is set a new command queue
++ * SVGA_CB_CONTEXT_1 is available.  Commands submitted to this queue
++ * will be executed as quickly as possible by the SVGA device
++ * potentially before already queued commands on SVGA_CB_CONTEXT_0.
++ * The SVGA device guarantees that any command buffers submitted to
++ * SVGA_CB_CONTEXT_0 will be executed after any _already_ submitted
++ * command buffers to SVGA_CB_CONTEXT_1.
+  */
+ 
+ #define SVGA_CB_MAX_SIZE (512 * 1024)  /* 512 KB */
+@@ -382,7 +390,8 @@ SVGAGuestPtr;
+ typedef enum {
+    SVGA_CB_CONTEXT_DEVICE = 0x3f,
+    SVGA_CB_CONTEXT_0      = 0x0,
+-   SVGA_CB_CONTEXT_MAX    = 0x1,
++   SVGA_CB_CONTEXT_1      = 0x1, /* Supported with SVGA_CAP_HP_CMD_QUEUE */
++   SVGA_CB_CONTEXT_MAX    = 0x2,
+ } SVGACBContext;
+ 
+ 
+@@ -689,6 +698,7 @@ SVGASignedPoint;
+ #define SVGA_CAP_CMD_BUFFERS_2      0x04000000
+ #define SVGA_CAP_GBOBJECTS          0x08000000
+ #define SVGA_CAP_DX                 0x10000000
++#define SVGA_CAP_HP_CMD_QUEUE       0x20000000
+ 
+ #define SVGA_CAP_CMD_RESERVED       0x80000000
+ 
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_cmdbuf.c
+@@ -101,6 +101,7 @@ struct vmw_cmdbuf_context {
+  * @handle: DMA address handle for the command buffer space if @using_mob is
+  * false. Immutable.
+  * @size: The size of the command buffer space. Immutable.
++ * @num_contexts: Number of contexts actually enabled.
+  */
+ struct vmw_cmdbuf_man {
+ 	struct mutex cur_mutex;
+@@ -128,6 +129,7 @@ struct vmw_cmdbuf_man {
+ 	bool has_pool;
+ 	dma_addr_t handle;
+ 	size_t size;
++	u32 num_contexts;
+ };
+ 
+ /**
+@@ -185,7 +187,7 @@ struct vmw_cmdbuf_alloc_info {
+ 
+ /* Loop over each context in the command buffer manager. */
+ #define for_each_cmdbuf_ctx(_man, _i, _ctx)				\
+-	for (_i = 0, _ctx = &(_man)->ctx[0]; (_i) < SVGA_CB_CONTEXT_MAX; \
++	for (_i = 0, _ctx = &(_man)->ctx[0]; (_i) < (_man)->num_contexts; \
+ 	     ++(_i), ++(_ctx))
+ 
+ static int vmw_cmdbuf_startstop(struct vmw_cmdbuf_man *man, u32 context,
+@@ -514,6 +516,7 @@ static void vmw_cmdbuf_work_func(struct
+ 	struct list_head restart_head[SVGA_CB_CONTEXT_MAX];
+ 	int i;
+ 	struct vmw_cmdbuf_context *ctx;
++	bool global_block = false;
+ 
+ 	for_each_cmdbuf_ctx(man, i, ctx) {
+ 		INIT_LIST_HEAD(&restart_head[i]);
+@@ -531,6 +534,7 @@ static void vmw_cmdbuf_work_func(struct
+ 
+ 		list_del_init(&entry->list);
+ 		restart[entry->cb_context] = true;
++		global_block = true;
+ 
+ 		if (!vmw_cmd_describe(header, &error_cmd_size, &cmd_name)) {
+ 			DRM_ERROR("Unknown command causing device error.\n");
+@@ -564,23 +568,21 @@ static void vmw_cmdbuf_work_func(struct
+ 		cb_hdr->length -= new_start_offset;
+ 		cb_hdr->errorOffset = 0;
+ 		cb_hdr->offset = 0;
++
+ 		list_add_tail(&entry->list, &restart_head[entry->cb_context]);
+-		man->ctx[entry->cb_context].block_submission = true;
+ 	}
++
++	for_each_cmdbuf_ctx(man, i, ctx)
++		man->ctx[i].block_submission = true;
++
+ 	spin_unlock(&man->lock);
+ 
+-	/* Preempt all contexts with errors */
+-	for_each_cmdbuf_ctx(man, i, ctx) {
+-		if (ctx->block_submission && vmw_cmdbuf_preempt(man, i))
+-			DRM_ERROR("Failed preempting command buffer "
+-				  "context %u.\n", i);
+-	}
++	/* Preempt all contexts */
++	if (global_block && vmw_cmdbuf_preempt(man, 0))
++		DRM_ERROR("Failed preempting command buffer contexts\n");
+ 
+ 	spin_lock(&man->lock);
+ 	for_each_cmdbuf_ctx(man, i, ctx) {
+-		if (!ctx->block_submission)
+-			continue;
+-
+ 		/* Move preempted command buffers to the preempted queue. */
+ 		vmw_cmdbuf_ctx_process(man, ctx, &dummy);
+ 
+@@ -594,19 +596,16 @@ static void vmw_cmdbuf_work_func(struct
+ 		 * Finally add all command buffers first in the submitted
+ 		 * queue, to rerun them.
+ 		 */
+-		list_splice_init(&restart_head[i], &ctx->submitted);
+ 
+ 		ctx->block_submission = false;
++		list_splice_init(&restart_head[i], &ctx->submitted);
+ 	}
+ 
+ 	vmw_cmdbuf_man_process(man);
+ 	spin_unlock(&man->lock);
+ 
+-	for_each_cmdbuf_ctx(man, i, ctx) {
+-		if (restart[i] && vmw_cmdbuf_startstop(man, i, true))
+-			DRM_ERROR("Failed restarting command buffer "
+-				  "context %u.\n", i);
+-	}
++	if (global_block && vmw_cmdbuf_startstop(man, 0, true))
++		DRM_ERROR("Failed restarting command buffer contexts\n");
+ 
+ 	/* Send a new fence in case one was removed */
+ 	if (send_fence) {
+@@ -1307,6 +1306,8 @@ struct vmw_cmdbuf_man *vmw_cmdbuf_man_cr
+ 	if (!man)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	man->num_contexts = (dev_priv->capabilities & SVGA_CAP_HP_CMD_QUEUE) ?
++		2 : 1;
+ 	man->headers = dma_pool_create("vmwgfx cmdbuf",
+ 				       &dev_priv->dev->pdev->dev,
+ 				       sizeof(SVGACBHeader),
+@@ -1341,14 +1342,11 @@ struct vmw_cmdbuf_man *vmw_cmdbuf_man_cr
+ 	INIT_WORK(&man->work, &vmw_cmdbuf_work_func);
+ 	vmw_generic_waiter_add(dev_priv, SVGA_IRQFLAG_ERROR,
+ 			       &dev_priv->error_waiters);
+-	for_each_cmdbuf_ctx(man, i, ctx) {
+-		ret = vmw_cmdbuf_startstop(man, i, true);
+-		if (ret) {
+-			DRM_ERROR("Failed starting command buffer "
+-				  "context %u.\n", i);
+-			vmw_cmdbuf_man_destroy(man);
+-			return ERR_PTR(ret);
+-		}
++	ret = vmw_cmdbuf_startstop(man, 0, true);
++	if (ret) {
++		DRM_ERROR("Failed starting command buffer contexts\n");
++		vmw_cmdbuf_man_destroy(man);
++		return ERR_PTR(ret);
+ 	}
+ 
+ 	return man;
+@@ -1398,16 +1396,11 @@ void vmw_cmdbuf_remove_pool(struct vmw_c
+  */
+ void vmw_cmdbuf_man_destroy(struct vmw_cmdbuf_man *man)
+ {
+-	struct vmw_cmdbuf_context *ctx;
+-	unsigned int i;
+-
+ 	WARN_ON_ONCE(man->has_pool);
+ 	(void) vmw_cmdbuf_idle(man, false, 10*HZ);
+ 
+-	for_each_cmdbuf_ctx(man, i, ctx)
+-		if (vmw_cmdbuf_startstop(man, i, false))
+-			DRM_ERROR("Failed stopping command buffer "
+-				  "context %u.\n", i);
++	if (vmw_cmdbuf_startstop(man, 0, false))
++		DRM_ERROR("Failed stopping command buffer contexts.\n");
+ 
+ 	vmw_generic_waiter_remove(man->dev_priv, SVGA_IRQFLAG_ERROR,
+ 				  &man->dev_priv->error_waiters);
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -301,6 +301,8 @@ static void vmw_print_capabilities(uint3
+ 		DRM_INFO("  Guest Backed Resources.\n");
+ 	if (capabilities & SVGA_CAP_DX)
+ 		DRM_INFO("  DX Features.\n");
++	if (capabilities & SVGA_CAP_HP_CMD_QUEUE)
++		DRM_INFO("  HP Command Queue.\n");
+ }
+ 
+ /**
