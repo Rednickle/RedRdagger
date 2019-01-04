@@ -1,0 +1,220 @@
+From: Thierry Reding <treding@nvidia.com>
+Date: Thu, 12 Oct 2017 17:40:46 +0200
+Subject: drm/tegra: Use atomic commit helpers
+Git-commit: 31b02caea3b30b044fe39301aad34886f7fd2556
+Patch-mainline: v4.16-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+There's no reason not to use them, and they already get all the
+semantics right, so rip out all of the custom code and replace it by the
+helpers.
+
+Signed-off-by: Thierry Reding <treding@nvidia.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/tegra/dc.c  |   27 +++++++-----
+ drivers/gpu/drm/tegra/dc.h  |    2 
+ drivers/gpu/drm/tegra/drm.c |   99 ++++----------------------------------------
+ drivers/gpu/drm/tegra/drm.h |    6 --
+ 4 files changed, 27 insertions(+), 107 deletions(-)
+
+--- a/drivers/gpu/drm/tegra/dc.c
++++ b/drivers/gpu/drm/tegra/dc.c
+@@ -1648,8 +1648,8 @@ static void tegra_dc_finish_page_flip(st
+ {
+ 	struct drm_device *drm = dc->base.dev;
+ 	struct drm_crtc *crtc = &dc->base;
+-	unsigned long flags, base;
+-	struct tegra_bo *bo;
++	u64 base = 0, phys = 0;
++	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&drm->event_lock, flags);
+ 
+@@ -1658,19 +1658,24 @@ static void tegra_dc_finish_page_flip(st
+ 		return;
+ 	}
+ 
+-	bo = tegra_fb_get_plane(crtc->primary->fb, 0);
++	if (crtc->primary->fb) {
++		struct tegra_bo *bo = tegra_fb_get_plane(crtc->primary->fb, 0);
+ 
+-	spin_lock(&dc->lock);
++		phys = bo->paddr + crtc->primary->fb->offsets[0];
+ 
+-	/* check if new start address has been latched */
+-	tegra_dc_writel(dc, WINDOW_A_SELECT, DC_CMD_DISPLAY_WINDOW_HEADER);
+-	tegra_dc_writel(dc, READ_MUX, DC_CMD_STATE_ACCESS);
+-	base = tegra_dc_readl(dc, DC_WINBUF_START_ADDR);
+-	tegra_dc_writel(dc, 0, DC_CMD_STATE_ACCESS);
++		spin_lock(&dc->lock);
+ 
+-	spin_unlock(&dc->lock);
++		/* check if new start address has been latched */
++		tegra_dc_writel(dc, WINDOW_A_SELECT, DC_CMD_DISPLAY_WINDOW_HEADER);
++		tegra_dc_writel(dc, READ_MUX, DC_CMD_STATE_ACCESS);
++		base = (u64)tegra_dc_readl(dc, DC_WINBUF_START_ADDR_HI) << 32;
++		base |= tegra_dc_readl(dc, DC_WINBUF_START_ADDR);
++		tegra_dc_writel(dc, 0, DC_CMD_STATE_ACCESS);
+ 
+-	if (base == bo->paddr + crtc->primary->fb->offsets[0]) {
++		spin_unlock(&dc->lock);
++	}
++
++	if (base == phys) {
+ 		drm_crtc_send_vblank_event(crtc, dc->event);
+ 		drm_crtc_vblank_put(crtc);
+ 		dc->event = NULL;
+--- a/drivers/gpu/drm/tegra/dc.h
++++ b/drivers/gpu/drm/tegra/dc.h
+@@ -579,6 +579,8 @@ int tegra_dc_rgb_exit(struct tegra_dc *d
+ #define DC_WINBUF_SURFACE_KIND_BLOCK	(2 << 0)
+ #define DC_WINBUF_SURFACE_KIND_BLOCK_HEIGHT(x) (((x) & 0x7) << 4)
+ 
++#define DC_WINBUF_START_ADDR_HI			0x80d
++
+ #define DC_WINBUF_AD_UFLOW_STATUS		0xbca
+ #define DC_WINBUF_BD_UFLOW_STATUS		0xdca
+ #define DC_WINBUF_CD_UFLOW_STATUS		0xfca
+--- a/drivers/gpu/drm/tegra/drm.c
++++ b/drivers/gpu/drm/tegra/drm.c
+@@ -33,97 +33,18 @@ struct tegra_drm_file {
+ 	struct mutex lock;
+ };
+ 
+-static void tegra_atomic_schedule(struct tegra_drm *tegra,
+-				  struct drm_atomic_state *state)
+-{
+-	tegra->commit.state = state;
+-	schedule_work(&tegra->commit.work);
+-}
+-
+-static void tegra_atomic_complete(struct tegra_drm *tegra,
+-				  struct drm_atomic_state *state)
+-{
+-	struct drm_device *drm = tegra->drm;
+-
+-	/*
+-	 * Everything below can be run asynchronously without the need to grab
+-	 * any modeset locks at all under one condition: It must be guaranteed
+-	 * that the asynchronous work has either been cancelled (if the driver
+-	 * supports it, which at least requires that the framebuffers get
+-	 * cleaned up with drm_atomic_helper_cleanup_planes()) or completed
+-	 * before the new state gets committed on the software side with
+-	 * drm_atomic_helper_swap_state().
+-	 *
+-	 * This scheme allows new atomic state updates to be prepared and
+-	 * checked in parallel to the asynchronous completion of the previous
+-	 * update. Which is important since compositors need to figure out the
+-	 * composition of the next frame right after having submitted the
+-	 * current layout.
+-	 */
+-
+-	drm_atomic_helper_commit_modeset_disables(drm, state);
+-	drm_atomic_helper_commit_modeset_enables(drm, state);
+-	drm_atomic_helper_commit_planes(drm, state,
+-					DRM_PLANE_COMMIT_ACTIVE_ONLY);
+-
+-	drm_atomic_helper_wait_for_vblanks(drm, state);
+-
+-	drm_atomic_helper_cleanup_planes(drm, state);
+-	drm_atomic_state_put(state);
+-}
+-
+-static void tegra_atomic_work(struct work_struct *work)
+-{
+-	struct tegra_drm *tegra = container_of(work, struct tegra_drm,
+-					       commit.work);
+-
+-	tegra_atomic_complete(tegra, tegra->commit.state);
+-}
+-
+-static int tegra_atomic_commit(struct drm_device *drm,
+-			       struct drm_atomic_state *state, bool nonblock)
+-{
+-	struct tegra_drm *tegra = drm->dev_private;
+-	int err;
+-
+-	err = drm_atomic_helper_prepare_planes(drm, state);
+-	if (err)
+-		return err;
+-
+-	/* serialize outstanding nonblocking commits */
+-	mutex_lock(&tegra->commit.lock);
+-	flush_work(&tegra->commit.work);
+-
+-	/*
+-	 * This is the point of no return - everything below never fails except
+-	 * when the hw goes bonghits. Which means we can commit the new state on
+-	 * the software side now.
+-	 */
+-
+-	err = drm_atomic_helper_swap_state(state, true);
+-	if (err) {
+-		mutex_unlock(&tegra->commit.lock);
+-		drm_atomic_helper_cleanup_planes(drm, state);
+-		return err;
+-	}
+-
+-	drm_atomic_state_get(state);
+-	if (nonblock)
+-		tegra_atomic_schedule(tegra, state);
+-	else
+-		tegra_atomic_complete(tegra, state);
+-
+-	mutex_unlock(&tegra->commit.lock);
+-	return 0;
+-}
+-
+-static const struct drm_mode_config_funcs tegra_drm_mode_funcs = {
++static const struct drm_mode_config_funcs tegra_drm_mode_config_funcs = {
+ 	.fb_create = tegra_fb_create,
+ #ifdef CONFIG_DRM_FBDEV_EMULATION
+ 	.output_poll_changed = drm_fb_helper_output_poll_changed,
+ #endif
+ 	.atomic_check = drm_atomic_helper_check,
+-	.atomic_commit = tegra_atomic_commit,
++	.atomic_commit = drm_atomic_helper_commit,
++};
++
++static const struct drm_mode_config_helper_funcs
++tegra_drm_mode_config_helpers = {
++	.atomic_commit_tail = drm_atomic_helper_commit_tail_rpm,
+ };
+ 
+ static int tegra_drm_load(struct drm_device *drm, unsigned long flags)
+@@ -172,9 +93,6 @@ static int tegra_drm_load(struct drm_dev
+ 	mutex_init(&tegra->clients_lock);
+ 	INIT_LIST_HEAD(&tegra->clients);
+ 
+-	mutex_init(&tegra->commit.lock);
+-	INIT_WORK(&tegra->commit.work, tegra_atomic_work);
+-
+ 	drm->dev_private = tegra;
+ 	tegra->drm = drm;
+ 
+@@ -188,7 +106,8 @@ static int tegra_drm_load(struct drm_dev
+ 
+ 	drm->mode_config.allow_fb_modifiers = true;
+ 
+-	drm->mode_config.funcs = &tegra_drm_mode_funcs;
++	drm->mode_config.funcs = &tegra_drm_mode_config_funcs;
++	drm->mode_config.helper_private = &tegra_drm_mode_config_helpers;
+ 
+ 	err = tegra_drm_fb_prepare(drm);
+ 	if (err < 0)
+--- a/drivers/gpu/drm/tegra/drm.h
++++ b/drivers/gpu/drm/tegra/drm.h
+@@ -62,12 +62,6 @@ struct tegra_drm {
+ 
+ 	unsigned int pitch_align;
+ 
+-	struct {
+-		struct drm_atomic_state *state;
+-		struct work_struct work;
+-		struct mutex lock;
+-	} commit;
+-
+ 	struct drm_atomic_state *state;
+ };
+ 
