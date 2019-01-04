@@ -1,0 +1,227 @@
+From: Roger He <Hongbo.He@amd.com>
+Date: Mon, 5 Feb 2018 17:57:07 +0800
+Subject: drm/ttm: check if free mem space is under the lower limit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: ec3fe391bdb321b1629cfb0ddbb9fcc114b579bc
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+the free mem space and the lower limit both include two parts:
+system memory and swap space.
+
+For the OOM triggered by TTM, that is the case as below:
+first swap space is full of swapped out pages and soon
+system memory also is filled up with ttm pages. and then
+any memory allocation request will run into OOM.
+
+to cover two cases:
+a. if no swap disk at all or free swap space is under swap mem
+   limit but available system mem is bigger than sys mem limit,
+   allow TTM allocation;
+
+b. if the available system mem is less than sys mem limit but
+   free swap space is bigger than swap mem limit, allow TTM
+   allocation.
+
+v2: merge two memory limit(swap and system) into one
+v3: keep original behavior except ttm_opt_ctx->flags with
+    TTM_OPT_FLAG_FORCE_ALLOC
+v4: always set force_alloc as tx->flags & TTM_OPT_FLAG_FORCE_ALLOC
+v5: add an attribute for lower_mem_limit
+v6: set lower_mem_limit as 0 to keep original behavior
+
+Signed-off-by: Roger He <Hongbo.He@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/ttm/ttm_memory.c         |   93 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/ttm/ttm_page_alloc.c     |    3 +
+ drivers/gpu/drm/ttm/ttm_page_alloc_dma.c |    3 +
+ include/drm/ttm/ttm_memory.h             |    5 +
+ 4 files changed, 104 insertions(+)
+
+--- a/drivers/gpu/drm/ttm/ttm_memory.c
++++ b/drivers/gpu/drm/ttm/ttm_memory.c
+@@ -36,6 +36,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/swap.h>
+ 
+ #define TTM_MEMORY_ALLOC_RETRIES 4
+ 
+@@ -166,6 +167,54 @@ static struct kobj_type ttm_mem_zone_kob
+ 	.default_attrs = ttm_mem_zone_attrs,
+ };
+ 
++static struct attribute ttm_mem_global_lower_mem_limit = {
++	.name = "lower_mem_limit",
++	.mode = S_IRUGO | S_IWUSR
++};
++
++static ssize_t ttm_mem_global_show(struct kobject *kobj,
++				 struct attribute *attr,
++				 char *buffer)
++{
++	struct ttm_mem_global *glob =
++		container_of(kobj, struct ttm_mem_global, kobj);
++	uint64_t val = 0;
++
++	spin_lock(&glob->lock);
++	val = glob->lower_mem_limit;
++	spin_unlock(&glob->lock);
++	/* convert from number of pages to KB */
++	val <<= (PAGE_SHIFT - 10);
++	return snprintf(buffer, PAGE_SIZE, "%llu\n",
++			(unsigned long long) val);
++}
++
++static ssize_t ttm_mem_global_store(struct kobject *kobj,
++				  struct attribute *attr,
++				  const char *buffer,
++				  size_t size)
++{
++	int chars;
++	uint64_t val64;
++	unsigned long val;
++	struct ttm_mem_global *glob =
++		container_of(kobj, struct ttm_mem_global, kobj);
++
++	chars = sscanf(buffer, "%lu", &val);
++	if (chars == 0)
++		return size;
++
++	val64 = val;
++	/* convert from KB to number of pages */
++	val64 >>= (PAGE_SHIFT - 10);
++
++	spin_lock(&glob->lock);
++	glob->lower_mem_limit = val64;
++	spin_unlock(&glob->lock);
++
++	return size;
++}
++
+ static void ttm_mem_global_kobj_release(struct kobject *kobj)
+ {
+ 	struct ttm_mem_global *glob =
+@@ -174,8 +223,20 @@ static void ttm_mem_global_kobj_release(
+ 	kfree(glob);
+ }
+ 
++static struct attribute *ttm_mem_global_attrs[] = {
++	&ttm_mem_global_lower_mem_limit,
++	NULL
++};
++
++static const struct sysfs_ops ttm_mem_global_ops = {
++	.show = &ttm_mem_global_show,
++	.store = &ttm_mem_global_store,
++};
++
+ static struct kobj_type ttm_mem_glob_kobj_type = {
+ 	.release = &ttm_mem_global_kobj_release,
++	.sysfs_ops = &ttm_mem_global_ops,
++	.default_attrs = ttm_mem_global_attrs,
+ };
+ 
+ static bool ttm_zones_above_swap_target(struct ttm_mem_global *glob,
+@@ -375,6 +436,9 @@ int ttm_mem_global_init(struct ttm_mem_g
+ 
+ 	si_meminfo(&si);
+ 
++	/* set it as 0 by default to keep original behavior of OOM */
++	glob->lower_mem_limit = 0;
++
+ 	ret = ttm_mem_init_kernel_zone(glob, &si);
+ 	if (unlikely(ret != 0))
+ 		goto out_no_zone;
+@@ -469,6 +533,35 @@ void ttm_mem_global_free(struct ttm_mem_
+ }
+ EXPORT_SYMBOL(ttm_mem_global_free);
+ 
++/*
++ * check if the available mem is under lower memory limit
++ *
++ * a. if no swap disk at all or free swap space is under swap_mem_limit
++ * but available system mem is bigger than sys_mem_limit, allow TTM
++ * allocation;
++ *
++ * b. if the available system mem is less than sys_mem_limit but free
++ * swap disk is bigger than swap_mem_limit, allow TTM allocation.
++ */
++bool
++ttm_check_under_lowerlimit(struct ttm_mem_global *glob,
++			uint64_t num_pages,
++			struct ttm_operation_ctx *ctx)
++{
++	int64_t available;
++
++	if (ctx->flags & TTM_OPT_FLAG_FORCE_ALLOC)
++		return false;
++
++	available = get_nr_swap_pages() + si_mem_available();
++	available -= num_pages;
++	if (available < glob->lower_mem_limit)
++		return true;
++
++	return false;
++}
++EXPORT_SYMBOL(ttm_check_under_lowerlimit);
++
+ static int ttm_mem_global_reserve(struct ttm_mem_global *glob,
+ 				  struct ttm_mem_zone *single_zone,
+ 				  uint64_t amount, bool reserve)
+--- a/drivers/gpu/drm/ttm/ttm_page_alloc.c
++++ b/drivers/gpu/drm/ttm/ttm_page_alloc.c
+@@ -1100,6 +1100,9 @@ int ttm_pool_populate(struct ttm_tt *ttm
+ 	if (ttm->state != tt_unpopulated)
+ 		return 0;
+ 
++	if (ttm_check_under_lowerlimit(mem_glob, ttm->num_pages, ctx))
++		return -ENOMEM;
++
+ 	ret = ttm_get_pages(ttm->pages, ttm->num_pages, ttm->page_flags,
+ 			    ttm->caching_state);
+ 	if (unlikely(ret != 0)) {
+--- a/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
++++ b/drivers/gpu/drm/ttm/ttm_page_alloc_dma.c
+@@ -940,6 +940,9 @@ int ttm_dma_populate(struct ttm_dma_tt *
+ 	if (ttm->state != tt_unpopulated)
+ 		return 0;
+ 
++	if (ttm_check_under_lowerlimit(mem_glob, num_pages, ctx))
++		return -ENOMEM;
++
+ 	INIT_LIST_HEAD(&ttm_dma->pages_list);
+ 	i = 0;
+ 
+--- a/include/drm/ttm/ttm_memory.h
++++ b/include/drm/ttm/ttm_memory.h
+@@ -49,6 +49,8 @@
+  * @work: The workqueue callback for the shrink queue.
+  * @lock: Lock to protect the @shrink - and the memory accounting members,
+  * that is, essentially the whole structure with some exceptions.
++ * @lower_mem_limit: include lower limit of swap space and lower limit of
++ * system memory.
+  * @zones: Array of pointers to accounting zones.
+  * @num_zones: Number of populated entries in the @zones array.
+  * @zone_kernel: Pointer to the kernel zone.
+@@ -67,6 +69,7 @@ struct ttm_mem_global {
+ 	struct workqueue_struct *swap_queue;
+ 	struct work_struct work;
+ 	spinlock_t lock;
++	uint64_t lower_mem_limit;
+ 	struct ttm_mem_zone *zones[TTM_MEM_MAX_ZONES];
+ 	unsigned int num_zones;
+ 	struct ttm_mem_zone *zone_kernel;
+@@ -90,4 +93,6 @@ extern void ttm_mem_global_free_page(str
+ 				     struct page *page, uint64_t size);
+ extern size_t ttm_round_pot(size_t size);
+ extern uint64_t ttm_get_kernel_zone_memory_size(struct ttm_mem_global *glob);
++extern bool ttm_check_under_lowerlimit(struct ttm_mem_global *glob,
++			uint64_t num_pages, struct ttm_operation_ctx *ctx);
+ #endif
