@@ -1,0 +1,220 @@
+From: Jordan Crouse <jcrouse@codeaurora.org>
+Date: Thu, 27 Jul 2017 10:42:39 -0600
+Subject: drm/msm: Attach the GPU MMU when it is created
+Git-commit: 1267a4dfe045df42faea5fc1dfe379b480595406
+Patch-mainline: v4.14-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Currently the GPU MMU is attached in the adreno_gpu code but as
+more and more of the GPU initialization moves to the generic
+GPU path we have a need to map and use GPU memory earlier and
+earlier.  There isn't any reason to defer attaching the MMU
+until later so attach it right after the address space is
+created so it can be used immediately.
+
+Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c   |    5 -
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c |   27 +---------
+ drivers/gpu/drm/msm/msm_gpu.c           |   85 +++++++++++++++++++++-----------
+ 3 files changed, 62 insertions(+), 55 deletions(-)
+
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -817,10 +817,9 @@ static void a5xx_fault_detect_irq(struct
+ {
+ 	struct drm_device *dev = gpu->dev;
+ 	struct msm_drm_private *priv = dev->dev_private;
+-	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
+ 
+-	dev_err(dev->dev, "gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
+-		ring ? ring->id : -1, ring ? ring->seqno : 0,
++	dev_err(dev->dev, "gpu fault fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
++		gpu->funcs->last_fence(gpu),
+ 		gpu_read(gpu, REG_A5XX_RBBM_STATUS),
+ 		gpu_read(gpu, REG_A5XX_CP_RB_RPTR),
+ 		gpu_read(gpu, REG_A5XX_CP_RB_WPTR),
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -337,11 +337,6 @@ void adreno_wait_ring(struct msm_gpu *gp
+ 		DRM_ERROR("%s: timeout waiting for ringbuffer space\n", gpu->name);
+ }
+ 
+-static const char *iommu_ports[] = {
+-		"gfx3d_user", "gfx3d_priv",
+-		"gfx3d1_user", "gfx3d1_priv",
+-};
+-
+ int adreno_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+ 		struct adreno_gpu *adreno_gpu, const struct adreno_gpu_funcs *funcs)
+ {
+@@ -373,15 +368,15 @@ int adreno_gpu_init(struct drm_device *d
+ 
+ 	adreno_gpu_config.ringsz = RB_SIZE;
+ 
++	pm_runtime_set_autosuspend_delay(&pdev->dev, DRM_MSM_INACTIVE_PERIOD);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
++
+ 	ret = msm_gpu_init(drm, pdev, &adreno_gpu->base, &funcs->base,
+ 			adreno_gpu->info->name, &adreno_gpu_config);
+ 	if (ret)
+ 		return ret;
+ 
+-	pm_runtime_set_autosuspend_delay(&pdev->dev, DRM_MSM_INACTIVE_PERIOD);
+-	pm_runtime_use_autosuspend(&pdev->dev);
+-	pm_runtime_enable(&pdev->dev);
+-
+ 	ret = request_firmware(&adreno_gpu->pm4, adreno_gpu->info->pm4fw, drm->dev);
+ 	if (ret) {
+ 		dev_err(drm->dev, "failed to load %s PM4 firmware: %d\n",
+@@ -396,14 +391,6 @@ int adreno_gpu_init(struct drm_device *d
+ 		return ret;
+ 	}
+ 
+-	if (gpu->aspace && gpu->aspace->mmu) {
+-		struct msm_mmu *mmu = gpu->aspace->mmu;
+-		ret = mmu->funcs->attach(mmu, iommu_ports,
+-				ARRAY_SIZE(iommu_ports));
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	adreno_gpu->memptrs_bo = msm_gem_new(drm, sizeof(*adreno_gpu->memptrs),
+ 			MSM_BO_UNCACHED);
+ 	if (IS_ERR(adreno_gpu->memptrs_bo)) {
+@@ -446,10 +433,4 @@ void adreno_gpu_cleanup(struct adreno_gp
+ 	release_firmware(adreno_gpu->pfp);
+ 
+ 	msm_gpu_cleanup(gpu);
+-
+-	if (gpu->aspace) {
+-		gpu->aspace->mmu->funcs->detach(gpu->aspace->mmu,
+-			iommu_ports, ARRAY_SIZE(iommu_ports));
+-		msm_gem_address_space_put(gpu->aspace);
+-	}
+ }
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -562,11 +562,49 @@ static int get_clocks(struct platform_de
+ 	return 0;
+ }
+ 
++static struct msm_gem_address_space *
++msm_gpu_create_address_space(struct msm_gpu *gpu, struct platform_device *pdev,
++		uint64_t va_start, uint64_t va_end)
++{
++	struct iommu_domain *iommu;
++	struct msm_gem_address_space *aspace;
++	int ret;
++
++	/*
++	 * Setup IOMMU.. eventually we will (I think) do this once per context
++	 * and have separate page tables per context.  For now, to keep things
++	 * simple and to get something working, just use a single address space:
++	 */
++	iommu = iommu_domain_alloc(&platform_bus_type);
++	if (!iommu)
++		return NULL;
++
++	iommu->geometry.aperture_start = va_start;
++	iommu->geometry.aperture_end = va_end;
++
++	dev_info(gpu->dev->dev, "%s: using IOMMU\n", gpu->name);
++
++	aspace = msm_gem_address_space_create(&pdev->dev, iommu, "gpu");
++	if (IS_ERR(aspace)) {
++		dev_err(gpu->dev->dev, "failed to init iommu: %ld\n",
++			PTR_ERR(aspace));
++		iommu_domain_free(iommu);
++		return ERR_CAST(aspace);
++	}
++
++	ret = aspace->mmu->funcs->attach(aspace->mmu, NULL, 0);
++	if (ret) {
++		msm_gem_address_space_put(aspace);
++		return ERR_PTR(ret);
++	}
++
++	return aspace;
++}
++
+ int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
+ 		struct msm_gpu *gpu, const struct msm_gpu_funcs *funcs,
+ 		const char *name, struct msm_gpu_config *config)
+ {
+-	struct iommu_domain *iommu;
+ 	int ret;
+ 
+ 	if (WARN_ON(gpu->num_perfcntrs > ARRAY_SIZE(gpu->last_cntrs)))
+@@ -636,28 +674,19 @@ int msm_gpu_init(struct drm_device *drm,
+ 	if (IS_ERR(gpu->gpu_cx))
+ 		gpu->gpu_cx = NULL;
+ 
+-	/* Setup IOMMU.. eventually we will (I think) do this once per context
+-	 * and have separate page tables per context.  For now, to keep things
+-	 * simple and to get something working, just use a single address space:
+-	 */
+-	iommu = iommu_domain_alloc(&platform_bus_type);
+-	if (iommu) {
+-		iommu->geometry.aperture_start = config->va_start;
+-		iommu->geometry.aperture_end = config->va_end;
+-
+-		dev_info(drm->dev, "%s: using IOMMU\n", name);
+-		gpu->aspace = msm_gem_address_space_create(&pdev->dev,
+-				iommu, "gpu");
+-		if (IS_ERR(gpu->aspace)) {
+-			ret = PTR_ERR(gpu->aspace);
+-			dev_err(drm->dev, "failed to init iommu: %d\n", ret);
+-			gpu->aspace = NULL;
+-			iommu_domain_free(iommu);
+-			goto fail;
+-		}
++	gpu->pdev = pdev;
++	platform_set_drvdata(pdev, gpu);
++
++	bs_init(gpu);
+ 
+-	} else {
++	gpu->aspace = msm_gpu_create_address_space(gpu, pdev,
++		config->va_start, config->va_end);
++
++	if (gpu->aspace == NULL)
+ 		dev_info(drm->dev, "%s: no IOMMU, fallback to VRAM carveout!\n", name);
++	else if (IS_ERR(gpu->aspace)) {
++		ret = PTR_ERR(gpu->aspace);
++		goto fail;
+ 	}
+ 
+ 	/* Create ringbuffer: */
+@@ -669,14 +698,10 @@ int msm_gpu_init(struct drm_device *drm,
+ 		goto fail;
+ 	}
+ 
+-	gpu->pdev = pdev;
+-	platform_set_drvdata(pdev, gpu);
+-
+-	bs_init(gpu);
+-
+ 	return 0;
+ 
+ fail:
++	platform_set_drvdata(pdev, NULL);
+ 	return ret;
+ }
+ 
+@@ -693,7 +718,9 @@ void msm_gpu_cleanup(struct msm_gpu *gpu
+ 			msm_gem_put_iova(gpu->rb->bo, gpu->aspace);
+ 		msm_ringbuffer_destroy(gpu->rb);
+ 	}
+-
+-	if (gpu->fctx)
+-		msm_fence_context_free(gpu->fctx);
++	if (gpu->aspace) {
++		gpu->aspace->mmu->funcs->detach(gpu->aspace->mmu,
++			NULL, 0);
++		msm_gem_address_space_put(gpu->aspace);
++	}
+ }
