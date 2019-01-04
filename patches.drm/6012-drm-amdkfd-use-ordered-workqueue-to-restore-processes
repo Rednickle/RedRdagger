@@ -1,0 +1,134 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 23 Mar 2018 15:30:36 -0400
+Subject: drm/amdkfd: Use ordered workqueue to restore processes
+Git-commit: 1679ae8f8f4148766423066aeb3dbb0a985a373a
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Restoring multiple processes concurrently can lead to live-locks
+where each process prevents the other from validating all its BOs.
+
+v2: fix duplicate check of same variable
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_module.c  |    6 +++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |    2 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c |   30 ++++++++++++++++++++++++++----
+ 3 files changed, 32 insertions(+), 6 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_module.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+@@ -133,7 +133,9 @@ static int __init kfd_module_init(void)
+ 	if (err < 0)
+ 		goto err_topology;
+ 
+-	kfd_process_create_wq();
++	err = kfd_process_create_wq();
++	if (err < 0)
++		goto err_create_wq;
+ 
+ 	kfd_debugfs_init();
+ 
+@@ -143,6 +145,8 @@ static int __init kfd_module_init(void)
+ 
+ 	return 0;
+ 
++err_create_wq:
++	kfd_topology_shutdown();
+ err_topology:
+ 	kfd_chardev_exit();
+ err_ioctl:
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -674,7 +674,7 @@ struct amdkfd_ioctl_desc {
+ 	const char *name;
+ };
+ 
+-void kfd_process_create_wq(void);
++int kfd_process_create_wq(void);
+ void kfd_process_destroy_wq(void);
+ struct kfd_process *kfd_create_process(struct file *filep);
+ struct kfd_process *kfd_get_process(const struct task_struct *);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -48,8 +48,17 @@ static DEFINE_MUTEX(kfd_processes_mutex)
+ 
+ DEFINE_SRCU(kfd_processes_srcu);
+ 
++/* For process termination handling */
+ static struct workqueue_struct *kfd_process_wq;
+ 
++/* Ordered, single-threaded workqueue for restoring evicted
++ * processes. Restoring multiple processes concurrently under memory
++ * pressure can lead to processes blocking each other from validating
++ * their BOs and result in a live-lock situation where processes
++ * remain evicted indefinitely.
++ */
++static struct workqueue_struct *kfd_restore_wq;
++
+ static struct kfd_process *find_process(const struct task_struct *thread);
+ static void kfd_process_ref_release(struct kref *ref);
+ static struct kfd_process *create_process(const struct task_struct *thread,
+@@ -59,10 +68,19 @@ static void evict_process_worker(struct
+ static void restore_process_worker(struct work_struct *work);
+ 
+ 
+-void kfd_process_create_wq(void)
++int kfd_process_create_wq(void)
+ {
+ 	if (!kfd_process_wq)
+ 		kfd_process_wq = alloc_workqueue("kfd_process_wq", 0, 0);
++	if (!kfd_restore_wq)
++		kfd_restore_wq = alloc_ordered_workqueue("kfd_restore_wq", 0);
++
++	if (!kfd_process_wq || !kfd_restore_wq) {
++		kfd_process_destroy_wq();
++		return -ENOMEM;
++	}
++
++	return 0;
+ }
+ 
+ void kfd_process_destroy_wq(void)
+@@ -71,6 +89,10 @@ void kfd_process_destroy_wq(void)
+ 		destroy_workqueue(kfd_process_wq);
+ 		kfd_process_wq = NULL;
+ 	}
++	if (kfd_restore_wq) {
++		destroy_workqueue(kfd_restore_wq);
++		kfd_restore_wq = NULL;
++	}
+ }
+ 
+ static void kfd_process_free_gpuvm(struct kgd_mem *mem,
+@@ -869,7 +891,7 @@ static void evict_process_worker(struct
+ 		dma_fence_signal(p->ef);
+ 		dma_fence_put(p->ef);
+ 		p->ef = NULL;
+-		schedule_delayed_work(&p->restore_work,
++		queue_delayed_work(kfd_restore_wq, &p->restore_work,
+ 				msecs_to_jiffies(PROCESS_RESTORE_TIME_MS));
+ 
+ 		pr_debug("Finished evicting pasid %d\n", p->pasid);
+@@ -918,7 +940,7 @@ static void restore_process_worker(struc
+ 	if (ret) {
+ 		pr_debug("Failed to restore BOs of pasid %d, retry after %d ms\n",
+ 			 p->pasid, PROCESS_BACK_OFF_TIME_MS);
+-		ret = schedule_delayed_work(&p->restore_work,
++		ret = queue_delayed_work(kfd_restore_wq, &p->restore_work,
+ 				msecs_to_jiffies(PROCESS_BACK_OFF_TIME_MS));
+ 		WARN(!ret, "reschedule restore work failed\n");
+ 		return;
+@@ -957,7 +979,7 @@ int kfd_resume_all_processes(void)
+ 	int ret = 0, idx = srcu_read_lock(&kfd_processes_srcu);
+ 
+ 	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
+-		if (!schedule_delayed_work(&p->restore_work, 0)) {
++		if (!queue_delayed_work(kfd_restore_wq, &p->restore_work, 0)) {
+ 			pr_err("Restore process %d failed during resume\n",
+ 			       p->pasid);
+ 			ret = -EFAULT;
