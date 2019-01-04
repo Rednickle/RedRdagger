@@ -1,0 +1,112 @@
+From 81c0ed21aa91230ab6c0de945155aa5c0626d001 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 11 Sep 2017 09:41:26 +0100
+Subject: [PATCH] drm/i915/fence: Avoid del_timer_sync() from inside a timer
+Git-commit: 81c0ed21aa91230ab6c0de945155aa5c0626d001
+Patch-mainline: v4.15-rc1
+References: FATE#322643 bsc#1055900
+
+A fence may be signaled from any context, including from inside a timer.
+One example is timer_i915_sw_fence_wake() which is used to provide a
+safety-net when waiting on an external fence. If the external fence is
+not signaled within a timely fashion, we signal our fence on its behalf,
+and so we then may process subsequent fences in the chain from within
+that timer context.
+
+Given that dma_i915_sw_fence_wake() may be from inside a timer, we cannot
+then use del_timer_sync() as that requires the timer lock for itself. To
+circumvent this, while trying to keep the signal propagation as low
+latency as possible, move the completion into a worker and use a bit of
+atomic switheroo to serialise the timer-callback and the dma-callback.
+
+Testcase: igt/gem_eio/in-flight-external
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170911084135.22903-3-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/Kconfig         |    1 +
+ drivers/gpu/drm/i915/i915_sw_fence.c |   27 +++++++++++++++++++++------
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+--- a/drivers/gpu/drm/i915/Kconfig
++++ b/drivers/gpu/drm/i915/Kconfig
+@@ -12,6 +12,7 @@ config DRM_I915
+ 	select DRM_PANEL
+ 	select DRM_MIPI_DSI
+ 	select RELAY
++	select IRQ_WORK
+ 	# i915 depends on ACPI_VIDEO when ACPI is enabled
+ 	# but for select to work, need to select ACPI_VIDEO's dependencies, ick
+ 	select BACKLIGHT_LCD_SUPPORT if ACPI
+--- a/drivers/gpu/drm/i915/i915_sw_fence.c
++++ b/drivers/gpu/drm/i915/i915_sw_fence.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/slab.h>
+ #include <linux/dma-fence.h>
++#include <linux/irq_work.h>
+ #include <linux/reservation.h>
+ 
+ #include "i915_sw_fence.h"
+@@ -356,31 +357,44 @@ struct i915_sw_dma_fence_cb {
+ 	struct i915_sw_fence *fence;
+ 	struct dma_fence *dma;
+ 	struct timer_list timer;
++	struct irq_work work;
+ };
+ 
+ static void timer_i915_sw_fence_wake(unsigned long data)
+ {
+ 	struct i915_sw_dma_fence_cb *cb = (struct i915_sw_dma_fence_cb *)data;
++	struct i915_sw_fence *fence;
++
++	fence = xchg(&cb->fence, NULL);
++	if (!fence)
++		return;
+ 
+ 	pr_warn("asynchronous wait on fence %s:%s:%x timed out\n",
+ 		cb->dma->ops->get_driver_name(cb->dma),
+ 		cb->dma->ops->get_timeline_name(cb->dma),
+ 		cb->dma->seqno);
+-	dma_fence_put(cb->dma);
+-	cb->dma = NULL;
+ 
+-	i915_sw_fence_complete(cb->fence);
+-	cb->timer.function = NULL;
++	i915_sw_fence_complete(fence);
+ }
+ 
+ static void dma_i915_sw_fence_wake(struct dma_fence *dma,
+ 				   struct dma_fence_cb *data)
+ {
+ 	struct i915_sw_dma_fence_cb *cb = container_of(data, typeof(*cb), base);
++	struct i915_sw_fence *fence;
++
++	fence = xchg(&cb->fence, NULL);
++	if (fence)
++		i915_sw_fence_complete(fence);
++
++	irq_work_queue(&cb->work);
++}
++
++static void irq_i915_sw_fence_work(struct irq_work *wrk)
++{
++	struct i915_sw_dma_fence_cb *cb = container_of(wrk, typeof(*cb), work);
+ 
+ 	del_timer_sync(&cb->timer);
+-	if (cb->timer.function)
+-		i915_sw_fence_complete(cb->fence);
+ 	dma_fence_put(cb->dma);
+ 
+ 	kfree(cb);
+@@ -414,6 +428,7 @@ int i915_sw_fence_await_dma_fence(struct
+ 	__setup_timer(&cb->timer,
+ 		      timer_i915_sw_fence_wake, (unsigned long)cb,
+ 		      TIMER_IRQSAFE);
++	init_irq_work(&cb->work, irq_i915_sw_fence_work);
+ 	if (timeout) {
+ 		cb->dma = dma_fence_get(dma);
+ 		mod_timer(&cb->timer, round_jiffies_up(jiffies + timeout));
