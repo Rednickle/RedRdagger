@@ -1,0 +1,208 @@
+From 0e86cc9ccc3bf557348befaddf5cb613cf3c4458 Mon Sep 17 00:00:00 2001
+From: Changbin Du <changbin.du@intel.com>
+Date: Thu, 4 May 2017 10:52:38 +0800
+Subject: [PATCH] drm/i915/gvt: implement per-vm mmio switching optimization
+Git-commit: 0e86cc9ccc3bf557348befaddf5cb613cf3c4458
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+Commit ab9da627906a ("drm/i915: make context status notifier head be
+per engine") gives us a chance to inspect every single request. Then
+we can eliminate unnecessary mmio switching for same vGPU. We only
+need mmio switching for different VMs (including host).
+
+This patch introduced a new general API intel_gvt_switch_mmio() to
+replace the old intel_gvt_load/restore_render_mmio(). This function
+can be further optimized for vGPU to vGPU switching.
+
+To support individual ring switch, we track the owner who occupy
+each ring. When another VM or host request a ring we do the mmio
+context switching. Otherwise no need to switch the ring.
+
+This optimization is very useful if only one guest has plenty of
+workloads and the host is mostly idle. The best case is no mmio
+switching will happen.
+
+V2: o fix missing ring switch issue. (chuanxiao)  o support individual ring switch.
+
+Signed-off-by: Changbin Du <changbin.du@intel.com>
+Reviewed-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/gvt/gvt.c          |    2 -
+ drivers/gpu/drm/i915/gvt/render.c       |   35 ++++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/gvt/render.h       |    4 +--
+ drivers/gpu/drm/i915/gvt/sched_policy.c |   12 ++++++++++
+ drivers/gpu/drm/i915/gvt/scheduler.c    |   35 +++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/gvt/scheduler.h    |    4 +++
+ 6 files changed, 80 insertions(+), 12 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/gvt.c
++++ b/drivers/gpu/drm/i915/gvt/gvt.c
+@@ -244,7 +244,7 @@ int intel_gvt_init_device(struct drm_i91
+ 	gvt_dbg_core("init gvt device\n");
+ 
+ 	idr_init(&gvt->vgpu_idr);
+-
++	spin_lock_init(&gvt->scheduler.mmio_context_lock);
+ 	mutex_init(&gvt->lock);
+ 	gvt->dev_priv = dev_priv;
+ 
+--- a/drivers/gpu/drm/i915/gvt/render.c
++++ b/drivers/gpu/drm/i915/gvt/render.c
+@@ -260,7 +260,8 @@ static void restore_mocs(struct intel_vg
+ 
+ #define CTX_CONTEXT_CONTROL_VAL	0x03
+ 
+-void intel_gvt_load_render_mmio(struct intel_vgpu *vgpu, int ring_id)
++/* Switch ring mmio values (context) from host to a vgpu. */
++static void switch_mmio_to_vgpu(struct intel_vgpu *vgpu, int ring_id)
+ {
+ 	struct drm_i915_private *dev_priv = vgpu->gvt->dev_priv;
+ 	struct render_mmio *mmio;
+@@ -312,7 +313,8 @@ void intel_gvt_load_render_mmio(struct i
+ 	handle_tlb_pending_event(vgpu, ring_id);
+ }
+ 
+-void intel_gvt_restore_render_mmio(struct intel_vgpu *vgpu, int ring_id)
++/* Switch ring mmio values (context) from vgpu to host. */
++static void switch_mmio_to_host(struct intel_vgpu *vgpu, int ring_id)
+ {
+ 	struct drm_i915_private *dev_priv = vgpu->gvt->dev_priv;
+ 	struct render_mmio *mmio;
+@@ -351,3 +353,32 @@ void intel_gvt_restore_render_mmio(struc
+ 				mmio->value, v);
+ 	}
+ }
++
++/**
++ * intel_gvt_switch_render_mmio - switch mmio context of specific engine
++ * @pre: the last vGPU that own the engine
++ * @next: the vGPU to switch to
++ * @ring_id: specify the engine
++ *
++ * If pre is null indicates that host own the engine. If next is null
++ * indicates that we are switching to host workload.
++ */
++void intel_gvt_switch_mmio(struct intel_vgpu *pre,
++			   struct intel_vgpu *next, int ring_id)
++{
++	if (WARN_ON(!pre && !next))
++		return;
++
++	gvt_dbg_render("switch ring %d from %s to %s\n", ring_id,
++		       pre ? "vGPU" : "host", next ? "vGPU" : "HOST");
++
++	/**
++	 * TODO: Optimize for vGPU to vGPU switch by merging
++	 * switch_mmio_to_host() and switch_mmio_to_vgpu().
++	 */
++	if (pre)
++		switch_mmio_to_host(pre, ring_id);
++
++	if (next)
++		switch_mmio_to_vgpu(next, ring_id);
++}
+--- a/drivers/gpu/drm/i915/gvt/render.h
++++ b/drivers/gpu/drm/i915/gvt/render.h
+@@ -36,8 +36,8 @@
+ #ifndef __GVT_RENDER_H__
+ #define __GVT_RENDER_H__
+ 
+-void intel_gvt_load_render_mmio(struct intel_vgpu *vgpu, int ring_id);
++void intel_gvt_switch_mmio(struct intel_vgpu *pre,
++			   struct intel_vgpu *next, int ring_id);
+ 
+-void intel_gvt_restore_render_mmio(struct intel_vgpu *vgpu, int ring_id);
+ 
+ #endif
+--- a/drivers/gpu/drm/i915/gvt/sched_policy.c
++++ b/drivers/gpu/drm/i915/gvt/sched_policy.c
+@@ -303,8 +303,20 @@ static int tbs_sched_init_vgpu(struct in
+ 
+ static void tbs_sched_clean_vgpu(struct intel_vgpu *vgpu)
+ {
++	struct intel_gvt_workload_scheduler *scheduler = &vgpu->gvt->scheduler;
++	int ring_id;
++
+ 	kfree(vgpu->sched_data);
+ 	vgpu->sched_data = NULL;
++
++	spin_lock_bh(&scheduler->mmio_context_lock);
++	for (ring_id = 0; ring_id < I915_NUM_ENGINES; ring_id++) {
++		if (scheduler->engine_owner[ring_id] == vgpu) {
++			intel_gvt_switch_mmio(vgpu, NULL, ring_id);
++			scheduler->engine_owner[ring_id] = NULL;
++		}
++	}
++	spin_unlock_bh(&scheduler->mmio_context_lock);
+ }
+ 
+ static void tbs_sched_start_schedule(struct intel_vgpu *vgpu)
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -138,21 +138,42 @@ static int shadow_context_status_change(
+ 	struct intel_gvt *gvt = container_of(nb, struct intel_gvt,
+ 				shadow_ctx_notifier_block[req->engine->id]);
+ 	struct intel_gvt_workload_scheduler *scheduler = &gvt->scheduler;
+-	struct intel_vgpu_workload *workload =
+-		scheduler->current_workload[req->engine->id];
++	enum intel_engine_id ring_id = req->engine->id;
++	struct intel_vgpu_workload *workload;
+ 
+-	if (!is_gvt_request(req) || unlikely(!workload))
++	if (!is_gvt_request(req)) {
++		spin_lock_bh(&scheduler->mmio_context_lock);
++		if (action == INTEL_CONTEXT_SCHEDULE_IN &&
++		    scheduler->engine_owner[ring_id]) {
++			/* Switch ring from vGPU to host. */
++			intel_gvt_switch_mmio(scheduler->engine_owner[ring_id],
++					      NULL, ring_id);
++			scheduler->engine_owner[ring_id] = NULL;
++		}
++		spin_unlock_bh(&scheduler->mmio_context_lock);
++
++		return NOTIFY_OK;
++	}
++
++	workload = scheduler->current_workload[ring_id];
++	if (unlikely(!workload))
+ 		return NOTIFY_OK;
+ 
+ 	switch (action) {
+ 	case INTEL_CONTEXT_SCHEDULE_IN:
+-		intel_gvt_load_render_mmio(workload->vgpu,
+-					   workload->ring_id);
++		spin_lock_bh(&scheduler->mmio_context_lock);
++		if (workload->vgpu != scheduler->engine_owner[ring_id]) {
++			/* Switch ring from host to vGPU or vGPU to vGPU. */
++			intel_gvt_switch_mmio(scheduler->engine_owner[ring_id],
++					      workload->vgpu, ring_id);
++			scheduler->engine_owner[ring_id] = workload->vgpu;
++		} else
++			gvt_dbg_sched("skip ring %d mmio switch for vgpu%d\n",
++				      ring_id, workload->vgpu->id);
++		spin_unlock_bh(&scheduler->mmio_context_lock);
+ 		atomic_set(&workload->shadow_ctx_active, 1);
+ 		break;
+ 	case INTEL_CONTEXT_SCHEDULE_OUT:
+-		intel_gvt_restore_render_mmio(workload->vgpu,
+-					      workload->ring_id);
+ 		/* If the status is -EINPROGRESS means this workload
+ 		 * doesn't meet any issue during dispatching so when
+ 		 * get the SCHEDULE_OUT set the status to be zero for
+--- a/drivers/gpu/drm/i915/gvt/scheduler.h
++++ b/drivers/gpu/drm/i915/gvt/scheduler.h
+@@ -42,6 +42,10 @@ struct intel_gvt_workload_scheduler {
+ 	struct intel_vgpu_workload *current_workload[I915_NUM_ENGINES];
+ 	bool need_reschedule;
+ 
++	spinlock_t mmio_context_lock;
++	/* can be null when owner is host */
++	struct intel_vgpu *engine_owner[I915_NUM_ENGINES];
++
+ 	wait_queue_head_t workload_complete_wq;
+ 	struct task_struct *thread[I915_NUM_ENGINES];
+ 	wait_queue_head_t waitq[I915_NUM_ENGINES];
