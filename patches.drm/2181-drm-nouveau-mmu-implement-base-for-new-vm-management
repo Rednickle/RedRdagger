@@ -1,0 +1,533 @@
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Nov 2017 03:56:19 +1000
+Subject: drm/nouveau/mmu: implement base for new vm management
+Git-commit: 806a7335653743a33f476a3705d55bada95b7dfe
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This is the first chunk of the new VMM code that provides the structures
+needed to describe a GPU virtual address-space layout, as well as common
+interfaces to handle VMM creation, and connecting instances to a VMM.
+
+The constructor now allocates the PD itself, rather than having the user
+handle that manually.  This won't/can't be used until after all backends
+have been ported to these interfaces, so a little bit of memory will be
+wasted on Fermi and newer for a couple of commits in the series.
+
+Compatibility has been hacked into the old code to allow each GPU backend
+to be ported individually.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/nouveau/include/nvif/class.h      |    2 
+ drivers/gpu/drm/nouveau/include/nvif/if000c.h     |    3 
+ drivers/gpu/drm/nouveau/include/nvkm/subdev/mmu.h |   16 +-
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/Kbuild    |    2 
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/base.c    |   76 +++++++++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/nv04.c    |    4 
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/priv.h    |    8 +
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c     |  147 ++++++++++++++++++++++
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h     |  111 ++++++++++++++++
+ 9 files changed, 350 insertions(+), 19 deletions(-)
+
+--- a/drivers/gpu/drm/nouveau/include/nvif/class.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/class.h
+@@ -14,6 +14,8 @@
+ #define NVIF_CLASS_SW_NV50                           /* if0005.h */ -0x00000006
+ #define NVIF_CLASS_SW_GF100                          /* if0005.h */ -0x00000007
+ 
++#define NVIF_CLASS_VMM                               /* if000c.h */  0x0000000c
++
+ /* the below match nvidia-assigned (either in hw, or sw) class numbers */
+ #define NV_NULL_CLASS                                                0x00000030
+ 
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/include/nvif/if000c.h
+@@ -0,0 +1,3 @@
++#ifndef __NVIF_IF000C_H__
++#define __NVIF_IF000C_H__
++#endif
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/mmu.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/mmu.h
+@@ -26,20 +26,28 @@ struct nvkm_vma {
+ };
+ 
+ struct nvkm_vm {
++	const struct nvkm_vmm_func *func;
+ 	struct nvkm_mmu *mmu;
+-
++	const char *name;
++	struct kref kref;
+ 	struct mutex mutex;
++
++	u64 start;
++	u64 limit;
++
++	struct nvkm_vmm_pt *pd;
++	u16 pd_offset;
++	struct list_head join;
++
+ 	struct nvkm_mm mm;
+ 	struct kref refcount;
+-
+ 	struct list_head pgd_list;
+-	atomic_t engref[NVKM_SUBDEV_NR];
+-
+ 	struct nvkm_vm_pgt *pgt;
+ 	u32 fpde;
+ 	u32 lpde;
+ 
+ 	bool bootstrapped;
++	atomic_t engref[NVKM_SUBDEV_NR];
+ };
+ 
+ int  nvkm_vm_new(struct nvkm_device *, u64 offset, u64 length, u64 mm_offset,
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/Kbuild
+@@ -11,3 +11,5 @@ nvkm-y += nvkm/subdev/mmu/gm200.o
+ nvkm-y += nvkm/subdev/mmu/gm20b.o
+ nvkm-y += nvkm/subdev/mmu/gp100.o
+ nvkm-y += nvkm/subdev/mmu/gp10b.o
++
++nvkm-y += nvkm/subdev/mmu/vmm.o
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/base.c
+@@ -22,6 +22,7 @@
+  * Authors: Ben Skeggs
+  */
+ #include "priv.h"
++#include "vmm.h"
+ 
+ #include <core/gpuobj.h>
+ #include <subdev/fb.h>
+@@ -584,22 +585,14 @@ nvkm_vm_boot(struct nvkm_vm *vm, u64 siz
+ 	return ret;
+ }
+ 
+-int
+-nvkm_vm_create(struct nvkm_mmu *mmu, u64 offset, u64 length, u64 mm_offset,
+-	       u32 block, struct lock_class_key *key, struct nvkm_vm **pvm)
++static int
++nvkm_vm_legacy(struct nvkm_mmu *mmu, u64 offset, u64 length, u64 mm_offset,
++	       u32 block, struct nvkm_vm *vm)
+ {
+-	static struct lock_class_key _key;
+-	struct nvkm_vm *vm;
+ 	u64 mm_length = (offset + length) - mm_offset;
+ 	int ret;
+ 
+-	vm = kzalloc(sizeof(*vm), GFP_KERNEL);
+-	if (!vm)
+-		return -ENOMEM;
+-
+-	__mutex_init(&vm->mutex, "&vm->mutex", key ? key : &_key);
+ 	INIT_LIST_HEAD(&vm->pgd_list);
+-	vm->mmu = mmu;
+ 	kref_init(&vm->refcount);
+ 	vm->fpde = offset >> (mmu->func->pgt_bits + 12);
+ 	vm->lpde = (offset + length - 1) >> (mmu->func->pgt_bits + 12);
+@@ -610,16 +603,41 @@ nvkm_vm_create(struct nvkm_mmu *mmu, u64
+ 		return -ENOMEM;
+ 	}
+ 
++	if (block > length)
++		block = length;
++
+ 	ret = nvkm_mm_init(&vm->mm, 0, mm_offset >> 12, mm_length >> 12,
+ 			   block >> 12);
+ 	if (ret) {
+ 		vfree(vm->pgt);
++		return ret;
++	}
++
++	return 0;
++}
++
++int
++nvkm_vm_create(struct nvkm_mmu *mmu, u64 offset, u64 length, u64 mm_offset,
++	       u32 block, struct lock_class_key *key, struct nvkm_vm **pvm)
++{
++	static struct lock_class_key _key;
++	struct nvkm_vm *vm;
++	int ret;
++
++	vm = kzalloc(sizeof(*vm), GFP_KERNEL);
++	if (!vm)
++		return -ENOMEM;
++
++	__mutex_init(&vm->mutex, "&vm->mutex", key ? key : &_key);
++	vm->mmu = mmu;
++
++	ret = nvkm_vm_legacy(mmu, offset, length, mm_offset, block, vm);
++	if (ret) {
+ 		kfree(vm);
+ 		return ret;
+ 	}
+ 
+ 	*pvm = vm;
+-
+ 	return 0;
+ }
+ 
+@@ -628,8 +646,29 @@ nvkm_vm_new(struct nvkm_device *device,
+ 	    struct lock_class_key *key, struct nvkm_vm **pvm)
+ {
+ 	struct nvkm_mmu *mmu = device->mmu;
++
++	*pvm = NULL;
++	if (mmu->func->vmm.ctor) {
++		int ret = mmu->func->vmm.ctor(mmu, mm_offset,
++					      offset + length - mm_offset,
++					      NULL, 0, key, "legacy", pvm);
++		if (ret) {
++			nvkm_vm_ref(NULL, pvm, NULL);
++			return ret;
++		}
++
++		ret = nvkm_vm_legacy(mmu, offset, length, mm_offset,
++				     (*pvm)->func->page_block ?
++				     (*pvm)->func->page_block : 4096, *pvm);
++		if (ret)
++			nvkm_vm_ref(NULL, pvm, NULL);
++
++		return ret;
++	}
++
+ 	if (!mmu->func->create)
+ 		return -EINVAL;
++
+ 	return mmu->func->create(mmu, offset, length, mm_offset, key, pvm);
+ }
+ 
+@@ -688,6 +727,9 @@ nvkm_vm_del(struct kref *kref)
+ 
+ 	nvkm_mm_fini(&vm->mm);
+ 	vfree(vm->pgt);
++
++	if (vm->func)
++		nvkm_vmm_dtor(vm);
+ 	kfree(vm);
+ }
+ 
+@@ -717,8 +759,17 @@ static int
+ nvkm_mmu_oneinit(struct nvkm_subdev *subdev)
+ {
+ 	struct nvkm_mmu *mmu = nvkm_mmu(subdev);
++
++	if (mmu->func->vmm.global) {
++		int ret = nvkm_vm_new(subdev->device, 0, mmu->limit, 0,
++				      NULL, &mmu->vmm);
++		if (ret)
++			return ret;
++	}
++
+ 	if (mmu->func->oneinit)
+ 		return mmu->func->oneinit(mmu);
++
+ 	return 0;
+ }
+ 
+@@ -739,6 +790,7 @@ nvkm_mmu_dtor(struct nvkm_subdev *subdev
+ 
+ 	if (mmu->func->dtor)
+ 		data = mmu->func->dtor(mmu);
++	nvkm_vm_ref(NULL, &mmu->vmm, NULL);
+ 
+ 	nvkm_mmu_ptc_fini(mmu);
+ 	return data;
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/nv04.c
+@@ -105,10 +105,8 @@ nv04_mmu_dtor(struct nvkm_mmu *base)
+ {
+ 	struct nv04_mmu *mmu = nv04_mmu(base);
+ 	struct nvkm_device *device = mmu->base.subdev.device;
+-	if (mmu->base.vmm) {
++	if (mmu->base.vmm)
+ 		nvkm_memory_unref(&mmu->base.vmm->pgt[0].mem[0]);
+-		nvkm_vm_ref(NULL, &mmu->base.vmm, NULL);
+-	}
+ 	if (mmu->nullp) {
+ 		dma_free_coherent(device->dev, 16 * 1024,
+ 				  mmu->nullp, mmu->null);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/priv.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/priv.h
+@@ -32,6 +32,14 @@ struct nvkm_mmu_func {
+ 	void (*unmap)(struct nvkm_vma *, struct nvkm_memory *pgt,
+ 		      u32 pte, u32 cnt);
+ 	void (*flush)(struct nvkm_vm *);
++
++	struct {
++		struct nvkm_sclass base;
++		int (*ctor)(struct nvkm_mmu *, u64 addr, u64 size,
++			    void *argv, u32 argc, struct lock_class_key *,
++			    const char *name, struct nvkm_vmm **);
++		bool global;
++	} vmm;
+ };
+ 
+ int nvkm_vm_create(struct nvkm_mmu *, u64, u64, u64, u32,
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c
+@@ -0,0 +1,147 @@
++/*
++ * Copyright 2017 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++#define NVKM_VMM_LEVELS_MAX 5
++#include "vmm.h"
++
++static void
++nvkm_vmm_pt_del(struct nvkm_vmm_pt **ppgt)
++{
++	struct nvkm_vmm_pt *pgt = *ppgt;
++	if (pgt) {
++		kvfree(pgt->pde);
++		kfree(pgt);
++		*ppgt = NULL;
++	}
++}
++
++
++static struct nvkm_vmm_pt *
++nvkm_vmm_pt_new(const struct nvkm_vmm_desc *desc, bool sparse,
++		const struct nvkm_vmm_page *page)
++{
++	const u32 pten = 1 << desc->bits;
++	struct nvkm_vmm_pt *pgt;
++	u32 lpte = 0;
++
++	if (desc->type > PGT) {
++		if (desc->type == SPT) {
++			const struct nvkm_vmm_desc *pair = page[-1].desc;
++			lpte = pten >> (desc->bits - pair->bits);
++		} else {
++			lpte = pten;
++		}
++	}
++
++	if (!(pgt = kzalloc(sizeof(*pgt) + lpte, GFP_KERNEL)))
++		return NULL;
++	pgt->page = page ? page->shift : 0;
++	pgt->sparse = sparse;
++
++	if (desc->type == PGD) {
++		pgt->pde = kvzalloc(sizeof(*pgt->pde) * pten, GFP_KERNEL);
++		if (!pgt->pde) {
++			kfree(pgt);
++			return NULL;
++		}
++	}
++
++	return pgt;
++}
++
++void
++nvkm_vmm_dtor(struct nvkm_vmm *vmm)
++{
++	if (vmm->pd) {
++		nvkm_mmu_ptc_put(vmm->mmu, true, &vmm->pd->pt[0]);
++		nvkm_vmm_pt_del(&vmm->pd);
++	}
++}
++
++int
++nvkm_vmm_ctor(const struct nvkm_vmm_func *func, struct nvkm_mmu *mmu,
++	      u32 pd_header, u64 addr, u64 size, struct lock_class_key *key,
++	      const char *name, struct nvkm_vmm *vmm)
++{
++	static struct lock_class_key _key;
++	const struct nvkm_vmm_page *page = func->page;
++	const struct nvkm_vmm_desc *desc;
++	int levels, bits = 0;
++
++	vmm->func = func;
++	vmm->mmu = mmu;
++	vmm->name = name;
++	kref_init(&vmm->kref);
++
++	__mutex_init(&vmm->mutex, "&vmm->mutex", key ? key : &_key);
++
++	/* Locate the smallest page size supported by the backend, it will
++	 * have the the deepest nesting of page tables.
++	 */
++	while (page[1].shift)
++		page++;
++
++	/* Locate the structure that describes the layout of the top-level
++	 * page table, and determine the number of valid bits in a virtual
++	 * address.
++	 */
++	for (levels = 0, desc = page->desc; desc->bits; desc++, levels++)
++		bits += desc->bits;
++	bits += page->shift;
++	desc--;
++
++	if (WARN_ON(levels > NVKM_VMM_LEVELS_MAX))
++		return -EINVAL;
++
++	vmm->start = addr;
++	vmm->limit = size ? (addr + size) : (1ULL << bits);
++	if (vmm->start > vmm->limit || vmm->limit > (1ULL << bits))
++		return -EINVAL;
++
++	/* Allocate top-level page table. */
++	vmm->pd = nvkm_vmm_pt_new(desc, false, NULL);
++	if (!vmm->pd)
++		return -ENOMEM;
++	vmm->pd->refs[0] = 1;
++	INIT_LIST_HEAD(&vmm->join);
++
++	/* ... and the GPU storage for it, except on Tesla-class GPUs that
++	 * have the PD embedded in the instance structure.
++	 */
++	if (desc->size && mmu->func->vmm.global) {
++		const u32 size = pd_header + desc->size * (1 << desc->bits);
++		vmm->pd->pt[0] = nvkm_mmu_ptc_get(mmu, size, desc->align, true);
++		if (!vmm->pd->pt[0])
++			return -ENOMEM;
++	}
++
++	return 0;
++}
++
++int
++nvkm_vmm_new_(const struct nvkm_vmm_func *func, struct nvkm_mmu *mmu,
++	      u32 hdr, u64 addr, u64 size, struct lock_class_key *key,
++	      const char *name, struct nvkm_vmm **pvmm)
++{
++	if (!(*pvmm = kzalloc(sizeof(**pvmm), GFP_KERNEL)))
++		return -ENOMEM;
++	return nvkm_vmm_ctor(func, mmu, hdr, addr, size, key, name, *pvmm);
++}
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.h
+@@ -0,0 +1,111 @@
++#ifndef __NVKM_VMM_H__
++#define __NVKM_VMM_H__
++#include "priv.h"
++#include <core/memory.h>
++
++struct nvkm_vmm_pt {
++	/* Some GPUs have a mapping level with a dual page tables to
++	 * support large and small pages in the same address-range.
++	 *
++	 * We track the state of both page tables in one place, which
++	 * is why there's multiple PT pointers/refcounts here.
++	 */
++	struct nvkm_mmu_pt *pt[2];
++	u32 refs[2];
++
++	/* Page size handled by this PT.
++	 *
++	 * Tesla backend needs to know this when writinge PDEs,
++	 * otherwise unnecessary.
++	 */
++	u8 page;
++
++	/* Entire page table sparse.
++	 *
++	 * Used to propagate sparseness to child page tables.
++	 */
++	bool sparse:1;
++
++	/* Tracking for page directories.
++	 *
++	 * The array is indexed by PDE, and will either point to the
++	 * child page table, or indicate the PDE is marked as sparse.
++	 **/
++#define NVKM_VMM_PDE_INVALID(pde) IS_ERR_OR_NULL(pde)
++#define NVKM_VMM_PDE_SPARSED(pde) IS_ERR(pde)
++#define NVKM_VMM_PDE_SPARSE       ERR_PTR(-EBUSY)
++	struct nvkm_vmm_pt **pde;
++
++	/* Tracking for dual page tables.
++	 *
++	 * There's one entry for each LPTE, keeping track of whether
++	 * there are valid SPTEs in the same address-range.
++	 *
++	 * This information is used to manage LPTE state transitions.
++	 */
++#define NVKM_VMM_PTE_SPARSE 0x80
++#define NVKM_VMM_PTE_VALID  0x40
++#define NVKM_VMM_PTE_SPTES  0x3f
++	u8 pte[];
++};
++
++struct nvkm_vmm_desc_func {
++};
++
++struct nvkm_vmm_desc {
++	enum {
++		PGD,
++		PGT,
++		SPT,
++		LPT,
++	} type;
++	u8 bits;	/* VMA bits covered by PT. */
++	u8 size;	/* Bytes-per-PTE. */
++	u32 align;	/* PT address alignment. */
++	const struct nvkm_vmm_desc_func *func;
++};
++
++struct nvkm_vmm_page {
++	u8 shift;
++	const struct nvkm_vmm_desc *desc;
++#define NVKM_VMM_PAGE_SPARSE                                               0x01
++#define NVKM_VMM_PAGE_VRAM                                                 0x02
++#define NVKM_VMM_PAGE_HOST                                                 0x04
++#define NVKM_VMM_PAGE_COMP                                                 0x08
++#define NVKM_VMM_PAGE_Sxxx                                (NVKM_VMM_PAGE_SPARSE)
++#define NVKM_VMM_PAGE_xVxx                                  (NVKM_VMM_PAGE_VRAM)
++#define NVKM_VMM_PAGE_SVxx             (NVKM_VMM_PAGE_Sxxx | NVKM_VMM_PAGE_VRAM)
++#define NVKM_VMM_PAGE_xxHx                                  (NVKM_VMM_PAGE_HOST)
++#define NVKM_VMM_PAGE_SxHx             (NVKM_VMM_PAGE_Sxxx | NVKM_VMM_PAGE_HOST)
++#define NVKM_VMM_PAGE_xVHx             (NVKM_VMM_PAGE_xVxx | NVKM_VMM_PAGE_HOST)
++#define NVKM_VMM_PAGE_SVHx             (NVKM_VMM_PAGE_SVxx | NVKM_VMM_PAGE_HOST)
++#define NVKM_VMM_PAGE_xVxC             (NVKM_VMM_PAGE_xVxx | NVKM_VMM_PAGE_COMP)
++#define NVKM_VMM_PAGE_SVxC             (NVKM_VMM_PAGE_SVxx | NVKM_VMM_PAGE_COMP)
++#define NVKM_VMM_PAGE_xxHC             (NVKM_VMM_PAGE_xxHx | NVKM_VMM_PAGE_COMP)
++#define NVKM_VMM_PAGE_SxHC             (NVKM_VMM_PAGE_SxHx | NVKM_VMM_PAGE_COMP)
++	u8 type;
++};
++
++struct nvkm_vmm_func {
++	int (*join)(struct nvkm_vmm *, struct nvkm_memory *inst);
++	void (*part)(struct nvkm_vmm *, struct nvkm_memory *inst);
++
++	u64 page_block;
++	const struct nvkm_vmm_page page[];
++};
++
++int nvkm_vmm_new_(const struct nvkm_vmm_func *, struct nvkm_mmu *,
++		  u32 pd_header, u64 addr, u64 size, struct lock_class_key *,
++		  const char *name, struct nvkm_vmm **);
++int nvkm_vmm_ctor(const struct nvkm_vmm_func *, struct nvkm_mmu *,
++		  u32 pd_header, u64 addr, u64 size, struct lock_class_key *,
++		  const char *name, struct nvkm_vmm *);
++void nvkm_vmm_dtor(struct nvkm_vmm *);
++
++struct nvkm_vmm_user {
++	struct nvkm_sclass base;
++	int (*ctor)(struct nvkm_mmu *, u64 addr, u64 size, void *args, u32 argc,
++		    struct lock_class_key *, const char *name,
++		    struct nvkm_vmm **);
++};
++#endif
