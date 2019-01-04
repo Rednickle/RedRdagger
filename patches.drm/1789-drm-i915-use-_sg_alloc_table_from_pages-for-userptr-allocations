@@ -1,0 +1,208 @@
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Thu, 3 Aug 2017 10:14:17 +0100
+Subject: drm/i915: Use __sg_alloc_table_from_pages for userptr allocations
+Git-commit: 5602452e4c9943a81c9cd049d10d37d3f137b0c0
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+With the addition of __sg_alloc_table_from_pages we can control
+the maximum coalescing size and eliminate a separate path for
+allocating backing store here.
+
+Similar to 871dfbd67d4e ("drm/i915: Allow compaction upto
+SWIOTLB max segment size") this enables more compact sg lists to
+be created and so has a beneficial effect on workloads with many
+and/or large objects of this class.
+
+v2:
+ * Rename helper to i915_sg_segment_size and fix swiotlb override.
+ * Commit message update.
+
+v3:
+ * Actually include the swiotlb override fix.
+
+v4:
+ * Regroup parameters a bit. (Chris Wilson)
+
+v5:
+ * Rebase for swiotlb_max_segment.
+ * Add DMA map failure handling as in abb0deacb5a6
+   ("drm/i915: Fallback to single PAGE_SIZE segments for DMA remapping").
+
+v6: Handle swiotlb_max_segment() returning 1. (Joonas Lahtinen)
+
+v7: Rebase.
+v8: Commit spelling fix.
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: linux-kernel@vger.kernel.org
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170803091417.23677-1-tvrtko.ursulin@linux.intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |   15 ++++++
+ drivers/gpu/drm/i915/i915_gem.c         |    6 --
+ drivers/gpu/drm/i915/i915_gem_userptr.c |   79 +++++++++++---------------------
+ 3 files changed, 45 insertions(+), 55 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2827,6 +2827,21 @@ static inline struct scatterlist *__sg_n
+ 	     (((__iter).curr += PAGE_SIZE) < (__iter).max) ||		\
+ 	     ((__iter) = __sgt_iter(__sg_next((__iter).sgp), false), 0))
+ 
++static inline unsigned int i915_sg_segment_size(void)
++{
++	unsigned int size = swiotlb_max_segment();
++
++	if (size == 0)
++		return SCATTERLIST_MAX_SEGMENT;
++
++	size = rounddown(size, PAGE_SIZE);
++	/* swiotlb_max_segment_size can return 1 byte when it means one page. */
++	if (size < PAGE_SIZE)
++		size = PAGE_SIZE;
++
++	return size;
++}
++
+ static inline const struct intel_device_info *
+ intel_info(const struct drm_i915_private *dev_priv)
+ {
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2305,7 +2305,7 @@ i915_gem_object_get_pages_gtt(struct drm
+ 	struct sgt_iter sgt_iter;
+ 	struct page *page;
+ 	unsigned long last_pfn = 0;	/* suppress gcc warning */
+-	unsigned int max_segment;
++	unsigned int max_segment = i915_sg_segment_size();
+ 	gfp_t noreclaim;
+ 	int ret;
+ 
+@@ -2316,10 +2316,6 @@ i915_gem_object_get_pages_gtt(struct drm
+ 	GEM_BUG_ON(obj->base.read_domains & I915_GEM_GPU_DOMAINS);
+ 	GEM_BUG_ON(obj->base.write_domain & I915_GEM_GPU_DOMAINS);
+ 
+-	max_segment = swiotlb_max_segment();
+-	if (!max_segment)
+-		max_segment = rounddown(UINT_MAX, PAGE_SIZE);
+-
+ 	st = kmalloc(sizeof(*st), GFP_KERNEL);
+ 	if (st == NULL)
+ 		return ERR_PTR(-ENOMEM);
+--- a/drivers/gpu/drm/i915/i915_gem_userptr.c
++++ b/drivers/gpu/drm/i915/i915_gem_userptr.c
+@@ -399,64 +399,42 @@ struct get_pages_work {
+ 	struct task_struct *task;
+ };
+ 
+-#if IS_ENABLED(CONFIG_SWIOTLB)
+-#define swiotlb_active() swiotlb_nr_tbl()
+-#else
+-#define swiotlb_active() 0
+-#endif
+-
+-static int
+-st_set_pages(struct sg_table **st, struct page **pvec, int num_pages)
+-{
+-	struct scatterlist *sg;
+-	int ret, n;
+-
+-	*st = kmalloc(sizeof(**st), GFP_KERNEL);
+-	if (*st == NULL)
+-		return -ENOMEM;
+-
+-	if (swiotlb_active()) {
+-		ret = sg_alloc_table(*st, num_pages, GFP_KERNEL);
+-		if (ret)
+-			goto err;
+-
+-		for_each_sg((*st)->sgl, sg, num_pages, n)
+-			sg_set_page(sg, pvec[n], PAGE_SIZE, 0);
+-	} else {
+-		ret = sg_alloc_table_from_pages(*st, pvec, num_pages,
+-						0, num_pages << PAGE_SHIFT,
+-						GFP_KERNEL);
+-		if (ret)
+-			goto err;
+-	}
+-
+-	return 0;
+-
+-err:
+-	kfree(*st);
+-	*st = NULL;
+-	return ret;
+-}
+-
+ static struct sg_table *
+-__i915_gem_userptr_set_pages(struct drm_i915_gem_object *obj,
+-			     struct page **pvec, int num_pages)
++__i915_gem_userptr_alloc_pages(struct drm_i915_gem_object *obj,
++			       struct page **pvec, int num_pages)
+ {
+-	struct sg_table *pages;
++	unsigned int max_segment = i915_sg_segment_size();
++	struct sg_table *st;
+ 	int ret;
+ 
+-	ret = st_set_pages(&pages, pvec, num_pages);
+-	if (ret)
++	st = kmalloc(sizeof(*st), GFP_KERNEL);
++	if (!st)
++		return ERR_PTR(-ENOMEM);
++
++alloc_table:
++	ret = __sg_alloc_table_from_pages(st, pvec, num_pages,
++					  0, num_pages << PAGE_SHIFT,
++					  max_segment,
++					  GFP_KERNEL);
++	if (ret) {
++		kfree(st);
+ 		return ERR_PTR(ret);
++	}
+ 
+-	ret = i915_gem_gtt_prepare_pages(obj, pages);
++	ret = i915_gem_gtt_prepare_pages(obj, st);
+ 	if (ret) {
+-		sg_free_table(pages);
+-		kfree(pages);
++		sg_free_table(st);
++
++		if (max_segment > PAGE_SIZE) {
++			max_segment = PAGE_SIZE;
++			goto alloc_table;
++		}
++
++		kfree(st);
+ 		return ERR_PTR(ret);
+ 	}
+ 
+-	return pages;
++	return st;
+ }
+ 
+ static int
+@@ -540,7 +518,8 @@ __i915_gem_userptr_get_pages_worker(stru
+ 		struct sg_table *pages = ERR_PTR(ret);
+ 
+ 		if (pinned == npages) {
+-			pages = __i915_gem_userptr_set_pages(obj, pvec, npages);
++			pages = __i915_gem_userptr_alloc_pages(obj, pvec,
++							       npages);
+ 			if (!IS_ERR(pages)) {
+ 				__i915_gem_object_set_pages(obj, pages);
+ 				pinned = 0;
+@@ -661,7 +640,7 @@ i915_gem_userptr_get_pages(struct drm_i9
+ 		pages = __i915_gem_userptr_get_pages_schedule(obj);
+ 		active = pages == ERR_PTR(-EAGAIN);
+ 	} else {
+-		pages = __i915_gem_userptr_set_pages(obj, pvec, num_pages);
++		pages = __i915_gem_userptr_alloc_pages(obj, pvec, num_pages);
+ 		active = !IS_ERR(pages);
+ 	}
+ 	if (active)
