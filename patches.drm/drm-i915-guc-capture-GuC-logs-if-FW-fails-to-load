@@ -1,0 +1,170 @@
+From ac58d2ab0ad9c8b7e41404048a3ba4375db012d3 Mon Sep 17 00:00:00 2001
+From: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date: Mon, 22 May 2017 10:50:28 -0700
+Subject: [PATCH] drm/i915/guc: capture GuC logs if FW fails to load
+Git-commit: ac58d2ab0ad9c8b7e41404048a3ba4375db012d3
+Patch-mainline: v4.13-rc1
+References: FATE#322643 bsc#1055900
+
+We're currently deleting the GuC logs if the FW fails to load, but those
+are still useful to understand why the loading failed. Keeping the
+object around allows us to access them after driver load is completed.
+
+V2: keep the object around instead of using kernel memory (chris)    don't store the logs in the gpu_error struct (Chris)    add a check on guc_log_level to avoid snapshotting empty logs
+
+V3: use separate debugfs for error log (Chris)
+
+V4: rebased
+
+V5: clean up obj selection, move err_load inside guc_log, move err_load    cleanup, rename functions (Michal)
+
+V6: move obj back to intel_guc, move functions to intel_uc.c, don't    clear obj on new GuC load, free object only if enable_guc_loading    is set (Michal)
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Oscar Mateo <oscar.mateo@intel.com>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1495475428-19295-1-git-send-email-daniele.ceraolospurio@intel.com
+Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Tested-by: Michel Thierry <michel.thierry@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   39 +++++++++++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_uc.c     |   25 +++++++++++++++++++++--
+ drivers/gpu/drm/i915/intel_uc.h     |    3 ++
+ 3 files changed, 51 insertions(+), 16 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -2590,27 +2590,37 @@ static int i915_guc_stage_pool(struct se
+ 
+ static int i915_guc_log_dump(struct seq_file *m, void *data)
+ {
+-	struct drm_i915_private *dev_priv = node_to_i915(m->private);
+-	struct drm_i915_gem_object *obj;
+-	int i = 0, pg;
++	struct drm_info_node *node = m->private;
++	struct drm_i915_private *dev_priv = node_to_i915(node);
++	bool dump_load_err = !!node->info_ent->data;
++	struct drm_i915_gem_object *obj = NULL;
++	u32 *log;
++	int i = 0;
++
++	if (dump_load_err)
++		obj = dev_priv->guc.load_err_log;
++	else if (dev_priv->guc.log.vma)
++		obj = dev_priv->guc.log.vma->obj;
+ 
+-	if (!dev_priv->guc.log.vma)
++	if (!obj)
+ 		return 0;
+ 
+-	obj = dev_priv->guc.log.vma->obj;
+-	for (pg = 0; pg < obj->base.size / PAGE_SIZE; pg++) {
+-		u32 *log = kmap_atomic(i915_gem_object_get_page(obj, pg));
+-
+-		for (i = 0; i < PAGE_SIZE / sizeof(u32); i += 4)
+-			seq_printf(m, "0x%08x 0x%08x 0x%08x 0x%08x\n",
+-				   *(log + i), *(log + i + 1),
+-				   *(log + i + 2), *(log + i + 3));
+-
+-		kunmap_atomic(log);
++	log = i915_gem_object_pin_map(obj, I915_MAP_WC);
++	if (IS_ERR(log)) {
++		DRM_DEBUG("Failed to pin object\n");
++		seq_puts(m, "(log data unaccessible)\n");
++		return PTR_ERR(log);
+ 	}
+ 
++	for (i = 0; i < obj->base.size / sizeof(u32); i += 4)
++		seq_printf(m, "0x%08x 0x%08x 0x%08x 0x%08x\n",
++			   *(log + i), *(log + i + 1),
++			   *(log + i + 2), *(log + i + 3));
++
+ 	seq_putc(m, '\n');
+ 
++	i915_gem_object_unpin_map(obj);
++
+ 	return 0;
+ }
+ 
+@@ -4795,6 +4805,7 @@ static const struct drm_info_list i915_d
+ 	{"i915_guc_info", i915_guc_info, 0},
+ 	{"i915_guc_load_status", i915_guc_load_status_info, 0},
+ 	{"i915_guc_log_dump", i915_guc_log_dump, 0},
++	{"i915_guc_load_err_log_dump", i915_guc_log_dump, 0, (void *)1},
+ 	{"i915_guc_stage_pool", i915_guc_stage_pool, 0},
+ 	{"i915_huc_load_status", i915_huc_load_status_info, 0},
+ 	{"i915_frequency_info", i915_frequency_info, 0},
+--- a/drivers/gpu/drm/i915/intel_uc.c
++++ b/drivers/gpu/drm/i915/intel_uc.c
+@@ -288,6 +288,23 @@ static void guc_init_send_regs(struct in
+ 	guc->send_regs.fw_domains = fw_domains;
+ }
+ 
++static void guc_capture_load_err_log(struct intel_guc *guc)
++{
++	if (!guc->log.vma || i915.guc_log_level < 0)
++		return;
++
++	if (!guc->load_err_log)
++		guc->load_err_log = i915_gem_object_get(guc->log.vma->obj);
++
++	return;
++}
++
++static void guc_free_load_err_log(struct intel_guc *guc)
++{
++	if (guc->load_err_log)
++		i915_gem_object_put(guc->load_err_log);
++}
++
+ static int guc_enable_communication(struct intel_guc *guc)
+ {
+ 	struct drm_i915_private *dev_priv = guc_to_i915(guc);
+@@ -367,11 +384,11 @@ int intel_uc_init_hw(struct drm_i915_pri
+ 
+ 	/* Did we succeded or run out of retries? */
+ 	if (ret)
+-		goto err_submission;
++		goto err_log_capture;
+ 
+ 	ret = guc_enable_communication(guc);
+ 	if (ret)
+-		goto err_submission;
++		goto err_log_capture;
+ 
+ 	intel_guc_auth_huc(dev_priv);
+ 	if (i915.enable_guc_submission) {
+@@ -397,6 +414,8 @@ int intel_uc_init_hw(struct drm_i915_pri
+ err_interrupts:
+ 	guc_disable_communication(guc);
+ 	gen9_disable_guc_interrupts(dev_priv);
++err_log_capture:
++	guc_capture_load_err_log(guc);
+ err_submission:
+ 	if (i915.enable_guc_submission)
+ 		i915_guc_submission_fini(dev_priv);
+@@ -422,6 +441,8 @@ void intel_uc_fini_hw(struct drm_i915_pr
+ 	if (!i915.enable_guc_loading)
+ 		return;
+ 
++	guc_free_load_err_log(&dev_priv->guc);
++
+ 	if (i915.enable_guc_submission)
+ 		i915_guc_submission_disable(dev_priv);
+ 
+--- a/drivers/gpu/drm/i915/intel_uc.h
++++ b/drivers/gpu/drm/i915/intel_uc.h
+@@ -175,6 +175,9 @@ struct intel_guc {
+ 	struct intel_guc_log log;
+ 	struct intel_guc_ct ct;
+ 
++	/* Log snapshot if GuC errors during load */
++	struct drm_i915_gem_object *load_err_log;
++
+ 	/* intel_guc_recv interrupt related state */
+ 	bool interrupts_enabled;
+ 
