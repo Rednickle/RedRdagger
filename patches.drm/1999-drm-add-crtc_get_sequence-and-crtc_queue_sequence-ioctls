@@ -1,0 +1,353 @@
+From: Keith Packard <keithp@keithp.com>
+Date: Thu, 29 Jun 2017 22:49:31 -0700
+Subject: drm: Add CRTC_GET_SEQUENCE and CRTC_QUEUE_SEQUENCE ioctls [v3]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 3064abfa932bd09faf8da01741d171d476cf7193
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+These provide crtc-id based functions instead of pipe-number, while
+also offering higher resolution time (ns) and wider frame count (64)
+as required by the Vulkan API.
+
+v2:
+
+ * Check for DRIVER_MODESET in new crtc-based vblank ioctls
+
+	Failing to check this will oops the driver.
+
+ * Ensure vblank interupt is running in crtc_get_sequence ioctl
+
+	The sequence and timing values are not correct while the
+	interrupt is off, so make sure it's running before asking for
+	them.
+
+ * Short-circuit get_sequence if the counter is enabled and accurate
+
+	Steal the idea from the code in wait_vblank to avoid the
+	expense of drm_vblank_get/put
+
+ * Return active state of crtc in crtc_get_sequence ioctl
+
+	Might be useful for applications that aren't in charge of
+	modesetting?
+
+ * Use drm_crtc_vblank_get/put in new crtc-based vblank sequence ioctls
+
+	Daniel Vetter prefers these over the old drm_vblank_put/get
+	APIs.
+
+ * Return s64 ns instead of u64 in new sequence event
+
+Suggested-by: Daniel Vetter <daniel@ffwll.ch>
+Suggested-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+
+v3:
+
+ * Removed FIRST_PIXEL_OUT_FLAG
+ * Document that the timestamp in the query and event are
+   that of the first pixel leaving the display engine for
+   the display (using the same wording as the Vulkan spec).
+
+Suggested-by: Michel Dänzer <michel@daenzer.net>
+Acked-by: Dave Airlie <airlied@redhat.com>
+
+[airlied: left->leaves (Michel)]
+
+Signed-off-by: Keith Packard <keithp@keithp.com>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/drm_internal.h |    6 +
+ drivers/gpu/drm/drm_ioctl.c    |    2 
+ drivers/gpu/drm/drm_vblank.c   |  168 +++++++++++++++++++++++++++++++++++++++++
+ include/drm/drm_vblank.h       |    1 
+ include/uapi/drm/drm.h         |   36 ++++++++
+ 5 files changed, 213 insertions(+)
+
+--- a/drivers/gpu/drm/drm_internal.h
++++ b/drivers/gpu/drm/drm_internal.h
+@@ -70,6 +70,12 @@ int drm_legacy_modeset_ctl_ioctl(struct
+ int drm_legacy_irq_control(struct drm_device *dev, void *data,
+ 			   struct drm_file *file_priv);
+ 
++int drm_crtc_get_sequence_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *filp);
++
++int drm_crtc_queue_sequence_ioctl(struct drm_device *dev, void *data,
++				  struct drm_file *filp);
++
+ /* drm_auth.c */
+ int drm_getmagic(struct drm_device *dev, void *data,
+ 		 struct drm_file *file_priv);
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -663,6 +663,8 @@ static const struct drm_ioctl_desc drm_i
+ 		      DRM_UNLOCKED|DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_SYNCOBJ_SIGNAL, drm_syncobj_signal_ioctl,
+ 		      DRM_UNLOCKED|DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF(DRM_IOCTL_CRTC_GET_SEQUENCE, drm_crtc_get_sequence_ioctl, DRM_UNLOCKED),
++	DRM_IOCTL_DEF(DRM_IOCTL_CRTC_QUEUE_SEQUENCE, drm_crtc_queue_sequence_ioctl, DRM_UNLOCKED),
+ };
+ 
+ #define DRM_CORE_IOCTL_COUNT	ARRAY_SIZE( drm_ioctls )
+--- a/drivers/gpu/drm/drm_vblank.c
++++ b/drivers/gpu/drm/drm_vblank.c
+@@ -819,6 +819,11 @@ static void send_vblank_event(struct drm
+ 		e->event.vbl.tv_sec = tv.tv_sec;
+ 		e->event.vbl.tv_usec = tv.tv_nsec / 1000;
+ 		break;
++	case DRM_EVENT_CRTC_SEQUENCE:
++		if (seq)
++			e->event.seq.sequence = seq;
++		e->event.seq.time_ns = ktime_to_ns(now);
++		break;
+ 	}
+ 	trace_drm_vblank_event_delivered(e->base.file_priv, e->pipe, seq);
+ 	drm_send_event_locked(dev, &e->base);
+@@ -1650,3 +1655,166 @@ bool drm_crtc_handle_vblank(struct drm_c
+ 	return drm_handle_vblank(crtc->dev, drm_crtc_index(crtc));
+ }
+ EXPORT_SYMBOL(drm_crtc_handle_vblank);
++
++/*
++ * Get crtc VBLANK count.
++ *
++ * \param dev DRM device
++ * \param data user arguement, pointing to a drm_crtc_get_sequence structure.
++ * \param file_priv drm file private for the user's open file descriptor
++ */
++
++int drm_crtc_get_sequence_ioctl(struct drm_device *dev, void *data,
++				struct drm_file *file_priv)
++{
++	struct drm_crtc *crtc;
++	struct drm_vblank_crtc *vblank;
++	int pipe;
++	struct drm_crtc_get_sequence *get_seq = data;
++	ktime_t now;
++	bool vblank_enabled;
++	int ret;
++
++	if (!drm_core_check_feature(dev, DRIVER_MODESET))
++		return -EINVAL;
++
++	if (!dev->irq_enabled)
++		return -EINVAL;
++
++	crtc = drm_crtc_find(dev, file_priv, get_seq->crtc_id);
++	if (!crtc)
++		return -ENOENT;
++
++	pipe = drm_crtc_index(crtc);
++
++	vblank = &dev->vblank[pipe];
++	vblank_enabled = dev->vblank_disable_immediate && READ_ONCE(vblank->enabled);
++
++	if (!vblank_enabled) {
++		ret = drm_crtc_vblank_get(crtc);
++		if (ret) {
++			DRM_DEBUG("crtc %d failed to acquire vblank counter, %d\n", pipe, ret);
++			return ret;
++		}
++	}
++	drm_modeset_lock(&crtc->mutex, NULL);
++	if (crtc->state)
++		get_seq->active = crtc->state->enable;
++	else
++		get_seq->active = crtc->enabled;
++	drm_modeset_unlock(&crtc->mutex);
++	get_seq->sequence = drm_vblank_count_and_time(dev, pipe, &now);
++	get_seq->sequence_ns = ktime_to_ns(now);
++	if (!vblank_enabled)
++		drm_crtc_vblank_put(crtc);
++	return 0;
++}
++
++/*
++ * Queue a event for VBLANK sequence
++ *
++ * \param dev DRM device
++ * \param data user arguement, pointing to a drm_crtc_queue_sequence structure.
++ * \param file_priv drm file private for the user's open file descriptor
++ */
++
++int drm_crtc_queue_sequence_ioctl(struct drm_device *dev, void *data,
++				  struct drm_file *file_priv)
++{
++	struct drm_crtc *crtc;
++	struct drm_vblank_crtc *vblank;
++	int pipe;
++	struct drm_crtc_queue_sequence *queue_seq = data;
++	ktime_t now;
++	struct drm_pending_vblank_event *e;
++	u32 flags;
++	u64 seq;
++	u64 req_seq;
++	int ret;
++	unsigned long spin_flags;
++
++	if (!drm_core_check_feature(dev, DRIVER_MODESET))
++		return -EINVAL;
++
++	if (!dev->irq_enabled)
++		return -EINVAL;
++
++	crtc = drm_crtc_find(dev, file_priv, queue_seq->crtc_id);
++	if (!crtc)
++		return -ENOENT;
++
++	flags = queue_seq->flags;
++	/* Check valid flag bits */
++	if (flags & ~(DRM_CRTC_SEQUENCE_RELATIVE|
++		      DRM_CRTC_SEQUENCE_NEXT_ON_MISS))
++		return -EINVAL;
++
++	pipe = drm_crtc_index(crtc);
++
++	vblank = &dev->vblank[pipe];
++
++	e = kzalloc(sizeof(*e), GFP_KERNEL);
++	if (e == NULL)
++		return -ENOMEM;
++
++	ret = drm_crtc_vblank_get(crtc);
++	if (ret) {
++		DRM_DEBUG("crtc %d failed to acquire vblank counter, %d\n", pipe, ret);
++		goto err_free;
++	}
++
++	seq = drm_vblank_count_and_time(dev, pipe, &now);
++	req_seq = queue_seq->sequence;
++
++	if (flags & DRM_CRTC_SEQUENCE_RELATIVE)
++		req_seq += seq;
++
++	if ((flags & DRM_CRTC_SEQUENCE_NEXT_ON_MISS) && vblank_passed(seq, req_seq))
++		req_seq = seq + 1;
++
++	e->pipe = pipe;
++	e->event.base.type = DRM_EVENT_CRTC_SEQUENCE;
++	e->event.base.length = sizeof(e->event.seq);
++	e->event.seq.user_data = queue_seq->user_data;
++
++	spin_lock_irqsave(&dev->event_lock, spin_flags);
++
++	/*
++	 * drm_crtc_vblank_off() might have been called after we called
++	 * drm_crtc_vblank_get(). drm_crtc_vblank_off() holds event_lock around the
++	 * vblank disable, so no need for further locking.  The reference from
++	 * drm_crtc_vblank_get() protects against vblank disable from another source.
++	 */
++	if (!READ_ONCE(vblank->enabled)) {
++		ret = -EINVAL;
++		goto err_unlock;
++	}
++
++	ret = drm_event_reserve_init_locked(dev, file_priv, &e->base,
++					    &e->event.base);
++
++	if (ret)
++		goto err_unlock;
++
++	e->sequence = req_seq;
++
++	if (vblank_passed(seq, req_seq)) {
++		drm_crtc_vblank_put(crtc);
++		send_vblank_event(dev, e, seq, now);
++		queue_seq->sequence = seq;
++	} else {
++		/* drm_handle_vblank_events will call drm_vblank_put */
++		list_add_tail(&e->base.link, &dev->vblank_event_list);
++		queue_seq->sequence = req_seq;
++	}
++
++	spin_unlock_irqrestore(&dev->event_lock, spin_flags);
++	return 0;
++
++err_unlock:
++	spin_unlock_irqrestore(&dev->event_lock, spin_flags);
++	drm_crtc_vblank_put(crtc);
++err_free:
++	kfree(e);
++	return ret;
++}
+--- a/include/drm/drm_vblank.h
++++ b/include/drm/drm_vblank.h
+@@ -57,6 +57,7 @@ struct drm_pending_vblank_event {
+ 	union {
+ 		struct drm_event base;
+ 		struct drm_event_vblank vbl;
++		struct drm_event_crtc_sequence seq;
+ 	} event;
+ };
+ 
+--- a/include/uapi/drm/drm.h
++++ b/include/uapi/drm/drm.h
+@@ -737,6 +737,28 @@ struct drm_syncobj_array {
+ 	__u32 pad;
+ };
+ 
++/* Query current scanout sequence number */
++struct drm_crtc_get_sequence {
++	__u32 crtc_id;		/* requested crtc_id */
++	__u32 active;		/* return: crtc output is active */
++	__u64 sequence;		/* return: most recent vblank sequence */
++	__s64 sequence_ns;	/* return: most recent time of first pixel out */
++};
++
++/* Queue event to be delivered at specified sequence. Time stamp marks
++ * when the first pixel of the refresh cycle leaves the display engine
++ * for the display
++ */
++#define DRM_CRTC_SEQUENCE_RELATIVE		0x00000001	/* sequence is relative to current */
++#define DRM_CRTC_SEQUENCE_NEXT_ON_MISS		0x00000002	/* Use next sequence if we've missed */
++
++struct drm_crtc_queue_sequence {
++	__u32 crtc_id;
++	__u32 flags;
++	__u64 sequence;		/* on input, target sequence. on output, actual sequence */
++	__u64 user_data;	/* user data passed to event */
++};
++
+ #if defined(__cplusplus)
+ }
+ #endif
+@@ -819,6 +841,9 @@ extern "C" {
+ 
+ #define DRM_IOCTL_WAIT_VBLANK		DRM_IOWR(0x3a, union drm_wait_vblank)
+ 
++#define DRM_IOCTL_CRTC_GET_SEQUENCE	DRM_IOWR(0x3b, struct drm_crtc_get_sequence)
++#define DRM_IOCTL_CRTC_QUEUE_SEQUENCE	DRM_IOWR(0x3c, struct drm_crtc_queue_sequence)
++
+ #define DRM_IOCTL_UPDATE_DRAW		DRM_IOW(0x3f, struct drm_update_draw)
+ 
+ #define DRM_IOCTL_MODE_GETRESOURCES	DRM_IOWR(0xA0, struct drm_mode_card_res)
+@@ -893,6 +918,7 @@ struct drm_event {
+ 
+ #define DRM_EVENT_VBLANK 0x01
+ #define DRM_EVENT_FLIP_COMPLETE 0x02
++#define DRM_EVENT_CRTC_SEQUENCE	0x03
+ 
+ struct drm_event_vblank {
+ 	struct drm_event base;
+@@ -903,6 +929,16 @@ struct drm_event_vblank {
+ 	__u32 crtc_id; /* 0 on older kernels that do not support this */
+ };
+ 
++/* Event delivered at sequence. Time stamp marks when the first pixel
++ * of the refresh cycle leaves the display engine for the display
++ */
++struct drm_event_crtc_sequence {
++	struct drm_event	base;
++	__u64			user_data;
++	__s64			time_ns;
++	__u64			sequence;
++};
++
+ /* typedef area */
+ #ifndef __KERNEL__
+ typedef struct drm_clip_rect drm_clip_rect_t;
