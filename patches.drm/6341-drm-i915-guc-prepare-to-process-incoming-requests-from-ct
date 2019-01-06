@@ -1,0 +1,174 @@
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Mon, 26 Mar 2018 19:48:26 +0000
+Subject: drm/i915/guc: Prepare to process incoming requests from CT
+Git-commit: 6c77a2b05841a4082f746bf58345209df57175c9
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Requests are read from CT in the irq handler, but actual processing
+will be done in the work thread. Processing of specific actions will
+be added in the upcoming patches.
+
+v2: don't use GEM_BUG_ON (Chris)
+    don't kmalloc too large buffer (Michal)
+v3: rebased
+v4: don't name it 'dispatch' (Michel) and fix checkpatch
+    add some documentation (Michal)
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Oscar Mateo <oscar.mateo@intel.com>
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180326194829.58836-10-michal.wajdeczko@intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/intel_guc_ct.c |   95 +++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_guc_ct.h |    6 ++
+ 2 files changed, 100 insertions(+), 1 deletion(-)
+
+--- a/drivers/gpu/drm/i915/intel_guc_ct.c
++++ b/drivers/gpu/drm/i915/intel_guc_ct.c
+@@ -32,10 +32,17 @@ struct ct_request {
+ 	u32 *response_buf;
+ };
+ 
++struct ct_incoming_request {
++	struct list_head link;
++	u32 msg[];
++};
++
+ enum { CTB_SEND = 0, CTB_RECV = 1 };
+ 
+ enum { CTB_OWNER_HOST = 0 };
+ 
++static void ct_incoming_request_worker_func(struct work_struct *w);
++
+ /**
+  * intel_guc_ct_init_early - Initialize CT state without requiring device access
+  * @ct: pointer to CT struct
+@@ -47,6 +54,8 @@ void intel_guc_ct_init_early(struct inte
+ 
+ 	spin_lock_init(&ct->lock);
+ 	INIT_LIST_HEAD(&ct->pending_requests);
++	INIT_LIST_HEAD(&ct->incoming_requests);
++	INIT_WORK(&ct->worker, ct_incoming_request_worker_func);
+ }
+ 
+ static inline struct intel_guc *ct_to_guc(struct intel_guc_ct *ct)
+@@ -682,13 +691,97 @@ static int ct_handle_response(struct int
+ 	return 0;
+ }
+ 
++static void ct_process_request(struct intel_guc_ct *ct,
++			       u32 action, u32 len, const u32 *payload)
++{
++	switch (action) {
++	default:
++		DRM_ERROR("CT: unexpected request %x %*phn\n",
++			  action, 4 * len, payload);
++		break;
++	}
++}
++
++static bool ct_process_incoming_requests(struct intel_guc_ct *ct)
++{
++	unsigned long flags;
++	struct ct_incoming_request *request;
++	u32 header;
++	u32 *payload;
++	bool done;
++
++	spin_lock_irqsave(&ct->lock, flags);
++	request = list_first_entry_or_null(&ct->incoming_requests,
++					   struct ct_incoming_request, link);
++	if (request)
++		list_del(&request->link);
++	done = !!list_empty(&ct->incoming_requests);
++	spin_unlock_irqrestore(&ct->lock, flags);
++
++	if (!request)
++		return true;
++
++	header = request->msg[0];
++	payload = &request->msg[1];
++	ct_process_request(ct,
++			   ct_header_get_action(header),
++			   ct_header_get_len(header),
++			   payload);
++
++	kfree(request);
++	return done;
++}
++
++static void ct_incoming_request_worker_func(struct work_struct *w)
++{
++	struct intel_guc_ct *ct = container_of(w, struct intel_guc_ct, worker);
++	bool done;
++
++	done = ct_process_incoming_requests(ct);
++	if (!done)
++		queue_work(system_unbound_wq, &ct->worker);
++}
++
++/**
++ * DOC: CTB GuC to Host request
++ *
++ * Format of the CTB GuC to Host request message is as follows::
++ *
++ *      +------------+---------+---------+---------+---------+---------+
++ *      |   msg[0]   |   [1]   |   [2]   |   [3]   |   ...   |  [n-1]  |
++ *      +------------+---------+---------+---------+---------+---------+
++ *      |   MESSAGE  |       MESSAGE PAYLOAD                           |
++ *      +   HEADER   +---------+---------+---------+---------+---------+
++ *      |            |    0    |    1    |    2    |   ...   |    n    |
++ *      +============+=========+=========+=========+=========+=========+
++ *      |     len    |            request specific data                |
++ *      +------+-----+---------+---------+---------+---------+---------+
++ *
++ *                   ^-----------------------len-----------------------^
++ */
++
+ static int ct_handle_request(struct intel_guc_ct *ct, const u32 *msg)
+ {
+ 	u32 header = msg[0];
++	u32 len = ct_header_get_len(header);
++	u32 msglen = len + 1; /* total message length including header */
++	struct ct_incoming_request *request;
++	unsigned long flags;
+ 
+ 	GEM_BUG_ON(ct_header_is_response(header));
+ 
+-	/* XXX */
++	request = kmalloc(sizeof(*request) + 4 * msglen, GFP_ATOMIC);
++	if (unlikely(!request)) {
++		DRM_ERROR("CT: dropping request %*phn\n", 4 * msglen, msg);
++		return 0; /* XXX: -ENOMEM ? */
++	}
++	memcpy(request->msg, msg, 4 * msglen);
++
++	spin_lock_irqsave(&ct->lock, flags);
++	list_add_tail(&request->link, &ct->incoming_requests);
++	spin_unlock_irqrestore(&ct->lock, flags);
++
++	queue_work(system_unbound_wq, &ct->worker);
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_guc_ct.h
++++ b/drivers/gpu/drm/i915/intel_guc_ct.h
+@@ -81,6 +81,12 @@ struct intel_guc_ct {
+ 
+ 	/** @pending_requests: list of requests waiting for response */
+ 	struct list_head pending_requests;
++
++	/** @incoming_requests: list of incoming requests */
++	struct list_head incoming_requests;
++
++	/** @worker: worker for handling incoming requests */
++	struct work_struct worker;
+ };
+ 
+ void intel_guc_ct_init_early(struct intel_guc_ct *ct);
