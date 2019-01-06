@@ -1,0 +1,272 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Fri, 23 Mar 2018 15:32:28 -0400
+Subject: drm/amdgpu: Add MMU notifier type for KFD userptr
+Git-commit: e52482dec8366a98ac380b3bdc1a4abb8a390914
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This commit adds the notion of MMU notifier types GFX and HSA. GFX
+continues to work like MMU notifiers did before. HSA adds support for
+KFD userptr BOs. The implementation of KFD userptr eviction is a stub
+for now.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h       |    1 
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |    7 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c           |    2 
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c           |   94 +++++++++++++++++++----
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mn.h           |   11 ++
+ 5 files changed, 97 insertions(+), 18 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.h
+@@ -104,6 +104,7 @@ void amdgpu_amdkfd_device_probe(struct a
+ void amdgpu_amdkfd_device_init(struct amdgpu_device *adev);
+ void amdgpu_amdkfd_device_fini(struct amdgpu_device *adev);
+ 
++int amdgpu_amdkfd_evict_userptr(struct kgd_mem *mem, struct mm_struct *mm);
+ int amdgpu_amdkfd_submit_ib(struct kgd_dev *kgd, enum kgd_engine_type engine,
+ 				uint32_t vmid, uint64_t gpu_addr,
+ 				uint32_t *ib_cmd, uint32_t ib_len);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1418,6 +1418,13 @@ bo_reserve_failed:
+ 	return ret;
+ }
+ 
++int amdgpu_amdkfd_evict_userptr(struct kgd_mem *mem,
++				struct mm_struct *mm)
++{
++	/* TODO */
++	return 0;
++}
++
+ /** amdgpu_amdkfd_gpuvm_restore_process_bos - Restore all BOs for the given
+  *   KFD process identified by process_info
+  *
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -536,7 +536,7 @@ static int amdgpu_cs_parser_bos(struct a
+ 	if (p->bo_list) {
+ 		amdgpu_bo_list_get_list(p->bo_list, &p->validated);
+ 		if (p->bo_list->first_userptr != p->bo_list->num_entries)
+-			p->mn = amdgpu_mn_get(p->adev);
++			p->mn = amdgpu_mn_get(p->adev, AMDGPU_MN_TYPE_GFX);
+ 	}
+ 
+ 	INIT_LIST_HEAD(&duplicates);
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.c
+@@ -36,12 +36,14 @@
+ #include <drm/drm.h>
+ 
+ #include "amdgpu.h"
++#include "amdgpu_amdkfd.h"
+ 
+ struct amdgpu_mn {
+ 	/* constant after initialisation */
+ 	struct amdgpu_device	*adev;
+ 	struct mm_struct	*mm;
+ 	struct mmu_notifier	mn;
++	enum amdgpu_mn_type	type;
+ 
+ 	/* only used on destruction */
+ 	struct work_struct	work;
+@@ -185,7 +187,7 @@ static void amdgpu_mn_invalidate_node(st
+ }
+ 
+ /**
+- * amdgpu_mn_invalidate_range_start - callback to notify about mm change
++ * amdgpu_mn_invalidate_range_start_gfx - callback to notify about mm change
+  *
+  * @mn: our notifier
+  * @mn: the mm this callback is about
+@@ -195,10 +197,10 @@ static void amdgpu_mn_invalidate_node(st
+  * We block for all BOs between start and end to be idle and
+  * unmap them by move them into system domain again.
+  */
+-static void amdgpu_mn_invalidate_range_start(struct mmu_notifier *mn,
+-					     struct mm_struct *mm,
+-					     unsigned long start,
+-					     unsigned long end)
++static void amdgpu_mn_invalidate_range_start_gfx(struct mmu_notifier *mn,
++						 struct mm_struct *mm,
++						 unsigned long start,
++						 unsigned long end)
+ {
+ 	struct amdgpu_mn *rmn = container_of(mn, struct amdgpu_mn, mn);
+ 	struct interval_tree_node *it;
+@@ -220,6 +222,49 @@ static void amdgpu_mn_invalidate_range_s
+ }
+ 
+ /**
++ * amdgpu_mn_invalidate_range_start_hsa - callback to notify about mm change
++ *
++ * @mn: our notifier
++ * @mn: the mm this callback is about
++ * @start: start of updated range
++ * @end: end of updated range
++ *
++ * We temporarily evict all BOs between start and end. This
++ * necessitates evicting all user-mode queues of the process. The BOs
++ * are restorted in amdgpu_mn_invalidate_range_end_hsa.
++ */
++static void amdgpu_mn_invalidate_range_start_hsa(struct mmu_notifier *mn,
++						 struct mm_struct *mm,
++						 unsigned long start,
++						 unsigned long end)
++{
++	struct amdgpu_mn *rmn = container_of(mn, struct amdgpu_mn, mn);
++	struct interval_tree_node *it;
++
++	/* notification is exclusive, but interval is inclusive */
++	end -= 1;
++
++	amdgpu_mn_read_lock(rmn);
++
++	it = interval_tree_iter_first(&rmn->objects, start, end);
++	while (it) {
++		struct amdgpu_mn_node *node;
++		struct amdgpu_bo *bo;
++
++		node = container_of(it, struct amdgpu_mn_node, it);
++		it = interval_tree_iter_next(it, start, end);
++
++		list_for_each_entry(bo, &node->bos, mn_list) {
++			struct kgd_mem *mem = bo->kfd_bo;
++
++			if (amdgpu_ttm_tt_affect_userptr(bo->tbo.ttm,
++							 start, end))
++				amdgpu_amdkfd_evict_userptr(mem, mm);
++		}
++	}
++}
++
++/**
+  * amdgpu_mn_invalidate_range_end - callback to notify about mm change
+  *
+  * @mn: our notifier
+@@ -239,23 +284,39 @@ static void amdgpu_mn_invalidate_range_e
+ 	amdgpu_mn_read_unlock(rmn);
+ }
+ 
+-static const struct mmu_notifier_ops amdgpu_mn_ops = {
+-	.release = amdgpu_mn_release,
+-	.invalidate_range_start = amdgpu_mn_invalidate_range_start,
+-	.invalidate_range_end = amdgpu_mn_invalidate_range_end,
++static const struct mmu_notifier_ops amdgpu_mn_ops[] = {
++	[AMDGPU_MN_TYPE_GFX] = {
++		.release = amdgpu_mn_release,
++		.invalidate_range_start = amdgpu_mn_invalidate_range_start_gfx,
++		.invalidate_range_end = amdgpu_mn_invalidate_range_end,
++	},
++	[AMDGPU_MN_TYPE_HSA] = {
++		.release = amdgpu_mn_release,
++		.invalidate_range_start = amdgpu_mn_invalidate_range_start_hsa,
++		.invalidate_range_end = amdgpu_mn_invalidate_range_end,
++	},
+ };
+ 
++/* Low bits of any reasonable mm pointer will be unused due to struct
++ * alignment. Use these bits to make a unique key from the mm pointer
++ * and notifier type.
++ */
++#define AMDGPU_MN_KEY(mm, type) ((unsigned long)(mm) + (type))
++
+ /**
+  * amdgpu_mn_get - create notifier context
+  *
+  * @adev: amdgpu device pointer
++ * @type: type of MMU notifier context
+  *
+  * Creates a notifier context for current->mm.
+  */
+-struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev)
++struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev,
++				enum amdgpu_mn_type type)
+ {
+ 	struct mm_struct *mm = current->mm;
+ 	struct amdgpu_mn *rmn;
++	unsigned long key = AMDGPU_MN_KEY(mm, type);
+ 	int r;
+ 
+ 	mutex_lock(&adev->mn_lock);
+@@ -264,8 +325,8 @@ struct amdgpu_mn *amdgpu_mn_get(struct a
+ 		return ERR_PTR(-EINTR);
+ 	}
+ 
+-	hash_for_each_possible(adev->mn_hash, rmn, node, (unsigned long)mm)
+-		if (rmn->mm == mm)
++	hash_for_each_possible(adev->mn_hash, rmn, node, key)
++		if (AMDGPU_MN_KEY(rmn->mm, rmn->type) == key)
+ 			goto release_locks;
+ 
+ 	rmn = kzalloc(sizeof(*rmn), GFP_KERNEL);
+@@ -276,8 +337,9 @@ struct amdgpu_mn *amdgpu_mn_get(struct a
+ 
+ 	rmn->adev = adev;
+ 	rmn->mm = mm;
+-	rmn->mn.ops = &amdgpu_mn_ops;
+ 	init_rwsem(&rmn->lock);
++	rmn->type = type;
++	rmn->mn.ops = &amdgpu_mn_ops[type];
+ 	rmn->objects = RB_ROOT;
+ 	mutex_init(&rmn->read_lock);
+ 	atomic_set(&rmn->recursion, 0);
+@@ -286,7 +348,7 @@ struct amdgpu_mn *amdgpu_mn_get(struct a
+ 	if (r)
+ 		goto free_rmn;
+ 
+-	hash_add(adev->mn_hash, &rmn->node, (unsigned long)mm);
++	hash_add(adev->mn_hash, &rmn->node, AMDGPU_MN_KEY(mm, type));
+ 
+ release_locks:
+ 	up_write(&mm->mmap_sem);
+@@ -315,12 +377,14 @@ int amdgpu_mn_register(struct amdgpu_bo
+ {
+ 	unsigned long end = addr + amdgpu_bo_size(bo) - 1;
+ 	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
++	enum amdgpu_mn_type type =
++		bo->kfd_bo ? AMDGPU_MN_TYPE_HSA : AMDGPU_MN_TYPE_GFX;
+ 	struct amdgpu_mn *rmn;
+ 	struct amdgpu_mn_node *node = NULL;
+ 	struct list_head bos;
+ 	struct interval_tree_node *it;
+ 
+-	rmn = amdgpu_mn_get(adev);
++	rmn = amdgpu_mn_get(adev, type);
+ 	if (IS_ERR(rmn))
+ 		return PTR_ERR(rmn);
+ 
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mn.h
+@@ -29,16 +29,23 @@
+  */
+ struct amdgpu_mn;
+ 
++enum amdgpu_mn_type {
++	AMDGPU_MN_TYPE_GFX,
++	AMDGPU_MN_TYPE_HSA,
++};
++
+ #if defined(CONFIG_MMU_NOTIFIER)
+ void amdgpu_mn_lock(struct amdgpu_mn *mn);
+ void amdgpu_mn_unlock(struct amdgpu_mn *mn);
+-struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev);
++struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev,
++				enum amdgpu_mn_type type);
+ int amdgpu_mn_register(struct amdgpu_bo *bo, unsigned long addr);
+ void amdgpu_mn_unregister(struct amdgpu_bo *bo);
+ #else
+ static inline void amdgpu_mn_lock(struct amdgpu_mn *mn) {}
+ static inline void amdgpu_mn_unlock(struct amdgpu_mn *mn) {}
+-static inline struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev)
++static inline struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev,
++					      enum amdgpu_mn_type type)
+ {
+ 	return NULL;
+ }
