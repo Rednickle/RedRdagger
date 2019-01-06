@@ -1,0 +1,350 @@
+From: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Date: Tue, 27 Mar 2018 12:14:39 +0000
+Subject: drm/i915/guc: Implement response handling in send_ct()
+Git-commit: 9ef4c75e06006eb041c0bcc578548e3cdb8f9e03
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Instead of returning small data in response status dword,
+GuC may append longer data as response message payload.
+If caller provides response buffer, we will copy received
+data and use number of received data dwords as new success
+return value. We will WARN if response from GuC does not
+match caller expectation.
+
+v2: fix timeout and checkpatch warnings (Michal)
+v3: fix checkpatch again (Michel)
+    update wait function name (Michal)
+    no need for spinlock_irqsave (MichalWi)
+    no magic numbers (MichalWi)
+    must check before use (Jani)
+    add some more documentation (Michal)
+v4: update documentation (Michal)
+
+Signed-off-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Oscar Mateo <oscar.mateo@intel.com>
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com> #2.5
+Cc: Michal Winiarski <michal.winiarski@intel.com>
+Cc: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180327121439.70096-1-michal.wajdeczko@intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/intel_guc_ct.c   |  142 ++++++++++++++++++++++++++++++----
+ drivers/gpu/drm/i915/intel_guc_ct.h   |    6 +
+ drivers/gpu/drm/i915/intel_guc_fwif.h |   52 ++++++++++++
+ 3 files changed, 186 insertions(+), 14 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_guc_ct.c
++++ b/drivers/gpu/drm/i915/intel_guc_ct.c
+@@ -24,6 +24,14 @@
+ #include "i915_drv.h"
+ #include "intel_guc_ct.h"
+ 
++struct ct_request {
++	struct list_head link;
++	u32 fence;
++	u32 status;
++	u32 response_len;
++	u32 *response_buf;
++};
++
+ enum { CTB_SEND = 0, CTB_RECV = 1 };
+ 
+ enum { CTB_OWNER_HOST = 0 };
+@@ -36,6 +44,9 @@ void intel_guc_ct_init_early(struct inte
+ {
+ 	/* we're using static channel owners */
+ 	ct->host_channel.owner = CTB_OWNER_HOST;
++
++	spin_lock_init(&ct->lock);
++	INIT_LIST_HEAD(&ct->pending_requests);
+ }
+ 
+ static inline struct intel_guc *ct_to_guc(struct intel_guc_ct *ct)
+@@ -294,7 +305,8 @@ static u32 ctch_get_next_fence(struct in
+ static int ctb_write(struct intel_guc_ct_buffer *ctb,
+ 		     const u32 *action,
+ 		     u32 len /* in dwords */,
+-		     u32 fence)
++		     u32 fence,
++		     bool want_response)
+ {
+ 	struct guc_ct_buffer_desc *desc = ctb->desc;
+ 	u32 head = desc->head / 4;	/* in dwords */
+@@ -331,6 +343,7 @@ static int ctb_write(struct intel_guc_ct
+ 	 */
+ 	header = (len << GUC_CT_MSG_LEN_SHIFT) |
+ 		 (GUC_CT_MSG_WRITE_FENCE_TO_DESC) |
++		 (want_response ? GUC_CT_MSG_SEND_STATUS : 0) |
+ 		 (action[0] << GUC_CT_MSG_ACTION_SHIFT);
+ 
+ 	cmds[tail] = header;
+@@ -401,36 +414,108 @@ static int wait_for_ctb_desc_update(stru
+ 	return err;
+ }
+ 
+-static int ctch_send(struct intel_guc *guc,
++/**
++ * wait_for_ct_request_update - Wait for CT request state update.
++ * @req:	pointer to pending request
++ * @status:	placeholder for status
++ *
++ * For each sent request, Guc shall send bac CT response message.
++ * Our message handler will update status of tracked request once
++ * response message with given fence is received. Wait here and
++ * check for valid response status value.
++ *
++ * Return:
++ * *	0 response received (status is valid)
++ * *	-ETIMEDOUT no response within hardcoded timeout
++ */
++static int wait_for_ct_request_update(struct ct_request *req, u32 *status)
++{
++	int err;
++
++	/*
++	 * Fast commands should complete in less than 10us, so sample quickly
++	 * up to that length of time, then switch to a slower sleep-wait loop.
++	 * No GuC command should ever take longer than 10ms.
++	 */
++#define done INTEL_GUC_MSG_IS_RESPONSE(READ_ONCE(req->status))
++	err = wait_for_us(done, 10);
++	if (err)
++		err = wait_for(done, 10);
++#undef done
++
++	if (unlikely(err))
++		DRM_ERROR("CT: fence %u err %d\n", req->fence, err);
++
++	*status = req->status;
++	return err;
++}
++
++static int ctch_send(struct intel_guc_ct *ct,
+ 		     struct intel_guc_ct_channel *ctch,
+ 		     const u32 *action,
+ 		     u32 len,
++		     u32 *response_buf,
++		     u32 response_buf_size,
+ 		     u32 *status)
+ {
+ 	struct intel_guc_ct_buffer *ctb = &ctch->ctbs[CTB_SEND];
+ 	struct guc_ct_buffer_desc *desc = ctb->desc;
++	struct ct_request request;
++	unsigned long flags;
+ 	u32 fence;
+ 	int err;
+ 
+ 	GEM_BUG_ON(!ctch_is_open(ctch));
+ 	GEM_BUG_ON(!len);
+ 	GEM_BUG_ON(len & ~GUC_CT_MSG_LEN_MASK);
++	GEM_BUG_ON(!response_buf && response_buf_size);
+ 
+ 	fence = ctch_get_next_fence(ctch);
+-	err = ctb_write(ctb, action, len, fence);
++	request.fence = fence;
++	request.status = 0;
++	request.response_len = response_buf_size;
++	request.response_buf = response_buf;
++
++	spin_lock_irqsave(&ct->lock, flags);
++	list_add_tail(&request.link, &ct->pending_requests);
++	spin_unlock_irqrestore(&ct->lock, flags);
++
++	err = ctb_write(ctb, action, len, fence, !!response_buf);
+ 	if (unlikely(err))
+-		return err;
++		goto unlink;
+ 
+-	intel_guc_notify(guc);
++	intel_guc_notify(ct_to_guc(ct));
+ 
+-	err = wait_for_ctb_desc_update(desc, fence, status);
++	if (response_buf)
++		err = wait_for_ct_request_update(&request, status);
++	else
++		err = wait_for_ctb_desc_update(desc, fence, status);
+ 	if (unlikely(err))
+-		return err;
+-	if (!INTEL_GUC_MSG_IS_RESPONSE_SUCCESS(*status))
+-		return -EIO;
++		goto unlink;
+ 
+-	/* Use data from the GuC status as our return value */
+-	return INTEL_GUC_MSG_TO_DATA(*status);
++	if (!INTEL_GUC_MSG_IS_RESPONSE_SUCCESS(*status)) {
++		err = -EIO;
++		goto unlink;
++	}
++
++	if (response_buf) {
++		/* There shall be no data in the status */
++		WARN_ON(INTEL_GUC_MSG_TO_DATA(request.status));
++		/* Return actual response len */
++		err = request.response_len;
++	} else {
++		/* There shall be no response payload */
++		WARN_ON(request.response_len);
++		/* Return data decoded from the status dword */
++		err = INTEL_GUC_MSG_TO_DATA(*status);
++	}
++
++unlink:
++	spin_lock_irqsave(&ct->lock, flags);
++	list_del(&request.link);
++	spin_unlock_irqrestore(&ct->lock, flags);
++
++	return err;
+ }
+ 
+ /*
+@@ -439,13 +524,15 @@ static int ctch_send(struct intel_guc *g
+ static int intel_guc_send_ct(struct intel_guc *guc, const u32 *action, u32 len,
+ 			     u32 *response_buf, u32 response_buf_size)
+ {
+-	struct intel_guc_ct_channel *ctch = &guc->ct.host_channel;
++	struct intel_guc_ct *ct = &guc->ct;
++	struct intel_guc_ct_channel *ctch = &ct->host_channel;
+ 	u32 status = ~0; /* undefined */
+ 	int ret;
+ 
+ 	mutex_lock(&guc->send_mutex);
+ 
+-	ret = ctch_send(guc, ctch, action, len, &status);
++	ret = ctch_send(ct, ctch, action, len, response_buf, response_buf_size,
++			&status);
+ 	if (unlikely(ret < 0)) {
+ 		DRM_ERROR("CT: send action %#X failed; err=%d status=%#X\n",
+ 			  action[0], ret, status);
+@@ -546,8 +633,12 @@ static int ct_handle_response(struct int
+ 	u32 msglen = len + 1; /* total message length including header */
+ 	u32 fence;
+ 	u32 status;
++	u32 datalen;
++	struct ct_request *req;
++	bool found = false;
+ 
+ 	GEM_BUG_ON(!ct_header_is_response(header));
++	GEM_BUG_ON(!in_irq());
+ 
+ 	/* Response payload shall at least include fence and status */
+ 	if (unlikely(len < 2)) {
+@@ -557,6 +648,7 @@ static int ct_handle_response(struct int
+ 
+ 	fence = msg[1];
+ 	status = msg[2];
++	datalen = len - 2;
+ 
+ 	/* Format of the status follows RESPONSE message */
+ 	if (unlikely(!INTEL_GUC_MSG_IS_RESPONSE(status))) {
+@@ -564,7 +656,29 @@ static int ct_handle_response(struct int
+ 		return -EPROTO;
+ 	}
+ 
+-	/* XXX */
++	spin_lock(&ct->lock);
++	list_for_each_entry(req, &ct->pending_requests, link) {
++		if (unlikely(fence != req->fence)) {
++			DRM_DEBUG_DRIVER("CT: request %u awaits response\n",
++					 req->fence);
++			continue;
++		}
++		if (unlikely(datalen > req->response_len)) {
++			DRM_ERROR("CT: response %u too long %*phn\n",
++				  req->fence, 4 * msglen, msg);
++			datalen = 0;
++		}
++		if (datalen)
++			memcpy(req->response_buf, msg + 3, 4 * datalen);
++		req->response_len = datalen;
++		WRITE_ONCE(req->status, status);
++		found = true;
++		break;
++	}
++	spin_unlock(&ct->lock);
++
++	if (!found)
++		DRM_ERROR("CT: unsolicited response %*phn\n", 4 * msglen, msg);
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_guc_ct.h
++++ b/drivers/gpu/drm/i915/intel_guc_ct.h
+@@ -75,6 +75,12 @@ struct intel_guc_ct_channel {
+ struct intel_guc_ct {
+ 	struct intel_guc_ct_channel host_channel;
+ 	/* other channels are tbd */
++
++	/** @lock: protects pending requests list */
++	spinlock_t lock;
++
++	/** @pending_requests: list of requests waiting for response */
++	struct list_head pending_requests;
+ };
+ 
+ void intel_guc_ct_init_early(struct intel_guc_ct *ct);
+--- a/drivers/gpu/drm/i915/intel_guc_fwif.h
++++ b/drivers/gpu/drm/i915/intel_guc_fwif.h
+@@ -327,6 +327,58 @@ struct guc_stage_desc {
+ 	u64 desc_private;
+ } __packed;
+ 
++/**
++ * DOC: CTB based communication
++ *
++ * The CTB (command transport buffer) communication between Host and GuC
++ * is based on u32 data stream written to the shared buffer. One buffer can
++ * be used to transmit data only in one direction (one-directional channel).
++ *
++ * Current status of the each buffer is stored in the buffer descriptor.
++ * Buffer descriptor holds tail and head fields that represents active data
++ * stream. The tail field is updated by the data producer (sender), and head
++ * field is updated by the data consumer (receiver)::
++ *
++ *      +------------+
++ *      | DESCRIPTOR |          +=================+============+========+
++ *      +============+          |                 | MESSAGE(s) |        |
++ *      | address    |--------->+=================+============+========+
++ *      +------------+
++ *      | head       |          ^-----head--------^
++ *      +------------+
++ *      | tail       |          ^---------tail-----------------^
++ *      +------------+
++ *      | size       |          ^---------------size--------------------^
++ *      +------------+
++ *
++ * Each message in data stream starts with the single u32 treated as a header,
++ * followed by optional set of u32 data that makes message specific payload::
++ *
++ *      +------------+---------+---------+---------+
++ *      |         MESSAGE                          |
++ *      +------------+---------+---------+---------+
++ *      |   msg[0]   |   [1]   |   ...   |  [n-1]  |
++ *      +------------+---------+---------+---------+
++ *      |   MESSAGE  |       MESSAGE PAYLOAD       |
++ *      +   HEADER   +---------+---------+---------+
++ *      |            |    0    |   ...   |    n    |
++ *      +======+=====+=========+=========+=========+
++ *      | 31:16| code|         |         |         |
++ *      +------+-----+         |         |         |
++ *      |  15:5|flags|         |         |         |
++ *      +------+-----+         |         |         |
++ *      |   4:0|  len|         |         |         |
++ *      +------+-----+---------+---------+---------+
++ *
++ *                   ^-------------len-------------^
++ *
++ * The message header consists of:
++ *
++ * - **len**, indicates length of the message payload (in u32)
++ * - **code**, indicates message code
++ * - **flags**, holds various bits to control message handling
++ */
++
+ /*
+  * Describes single command transport buffer.
+  * Used by both guc-master and clients.
