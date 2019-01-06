@@ -1,0 +1,246 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Sun, 8 Apr 2018 22:03:51 -0400
+Subject: drm/amdkfd: Add 64-bit doorbell and wptr support to kernel queue
+Git-commit: 9d7d024816686f922735f7adccd00e3fc44e2e03
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+v2: Removed redundant 0x before %p.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c         |   10 ++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c     |   25 ++++++++++++++++------
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h     |    7 +++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_cik.c |    9 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c  |    9 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c  |    9 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h             |    1 
+ 7 files changed, 63 insertions(+), 7 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
+@@ -214,6 +214,16 @@ void write_kernel_doorbell(void __iomem
+ 	}
+ }
+ 
++void write_kernel_doorbell64(void __iomem *db, u64 value)
++{
++	if (db) {
++		WARN(((unsigned long)db & 7) != 0,
++		     "Unaligned 64-bit doorbell");
++		writeq(value, (u64 __iomem *)db);
++		pr_debug("writing %llu to doorbell address %p\n", value, db);
++	}
++}
++
+ unsigned int kfd_doorbell_id_to_offset(struct kfd_dev *kfd,
+ 					struct kfd_process *process,
+ 					unsigned int doorbell_id)
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -99,7 +99,7 @@ static bool initialize(struct kernel_que
+ 	kq->rptr_kernel = kq->rptr_mem->cpu_ptr;
+ 	kq->rptr_gpu_addr = kq->rptr_mem->gpu_addr;
+ 
+-	retval = kfd_gtt_sa_allocate(dev, sizeof(*kq->wptr_kernel),
++	retval = kfd_gtt_sa_allocate(dev, dev->device_info->doorbell_size,
+ 					&kq->wptr_mem);
+ 
+ 	if (retval != 0)
+@@ -208,6 +208,7 @@ static int acquire_packet_buffer(struct
+ 	size_t available_size;
+ 	size_t queue_size_dwords;
+ 	uint32_t wptr, rptr;
++	uint64_t wptr64;
+ 	unsigned int *queue_address;
+ 
+ 	/* When rptr == wptr, the buffer is empty.
+@@ -216,7 +217,8 @@ static int acquire_packet_buffer(struct
+ 	 * the opposite. So we can only use up to queue_size_dwords - 1 dwords.
+ 	 */
+ 	rptr = *kq->rptr_kernel;
+-	wptr = *kq->wptr_kernel;
++	wptr = kq->pending_wptr;
++	wptr64 = kq->pending_wptr64;
+ 	queue_address = (unsigned int *)kq->pq_kernel_addr;
+ 	queue_size_dwords = kq->queue->properties.queue_size / 4;
+ 
+@@ -246,11 +248,13 @@ static int acquire_packet_buffer(struct
+ 		while (wptr > 0) {
+ 			queue_address[wptr] = kq->nop_packet;
+ 			wptr = (wptr + 1) % queue_size_dwords;
++			wptr64++;
+ 		}
+ 	}
+ 
+ 	*buffer_ptr = &queue_address[wptr];
+ 	kq->pending_wptr = wptr + packet_size_in_dwords;
++	kq->pending_wptr64 = wptr64 + packet_size_in_dwords;
+ 
+ 	return 0;
+ 
+@@ -272,14 +276,18 @@ static void submit_packet(struct kernel_
+ 	pr_debug("\n");
+ #endif
+ 
+-	*kq->wptr_kernel = kq->pending_wptr;
+-	write_kernel_doorbell(kq->queue->properties.doorbell_ptr,
+-				kq->pending_wptr);
++	kq->ops_asic_specific.submit_packet(kq);
+ }
+ 
+ static void rollback_packet(struct kernel_queue *kq)
+ {
+-	kq->pending_wptr = *kq->wptr_kernel;
++	if (kq->dev->device_info->doorbell_size == 8) {
++		kq->pending_wptr64 = *kq->wptr64_kernel;
++		kq->pending_wptr = *kq->wptr_kernel %
++			(kq->queue->properties.queue_size / 4);
++	} else {
++		kq->pending_wptr = *kq->wptr_kernel;
++	}
+ }
+ 
+ struct kernel_queue *kernel_queue_init(struct kfd_dev *dev,
+@@ -310,6 +318,11 @@ struct kernel_queue *kernel_queue_init(s
+ 	case CHIP_HAWAII:
+ 		kernel_queue_init_cik(&kq->ops_asic_specific);
+ 		break;
++
++	case CHIP_VEGA10:
++	case CHIP_RAVEN:
++		kernel_queue_init_v9(&kq->ops_asic_specific);
++		break;
+ 	default:
+ 		WARN(1, "Unexpected ASIC family %u",
+ 		     dev->device_info->asic_family);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.h
+@@ -72,6 +72,7 @@ struct kernel_queue {
+ 	struct kfd_dev		*dev;
+ 	struct mqd_manager	*mqd;
+ 	struct queue		*queue;
++	uint64_t		pending_wptr64;
+ 	uint32_t		pending_wptr;
+ 	unsigned int		nop_packet;
+ 
+@@ -79,7 +80,10 @@ struct kernel_queue {
+ 	uint32_t		*rptr_kernel;
+ 	uint64_t		rptr_gpu_addr;
+ 	struct kfd_mem_obj	*wptr_mem;
+-	uint32_t		*wptr_kernel;
++	union {
++		uint64_t	*wptr64_kernel;
++		uint32_t	*wptr_kernel;
++	};
+ 	uint64_t		wptr_gpu_addr;
+ 	struct kfd_mem_obj	*pq;
+ 	uint64_t		pq_gpu_addr;
+@@ -97,5 +101,6 @@ struct kernel_queue {
+ 
+ void kernel_queue_init_cik(struct kernel_queue_ops *ops);
+ void kernel_queue_init_vi(struct kernel_queue_ops *ops);
++void kernel_queue_init_v9(struct kernel_queue_ops *ops);
+ 
+ #endif /* KFD_KERNEL_QUEUE_H_ */
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_cik.c
+@@ -26,11 +26,13 @@
+ static bool initialize_cik(struct kernel_queue *kq, struct kfd_dev *dev,
+ 			enum kfd_queue_type type, unsigned int queue_size);
+ static void uninitialize_cik(struct kernel_queue *kq);
++static void submit_packet_cik(struct kernel_queue *kq);
+ 
+ void kernel_queue_init_cik(struct kernel_queue_ops *ops)
+ {
+ 	ops->initialize = initialize_cik;
+ 	ops->uninitialize = uninitialize_cik;
++	ops->submit_packet = submit_packet_cik;
+ }
+ 
+ static bool initialize_cik(struct kernel_queue *kq, struct kfd_dev *dev,
+@@ -42,3 +44,10 @@ static bool initialize_cik(struct kernel
+ static void uninitialize_cik(struct kernel_queue *kq)
+ {
+ }
++
++static void submit_packet_cik(struct kernel_queue *kq)
++{
++	*kq->wptr_kernel = kq->pending_wptr;
++	write_kernel_doorbell(kq->queue->properties.doorbell_ptr,
++				kq->pending_wptr);
++}
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_v9.c
+@@ -29,11 +29,13 @@
+ static bool initialize_v9(struct kernel_queue *kq, struct kfd_dev *dev,
+ 			enum kfd_queue_type type, unsigned int queue_size);
+ static void uninitialize_v9(struct kernel_queue *kq);
++static void submit_packet_v9(struct kernel_queue *kq);
+ 
+ void kernel_queue_init_v9(struct kernel_queue_ops *ops)
+ {
+ 	ops->initialize = initialize_v9;
+ 	ops->uninitialize = uninitialize_v9;
++	ops->submit_packet = submit_packet_v9;
+ }
+ 
+ static bool initialize_v9(struct kernel_queue *kq, struct kfd_dev *dev,
+@@ -58,6 +60,13 @@ static void uninitialize_v9(struct kerne
+ 	kfd_gtt_sa_free(kq->dev, kq->eop_mem);
+ }
+ 
++static void submit_packet_v9(struct kernel_queue *kq)
++{
++	*kq->wptr64_kernel = kq->pending_wptr64;
++	write_kernel_doorbell64(kq->queue->properties.doorbell_ptr,
++				kq->pending_wptr64);
++}
++
+ static int pm_map_process_v9(struct packet_manager *pm,
+ 		uint32_t *buffer, struct qcm_process_device *qpd)
+ {
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue_vi.c
+@@ -29,11 +29,13 @@
+ static bool initialize_vi(struct kernel_queue *kq, struct kfd_dev *dev,
+ 			enum kfd_queue_type type, unsigned int queue_size);
+ static void uninitialize_vi(struct kernel_queue *kq);
++static void submit_packet_vi(struct kernel_queue *kq);
+ 
+ void kernel_queue_init_vi(struct kernel_queue_ops *ops)
+ {
+ 	ops->initialize = initialize_vi;
+ 	ops->uninitialize = uninitialize_vi;
++	ops->submit_packet = submit_packet_vi;
+ }
+ 
+ static bool initialize_vi(struct kernel_queue *kq, struct kfd_dev *dev,
+@@ -58,6 +60,13 @@ static void uninitialize_vi(struct kerne
+ 	kfd_gtt_sa_free(kq->dev, kq->eop_mem);
+ }
+ 
++static void submit_packet_vi(struct kernel_queue *kq)
++{
++	*kq->wptr_kernel = kq->pending_wptr;
++	write_kernel_doorbell(kq->queue->properties.doorbell_ptr,
++				kq->pending_wptr);
++}
++
+ unsigned int pm_build_pm4_header(unsigned int opcode, size_t packet_size)
+ {
+ 	union PM4_MES_TYPE_3_HEADER header;
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -769,6 +769,7 @@ void __iomem *kfd_get_kernel_doorbell(st
+ void kfd_release_kernel_doorbell(struct kfd_dev *kfd, u32 __iomem *db_addr);
+ u32 read_kernel_doorbell(u32 __iomem *db);
+ void write_kernel_doorbell(void __iomem *db, u32 value);
++void write_kernel_doorbell64(void __iomem *db, u64 value);
+ unsigned int kfd_doorbell_id_to_offset(struct kfd_dev *kfd,
+ 					struct kfd_process *process,
+ 					unsigned int doorbell_id);
