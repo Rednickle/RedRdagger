@@ -1,0 +1,224 @@
+From: Oscar Mateo <oscar.mateo@intel.com>
+Date: Fri, 6 Apr 2018 12:32:37 +0300
+Subject: drm/i915/icl: Deal with GT INT DW correctly
+Git-commit: 96606f3beb8668de2c936d7719a7e385cff9ff01
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+BSpec says:
+
+"Second level interrupt events are stored in the GT INT DW. GT INT DW is
+a double buffered structure. A snapshot of events is taken when SW reads
+GT INT DW. From the time of read to the time of SW completely clearing
+GT INT DW (to indicate end of service), all incoming interrupts are logged
+in a secondary storage structure. this guarantees that the record of
+interrupts SW is servicing will not change while under service".
+
+We read GT INT DW in several places now:
+
+- The IRQ handler (banks 0 and 1) where, hopefully, it is completely
+  cleared (operation now covered with the irq lock).
+- The 'reset' interrupts functions for RPS and GuC logs, where we clear
+  the bit we are interested in and leave the others for the normal
+  interrupt handler.
+- The 'enable' interrupts functions for RPS and GuC logs, as a measure
+  of precaution. Here we could relax a bit and don't check GT INT DW
+  at all or, if we do, at least we should clear the offending bit
+  (which is what this patch does).
+
+Note that, if every bit is cleared on reading GT INT DW, the register
+won't be locked. Also note that, according to the BSpec, GT INT DW
+cannot be cleared without first servicing the Selector & Shared IIR
+registers.
+
+v2:
+  - Remove some code duplication (Tvrtko)
+  - Make sure GT_INTR_DW are protected by the irq spinlock, since it's a
+    global resource (Tvrtko)
+
+v3: Optimize the spinlock (Tvrtko)
+
+v4: Rebase.
+v5:
+  - take spinlock on outer scope to please sparse (Mika)
+  - use raw_reg accessors (Mika)
+v6: omit the continue in looping banks (Michel)
+
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Cc: Sagar Arun Kamble <sagar.a.kamble@intel.com>
+Signed-off-by: Oscar Mateo <oscar.mateo@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com> (v4)
+Signed-off-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180406093237.14548-1-mika.kuoppala@linux.intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_irq.c |  110 ++++++++++++++++++++++++++--------------
+ 1 file changed, 73 insertions(+), 37 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -243,6 +243,41 @@ void i915_hotplug_interrupt_update(struc
+ 	spin_unlock_irq(&dev_priv->irq_lock);
+ }
+ 
++static u32
++gen11_gt_engine_identity(struct drm_i915_private * const i915,
++			 const unsigned int bank, const unsigned int bit);
++
++static bool gen11_reset_one_iir(struct drm_i915_private * const i915,
++				const unsigned int bank,
++				const unsigned int bit)
++{
++	void __iomem * const regs = i915->regs;
++	u32 dw;
++
++	lockdep_assert_held(&i915->irq_lock);
++
++	dw = raw_reg_read(regs, GEN11_GT_INTR_DW(bank));
++	if (dw & BIT(bit)) {
++		/*
++		 * According to the BSpec, DW_IIR bits cannot be cleared without
++		 * first servicing the Selector & Shared IIR registers.
++		 */
++		gen11_gt_engine_identity(i915, bank, bit);
++
++		/*
++		 * We locked GT INT DW by reading it. If we want to (try
++		 * to) recover from this succesfully, we need to clear
++		 * our bit, otherwise we are locking the register for
++		 * everybody.
++		 */
++		raw_reg_write(regs, GEN11_GT_INTR_DW(bank), BIT(bit));
++
++		return true;
++	}
++
++	return false;
++}
++
+ /**
+  * ilk_update_display_irq - update DEIMR
+  * @dev_priv: driver private
+@@ -412,26 +447,12 @@ static void gen6_disable_pm_irq(struct d
+ 	/* though a barrier is missing here, but don't really need a one */
+ }
+ 
+-static u32
+-gen11_gt_engine_identity(struct drm_i915_private * const i915,
+-			 const unsigned int bank, const unsigned int bit);
+-
+ void gen11_reset_rps_interrupts(struct drm_i915_private *dev_priv)
+ {
+-	u32 dw;
+-
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 
+-	/*
+-	 * According to the BSpec, DW_IIR bits cannot be cleared without
+-	 * first servicing the Selector & Shared IIR registers.
+-	 */
+-	dw = I915_READ_FW(GEN11_GT_INTR_DW0);
+-	while (dw & BIT(GEN11_GTPM)) {
+-		gen11_gt_engine_identity(dev_priv, 0, GEN11_GTPM);
+-		I915_WRITE_FW(GEN11_GT_INTR_DW0, BIT(GEN11_GTPM));
+-		dw = I915_READ_FW(GEN11_GT_INTR_DW0);
+-	}
++	while (gen11_reset_one_iir(dev_priv, 0, GEN11_GTPM))
++		;
+ 
+ 	dev_priv->gt_pm.rps.pm_iir = 0;
+ 
+@@ -455,10 +476,12 @@ void gen6_enable_rps_interrupts(struct d
+ 
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 	WARN_ON_ONCE(rps->pm_iir);
++
+ 	if (INTEL_GEN(dev_priv) >= 11)
+-		WARN_ON_ONCE(I915_READ_FW(GEN11_GT_INTR_DW0) & BIT(GEN11_GTPM));
++		WARN_ON_ONCE(gen11_reset_one_iir(dev_priv, 0, GEN11_GTPM));
+ 	else
+ 		WARN_ON_ONCE(I915_READ(gen6_pm_iir(dev_priv)) & dev_priv->pm_rps_events);
++
+ 	rps->interrupts_enabled = true;
+ 	gen6_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
+ 
+@@ -2778,6 +2801,8 @@ gen11_gt_engine_identity(struct drm_i915
+ 	u32 timeout_ts;
+ 	u32 ident;
+ 
++	lockdep_assert_held(&i915->irq_lock);
++
+ 	raw_reg_write(regs, GEN11_IIR_REG_SELECTOR(bank), BIT(bit));
+ 
+ 	/*
+@@ -2853,36 +2878,47 @@ gen11_gt_identity_handler(struct drm_i91
+ }
+ 
+ static void
+-gen11_gt_irq_handler(struct drm_i915_private * const i915,
+-		     const u32 master_ctl)
++gen11_gt_bank_handler(struct drm_i915_private * const i915,
++		      const unsigned int bank)
+ {
+ 	void __iomem * const regs = i915->regs;
+-	unsigned int bank;
++	unsigned long intr_dw;
++	unsigned int bit;
+ 
+-	for (bank = 0; bank < 2; bank++) {
+-		unsigned long intr_dw;
+-		unsigned int bit;
++	lockdep_assert_held(&i915->irq_lock);
+ 
+-		if (!(master_ctl & GEN11_GT_DW_IRQ(bank)))
+-			continue;
++	intr_dw = raw_reg_read(regs, GEN11_GT_INTR_DW(bank));
+ 
+-		intr_dw = raw_reg_read(regs, GEN11_GT_INTR_DW(bank));
++	if (unlikely(!intr_dw)) {
++		DRM_ERROR("GT_INTR_DW%u blank!\n", bank);
++		return;
++	}
+ 
+-		if (unlikely(!intr_dw)) {
+-			DRM_ERROR("GT_INTR_DW%u blank!\n", bank);
+-			continue;
+-		}
++	for_each_set_bit(bit, &intr_dw, 32) {
++		const u32 ident = gen11_gt_engine_identity(i915,
++							   bank, bit);
+ 
+-		for_each_set_bit(bit, &intr_dw, 32) {
+-			const u32 ident = gen11_gt_engine_identity(i915,
+-								   bank, bit);
++		gen11_gt_identity_handler(i915, ident);
++	}
+ 
+-			gen11_gt_identity_handler(i915, ident);
+-		}
++	/* Clear must be after shared has been served for engine */
++	raw_reg_write(regs, GEN11_GT_INTR_DW(bank), intr_dw);
++}
+ 
+-		/* Clear must be after shared has been served for engine */
+-		raw_reg_write(regs, GEN11_GT_INTR_DW(bank), intr_dw);
++static void
++gen11_gt_irq_handler(struct drm_i915_private * const i915,
++		     const u32 master_ctl)
++{
++	unsigned int bank;
++
++	spin_lock(&i915->irq_lock);
++
++	for (bank = 0; bank < 2; bank++) {
++		if (master_ctl & GEN11_GT_DW_IRQ(bank))
++			gen11_gt_bank_handler(i915, bank);
+ 	}
++
++	spin_unlock(&i915->irq_lock);
+ }
+ 
+ static irqreturn_t gen11_irq_handler(int irq, void *arg)
