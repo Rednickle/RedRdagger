@@ -1,0 +1,378 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 10 Apr 2018 17:33:05 -0400
+Subject: drm/amdkfd: Implement doorbell allocation for SOC15
+Git-commit: ef568db792e66216b48fd1567ff4a9d3bf9af866
+Patch-mainline: v4.20 or v4.20-rc7 (next release)
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Allocate doorbells according to the doorbell routing information on
+SOC15 ASICs (Vega10 and later). On older ASICs we continue to use the
+queue_id as the doorbell ID to maintain compatibility with the Thunk.
+
+Signed-off-by: Shaoyun Liu <Shaoyun.Liu@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Reviewed-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c               |    7 +
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c  |   82 ++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c              |   12 --
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h                  |   11 +-
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c               |   32 ++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c |   12 +-
+ 6 files changed, 139 insertions(+), 17 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -295,6 +295,13 @@ static int kfd_ioctl_create_queue(struct
+ 	args->doorbell_offset = KFD_MMAP_TYPE_DOORBELL;
+ 	args->doorbell_offset |= KFD_MMAP_GPU_ID(args->gpu_id);
+ 	args->doorbell_offset <<= PAGE_SHIFT;
++	if (KFD_IS_SOC15(dev->device_info->asic_family))
++		/* On SOC15 ASICs, doorbell allocation must be
++		 * per-device, and independent from the per-process
++		 * queue_id. Return the doorbell offset within the
++		 * doorbell aperture to user mode.
++		 */
++		args->doorbell_offset |= q_properties.doorbell_off;
+ 
+ 	mutex_unlock(&p->mutex);
+ 
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -110,6 +110,57 @@ void program_sh_mem_settings(struct devi
+ 						qpd->sh_mem_bases);
+ }
+ 
++static int allocate_doorbell(struct qcm_process_device *qpd, struct queue *q)
++{
++	struct kfd_dev *dev = qpd->dqm->dev;
++
++	if (!KFD_IS_SOC15(dev->device_info->asic_family)) {
++		/* On pre-SOC15 chips we need to use the queue ID to
++		 * preserve the user mode ABI.
++		 */
++		q->doorbell_id = q->properties.queue_id;
++	} else if (q->properties.type == KFD_QUEUE_TYPE_SDMA) {
++		/* For SDMA queues on SOC15, use static doorbell
++		 * assignments based on the engine and queue.
++		 */
++		q->doorbell_id = dev->shared_resources.sdma_doorbell
++			[q->properties.sdma_engine_id]
++			[q->properties.sdma_queue_id];
++	} else {
++		/* For CP queues on SOC15 reserve a free doorbell ID */
++		unsigned int found;
++
++		found = find_first_zero_bit(qpd->doorbell_bitmap,
++					    KFD_MAX_NUM_OF_QUEUES_PER_PROCESS);
++		if (found >= KFD_MAX_NUM_OF_QUEUES_PER_PROCESS) {
++			pr_debug("No doorbells available");
++			return -EBUSY;
++		}
++		set_bit(found, qpd->doorbell_bitmap);
++		q->doorbell_id = found;
++	}
++
++	q->properties.doorbell_off =
++		kfd_doorbell_id_to_offset(dev, q->process,
++					  q->doorbell_id);
++
++	return 0;
++}
++
++static void deallocate_doorbell(struct qcm_process_device *qpd,
++				struct queue *q)
++{
++	unsigned int old;
++	struct kfd_dev *dev = qpd->dqm->dev;
++
++	if (!KFD_IS_SOC15(dev->device_info->asic_family) ||
++	    q->properties.type == KFD_QUEUE_TYPE_SDMA)
++		return;
++
++	old = test_and_clear_bit(q->doorbell_id, qpd->doorbell_bitmap);
++	WARN_ON(!old);
++}
++
+ static int allocate_vmid(struct device_queue_manager *dqm,
+ 			struct qcm_process_device *qpd,
+ 			struct queue *q)
+@@ -301,10 +352,14 @@ static int create_compute_queue_nocpsch(
+ 	if (retval)
+ 		return retval;
+ 
++	retval = allocate_doorbell(qpd, q);
++	if (retval)
++		goto out_deallocate_hqd;
++
+ 	retval = mqd->init_mqd(mqd, &q->mqd, &q->mqd_mem_obj,
+ 				&q->gart_mqd_addr, &q->properties);
+ 	if (retval)
+-		goto out_deallocate_hqd;
++		goto out_deallocate_doorbell;
+ 
+ 	pr_debug("Loading mqd to hqd on pipe %d, queue %d\n",
+ 			q->pipe, q->queue);
+@@ -324,6 +379,8 @@ static int create_compute_queue_nocpsch(
+ 
+ out_uninit_mqd:
+ 	mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
++out_deallocate_doorbell:
++	deallocate_doorbell(qpd, q);
+ out_deallocate_hqd:
+ 	deallocate_hqd(dqm, q);
+ 
+@@ -357,6 +414,8 @@ static int destroy_queue_nocpsch_locked(
+ 	}
+ 	dqm->total_queue_count--;
+ 
++	deallocate_doorbell(qpd, q);
++
+ 	retval = mqd->destroy_mqd(mqd, q->mqd,
+ 				KFD_PREEMPT_TYPE_WAVEFRONT_RESET,
+ 				KFD_UNMAP_LATENCY_MS,
+@@ -861,6 +920,10 @@ static int create_sdma_queue_nocpsch(str
+ 	q->properties.sdma_queue_id = q->sdma_id / CIK_SDMA_QUEUES_PER_ENGINE;
+ 	q->properties.sdma_engine_id = q->sdma_id % CIK_SDMA_QUEUES_PER_ENGINE;
+ 
++	retval = allocate_doorbell(qpd, q);
++	if (retval)
++		goto out_deallocate_sdma_queue;
++
+ 	pr_debug("SDMA id is:    %d\n", q->sdma_id);
+ 	pr_debug("SDMA queue id: %d\n", q->properties.sdma_queue_id);
+ 	pr_debug("SDMA engine id: %d\n", q->properties.sdma_engine_id);
+@@ -869,7 +932,7 @@ static int create_sdma_queue_nocpsch(str
+ 	retval = mqd->init_mqd(mqd, &q->mqd, &q->mqd_mem_obj,
+ 				&q->gart_mqd_addr, &q->properties);
+ 	if (retval)
+-		goto out_deallocate_sdma_queue;
++		goto out_deallocate_doorbell;
+ 
+ 	retval = mqd->load_mqd(mqd, q->mqd, 0, 0, &q->properties, NULL);
+ 	if (retval)
+@@ -879,6 +942,8 @@ static int create_sdma_queue_nocpsch(str
+ 
+ out_uninit_mqd:
+ 	mqd->uninit_mqd(mqd, q->mqd, q->mqd_mem_obj);
++out_deallocate_doorbell:
++	deallocate_doorbell(qpd, q);
+ out_deallocate_sdma_queue:
+ 	deallocate_sdma_queue(dqm, q->sdma_id);
+ 
+@@ -1070,12 +1135,17 @@ static int create_queue_cpsch(struct dev
+ 		q->properties.sdma_engine_id =
+ 			q->sdma_id % CIK_SDMA_QUEUES_PER_ENGINE;
+ 	}
++
++	retval = allocate_doorbell(qpd, q);
++	if (retval)
++		goto out_deallocate_sdma_queue;
++
+ 	mqd = dqm->ops.get_mqd_manager(dqm,
+ 			get_mqd_type_from_queue_type(q->properties.type));
+ 
+ 	if (!mqd) {
+ 		retval = -ENOMEM;
+-		goto out_deallocate_sdma_queue;
++		goto out_deallocate_doorbell;
+ 	}
+ 	/*
+ 	 * Eviction state logic: we only mark active queues as evicted
+@@ -1093,7 +1163,7 @@ static int create_queue_cpsch(struct dev
+ 	retval = mqd->init_mqd(mqd, &q->mqd, &q->mqd_mem_obj,
+ 				&q->gart_mqd_addr, &q->properties);
+ 	if (retval)
+-		goto out_deallocate_sdma_queue;
++		goto out_deallocate_doorbell;
+ 
+ 	list_add(&q->list, &qpd->queues_list);
+ 	qpd->queue_count++;
+@@ -1117,6 +1187,8 @@ static int create_queue_cpsch(struct dev
+ 	mutex_unlock(&dqm->lock);
+ 	return retval;
+ 
++out_deallocate_doorbell:
++	deallocate_doorbell(qpd, q);
+ out_deallocate_sdma_queue:
+ 	if (q->properties.type == KFD_QUEUE_TYPE_SDMA)
+ 		deallocate_sdma_queue(dqm, q->sdma_id);
+@@ -1257,6 +1329,8 @@ static int destroy_queue_cpsch(struct de
+ 		goto failed;
+ 	}
+ 
++	deallocate_doorbell(qpd, q);
++
+ 	if (q->properties.type == KFD_QUEUE_TYPE_SDMA) {
+ 		dqm->sdma_queue_count--;
+ 		deallocate_sdma_queue(dqm, q->sdma_id);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c
+@@ -49,7 +49,7 @@ static unsigned int max_doorbell_slices;
+  */
+ 
+ /* # of doorbell bytes allocated for each process. */
+-static size_t kfd_doorbell_process_slice(struct kfd_dev *kfd)
++size_t kfd_doorbell_process_slice(struct kfd_dev *kfd)
+ {
+ 	return roundup(kfd->device_info->doorbell_size *
+ 			KFD_MAX_NUM_OF_QUEUES_PER_PROCESS,
+@@ -214,13 +214,9 @@ void write_kernel_doorbell(void __iomem
+ 	}
+ }
+ 
+-/*
+- * queue_ids are in the range [0,MAX_PROCESS_QUEUES) and are mapped 1:1
+- * to doorbells with the process's doorbell page
+- */
+-unsigned int kfd_queue_id_to_doorbell(struct kfd_dev *kfd,
++unsigned int kfd_doorbell_id_to_offset(struct kfd_dev *kfd,
+ 					struct kfd_process *process,
+-					unsigned int queue_id)
++					unsigned int doorbell_id)
+ {
+ 	/*
+ 	 * doorbell_id_offset accounts for doorbells taken by KGD.
+@@ -231,7 +227,7 @@ unsigned int kfd_queue_id_to_doorbell(st
+ 	return kfd->doorbell_id_offset +
+ 		process->doorbell_index
+ 		* kfd_doorbell_process_slice(kfd) / sizeof(u32) +
+-		queue_id * kfd->device_info->doorbell_size / sizeof(u32);
++		doorbell_id * kfd->device_info->doorbell_size / sizeof(u32);
+ }
+ 
+ uint64_t kfd_get_number_elems(struct kfd_dev *kfd)
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -169,6 +169,8 @@ enum cache_policy {
+ 	cache_policy_noncoherent
+ };
+ 
++#define KFD_IS_SOC15(chip) ((chip) >= CHIP_VEGA10)
++
+ struct kfd_event_interrupt_class {
+ 	bool (*interrupt_isr)(struct kfd_dev *dev,
+ 				const uint32_t *ih_ring_entry);
+@@ -449,6 +451,7 @@ struct queue {
+ 	uint32_t queue;
+ 
+ 	unsigned int sdma_id;
++	unsigned int doorbell_id;
+ 
+ 	struct kfd_process	*process;
+ 	struct kfd_dev		*device;
+@@ -523,6 +526,9 @@ struct qcm_process_device {
+ 	/* IB memory */
+ 	uint64_t ib_base;
+ 	void *ib_kaddr;
++
++	/* doorbell resources per process per device */
++	unsigned long *doorbell_bitmap;
+ };
+ 
+ /* KFD Memory Eviction */
+@@ -747,6 +753,7 @@ unsigned int kfd_pasid_alloc(void);
+ void kfd_pasid_free(unsigned int pasid);
+ 
+ /* Doorbells */
++size_t kfd_doorbell_process_slice(struct kfd_dev *kfd);
+ int kfd_doorbell_init(struct kfd_dev *kfd);
+ void kfd_doorbell_fini(struct kfd_dev *kfd);
+ int kfd_doorbell_mmap(struct kfd_dev *dev, struct kfd_process *process,
+@@ -756,9 +763,9 @@ void __iomem *kfd_get_kernel_doorbell(st
+ void kfd_release_kernel_doorbell(struct kfd_dev *kfd, u32 __iomem *db_addr);
+ u32 read_kernel_doorbell(u32 __iomem *db);
+ void write_kernel_doorbell(void __iomem *db, u32 value);
+-unsigned int kfd_queue_id_to_doorbell(struct kfd_dev *kfd,
++unsigned int kfd_doorbell_id_to_offset(struct kfd_dev *kfd,
+ 					struct kfd_process *process,
+-					unsigned int queue_id);
++					unsigned int doorbell_id);
+ phys_addr_t kfd_get_process_doorbells(struct kfd_dev *dev,
+ 					struct kfd_process *process);
+ int kfd_alloc_process_doorbells(struct kfd_process *process);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -332,6 +332,7 @@ static void kfd_process_destroy_pdds(str
+ 			free_pages((unsigned long)pdd->qpd.cwsr_kaddr,
+ 				get_order(KFD_CWSR_TBA_TMA_SIZE));
+ 
++		kfree(pdd->qpd.doorbell_bitmap);
+ 		idr_destroy(&pdd->alloc_idr);
+ 
+ 		kfree(pdd);
+@@ -586,6 +587,31 @@ err_alloc_process:
+ 	return ERR_PTR(err);
+ }
+ 
++static int init_doorbell_bitmap(struct qcm_process_device *qpd,
++			struct kfd_dev *dev)
++{
++	unsigned int i;
++
++	if (!KFD_IS_SOC15(dev->device_info->asic_family))
++		return 0;
++
++	qpd->doorbell_bitmap =
++		kzalloc(DIV_ROUND_UP(KFD_MAX_NUM_OF_QUEUES_PER_PROCESS,
++				     BITS_PER_BYTE), GFP_KERNEL);
++	if (!qpd->doorbell_bitmap)
++		return -ENOMEM;
++
++	/* Mask out any reserved doorbells */
++	for (i = 0; i < KFD_MAX_NUM_OF_QUEUES_PER_PROCESS; i++)
++		if ((dev->shared_resources.reserved_doorbell_mask & i) ==
++		    dev->shared_resources.reserved_doorbell_val) {
++			set_bit(i, qpd->doorbell_bitmap);
++			pr_debug("reserved doorbell 0x%03x\n", i);
++		}
++
++	return 0;
++}
++
+ struct kfd_process_device *kfd_get_process_device_data(struct kfd_dev *dev,
+ 							struct kfd_process *p)
+ {
+@@ -607,6 +633,12 @@ struct kfd_process_device *kfd_create_pr
+ 	if (!pdd)
+ 		return NULL;
+ 
++	if (init_doorbell_bitmap(&pdd->qpd, dev)) {
++		pr_err("Failed to init doorbell for process\n");
++		kfree(pdd);
++		return NULL;
++	}
++
+ 	pdd->dev = dev;
+ 	INIT_LIST_HEAD(&pdd->qpd.queues_list);
+ 	INIT_LIST_HEAD(&pdd->qpd.priv_queue_list);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -119,9 +119,6 @@ static int create_cp_queue(struct proces
+ 	/* Doorbell initialized in user space*/
+ 	q_properties->doorbell_ptr = NULL;
+ 
+-	q_properties->doorbell_off =
+-			kfd_queue_id_to_doorbell(dev, pqm->process, qid);
+-
+ 	/* let DQM handle it*/
+ 	q_properties->vmid = 0;
+ 	q_properties->queue_id = qid;
+@@ -248,6 +245,15 @@ int pqm_create_queue(struct process_queu
+ 		goto err_create_queue;
+ 	}
+ 
++	if (q)
++		/* Return the doorbell offset within the doorbell page
++		 * to the caller so it can be passed up to user mode
++		 * (in bytes).
++		 */
++		properties->doorbell_off =
++			(q->properties.doorbell_off * sizeof(uint32_t)) &
++			(kfd_doorbell_process_slice(dev) - 1);
++
+ 	pr_debug("PQM After DQM create queue\n");
+ 
+ 	list_add(&pqn->process_queue_list, &pqm->queues);
