@@ -1,0 +1,480 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 30 Apr 2018 14:15:02 +0100
+Subject: drm/i915: Retire requests along rings
+Git-commit: b887d61546245389c0304d8b1371bab9af8106c2
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+In the next patch, rings are the central timeline as requests may jump
+between engines. Therefore in the future as we retire in order along the
+engine timeline, we may retire out-of-order within a ring (as the ring now
+occurs along multiple engines), leading to much hilarity in miscomputing
+the position of ring->head.
+
+As an added bonus, retiring along the ring reduces the penalty of having
+one execlists client do cleanup for another (old legacy submission
+shares a ring between all clients). The downside is that slow and
+irregular (off the critical path) process of cleaning up stale requests
+after userspace becomes a modicum less efficient.
+
+In the long run, it will become apparent that the ordered
+ring->request_list matches the ring->timeline, a fun challenge for the
+future will be unifying the two lists to avoid duplication!
+
+v2: We need both engine-order and ring-order processing to maintain our
+knowledge of where individual rings have completed upto as well as
+knowing what was last executing on any engine. And finally by decoupling
+retiring the contexts on the engine and the timelines along the rings,
+we do have to keep a reference to the context on each request
+(previously it was guaranteed by the context being pinned).
+
+v3: Not just a reference to the context, but we need to keep it pinned
+as we manipulate the rings; i.e. we need a pin for both the manipulation
+of the engine state during its retirements, and a separate pin for the
+manipulation of the ring state.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180430131503.5375-3-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h                  |    3 
+ drivers/gpu/drm/i915/i915_gem.c                  |    1 
+ drivers/gpu/drm/i915/i915_request.c              |  150 ++++++++++++++---------
+ drivers/gpu/drm/i915/i915_utils.h                |    6 
+ drivers/gpu/drm/i915/intel_ringbuffer.c          |    6 
+ drivers/gpu/drm/i915/intel_ringbuffer.h          |    1 
+ drivers/gpu/drm/i915/selftests/mock_engine.c     |   27 +++-
+ drivers/gpu/drm/i915/selftests/mock_gem_device.c |    2 
+ 8 files changed, 131 insertions(+), 65 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2059,8 +2059,9 @@ struct drm_i915_private {
+ 		void (*resume)(struct drm_i915_private *);
+ 		void (*cleanup_engine)(struct intel_engine_cs *engine);
+ 
+-		struct list_head timelines;
+ 		struct i915_gem_timeline global_timeline;
++		struct list_head timelines;
++		struct list_head rings;
+ 		u32 active_requests;
+ 		u32 request_serial;
+ 
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5600,6 +5600,7 @@ int i915_gem_init_early(struct drm_i915_
+ 		goto err_dependencies;
+ 
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
++	INIT_LIST_HEAD(&dev_priv->gt.rings);
+ 	INIT_LIST_HEAD(&dev_priv->gt.timelines);
+ 	err = i915_gem_timeline_init__global(dev_priv);
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -286,6 +286,7 @@ static int reserve_gt(struct drm_i915_pr
+ 
+ static void unreserve_gt(struct drm_i915_private *i915)
+ {
++	GEM_BUG_ON(!i915->gt.active_requests);
+ 	if (!--i915->gt.active_requests)
+ 		i915_gem_park(i915);
+ }
+@@ -298,6 +299,7 @@ void i915_gem_retire_noop(struct i915_ge
+ 
+ static void advance_ring(struct i915_request *request)
+ {
++	struct intel_ring *ring = request->ring;
+ 	unsigned int tail;
+ 
+ 	/*
+@@ -309,7 +311,8 @@ static void advance_ring(struct i915_req
+ 	 * Note this requires that we are always called in request
+ 	 * completion order.
+ 	 */
+-	if (list_is_last(&request->ring_link, &request->ring->request_list)) {
++	GEM_BUG_ON(!list_is_first(&request->ring_link, &ring->request_list));
++	if (list_is_last(&request->ring_link, &ring->request_list)) {
+ 		/*
+ 		 * We may race here with execlists resubmitting this request
+ 		 * as we retire it. The resubmission will move the ring->tail
+@@ -322,9 +325,9 @@ static void advance_ring(struct i915_req
+ 	} else {
+ 		tail = request->postfix;
+ 	}
+-	list_del(&request->ring_link);
++	list_del_init(&request->ring_link);
+ 
+-	request->ring->head = tail;
++	ring->head = tail;
+ }
+ 
+ static void free_capture_list(struct i915_request *request)
+@@ -340,30 +343,84 @@ static void free_capture_list(struct i91
+ 	}
+ }
+ 
++static void __retire_engine_request(struct intel_engine_cs *engine,
++				    struct i915_request *rq)
++{
++	GEM_TRACE("%s(%s) fence %llx:%d, global=%d, current %d\n",
++		  __func__, engine->name,
++		  rq->fence.context, rq->fence.seqno,
++		  rq->global_seqno,
++		  intel_engine_get_seqno(engine));
++
++	GEM_BUG_ON(!i915_request_completed(rq));
++
++	local_irq_disable();
++
++	spin_lock(&engine->timeline->lock);
++	GEM_BUG_ON(!list_is_first(&rq->link, &engine->timeline->requests));
++	list_del_init(&rq->link);
++	spin_unlock(&engine->timeline->lock);
++
++	spin_lock(&rq->lock);
++	if (!test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &rq->fence.flags))
++		dma_fence_signal_locked(&rq->fence);
++	if (test_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, &rq->fence.flags))
++		intel_engine_cancel_signaling(rq);
++	if (rq->waitboost) {
++		GEM_BUG_ON(!atomic_read(&rq->i915->gt_pm.rps.num_waiters));
++		atomic_dec(&rq->i915->gt_pm.rps.num_waiters);
++	}
++	spin_unlock(&rq->lock);
++
++	local_irq_enable();
++
++	/*
++	 * The backing object for the context is done after switching to the
++	 * *next* context. Therefore we cannot retire the previous context until
++	 * the next context has already started running. However, since we
++	 * cannot take the required locks at i915_request_submit() we
++	 * defer the unpinning of the active context to now, retirement of
++	 * the subsequent request.
++	 */
++	if (engine->last_retired_context)
++		intel_context_unpin(engine->last_retired_context, engine);
++	engine->last_retired_context = rq->ctx;
++}
++
++static void __retire_engine_upto(struct intel_engine_cs *engine,
++				 struct i915_request *rq)
++{
++	struct i915_request *tmp;
++
++	if (list_empty(&rq->link))
++		return;
++
++	do {
++		tmp = list_first_entry(&engine->timeline->requests,
++				       typeof(*tmp), link);
++
++		GEM_BUG_ON(tmp->engine != engine);
++		__retire_engine_request(engine, tmp);
++	} while (tmp != rq);
++}
++
+ static void i915_request_retire(struct i915_request *request)
+ {
+-	struct intel_engine_cs *engine = request->engine;
+ 	struct i915_gem_active *active, *next;
+ 
+ 	GEM_TRACE("%s fence %llx:%d, global=%d, current %d\n",
+-		  engine->name,
++		  request->engine->name,
+ 		  request->fence.context, request->fence.seqno,
+ 		  request->global_seqno,
+-		  intel_engine_get_seqno(engine));
++		  intel_engine_get_seqno(request->engine));
+ 
+ 	lockdep_assert_held(&request->i915->drm.struct_mutex);
+ 	GEM_BUG_ON(!i915_sw_fence_signaled(&request->submit));
+ 	GEM_BUG_ON(!i915_request_completed(request));
+-	GEM_BUG_ON(!request->i915->gt.active_requests);
+ 
+ 	trace_i915_request_retire(request);
+ 
+-	spin_lock_irq(&engine->timeline->lock);
+-	list_del_init(&request->link);
+-	spin_unlock_irq(&engine->timeline->lock);
+-
+ 	advance_ring(request);
+-
+ 	free_capture_list(request);
+ 
+ 	/*
+@@ -399,29 +456,9 @@ static void i915_request_retire(struct i
+ 
+ 	/* Retirement decays the ban score as it is a sign of ctx progress */
+ 	atomic_dec_if_positive(&request->ctx->ban_score);
++	intel_context_unpin(request->ctx, request->engine);
+ 
+-	/*
+-	 * The backing object for the context is done after switching to the
+-	 * *next* context. Therefore we cannot retire the previous context until
+-	 * the next context has already started running. However, since we
+-	 * cannot take the required locks at i915_request_submit() we
+-	 * defer the unpinning of the active context to now, retirement of
+-	 * the subsequent request.
+-	 */
+-	if (engine->last_retired_context)
+-		intel_context_unpin(engine->last_retired_context, engine);
+-	engine->last_retired_context = request->ctx;
+-
+-	spin_lock_irq(&request->lock);
+-	if (!test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &request->fence.flags))
+-		dma_fence_signal_locked(&request->fence);
+-	if (test_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT, &request->fence.flags))
+-		intel_engine_cancel_signaling(request);
+-	if (request->waitboost) {
+-		GEM_BUG_ON(!atomic_read(&request->i915->gt_pm.rps.num_waiters));
+-		atomic_dec(&request->i915->gt_pm.rps.num_waiters);
+-	}
+-	spin_unlock_irq(&request->lock);
++	__retire_engine_upto(request->engine, request);
+ 
+ 	unreserve_gt(request->i915);
+ 
+@@ -431,18 +468,24 @@ static void i915_request_retire(struct i
+ 
+ void i915_request_retire_upto(struct i915_request *rq)
+ {
+-	struct intel_engine_cs *engine = rq->engine;
++	struct intel_ring *ring = rq->ring;
+ 	struct i915_request *tmp;
+ 
++	GEM_TRACE("%s fence %llx:%d, global=%d, current %d\n",
++		  rq->engine->name,
++		  rq->fence.context, rq->fence.seqno,
++		  rq->global_seqno,
++		  intel_engine_get_seqno(rq->engine));
++
+ 	lockdep_assert_held(&rq->i915->drm.struct_mutex);
+ 	GEM_BUG_ON(!i915_request_completed(rq));
+ 
+-	if (list_empty(&rq->link))
++	if (list_empty(&rq->ring_link))
+ 		return;
+ 
+ 	do {
+-		tmp = list_first_entry(&engine->timeline->requests,
+-				       typeof(*tmp), link);
++		tmp = list_first_entry(&ring->request_list,
++				       typeof(*tmp), ring_link);
+ 
+ 		i915_request_retire(tmp);
+ 	} while (tmp != rq);
+@@ -651,9 +694,9 @@ i915_request_alloc(struct intel_engine_c
+ 	if (ret)
+ 		goto err_unreserve;
+ 
+-	/* Move the oldest request to the slab-cache (if not in use!) */
+-	rq = list_first_entry_or_null(&engine->timeline->requests,
+-				      typeof(*rq), link);
++	/* Move our oldest request to the slab-cache (if not in use!) */
++	rq = list_first_entry_or_null(&ring->request_list,
++				      typeof(*rq), ring_link);
+ 	if (rq && i915_request_completed(rq))
+ 		i915_request_retire(rq);
+ 
+@@ -771,6 +814,9 @@ i915_request_alloc(struct intel_engine_c
+ 	if (ret)
+ 		goto err_unwind;
+ 
++	/* Keep a second pin for the dual retirement along engine and ring */
++	__intel_context_pin(rq->ctx, engine);
++
+ 	/* Check that we didn't interrupt ourselves with a new request */
+ 	GEM_BUG_ON(rq->timeline->seqno != rq->fence.seqno);
+ 	return rq;
+@@ -1357,38 +1403,30 @@ complete:
+ 	return timeout;
+ }
+ 
+-static void engine_retire_requests(struct intel_engine_cs *engine)
++static void ring_retire_requests(struct intel_ring *ring)
+ {
+ 	struct i915_request *request, *next;
+-	u32 seqno = intel_engine_get_seqno(engine);
+-	LIST_HEAD(retire);
+ 
+-	spin_lock_irq(&engine->timeline->lock);
+ 	list_for_each_entry_safe(request, next,
+-				 &engine->timeline->requests, link) {
+-		if (!i915_seqno_passed(seqno, request->global_seqno))
++				 &ring->request_list, ring_link) {
++		if (!i915_request_completed(request))
+ 			break;
+ 
+-		list_move_tail(&request->link, &retire);
+-	}
+-	spin_unlock_irq(&engine->timeline->lock);
+-
+-	list_for_each_entry_safe(request, next, &retire, link)
+ 		i915_request_retire(request);
++	}
+ }
+ 
+ void i915_retire_requests(struct drm_i915_private *i915)
+ {
+-	struct intel_engine_cs *engine;
+-	enum intel_engine_id id;
++	struct intel_ring *ring, *next;
+ 
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 
+ 	if (!i915->gt.active_requests)
+ 		return;
+ 
+-	for_each_engine(engine, i915, id)
+-		engine_retire_requests(engine);
++	list_for_each_entry_safe(ring, next, &i915->gt.rings, link)
++		ring_retire_requests(ring);
+ }
+ 
+ #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+--- a/drivers/gpu/drm/i915/i915_utils.h
++++ b/drivers/gpu/drm/i915/i915_utils.h
+@@ -120,6 +120,12 @@ static inline u64 ptr_to_u64(const void
+ 
+ #include <linux/list.h>
+ 
++static inline int list_is_first(const struct list_head *list,
++				const struct list_head *head)
++{
++	return head->next == list;
++}
++
+ static inline void __list_del_many(struct list_head *head,
+ 				   struct list_head *first)
+ {
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1066,7 +1066,6 @@ err:
+ 
+ void intel_ring_reset(struct intel_ring *ring, u32 tail)
+ {
+-	GEM_BUG_ON(!list_empty(&ring->request_list));
+ 	ring->tail = tail;
+ 	ring->head = tail;
+ 	ring->emit = tail;
+@@ -1125,6 +1124,7 @@ intel_engine_create_ring(struct intel_en
+ 
+ 	GEM_BUG_ON(!is_power_of_2(size));
+ 	GEM_BUG_ON(RING_CTL_SIZE(size) & ~RING_NR_PAGES);
++	lockdep_assert_held(&engine->i915->drm.struct_mutex);
+ 
+ 	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
+ 	if (!ring)
+@@ -1150,6 +1150,8 @@ intel_engine_create_ring(struct intel_en
+ 	}
+ 	ring->vma = vma;
+ 
++	list_add(&ring->link, &engine->i915->gt.rings);
++
+ 	return ring;
+ }
+ 
+@@ -1161,6 +1163,8 @@ intel_ring_free(struct intel_ring *ring)
+ 	i915_vma_close(ring->vma);
+ 	__i915_gem_object_release_unless_active(obj);
+ 
++	list_del(&ring->link);
++
+ 	kfree(ring);
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -129,6 +129,7 @@ struct intel_ring {
+ 	void *vaddr;
+ 
+ 	struct list_head request_list;
++	struct list_head link;
+ 
+ 	u32 head;
+ 	u32 tail;
+--- a/drivers/gpu/drm/i915/selftests/mock_engine.c
++++ b/drivers/gpu/drm/i915/selftests/mock_engine.c
+@@ -147,9 +147,18 @@ static struct intel_ring *mock_ring(stru
+ 	INIT_LIST_HEAD(&ring->request_list);
+ 	intel_ring_update_space(ring);
+ 
++	list_add(&ring->link, &engine->i915->gt.rings);
++
+ 	return ring;
+ }
+ 
++static void mock_ring_free(struct intel_ring *ring)
++{
++	list_del(&ring->link);
++
++	kfree(ring);
++}
++
+ struct intel_engine_cs *mock_engine(struct drm_i915_private *i915,
+ 				    const char *name,
+ 				    int id)
+@@ -162,12 +171,6 @@ struct intel_engine_cs *mock_engine(stru
+ 	if (!engine)
+ 		return NULL;
+ 
+-	engine->base.buffer = mock_ring(&engine->base);
+-	if (!engine->base.buffer) {
+-		kfree(engine);
+-		return NULL;
+-	}
+-
+ 	/* minimal engine setup for requests */
+ 	engine->base.i915 = i915;
+ 	snprintf(engine->base.name, sizeof(engine->base.name), "%s", name);
+@@ -192,7 +195,16 @@ struct intel_engine_cs *mock_engine(stru
+ 	timer_setup(&engine->hw_delay, hw_delay_complete, 0);
+ 	INIT_LIST_HEAD(&engine->hw_queue);
+ 
++	engine->base.buffer = mock_ring(&engine->base);
++	if (!engine->base.buffer)
++		goto err_breadcrumbs;
++
+ 	return &engine->base;
++
++err_breadcrumbs:
++	intel_engine_fini_breadcrumbs(&engine->base);
++	kfree(engine);
++	return NULL;
+ }
+ 
+ void mock_engine_flush(struct intel_engine_cs *engine)
+@@ -226,8 +238,9 @@ void mock_engine_free(struct intel_engin
+ 	if (engine->last_retired_context)
+ 		intel_context_unpin(engine->last_retired_context, engine);
+ 
++	mock_ring_free(engine->buffer);
++
+ 	intel_engine_fini_breadcrumbs(engine);
+ 
+-	kfree(engine->buffer);
+ 	kfree(engine);
+ }
+--- a/drivers/gpu/drm/i915/selftests/mock_gem_device.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+@@ -44,6 +44,7 @@ void mock_device_flush(struct drm_i915_p
+ 		mock_engine_flush(engine);
+ 
+ 	i915_retire_requests(i915);
++	GEM_BUG_ON(i915->gt.active_requests);
+ }
+ 
+ static void mock_device_release(struct drm_device *dev)
+@@ -224,6 +225,7 @@ struct drm_i915_private *mock_gem_device
+ 		goto err_dependencies;
+ 
+ 	mutex_lock(&i915->drm.struct_mutex);
++	INIT_LIST_HEAD(&i915->gt.rings);
+ 	INIT_LIST_HEAD(&i915->gt.timelines);
+ 	err = i915_gem_timeline_init__global(i915);
+ 	if (err) {
