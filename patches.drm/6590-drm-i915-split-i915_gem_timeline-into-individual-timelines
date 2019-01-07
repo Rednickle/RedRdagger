@@ -1,0 +1,2541 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 2 May 2018 17:38:39 +0100
+Subject: drm/i915: Split i915_gem_timeline into individual timelines
+Git-commit: a89d1f921c15932b4c9a70861d134290f1a14a10
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We need to move to a more flexible timeline that doesn't assume one
+fence context per engine, and so allow for a single timeline to be used
+across a combination of engines. This means that preallocating a fence
+context per engine is now a hindrance, and so we want to introduce the
+singular timeline. From the code perspective, this has the notable
+advantage of clearing up a lot of mirky semantics and some clumsy
+pointer chasing.
+
+By splitting the timeline up into a single entity rather than an array
+of per-engine timelines, we can realise the goal of the previous patch
+of tracking the timeline alongside the ring.
+
+v2: Tweak wait_for_idle to stop the compiling thinking that ret may be
+uninitialised.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180502163839.3248-2-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/Makefile                      |    2 
+ drivers/gpu/drm/i915/i915_drv.h                    |    4 
+ drivers/gpu/drm/i915/i915_gem.c                    |  129 +++------
+ drivers/gpu/drm/i915/i915_gem_context.c            |   48 +--
+ drivers/gpu/drm/i915/i915_gem_context.h            |    2 
+ drivers/gpu/drm/i915/i915_gem_gtt.h                |    3 
+ drivers/gpu/drm/i915/i915_gem_timeline.c           |  198 -------------
+ drivers/gpu/drm/i915/i915_gem_timeline.h           |  121 --------
+ drivers/gpu/drm/i915/i915_gpu_error.c              |    4 
+ drivers/gpu/drm/i915/i915_perf.c                   |   10 
+ drivers/gpu/drm/i915/i915_request.c                |   68 ++--
+ drivers/gpu/drm/i915/i915_request.h                |    3 
+ drivers/gpu/drm/i915/i915_timeline.c               |  105 +++++++
+ drivers/gpu/drm/i915/i915_timeline.h               |  126 ++++++++
+ drivers/gpu/drm/i915/intel_engine_cs.c             |   27 -
+ drivers/gpu/drm/i915/intel_guc_submission.c        |    4 
+ drivers/gpu/drm/i915/intel_lrc.c                   |   48 +--
+ drivers/gpu/drm/i915/intel_ringbuffer.c            |   25 +
+ drivers/gpu/drm/i915/intel_ringbuffer.h            |   11 
+ drivers/gpu/drm/i915/selftests/i915_gem_context.c  |   12 
+ drivers/gpu/drm/i915/selftests/i915_gem_timeline.c |  299 ---------------------
+ drivers/gpu/drm/i915/selftests/i915_timeline.c     |  267 ++++++++++++++++++
+ drivers/gpu/drm/i915/selftests/mock_engine.c       |   32 +-
+ drivers/gpu/drm/i915/selftests/mock_gem_device.c   |   10 
+ drivers/gpu/drm/i915/selftests/mock_timeline.c     |   45 ---
+ drivers/gpu/drm/i915/selftests/mock_timeline.h     |   28 -
+ 26 files changed, 723 insertions(+), 908 deletions(-)
+
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -70,11 +70,11 @@ i915-y += i915_cmd_parser.o \
+ 	  i915_gem_shrinker.o \
+ 	  i915_gem_stolen.o \
+ 	  i915_gem_tiling.o \
+-	  i915_gem_timeline.o \
+ 	  i915_gem_userptr.o \
+ 	  i915_gemfs.o \
+ 	  i915_query.o \
+ 	  i915_request.o \
++	  i915_timeline.o \
+ 	  i915_trace_points.o \
+ 	  i915_vma.o \
+ 	  intel_breadcrumbs.o \
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -72,10 +72,10 @@
+ #include "i915_gem_fence_reg.h"
+ #include "i915_gem_object.h"
+ #include "i915_gem_gtt.h"
+-#include "i915_gem_timeline.h"
+ #include "i915_gpu_error.h"
+ #include "i915_request.h"
+ #include "i915_scheduler.h"
++#include "i915_timeline.h"
+ #include "i915_vma.h"
+ 
+ #include "intel_gvt.h"
+@@ -2059,8 +2059,6 @@ struct drm_i915_private {
+ 		void (*resume)(struct drm_i915_private *);
+ 		void (*cleanup_engine)(struct intel_engine_cs *engine);
+ 
+-		struct i915_gem_timeline execution_timeline;
+-		struct i915_gem_timeline legacy_timeline;
+ 		struct list_head timelines;
+ 
+ 		struct list_head active_rings;
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -162,7 +162,7 @@ static u32 __i915_gem_park(struct drm_i9
+ 	synchronize_irq(i915->drm.irq);
+ 
+ 	intel_engines_park(i915);
+-	i915_gem_timelines_park(i915);
++	i915_timelines_park(i915);
+ 
+ 	i915_pmu_gt_parked(i915);
+ 
+@@ -2977,8 +2977,8 @@ i915_gem_find_active_request(struct inte
+ 	 * extra delay for a recent interrupt is pointless. Hence, we do
+ 	 * not need an engine->irq_seqno_barrier() before the seqno reads.
+ 	 */
+-	spin_lock_irqsave(&engine->timeline->lock, flags);
+-	list_for_each_entry(request, &engine->timeline->requests, link) {
++	spin_lock_irqsave(&engine->timeline.lock, flags);
++	list_for_each_entry(request, &engine->timeline.requests, link) {
+ 		if (__i915_request_completed(request, request->global_seqno))
+ 			continue;
+ 
+@@ -2989,7 +2989,7 @@ i915_gem_find_active_request(struct inte
+ 		active = request;
+ 		break;
+ 	}
+-	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ 
+ 	return active;
+ }
+@@ -3110,15 +3110,15 @@ static void engine_skip_context(struct i
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+ 	struct i915_gem_context *hung_ctx = request->ctx;
+-	struct intel_timeline *timeline = request->timeline;
++	struct i915_timeline *timeline = request->timeline;
+ 	unsigned long flags;
+ 
+-	GEM_BUG_ON(timeline == engine->timeline);
++	GEM_BUG_ON(timeline == &engine->timeline);
+ 
+-	spin_lock_irqsave(&engine->timeline->lock, flags);
++	spin_lock_irqsave(&engine->timeline.lock, flags);
+ 	spin_lock(&timeline->lock);
+ 
+-	list_for_each_entry_continue(request, &engine->timeline->requests, link)
++	list_for_each_entry_continue(request, &engine->timeline.requests, link)
+ 		if (request->ctx == hung_ctx)
+ 			skip_request(request);
+ 
+@@ -3126,7 +3126,7 @@ static void engine_skip_context(struct i
+ 		skip_request(request);
+ 
+ 	spin_unlock(&timeline->lock);
+-	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ }
+ 
+ /* Returns the request if it was guilty of the hang */
+@@ -3183,11 +3183,11 @@ i915_gem_reset_request(struct intel_engi
+ 			dma_fence_set_error(&request->fence, -EAGAIN);
+ 
+ 			/* Rewind the engine to replay the incomplete rq */
+-			spin_lock_irq(&engine->timeline->lock);
++			spin_lock_irq(&engine->timeline.lock);
+ 			request = list_prev_entry(request, link);
+-			if (&request->link == &engine->timeline->requests)
++			if (&request->link == &engine->timeline.requests)
+ 				request = NULL;
+-			spin_unlock_irq(&engine->timeline->lock);
++			spin_unlock_irq(&engine->timeline.lock);
+ 		}
+ 	}
+ 
+@@ -3300,10 +3300,10 @@ static void nop_complete_submit_request(
+ 		  request->fence.context, request->fence.seqno);
+ 	dma_fence_set_error(&request->fence, -EIO);
+ 
+-	spin_lock_irqsave(&request->engine->timeline->lock, flags);
++	spin_lock_irqsave(&request->engine->timeline.lock, flags);
+ 	__i915_request_submit(request);
+ 	intel_engine_init_global_seqno(request->engine, request->global_seqno);
+-	spin_unlock_irqrestore(&request->engine->timeline->lock, flags);
++	spin_unlock_irqrestore(&request->engine->timeline.lock, flags);
+ }
+ 
+ void i915_gem_set_wedged(struct drm_i915_private *i915)
+@@ -3372,10 +3372,10 @@ void i915_gem_set_wedged(struct drm_i915
+ 		 * (lockless) lookup doesn't try and wait upon the request as we
+ 		 * reset it.
+ 		 */
+-		spin_lock_irqsave(&engine->timeline->lock, flags);
++		spin_lock_irqsave(&engine->timeline.lock, flags);
+ 		intel_engine_init_global_seqno(engine,
+ 					       intel_engine_last_submit(engine));
+-		spin_unlock_irqrestore(&engine->timeline->lock, flags);
++		spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ 
+ 		i915_gem_reset_finish_engine(engine);
+ 	}
+@@ -3387,8 +3387,7 @@ void i915_gem_set_wedged(struct drm_i915
+ 
+ bool i915_gem_unset_wedged(struct drm_i915_private *i915)
+ {
+-	struct i915_gem_timeline *tl;
+-	int i;
++	struct i915_timeline *tl;
+ 
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 	if (!test_bit(I915_WEDGED, &i915->gpu_error.flags))
+@@ -3407,29 +3406,27 @@ bool i915_gem_unset_wedged(struct drm_i9
+ 	 * No more can be submitted until we reset the wedged bit.
+ 	 */
+ 	list_for_each_entry(tl, &i915->gt.timelines, link) {
+-		for (i = 0; i < ARRAY_SIZE(tl->engine); i++) {
+-			struct i915_request *rq;
++		struct i915_request *rq;
+ 
+-			rq = i915_gem_active_peek(&tl->engine[i].last_request,
+-						  &i915->drm.struct_mutex);
+-			if (!rq)
+-				continue;
++		rq = i915_gem_active_peek(&tl->last_request,
++					  &i915->drm.struct_mutex);
++		if (!rq)
++			continue;
+ 
+-			/*
+-			 * We can't use our normal waiter as we want to
+-			 * avoid recursively trying to handle the current
+-			 * reset. The basic dma_fence_default_wait() installs
+-			 * a callback for dma_fence_signal(), which is
+-			 * triggered by our nop handler (indirectly, the
+-			 * callback enables the signaler thread which is
+-			 * woken by the nop_submit_request() advancing the seqno
+-			 * and when the seqno passes the fence, the signaler
+-			 * then signals the fence waking us up).
+-			 */
+-			if (dma_fence_default_wait(&rq->fence, true,
+-						   MAX_SCHEDULE_TIMEOUT) < 0)
+-				return false;
+-		}
++		/*
++		 * We can't use our normal waiter as we want to
++		 * avoid recursively trying to handle the current
++		 * reset. The basic dma_fence_default_wait() installs
++		 * a callback for dma_fence_signal(), which is
++		 * triggered by our nop handler (indirectly, the
++		 * callback enables the signaler thread which is
++		 * woken by the nop_submit_request() advancing the seqno
++		 * and when the seqno passes the fence, the signaler
++		 * then signals the fence waking us up).
++		 */
++		if (dma_fence_default_wait(&rq->fence, true,
++					   MAX_SCHEDULE_TIMEOUT) < 0)
++			return false;
+ 	}
+ 	i915_retire_requests(i915);
+ 	GEM_BUG_ON(i915->gt.active_requests);
+@@ -3734,17 +3731,9 @@ i915_gem_wait_ioctl(struct drm_device *d
+ 	return ret;
+ }
+ 
+-static int wait_for_timeline(struct i915_gem_timeline *tl, unsigned int flags)
++static int wait_for_timeline(struct i915_timeline *tl, unsigned int flags)
+ {
+-	int ret, i;
+-
+-	for (i = 0; i < ARRAY_SIZE(tl->engine); i++) {
+-		ret = i915_gem_active_wait(&tl->engine[i].last_request, flags);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	return 0;
++	return i915_gem_active_wait(&tl->last_request, flags);
+ }
+ 
+ static int wait_for_engines(struct drm_i915_private *i915)
+@@ -3762,30 +3751,37 @@ static int wait_for_engines(struct drm_i
+ 
+ int i915_gem_wait_for_idle(struct drm_i915_private *i915, unsigned int flags)
+ {
+-	int ret;
+-
+ 	/* If the device is asleep, we have no requests outstanding */
+ 	if (!READ_ONCE(i915->gt.awake))
+ 		return 0;
+ 
+ 	if (flags & I915_WAIT_LOCKED) {
+-		struct i915_gem_timeline *tl;
++		struct i915_timeline *tl;
++		int err;
+ 
+ 		lockdep_assert_held(&i915->drm.struct_mutex);
+ 
+ 		list_for_each_entry(tl, &i915->gt.timelines, link) {
+-			ret = wait_for_timeline(tl, flags);
+-			if (ret)
+-				return ret;
++			err = wait_for_timeline(tl, flags);
++			if (err)
++				return err;
+ 		}
+ 		i915_retire_requests(i915);
+ 
+-		ret = wait_for_engines(i915);
++		return wait_for_engines(i915);
+ 	} else {
+-		ret = wait_for_timeline(&i915->gt.execution_timeline, flags);
+-	}
++		struct intel_engine_cs *engine;
++		enum intel_engine_id id;
++		int err;
+ 
+-	return ret;
++		for_each_engine(engine, i915, id) {
++			err = wait_for_timeline(&engine->timeline, flags);
++			if (err)
++				return err;
++		}
++
++		return 0;
++	}
+ }
+ 
+ static void __i915_gem_object_flush_for_display(struct drm_i915_gem_object *obj)
+@@ -4954,7 +4950,7 @@ static void assert_kernel_context_is_cur
+ 	enum intel_engine_id id;
+ 
+ 	for_each_engine(engine, i915, id) {
+-		GEM_BUG_ON(__i915_gem_active_peek(&engine->timeline->last_request));
++		GEM_BUG_ON(__i915_gem_active_peek(&engine->timeline.last_request));
+ 		GEM_BUG_ON(engine->last_retired_context != kernel_context);
+ 	}
+ }
+@@ -5603,12 +5599,6 @@ int i915_gem_init_early(struct drm_i915_
+ 	INIT_LIST_HEAD(&dev_priv->gt.timelines);
+ 	INIT_LIST_HEAD(&dev_priv->gt.active_rings);
+ 
+-	mutex_lock(&dev_priv->drm.struct_mutex);
+-	err = i915_gem_timeline_init__global(dev_priv);
+-	mutex_unlock(&dev_priv->drm.struct_mutex);
+-	if (err)
+-		goto err_priorities;
+-
+ 	i915_gem_init__mm(dev_priv);
+ 
+ 	INIT_DELAYED_WORK(&dev_priv->gt.retire_work,
+@@ -5628,8 +5618,6 @@ int i915_gem_init_early(struct drm_i915_
+ 
+ 	return 0;
+ 
+-err_priorities:
+-	kmem_cache_destroy(dev_priv->priorities);
+ err_dependencies:
+ 	kmem_cache_destroy(dev_priv->dependencies);
+ err_requests:
+@@ -5650,12 +5638,7 @@ void i915_gem_cleanup_early(struct drm_i
+ 	GEM_BUG_ON(!llist_empty(&dev_priv->mm.free_list));
+ 	GEM_BUG_ON(atomic_read(&dev_priv->mm.free_count));
+ 	WARN_ON(dev_priv->mm.object_count);
+-
+-	mutex_lock(&dev_priv->drm.struct_mutex);
+-	i915_gem_timeline_fini(&dev_priv->gt.legacy_timeline);
+-	i915_gem_timeline_fini(&dev_priv->gt.execution_timeline);
+ 	WARN_ON(!list_empty(&dev_priv->gt.timelines));
+-	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 
+ 	kmem_cache_destroy(dev_priv->priorities);
+ 	kmem_cache_destroy(dev_priv->dependencies);
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -122,7 +122,6 @@ static void i915_gem_context_free(struct
+ 	lockdep_assert_held(&ctx->i915->drm.struct_mutex);
+ 	GEM_BUG_ON(!i915_gem_context_is_closed(ctx));
+ 
+-	i915_gem_timeline_free(ctx->timeline);
+ 	i915_ppgtt_put(ctx->ppgtt);
+ 
+ 	for (n = 0; n < ARRAY_SIZE(ctx->__engine); n++) {
+@@ -377,18 +376,6 @@ i915_gem_create_context(struct drm_i915_
+ 		ctx->desc_template = default_desc_template(dev_priv, ppgtt);
+ 	}
+ 
+-	if (HAS_EXECLISTS(dev_priv)) {
+-		struct i915_gem_timeline *timeline;
+-
+-		timeline = i915_gem_timeline_create(dev_priv, ctx->name);
+-		if (IS_ERR(timeline)) {
+-			__destroy_hw_context(ctx, file_priv);
+-			return ERR_CAST(timeline);
+-		}
+-
+-		ctx->timeline = timeline;
+-	}
+-
+ 	trace_i915_context_create(ctx);
+ 
+ 	return ctx;
+@@ -590,19 +577,29 @@ void i915_gem_context_close(struct drm_f
+ 	idr_destroy(&file_priv->context_idr);
+ }
+ 
+-static bool engine_has_idle_kernel_context(struct intel_engine_cs *engine)
++static struct i915_request *
++last_request_on_engine(struct i915_timeline *timeline,
++		       struct intel_engine_cs *engine)
+ {
+-	struct i915_gem_timeline *timeline;
++	struct i915_request *rq;
+ 
+-	list_for_each_entry(timeline, &engine->i915->gt.timelines, link) {
+-		struct intel_timeline *tl;
++	if (timeline == &engine->timeline)
++		return NULL;
+ 
+-		if (timeline == &engine->i915->gt.execution_timeline)
+-			continue;
++	rq = i915_gem_active_raw(&timeline->last_request,
++				 &engine->i915->drm.struct_mutex);
++	if (rq && rq->engine == engine)
++		return rq;
++
++	return NULL;
++}
+ 
+-		tl = &timeline->engine[engine->id];
+-		if (i915_gem_active_peek(&tl->last_request,
+-					 &engine->i915->drm.struct_mutex))
++static bool engine_has_idle_kernel_context(struct intel_engine_cs *engine)
++{
++	struct i915_timeline *timeline;
++
++	list_for_each_entry(timeline, &engine->i915->gt.timelines, link) {
++		if (last_request_on_engine(timeline, engine))
+ 			return false;
+ 	}
+ 
+@@ -612,7 +609,7 @@ static bool engine_has_idle_kernel_conte
+ int i915_gem_switch_to_kernel_context(struct drm_i915_private *dev_priv)
+ {
+ 	struct intel_engine_cs *engine;
+-	struct i915_gem_timeline *timeline;
++	struct i915_timeline *timeline;
+ 	enum intel_engine_id id;
+ 
+ 	lockdep_assert_held(&dev_priv->drm.struct_mutex);
+@@ -632,11 +629,8 @@ int i915_gem_switch_to_kernel_context(st
+ 		/* Queue this switch after all other activity */
+ 		list_for_each_entry(timeline, &dev_priv->gt.timelines, link) {
+ 			struct i915_request *prev;
+-			struct intel_timeline *tl;
+ 
+-			tl = &timeline->engine[engine->id];
+-			prev = i915_gem_active_raw(&tl->last_request,
+-						   &dev_priv->drm.struct_mutex);
++			prev = last_request_on_engine(timeline, engine);
+ 			if (prev)
+ 				i915_sw_fence_await_sw_fence_gfp(&rq->submit,
+ 								 &prev->submit,
+--- a/drivers/gpu/drm/i915/i915_gem_context.h
++++ b/drivers/gpu/drm/i915/i915_gem_context.h
+@@ -58,8 +58,6 @@ struct i915_gem_context {
+ 	/** file_priv: owning file descriptor */
+ 	struct drm_i915_file_private *file_priv;
+ 
+-	struct i915_gem_timeline *timeline;
+-
+ 	/**
+ 	 * @ppgtt: unique address space (GTT)
+ 	 *
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -38,10 +38,9 @@
+ #include <linux/mm.h>
+ #include <linux/pagevec.h>
+ 
+-#include "i915_gem_timeline.h"
+-
+ #include "i915_request.h"
+ #include "i915_selftest.h"
++#include "i915_timeline.h"
+ 
+ #define I915_GTT_PAGE_SIZE_4K BIT(12)
+ #define I915_GTT_PAGE_SIZE_64K BIT(16)
+--- a/drivers/gpu/drm/i915/i915_gem_timeline.c
++++ /dev/null
+@@ -1,198 +0,0 @@
+-/*
+- * Copyright © 2016 Intel Corporation
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+- * IN THE SOFTWARE.
+- *
+- */
+-
+-#include "i915_drv.h"
+-#include "i915_syncmap.h"
+-
+-static void __intel_timeline_init(struct intel_timeline *tl,
+-				  struct i915_gem_timeline *parent,
+-				  u64 context,
+-				  struct lock_class_key *lockclass,
+-				  const char *lockname)
+-{
+-	tl->fence_context = context;
+-	tl->common = parent;
+-	spin_lock_init(&tl->lock);
+-	lockdep_set_class_and_name(&tl->lock, lockclass, lockname);
+-	init_request_active(&tl->last_request, NULL);
+-	INIT_LIST_HEAD(&tl->requests);
+-	i915_syncmap_init(&tl->sync);
+-}
+-
+-static void __intel_timeline_fini(struct intel_timeline *tl)
+-{
+-	GEM_BUG_ON(!list_empty(&tl->requests));
+-
+-	i915_syncmap_free(&tl->sync);
+-}
+-
+-static int __i915_gem_timeline_init(struct drm_i915_private *i915,
+-				    struct i915_gem_timeline *timeline,
+-				    const char *name,
+-				    struct lock_class_key *lockclass,
+-				    const char *lockname)
+-{
+-	unsigned int i;
+-	u64 fences;
+-
+-	lockdep_assert_held(&i915->drm.struct_mutex);
+-
+-	/*
+-	 * Ideally we want a set of engines on a single leaf as we expect
+-	 * to mostly be tracking synchronisation between engines. It is not
+-	 * a huge issue if this is not the case, but we may want to mitigate
+-	 * any page crossing penalties if they become an issue.
+-	 */
+-	BUILD_BUG_ON(KSYNCMAP < I915_NUM_ENGINES);
+-
+-	timeline->i915 = i915;
+-	timeline->name = kstrdup(name ?: "[kernel]", GFP_KERNEL);
+-	if (!timeline->name)
+-		return -ENOMEM;
+-
+-	list_add(&timeline->link, &i915->gt.timelines);
+-
+-	/* Called during early_init before we know how many engines there are */
+-	fences = dma_fence_context_alloc(ARRAY_SIZE(timeline->engine));
+-	for (i = 0; i < ARRAY_SIZE(timeline->engine); i++)
+-		__intel_timeline_init(&timeline->engine[i],
+-				      timeline, fences++,
+-				      lockclass, lockname);
+-
+-	return 0;
+-}
+-
+-int i915_gem_timeline_init(struct drm_i915_private *i915,
+-			   struct i915_gem_timeline *timeline,
+-			   const char *name)
+-{
+-	static struct lock_class_key class;
+-
+-	return __i915_gem_timeline_init(i915, timeline, name,
+-					&class, "&timeline->lock");
+-}
+-
+-int i915_gem_timeline_init__global(struct drm_i915_private *i915)
+-{
+-	static struct lock_class_key class1, class2;
+-	int err;
+-
+-	err = __i915_gem_timeline_init(i915,
+-				       &i915->gt.execution_timeline,
+-				       "[execution]", &class1,
+-				       "i915_execution_timeline");
+-	if (err)
+-		return err;
+-
+-	err = __i915_gem_timeline_init(i915,
+-				       &i915->gt.legacy_timeline,
+-				       "[global]", &class2,
+-				       "i915_global_timeline");
+-	if (err)
+-		goto err_exec_timeline;
+-
+-	return 0;
+-
+-err_exec_timeline:
+-	i915_gem_timeline_fini(&i915->gt.execution_timeline);
+-	return err;
+-}
+-
+-/**
+- * i915_gem_timelines_park - called when the driver idles
+- * @i915: the drm_i915_private device
+- *
+- * When the driver is completely idle, we know that all of our sync points
+- * have been signaled and our tracking is then entirely redundant. Any request
+- * to wait upon an older sync point will be completed instantly as we know
+- * the fence is signaled and therefore we will not even look them up in the
+- * sync point map.
+- */
+-void i915_gem_timelines_park(struct drm_i915_private *i915)
+-{
+-	struct i915_gem_timeline *timeline;
+-	int i;
+-
+-	lockdep_assert_held(&i915->drm.struct_mutex);
+-
+-	list_for_each_entry(timeline, &i915->gt.timelines, link) {
+-		for (i = 0; i < ARRAY_SIZE(timeline->engine); i++) {
+-			struct intel_timeline *tl = &timeline->engine[i];
+-
+-			/*
+-			 * All known fences are completed so we can scrap
+-			 * the current sync point tracking and start afresh,
+-			 * any attempt to wait upon a previous sync point
+-			 * will be skipped as the fence was signaled.
+-			 */
+-			i915_syncmap_free(&tl->sync);
+-		}
+-	}
+-}
+-
+-void i915_gem_timeline_fini(struct i915_gem_timeline *timeline)
+-{
+-	int i;
+-
+-	lockdep_assert_held(&timeline->i915->drm.struct_mutex);
+-
+-	for (i = 0; i < ARRAY_SIZE(timeline->engine); i++)
+-		__intel_timeline_fini(&timeline->engine[i]);
+-
+-	list_del(&timeline->link);
+-	kfree(timeline->name);
+-}
+-
+-struct i915_gem_timeline *
+-i915_gem_timeline_create(struct drm_i915_private *i915, const char *name)
+-{
+-	struct i915_gem_timeline *timeline;
+-	int err;
+-
+-	timeline = kzalloc(sizeof(*timeline), GFP_KERNEL);
+-	if (!timeline)
+-		return ERR_PTR(-ENOMEM);
+-
+-	err = i915_gem_timeline_init(i915, timeline, name);
+-	if (err) {
+-		kfree(timeline);
+-		return ERR_PTR(err);
+-	}
+-
+-	return timeline;
+-}
+-
+-void i915_gem_timeline_free(struct i915_gem_timeline *timeline)
+-{
+-	if (!timeline)
+-		return;
+-
+-	i915_gem_timeline_fini(timeline);
+-	kfree(timeline);
+-}
+-
+-#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+-#include "selftests/mock_timeline.c"
+-#include "selftests/i915_gem_timeline.c"
+-#endif
+--- a/drivers/gpu/drm/i915/i915_gem_timeline.h
++++ /dev/null
+@@ -1,121 +0,0 @@
+-/*
+- * Copyright © 2016 Intel Corporation
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+- * IN THE SOFTWARE.
+- *
+- */
+-
+-#ifndef I915_GEM_TIMELINE_H
+-#define I915_GEM_TIMELINE_H
+-
+-#include <linux/list.h>
+-
+-#include "i915_request.h"
+-#include "i915_syncmap.h"
+-#include "i915_utils.h"
+-
+-struct i915_gem_timeline;
+-
+-struct intel_timeline {
+-	u64 fence_context;
+-	u32 seqno;
+-
+-	spinlock_t lock;
+-
+-	/**
+-	 * List of breadcrumbs associated with GPU requests currently
+-	 * outstanding.
+-	 */
+-	struct list_head requests;
+-
+-	/* Contains an RCU guarded pointer to the last request. No reference is
+-	 * held to the request, users must carefully acquire a reference to
+-	 * the request using i915_gem_active_get_request_rcu(), or hold the
+-	 * struct_mutex.
+-	 */
+-	struct i915_gem_active last_request;
+-
+-	/**
+-	 * We track the most recent seqno that we wait on in every context so
+-	 * that we only have to emit a new await and dependency on a more
+-	 * recent sync point. As the contexts may be executed out-of-order, we
+-	 * have to track each individually and can not rely on an absolute
+-	 * global_seqno. When we know that all tracked fences are completed
+-	 * (i.e. when the driver is idle), we know that the syncmap is
+-	 * redundant and we can discard it without loss of generality.
+-	 */
+-	struct i915_syncmap *sync;
+-	/**
+-	 * Separately to the inter-context seqno map above, we track the last
+-	 * barrier (e.g. semaphore wait) to the global engine timelines. Note
+-	 * that this tracks global_seqno rather than the context.seqno, and
+-	 * so it is subject to the limitations of hw wraparound and that we
+-	 * may need to revoke global_seqno (on pre-emption).
+-	 */
+-	u32 global_sync[I915_NUM_ENGINES];
+-
+-	struct i915_gem_timeline *common;
+-};
+-
+-struct i915_gem_timeline {
+-	struct list_head link;
+-
+-	struct drm_i915_private *i915;
+-	const char *name;
+-
+-	struct intel_timeline engine[I915_NUM_ENGINES];
+-};
+-
+-int i915_gem_timeline_init(struct drm_i915_private *i915,
+-			   struct i915_gem_timeline *tl,
+-			   const char *name);
+-int i915_gem_timeline_init__global(struct drm_i915_private *i915);
+-void i915_gem_timelines_park(struct drm_i915_private *i915);
+-void i915_gem_timeline_fini(struct i915_gem_timeline *tl);
+-
+-struct i915_gem_timeline *
+-i915_gem_timeline_create(struct drm_i915_private *i915, const char *name);
+-void i915_gem_timeline_free(struct i915_gem_timeline *timeline);
+-
+-static inline int __intel_timeline_sync_set(struct intel_timeline *tl,
+-					    u64 context, u32 seqno)
+-{
+-	return i915_syncmap_set(&tl->sync, context, seqno);
+-}
+-
+-static inline int intel_timeline_sync_set(struct intel_timeline *tl,
+-					  const struct dma_fence *fence)
+-{
+-	return __intel_timeline_sync_set(tl, fence->context, fence->seqno);
+-}
+-
+-static inline bool __intel_timeline_sync_is_later(struct intel_timeline *tl,
+-						  u64 context, u32 seqno)
+-{
+-	return i915_syncmap_is_later(&tl->sync, context, seqno);
+-}
+-
+-static inline bool intel_timeline_sync_is_later(struct intel_timeline *tl,
+-						const struct dma_fence *fence)
+-{
+-	return __intel_timeline_sync_is_later(tl, fence->context, fence->seqno);
+-}
+-
+-#endif
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -1310,7 +1310,7 @@ static void engine_record_requests(struc
+ 
+ 	count = 0;
+ 	request = first;
+-	list_for_each_entry_from(request, &engine->timeline->requests, link)
++	list_for_each_entry_from(request, &engine->timeline.requests, link)
+ 		count++;
+ 	if (!count)
+ 		return;
+@@ -1323,7 +1323,7 @@ static void engine_record_requests(struc
+ 
+ 	count = 0;
+ 	request = first;
+-	list_for_each_entry_from(request, &engine->timeline->requests, link) {
++	list_for_each_entry_from(request, &engine->timeline.requests, link) {
+ 		if (count >= ee->num_requests) {
+ 			/*
+ 			 * If the ring request list was changed in
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -1695,7 +1695,7 @@ static int gen8_switch_to_updated_kernel
+ 						 const struct i915_oa_config *oa_config)
+ {
+ 	struct intel_engine_cs *engine = dev_priv->engine[RCS];
+-	struct i915_gem_timeline *timeline;
++	struct i915_timeline *timeline;
+ 	struct i915_request *rq;
+ 	int ret;
+ 
+@@ -1716,15 +1716,11 @@ static int gen8_switch_to_updated_kernel
+ 	/* Queue this switch after all other activity */
+ 	list_for_each_entry(timeline, &dev_priv->gt.timelines, link) {
+ 		struct i915_request *prev;
+-		struct intel_timeline *tl;
+ 
+-		tl = &timeline->engine[engine->id];
+-		prev = i915_gem_active_raw(&tl->last_request,
++		prev = i915_gem_active_raw(&timeline->last_request,
+ 					   &dev_priv->drm.struct_mutex);
+ 		if (prev)
+-			i915_sw_fence_await_sw_fence_gfp(&rq->submit,
+-							 &prev->submit,
+-							 GFP_KERNEL);
++			i915_request_await_dma_fence(rq, &prev->fence);
+ 	}
+ 
+ 	i915_request_add(rq);
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -49,7 +49,7 @@ static const char *i915_fence_get_timeli
+ 	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+ 		return "signaled";
+ 
+-	return to_request(fence)->timeline->common->name;
++	return to_request(fence)->timeline->name;
+ }
+ 
+ static bool i915_fence_signaled(struct dma_fence *fence)
+@@ -199,6 +199,7 @@ i915_sched_node_init(struct i915_sched_n
+ static int reset_all_global_seqno(struct drm_i915_private *i915, u32 seqno)
+ {
+ 	struct intel_engine_cs *engine;
++	struct i915_timeline *timeline;
+ 	enum intel_engine_id id;
+ 	int ret;
+ 
+@@ -213,16 +214,13 @@ static int reset_all_global_seqno(struct
+ 
+ 	/* If the seqno wraps around, we need to clear the breadcrumb rbtree */
+ 	for_each_engine(engine, i915, id) {
+-		struct i915_gem_timeline *timeline;
+-		struct intel_timeline *tl = engine->timeline;
+-
+ 		GEM_TRACE("%s seqno %d (current %d) -> %d\n",
+ 			  engine->name,
+-			  tl->seqno,
++			  engine->timeline.seqno,
+ 			  intel_engine_get_seqno(engine),
+ 			  seqno);
+ 
+-		if (!i915_seqno_passed(seqno, tl->seqno)) {
++		if (!i915_seqno_passed(seqno, engine->timeline.seqno)) {
+ 			/* Flush any waiters before we reuse the seqno */
+ 			intel_engine_disarm_breadcrumbs(engine);
+ 			GEM_BUG_ON(!list_empty(&engine->breadcrumbs.signals));
+@@ -230,18 +228,18 @@ static int reset_all_global_seqno(struct
+ 
+ 		/* Check we are idle before we fiddle with hw state! */
+ 		GEM_BUG_ON(!intel_engine_is_idle(engine));
+-		GEM_BUG_ON(i915_gem_active_isset(&engine->timeline->last_request));
++		GEM_BUG_ON(i915_gem_active_isset(&engine->timeline.last_request));
+ 
+ 		/* Finally reset hw state */
+ 		intel_engine_init_global_seqno(engine, seqno);
+-		tl->seqno = seqno;
+-
+-		list_for_each_entry(timeline, &i915->gt.timelines, link)
+-			memset(timeline->engine[id].global_sync, 0,
+-			       sizeof(timeline->engine[id].global_sync));
++		engine->timeline.seqno = seqno;
+ 	}
+ 
++	list_for_each_entry(timeline, &i915->gt.timelines, link)
++		memset(timeline->global_sync, 0, sizeof(timeline->global_sync));
++
+ 	i915->gt.request_serial = seqno;
++
+ 	return 0;
+ }
+ 
+@@ -357,10 +355,10 @@ static void __retire_engine_request(stru
+ 
+ 	local_irq_disable();
+ 
+-	spin_lock(&engine->timeline->lock);
+-	GEM_BUG_ON(!list_is_first(&rq->link, &engine->timeline->requests));
++	spin_lock(&engine->timeline.lock);
++	GEM_BUG_ON(!list_is_first(&rq->link, &engine->timeline.requests));
+ 	list_del_init(&rq->link);
+-	spin_unlock(&engine->timeline->lock);
++	spin_unlock(&engine->timeline.lock);
+ 
+ 	spin_lock(&rq->lock);
+ 	if (!test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &rq->fence.flags))
+@@ -397,7 +395,7 @@ static void __retire_engine_upto(struct
+ 		return;
+ 
+ 	do {
+-		tmp = list_first_entry(&engine->timeline->requests,
++		tmp = list_first_entry(&engine->timeline.requests,
+ 				       typeof(*tmp), link);
+ 
+ 		GEM_BUG_ON(tmp->engine != engine);
+@@ -492,16 +490,16 @@ void i915_request_retire_upto(struct i91
+ 	} while (tmp != rq);
+ }
+ 
+-static u32 timeline_get_seqno(struct intel_timeline *tl)
++static u32 timeline_get_seqno(struct i915_timeline *tl)
+ {
+ 	return ++tl->seqno;
+ }
+ 
+ static void move_to_timeline(struct i915_request *request,
+-			     struct intel_timeline *timeline)
++			     struct i915_timeline *timeline)
+ {
+-	GEM_BUG_ON(request->timeline == request->engine->timeline);
+-	lockdep_assert_held(&request->engine->timeline->lock);
++	GEM_BUG_ON(request->timeline == &request->engine->timeline);
++	lockdep_assert_held(&request->engine->timeline.lock);
+ 
+ 	spin_lock(&request->timeline->lock);
+ 	list_move_tail(&request->link, &timeline->requests);
+@@ -516,15 +514,15 @@ void __i915_request_submit(struct i915_r
+ 	GEM_TRACE("%s fence %llx:%d -> global=%d, current %d\n",
+ 		  engine->name,
+ 		  request->fence.context, request->fence.seqno,
+-		  engine->timeline->seqno + 1,
++		  engine->timeline.seqno + 1,
+ 		  intel_engine_get_seqno(engine));
+ 
+ 	GEM_BUG_ON(!irqs_disabled());
+-	lockdep_assert_held(&engine->timeline->lock);
++	lockdep_assert_held(&engine->timeline.lock);
+ 
+ 	GEM_BUG_ON(request->global_seqno);
+ 
+-	seqno = timeline_get_seqno(engine->timeline);
++	seqno = timeline_get_seqno(&engine->timeline);
+ 	GEM_BUG_ON(!seqno);
+ 	GEM_BUG_ON(i915_seqno_passed(intel_engine_get_seqno(engine), seqno));
+ 
+@@ -539,7 +537,7 @@ void __i915_request_submit(struct i915_r
+ 				request->ring->vaddr + request->postfix);
+ 
+ 	/* Transfer from per-context onto the global per-engine timeline */
+-	move_to_timeline(request, engine->timeline);
++	move_to_timeline(request, &engine->timeline);
+ 
+ 	trace_i915_request_execute(request);
+ 
+@@ -552,11 +550,11 @@ void i915_request_submit(struct i915_req
+ 	unsigned long flags;
+ 
+ 	/* Will be called from irq-context when using foreign fences. */
+-	spin_lock_irqsave(&engine->timeline->lock, flags);
++	spin_lock_irqsave(&engine->timeline.lock, flags);
+ 
+ 	__i915_request_submit(request);
+ 
+-	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ }
+ 
+ void __i915_request_unsubmit(struct i915_request *request)
+@@ -570,17 +568,17 @@ void __i915_request_unsubmit(struct i915
+ 		  intel_engine_get_seqno(engine));
+ 
+ 	GEM_BUG_ON(!irqs_disabled());
+-	lockdep_assert_held(&engine->timeline->lock);
++	lockdep_assert_held(&engine->timeline.lock);
+ 
+ 	/*
+ 	 * Only unwind in reverse order, required so that the per-context list
+ 	 * is kept in seqno/ring order.
+ 	 */
+ 	GEM_BUG_ON(!request->global_seqno);
+-	GEM_BUG_ON(request->global_seqno != engine->timeline->seqno);
++	GEM_BUG_ON(request->global_seqno != engine->timeline.seqno);
+ 	GEM_BUG_ON(i915_seqno_passed(intel_engine_get_seqno(engine),
+ 				     request->global_seqno));
+-	engine->timeline->seqno--;
++	engine->timeline.seqno--;
+ 
+ 	/* We may be recursing from the signal callback of another i915 fence */
+ 	spin_lock_nested(&request->lock, SINGLE_DEPTH_NESTING);
+@@ -607,11 +605,11 @@ void i915_request_unsubmit(struct i915_r
+ 	unsigned long flags;
+ 
+ 	/* Will be called from irq-context when using foreign fences. */
+-	spin_lock_irqsave(&engine->timeline->lock, flags);
++	spin_lock_irqsave(&engine->timeline.lock, flags);
+ 
+ 	__i915_request_unsubmit(request);
+ 
+-	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ }
+ 
+ static int __i915_sw_fence_call
+@@ -764,7 +762,7 @@ i915_request_alloc(struct intel_engine_c
+ 	rq->ctx = ctx;
+ 	rq->ring = ring;
+ 	rq->timeline = ring->timeline;
+-	GEM_BUG_ON(rq->timeline == engine->timeline);
++	GEM_BUG_ON(rq->timeline == &engine->timeline);
+ 
+ 	spin_lock_init(&rq->lock);
+ 	dma_fence_init(&rq->fence,
+@@ -929,7 +927,7 @@ i915_request_await_dma_fence(struct i915
+ 
+ 		/* Squash repeated waits to the same timelines */
+ 		if (fence->context != rq->i915->mm.unordered_timeline &&
+-		    intel_timeline_sync_is_later(rq->timeline, fence))
++		    i915_timeline_sync_is_later(rq->timeline, fence))
+ 			continue;
+ 
+ 		if (dma_fence_is_i915(fence))
+@@ -943,7 +941,7 @@ i915_request_await_dma_fence(struct i915
+ 
+ 		/* Record the latest fence used against each timeline */
+ 		if (fence->context != rq->i915->mm.unordered_timeline)
+-			intel_timeline_sync_set(rq->timeline, fence);
++			i915_timeline_sync_set(rq->timeline, fence);
+ 	} while (--nchild);
+ 
+ 	return 0;
+@@ -1020,7 +1018,7 @@ void __i915_request_add(struct i915_requ
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+ 	struct intel_ring *ring = request->ring;
+-	struct intel_timeline *timeline = request->timeline;
++	struct i915_timeline *timeline = request->timeline;
+ 	struct i915_request *prev;
+ 	u32 *cs;
+ 	int err;
+--- a/drivers/gpu/drm/i915/i915_request.h
++++ b/drivers/gpu/drm/i915/i915_request.h
+@@ -37,6 +37,7 @@
+ struct drm_file;
+ struct drm_i915_gem_object;
+ struct i915_request;
++struct i915_timeline;
+ 
+ struct intel_wait {
+ 	struct rb_node node;
+@@ -95,7 +96,7 @@ struct i915_request {
+ 	struct i915_gem_context *ctx;
+ 	struct intel_engine_cs *engine;
+ 	struct intel_ring *ring;
+-	struct intel_timeline *timeline;
++	struct i915_timeline *timeline;
+ 	struct intel_signal_node signaling;
+ 
+ 	/*
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_timeline.c
+@@ -0,0 +1,105 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Copyright © 2016-2018 Intel Corporation
++ */
++
++#include "i915_drv.h"
++
++#include "i915_timeline.h"
++#include "i915_syncmap.h"
++
++void i915_timeline_init(struct drm_i915_private *i915,
++			struct i915_timeline *timeline,
++			const char *name)
++{
++	lockdep_assert_held(&i915->drm.struct_mutex);
++
++	/*
++	 * Ideally we want a set of engines on a single leaf as we expect
++	 * to mostly be tracking synchronisation between engines. It is not
++	 * a huge issue if this is not the case, but we may want to mitigate
++	 * any page crossing penalties if they become an issue.
++	 */
++	BUILD_BUG_ON(KSYNCMAP < I915_NUM_ENGINES);
++
++	timeline->name = name;
++
++	list_add(&timeline->link, &i915->gt.timelines);
++
++	/* Called during early_init before we know how many engines there are */
++
++	timeline->fence_context = dma_fence_context_alloc(1);
++
++	spin_lock_init(&timeline->lock);
++
++	init_request_active(&timeline->last_request, NULL);
++	INIT_LIST_HEAD(&timeline->requests);
++
++	i915_syncmap_init(&timeline->sync);
++}
++
++/**
++ * i915_timelines_park - called when the driver idles
++ * @i915: the drm_i915_private device
++ *
++ * When the driver is completely idle, we know that all of our sync points
++ * have been signaled and our tracking is then entirely redundant. Any request
++ * to wait upon an older sync point will be completed instantly as we know
++ * the fence is signaled and therefore we will not even look them up in the
++ * sync point map.
++ */
++void i915_timelines_park(struct drm_i915_private *i915)
++{
++	struct i915_timeline *timeline;
++
++	lockdep_assert_held(&i915->drm.struct_mutex);
++
++	list_for_each_entry(timeline, &i915->gt.timelines, link) {
++		/*
++		 * All known fences are completed so we can scrap
++		 * the current sync point tracking and start afresh,
++		 * any attempt to wait upon a previous sync point
++		 * will be skipped as the fence was signaled.
++		 */
++		i915_syncmap_free(&timeline->sync);
++	}
++}
++
++void i915_timeline_fini(struct i915_timeline *timeline)
++{
++	GEM_BUG_ON(!list_empty(&timeline->requests));
++
++	i915_syncmap_free(&timeline->sync);
++
++	list_del(&timeline->link);
++}
++
++struct i915_timeline *
++i915_timeline_create(struct drm_i915_private *i915, const char *name)
++{
++	struct i915_timeline *timeline;
++
++	timeline = kzalloc(sizeof(*timeline), GFP_KERNEL);
++	if (!timeline)
++		return ERR_PTR(-ENOMEM);
++
++	i915_timeline_init(i915, timeline, name);
++	kref_init(&timeline->kref);
++
++	return timeline;
++}
++
++void __i915_timeline_free(struct kref *kref)
++{
++	struct i915_timeline *timeline =
++		container_of(kref, typeof(*timeline), kref);
++
++	i915_timeline_fini(timeline);
++	kfree(timeline);
++}
++
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++#include "selftests/mock_timeline.c"
++#include "selftests/i915_timeline.c"
++#endif
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_timeline.h
+@@ -0,0 +1,126 @@
++/*
++ * Copyright © 2016 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#ifndef I915_TIMELINE_H
++#define I915_TIMELINE_H
++
++#include <linux/list.h>
++#include <linux/kref.h>
++
++#include "i915_request.h"
++#include "i915_syncmap.h"
++#include "i915_utils.h"
++
++struct i915_timeline {
++	u64 fence_context;
++	u32 seqno;
++
++	spinlock_t lock;
++
++	/**
++	 * List of breadcrumbs associated with GPU requests currently
++	 * outstanding.
++	 */
++	struct list_head requests;
++
++	/* Contains an RCU guarded pointer to the last request. No reference is
++	 * held to the request, users must carefully acquire a reference to
++	 * the request using i915_gem_active_get_request_rcu(), or hold the
++	 * struct_mutex.
++	 */
++	struct i915_gem_active last_request;
++
++	/**
++	 * We track the most recent seqno that we wait on in every context so
++	 * that we only have to emit a new await and dependency on a more
++	 * recent sync point. As the contexts may be executed out-of-order, we
++	 * have to track each individually and can not rely on an absolute
++	 * global_seqno. When we know that all tracked fences are completed
++	 * (i.e. when the driver is idle), we know that the syncmap is
++	 * redundant and we can discard it without loss of generality.
++	 */
++	struct i915_syncmap *sync;
++	/**
++	 * Separately to the inter-context seqno map above, we track the last
++	 * barrier (e.g. semaphore wait) to the global engine timelines. Note
++	 * that this tracks global_seqno rather than the context.seqno, and
++	 * so it is subject to the limitations of hw wraparound and that we
++	 * may need to revoke global_seqno (on pre-emption).
++	 */
++	u32 global_sync[I915_NUM_ENGINES];
++
++	struct list_head link;
++	const char *name;
++
++	struct kref kref;
++};
++
++void i915_timeline_init(struct drm_i915_private *i915,
++			struct i915_timeline *tl,
++			const char *name);
++void i915_timeline_fini(struct i915_timeline *tl);
++
++struct i915_timeline *
++i915_timeline_create(struct drm_i915_private *i915, const char *name);
++
++static inline struct i915_timeline *
++i915_timeline_get(struct i915_timeline *timeline)
++{
++	kref_get(&timeline->kref);
++	return timeline;
++}
++
++void __i915_timeline_free(struct kref *kref);
++static inline void i915_timeline_put(struct i915_timeline *timeline)
++{
++	kref_put(&timeline->kref, __i915_timeline_free);
++}
++
++static inline int __i915_timeline_sync_set(struct i915_timeline *tl,
++					   u64 context, u32 seqno)
++{
++	return i915_syncmap_set(&tl->sync, context, seqno);
++}
++
++static inline int i915_timeline_sync_set(struct i915_timeline *tl,
++					 const struct dma_fence *fence)
++{
++	return __i915_timeline_sync_set(tl, fence->context, fence->seqno);
++}
++
++static inline bool __i915_timeline_sync_is_later(struct i915_timeline *tl,
++						 u64 context, u32 seqno)
++{
++	return i915_syncmap_is_later(&tl->sync, context, seqno);
++}
++
++static inline bool i915_timeline_sync_is_later(struct i915_timeline *tl,
++					       const struct dma_fence *fence)
++{
++	return __i915_timeline_sync_is_later(tl, fence->context, fence->seqno);
++}
++
++void i915_timelines_park(struct drm_i915_private *i915);
++
++#endif
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -451,12 +451,6 @@ void intel_engine_init_global_seqno(stru
+ 	GEM_BUG_ON(intel_engine_get_seqno(engine) != seqno);
+ }
+ 
+-static void intel_engine_init_timeline(struct intel_engine_cs *engine)
+-{
+-	engine->timeline =
+-		&engine->i915->gt.execution_timeline.engine[engine->id];
+-}
+-
+ static void intel_engine_init_batch_pool(struct intel_engine_cs *engine)
+ {
+ 	i915_gem_batch_pool_init(&engine->batch_pool, engine);
+@@ -508,8 +502,9 @@ static void intel_engine_init_execlist(s
+  */
+ void intel_engine_setup_common(struct intel_engine_cs *engine)
+ {
++	i915_timeline_init(engine->i915, &engine->timeline, engine->name);
++
+ 	intel_engine_init_execlist(engine);
+-	intel_engine_init_timeline(engine);
+ 	intel_engine_init_hangcheck(engine);
+ 	intel_engine_init_batch_pool(engine);
+ 	intel_engine_init_cmd_parser(engine);
+@@ -751,6 +746,8 @@ void intel_engine_cleanup_common(struct
+ 	if (engine->i915->preempt_context)
+ 		intel_context_unpin(engine->i915->preempt_context, engine);
+ 	intel_context_unpin(engine->i915->kernel_context, engine);
++
++	i915_timeline_fini(&engine->timeline);
+ }
+ 
+ u64 intel_engine_get_active_head(const struct intel_engine_cs *engine)
+@@ -1003,7 +1000,7 @@ bool intel_engine_has_kernel_context(con
+ 	 * the last request that remains in the timeline. When idle, it is
+ 	 * the last executed context as tracked by retirement.
+ 	 */
+-	rq = __i915_gem_active_peek(&engine->timeline->last_request);
++	rq = __i915_gem_active_peek(&engine->timeline.last_request);
+ 	if (rq)
+ 		return rq->ctx == kernel_context;
+ 	else
+@@ -1335,14 +1332,14 @@ void intel_engine_dump(struct intel_engi
+ 
+ 	drm_printf(m, "\tRequests:\n");
+ 
+-	rq = list_first_entry(&engine->timeline->requests,
++	rq = list_first_entry(&engine->timeline.requests,
+ 			      struct i915_request, link);
+-	if (&rq->link != &engine->timeline->requests)
++	if (&rq->link != &engine->timeline.requests)
+ 		print_request(m, rq, "\t\tfirst  ");
+ 
+-	rq = list_last_entry(&engine->timeline->requests,
++	rq = list_last_entry(&engine->timeline.requests,
+ 			     struct i915_request, link);
+-	if (&rq->link != &engine->timeline->requests)
++	if (&rq->link != &engine->timeline.requests)
+ 		print_request(m, rq, "\t\tlast   ");
+ 
+ 	rq = i915_gem_find_active_request(engine);
+@@ -1374,11 +1371,11 @@ void intel_engine_dump(struct intel_engi
+ 		drm_printf(m, "\tDevice is asleep; skipping register dump\n");
+ 	}
+ 
+-	spin_lock_irq(&engine->timeline->lock);
++	spin_lock_irq(&engine->timeline.lock);
+ 
+ 	last = NULL;
+ 	count = 0;
+-	list_for_each_entry(rq, &engine->timeline->requests, link) {
++	list_for_each_entry(rq, &engine->timeline.requests, link) {
+ 		if (count++ < MAX_REQUESTS_TO_SHOW - 1)
+ 			print_request(m, rq, "\t\tE ");
+ 		else
+@@ -1416,7 +1413,7 @@ void intel_engine_dump(struct intel_engi
+ 		print_request(m, last, "\t\tQ ");
+ 	}
+ 
+-	spin_unlock_irq(&engine->timeline->lock);
++	spin_unlock_irq(&engine->timeline.lock);
+ 
+ 	spin_lock_irq(&b->rb_lock);
+ 	for (rb = rb_first(&b->waiters); rb; rb = rb_next(rb)) {
+--- a/drivers/gpu/drm/i915/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/intel_guc_submission.c
+@@ -679,7 +679,7 @@ static void guc_dequeue(struct intel_eng
+ 	bool submit = false;
+ 	struct rb_node *rb;
+ 
+-	spin_lock_irq(&engine->timeline->lock);
++	spin_lock_irq(&engine->timeline.lock);
+ 	rb = execlists->first;
+ 	GEM_BUG_ON(rb_first(&execlists->queue) != rb);
+ 
+@@ -750,7 +750,7 @@ done:
+ 	GEM_BUG_ON(execlists->first && !port_isset(execlists->port));
+ 
+ unlock:
+-	spin_unlock_irq(&engine->timeline->lock);
++	spin_unlock_irq(&engine->timeline.lock);
+ }
+ 
+ static void guc_submission_tasklet(unsigned long data)
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -331,10 +331,10 @@ static void __unwind_incomplete_requests
+ 	struct i915_priolist *uninitialized_var(p);
+ 	int last_prio = I915_PRIORITY_INVALID;
+ 
+-	lockdep_assert_held(&engine->timeline->lock);
++	lockdep_assert_held(&engine->timeline.lock);
+ 
+ 	list_for_each_entry_safe_reverse(rq, rn,
+-					 &engine->timeline->requests,
++					 &engine->timeline.requests,
+ 					 link) {
+ 		if (i915_request_completed(rq))
+ 			return;
+@@ -358,9 +358,9 @@ execlists_unwind_incomplete_requests(str
+ 	struct intel_engine_cs *engine =
+ 		container_of(execlists, typeof(*engine), execlists);
+ 
+-	spin_lock_irq(&engine->timeline->lock);
++	spin_lock_irq(&engine->timeline.lock);
+ 	__unwind_incomplete_requests(engine);
+-	spin_unlock_irq(&engine->timeline->lock);
++	spin_unlock_irq(&engine->timeline.lock);
+ }
+ 
+ static inline void
+@@ -584,7 +584,7 @@ static void execlists_dequeue(struct int
+ 	 * and context switches) submission.
+ 	 */
+ 
+-	spin_lock_irq(&engine->timeline->lock);
++	spin_lock_irq(&engine->timeline.lock);
+ 	rb = execlists->first;
+ 	GEM_BUG_ON(rb_first(&execlists->queue) != rb);
+ 
+@@ -744,7 +744,7 @@ done:
+ 	GEM_BUG_ON(execlists->first && !port_isset(execlists->port));
+ 
+ unlock:
+-	spin_unlock_irq(&engine->timeline->lock);
++	spin_unlock_irq(&engine->timeline.lock);
+ 
+ 	if (submit) {
+ 		execlists_user_begin(execlists, execlists->port);
+@@ -893,10 +893,10 @@ static void execlists_cancel_requests(st
+ 	execlists_cancel_port_requests(execlists);
+ 	reset_irq(engine);
+ 
+-	spin_lock(&engine->timeline->lock);
++	spin_lock(&engine->timeline.lock);
+ 
+ 	/* Mark all executing requests as skipped. */
+-	list_for_each_entry(rq, &engine->timeline->requests, link) {
++	list_for_each_entry(rq, &engine->timeline.requests, link) {
+ 		GEM_BUG_ON(!rq->global_seqno);
+ 		if (!i915_request_completed(rq))
+ 			dma_fence_set_error(&rq->fence, -EIO);
+@@ -928,7 +928,7 @@ static void execlists_cancel_requests(st
+ 	execlists->first = NULL;
+ 	GEM_BUG_ON(port_isset(execlists->port));
+ 
+-	spin_unlock(&engine->timeline->lock);
++	spin_unlock(&engine->timeline.lock);
+ 
+ 	local_irq_restore(flags);
+ }
+@@ -1167,7 +1167,7 @@ static void execlists_submit_request(str
+ 	unsigned long flags;
+ 
+ 	/* Will be called from irq-context when using foreign fences. */
+-	spin_lock_irqsave(&engine->timeline->lock, flags);
++	spin_lock_irqsave(&engine->timeline.lock, flags);
+ 
+ 	queue_request(engine, &request->sched, rq_prio(request));
+ 	submit_queue(engine, rq_prio(request));
+@@ -1175,7 +1175,7 @@ static void execlists_submit_request(str
+ 	GEM_BUG_ON(!engine->execlists.first);
+ 	GEM_BUG_ON(list_empty(&request->sched.link));
+ 
+-	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ }
+ 
+ static struct i915_request *sched_to_request(struct i915_sched_node *node)
+@@ -1191,8 +1191,8 @@ sched_lock_engine(struct i915_sched_node
+ 	GEM_BUG_ON(!locked);
+ 
+ 	if (engine != locked) {
+-		spin_unlock(&locked->timeline->lock);
+-		spin_lock(&engine->timeline->lock);
++		spin_unlock(&locked->timeline.lock);
++		spin_lock(&engine->timeline.lock);
+ 	}
+ 
+ 	return engine;
+@@ -1275,7 +1275,7 @@ static void execlists_schedule(struct i9
+ 	}
+ 
+ 	engine = request->engine;
+-	spin_lock_irq(&engine->timeline->lock);
++	spin_lock_irq(&engine->timeline.lock);
+ 
+ 	/* Fifo and depth-first replacement ensure our deps execute before us */
+ 	list_for_each_entry_safe_reverse(dep, p, &dfs, dfs_link) {
+@@ -1299,7 +1299,7 @@ static void execlists_schedule(struct i9
+ 			__submit_queue(engine, prio);
+ 	}
+ 
+-	spin_unlock_irq(&engine->timeline->lock);
++	spin_unlock_irq(&engine->timeline.lock);
+ }
+ 
+ static int __context_pin(struct i915_gem_context *ctx, struct i915_vma *vma)
+@@ -1828,9 +1828,9 @@ static void reset_common_ring(struct int
+ 	reset_irq(engine);
+ 
+ 	/* Push back any incomplete requests for replay after the reset. */
+-	spin_lock(&engine->timeline->lock);
++	spin_lock(&engine->timeline.lock);
+ 	__unwind_incomplete_requests(engine);
+-	spin_unlock(&engine->timeline->lock);
++	spin_unlock(&engine->timeline.lock);
+ 
+ 	local_irq_restore(flags);
+ 
+@@ -2599,6 +2599,7 @@ static int execlists_context_deferred_al
+ 	struct i915_vma *vma;
+ 	uint32_t context_size;
+ 	struct intel_ring *ring;
++	struct i915_timeline *timeline;
+ 	int ret;
+ 
+ 	if (ce->state)
+@@ -2614,8 +2615,8 @@ static int execlists_context_deferred_al
+ 
+ 	ctx_obj = i915_gem_object_create(ctx->i915, context_size);
+ 	if (IS_ERR(ctx_obj)) {
+-		DRM_DEBUG_DRIVER("Alloc LRC backing obj failed.\n");
+-		return PTR_ERR(ctx_obj);
++		ret = PTR_ERR(ctx_obj);
++		goto error_deref_obj;
+ 	}
+ 
+ 	vma = i915_vma_instance(ctx_obj, &ctx->i915->ggtt.base, NULL);
+@@ -2624,7 +2625,14 @@ static int execlists_context_deferred_al
+ 		goto error_deref_obj;
+ 	}
+ 
+-	ring = intel_engine_create_ring(engine, ctx->timeline, ctx->ring_size);
++	timeline = i915_timeline_create(ctx->i915, ctx->name);
++	if (IS_ERR(timeline)) {
++		ret = PTR_ERR(timeline);
++		goto error_deref_obj;
++	}
++
++	ring = intel_engine_create_ring(engine, timeline, ctx->ring_size);
++	i915_timeline_put(timeline);
+ 	if (IS_ERR(ring)) {
+ 		ret = PTR_ERR(ring);
+ 		goto error_deref_obj;
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -697,17 +697,17 @@ static void cancel_requests(struct intel
+ 	struct i915_request *request;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&engine->timeline->lock, flags);
++	spin_lock_irqsave(&engine->timeline.lock, flags);
+ 
+ 	/* Mark all submitted requests as skipped. */
+-	list_for_each_entry(request, &engine->timeline->requests, link) {
++	list_for_each_entry(request, &engine->timeline.requests, link) {
+ 		GEM_BUG_ON(!request->global_seqno);
+ 		if (!i915_request_completed(request))
+ 			dma_fence_set_error(&request->fence, -EIO);
+ 	}
+ 	/* Remaining _unready_ requests will be nop'ed when submitted */
+ 
+-	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ }
+ 
+ static void i9xx_submit_request(struct i915_request *request)
+@@ -1118,7 +1118,7 @@ err:
+ 
+ struct intel_ring *
+ intel_engine_create_ring(struct intel_engine_cs *engine,
+-			 struct i915_gem_timeline *timeline,
++			 struct i915_timeline *timeline,
+ 			 int size)
+ {
+ 	struct intel_ring *ring;
+@@ -1126,7 +1126,7 @@ intel_engine_create_ring(struct intel_en
+ 
+ 	GEM_BUG_ON(!is_power_of_2(size));
+ 	GEM_BUG_ON(RING_CTL_SIZE(size) & ~RING_NR_PAGES);
+-	GEM_BUG_ON(&timeline->engine[engine->id] == engine->timeline);
++	GEM_BUG_ON(timeline == &engine->timeline);
+ 	lockdep_assert_held(&engine->i915->drm.struct_mutex);
+ 
+ 	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
+@@ -1134,7 +1134,7 @@ intel_engine_create_ring(struct intel_en
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	INIT_LIST_HEAD(&ring->request_list);
+-	ring->timeline = &timeline->engine[engine->id];
++	ring->timeline = i915_timeline_get(timeline);
+ 
+ 	ring->size = size;
+ 	/* Workaround an erratum on the i830 which causes a hang if
+@@ -1165,6 +1165,7 @@ intel_ring_free(struct intel_ring *ring)
+ 	i915_vma_close(ring->vma);
+ 	__i915_gem_object_release_unless_active(obj);
+ 
++	i915_timeline_put(ring->timeline);
+ 	kfree(ring);
+ }
+ 
+@@ -1323,6 +1324,7 @@ static void intel_ring_context_unpin(str
+ static int intel_init_ring_buffer(struct intel_engine_cs *engine)
+ {
+ 	struct intel_ring *ring;
++	struct i915_timeline *timeline;
+ 	int err;
+ 
+ 	intel_engine_setup_common(engine);
+@@ -1331,9 +1333,14 @@ static int intel_init_ring_buffer(struct
+ 	if (err)
+ 		goto err;
+ 
+-	ring = intel_engine_create_ring(engine,
+-					&engine->i915->gt.legacy_timeline,
+-					32 * PAGE_SIZE);
++	timeline = i915_timeline_create(engine->i915, engine->name);
++	if (IS_ERR(timeline)) {
++		err = PTR_ERR(timeline);
++		goto err;
++	}
++
++	ring = intel_engine_create_ring(engine, timeline, 32 * PAGE_SIZE);
++	i915_timeline_put(timeline);
+ 	if (IS_ERR(ring)) {
+ 		err = PTR_ERR(ring);
+ 		goto err;
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -5,12 +5,12 @@
+ #include <linux/seqlock.h>
+ 
+ #include "i915_gem_batch_pool.h"
+-#include "i915_gem_timeline.h"
+ 
+ #include "i915_reg.h"
+ #include "i915_pmu.h"
+ #include "i915_request.h"
+ #include "i915_selftest.h"
++#include "i915_timeline.h"
+ #include "intel_gpu_commands.h"
+ 
+ struct drm_printer;
+@@ -128,7 +128,7 @@ struct intel_ring {
+ 	struct i915_vma *vma;
+ 	void *vaddr;
+ 
+-	struct intel_timeline *timeline;
++	struct i915_timeline *timeline;
+ 	struct list_head request_list;
+ 	struct list_head active_link;
+ 
+@@ -337,7 +337,8 @@ struct intel_engine_cs {
+ 	u32 mmio_base;
+ 
+ 	struct intel_ring *buffer;
+-	struct intel_timeline *timeline;
++
++	struct i915_timeline timeline;
+ 
+ 	struct drm_i915_gem_object *default_state;
+ 
+@@ -769,7 +770,7 @@ intel_write_status_page(struct intel_eng
+ 
+ struct intel_ring *
+ intel_engine_create_ring(struct intel_engine_cs *engine,
+-			 struct i915_gem_timeline *timeline,
++			 struct i915_timeline *timeline,
+ 			 int size);
+ int intel_ring_pin(struct intel_ring *ring,
+ 		   struct drm_i915_private *i915,
+@@ -888,7 +889,7 @@ static inline u32 intel_engine_last_subm
+ 	 * wtih serialising this hint with anything, so document it as
+ 	 * a hint and nothing more.
+ 	 */
+-	return READ_ONCE(engine->timeline->seqno);
++	return READ_ONCE(engine->timeline.seqno);
+ }
+ 
+ void intel_engine_get_instdone(struct intel_engine_cs *engine,
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_context.c
+@@ -355,18 +355,6 @@ static int igt_ctx_exec(void *arg)
+ 
+ 		if (first_shared_gtt) {
+ 			ctx = __create_hw_context(i915, file->driver_priv);
+-			if (!IS_ERR(ctx) && HAS_EXECLISTS(i915)) {
+-				struct i915_gem_timeline *timeline;
+-
+-				timeline = i915_gem_timeline_create(i915, ctx->name);
+-				if (IS_ERR(timeline)) {
+-					__destroy_hw_context(ctx, file->driver_priv);
+-					ctx = ERR_CAST(timeline);
+-				} else {
+-					ctx->timeline = timeline;
+-				}
+-			}
+-
+ 			first_shared_gtt = false;
+ 		} else {
+ 			ctx = i915_gem_create_context(i915, file->driver_priv);
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_timeline.c
++++ /dev/null
+@@ -1,299 +0,0 @@
+-/*
+- * Copyright © 2017 Intel Corporation
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+- * IN THE SOFTWARE.
+- *
+- */
+-
+-#include "../i915_selftest.h"
+-#include "i915_random.h"
+-
+-#include "mock_gem_device.h"
+-#include "mock_timeline.h"
+-
+-struct __igt_sync {
+-	const char *name;
+-	u32 seqno;
+-	bool expected;
+-	bool set;
+-};
+-
+-static int __igt_sync(struct intel_timeline *tl,
+-		      u64 ctx,
+-		      const struct __igt_sync *p,
+-		      const char *name)
+-{
+-	int ret;
+-
+-	if (__intel_timeline_sync_is_later(tl, ctx, p->seqno) != p->expected) {
+-		pr_err("%s: %s(ctx=%llu, seqno=%u) expected passed %s but failed\n",
+-		       name, p->name, ctx, p->seqno, yesno(p->expected));
+-		return -EINVAL;
+-	}
+-
+-	if (p->set) {
+-		ret = __intel_timeline_sync_set(tl, ctx, p->seqno);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	return 0;
+-}
+-
+-static int igt_sync(void *arg)
+-{
+-	const struct __igt_sync pass[] = {
+-		{ "unset", 0, false, false },
+-		{ "new", 0, false, true },
+-		{ "0a", 0, true, true },
+-		{ "1a", 1, false, true },
+-		{ "1b", 1, true, true },
+-		{ "0b", 0, true, false },
+-		{ "2a", 2, false, true },
+-		{ "4", 4, false, true },
+-		{ "INT_MAX", INT_MAX, false, true },
+-		{ "INT_MAX-1", INT_MAX-1, true, false },
+-		{ "INT_MAX+1", (u32)INT_MAX+1, false, true },
+-		{ "INT_MAX", INT_MAX, true, false },
+-		{ "UINT_MAX", UINT_MAX, false, true },
+-		{ "wrap", 0, false, true },
+-		{ "unwrap", UINT_MAX, true, false },
+-		{},
+-	}, *p;
+-	struct intel_timeline *tl;
+-	int order, offset;
+-	int ret = -ENODEV;
+-
+-	tl = mock_timeline(0);
+-	if (!tl)
+-		return -ENOMEM;
+-
+-	for (p = pass; p->name; p++) {
+-		for (order = 1; order < 64; order++) {
+-			for (offset = -1; offset <= (order > 1); offset++) {
+-				u64 ctx = BIT_ULL(order) + offset;
+-
+-				ret = __igt_sync(tl, ctx, p, "1");
+-				if (ret)
+-					goto out;
+-			}
+-		}
+-	}
+-	mock_timeline_destroy(tl);
+-
+-	tl = mock_timeline(0);
+-	if (!tl)
+-		return -ENOMEM;
+-
+-	for (order = 1; order < 64; order++) {
+-		for (offset = -1; offset <= (order > 1); offset++) {
+-			u64 ctx = BIT_ULL(order) + offset;
+-
+-			for (p = pass; p->name; p++) {
+-				ret = __igt_sync(tl, ctx, p, "2");
+-				if (ret)
+-					goto out;
+-			}
+-		}
+-	}
+-
+-out:
+-	mock_timeline_destroy(tl);
+-	return ret;
+-}
+-
+-static unsigned int random_engine(struct rnd_state *rnd)
+-{
+-	return i915_prandom_u32_max_state(I915_NUM_ENGINES, rnd);
+-}
+-
+-static int bench_sync(void *arg)
+-{
+-	struct rnd_state prng;
+-	struct intel_timeline *tl;
+-	unsigned long end_time, count;
+-	u64 prng32_1M;
+-	ktime_t kt;
+-	int order, last_order;
+-
+-	tl = mock_timeline(0);
+-	if (!tl)
+-		return -ENOMEM;
+-
+-	/* Lookups from cache are very fast and so the random number generation
+-	 * and the loop itself becomes a significant factor in the per-iteration
+-	 * timings. We try to compensate the results by measuring the overhead
+-	 * of the prng and subtract it from the reported results.
+-	 */
+-	prandom_seed_state(&prng, i915_selftest.random_seed);
+-	count = 0;
+-	kt = ktime_get();
+-	end_time = jiffies + HZ/10;
+-	do {
+-		u32 x;
+-
+-		/* Make sure the compiler doesn't optimise away the prng call */
+-		WRITE_ONCE(x, prandom_u32_state(&prng));
+-
+-		count++;
+-	} while (!time_after(jiffies, end_time));
+-	kt = ktime_sub(ktime_get(), kt);
+-	pr_debug("%s: %lu random evaluations, %lluns/prng\n",
+-		 __func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
+-	prng32_1M = div64_ul(ktime_to_ns(kt) << 20, count);
+-
+-	/* Benchmark (only) setting random context ids */
+-	prandom_seed_state(&prng, i915_selftest.random_seed);
+-	count = 0;
+-	kt = ktime_get();
+-	end_time = jiffies + HZ/10;
+-	do {
+-		u64 id = i915_prandom_u64_state(&prng);
+-
+-		__intel_timeline_sync_set(tl, id, 0);
+-		count++;
+-	} while (!time_after(jiffies, end_time));
+-	kt = ktime_sub(ktime_get(), kt);
+-	kt = ktime_sub_ns(kt, (count * prng32_1M * 2) >> 20);
+-	pr_info("%s: %lu random insertions, %lluns/insert\n",
+-		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
+-
+-	/* Benchmark looking up the exact same context ids as we just set */
+-	prandom_seed_state(&prng, i915_selftest.random_seed);
+-	end_time = count;
+-	kt = ktime_get();
+-	while (end_time--) {
+-		u64 id = i915_prandom_u64_state(&prng);
+-
+-		if (!__intel_timeline_sync_is_later(tl, id, 0)) {
+-			mock_timeline_destroy(tl);
+-			pr_err("Lookup of %llu failed\n", id);
+-			return -EINVAL;
+-		}
+-	}
+-	kt = ktime_sub(ktime_get(), kt);
+-	kt = ktime_sub_ns(kt, (count * prng32_1M * 2) >> 20);
+-	pr_info("%s: %lu random lookups, %lluns/lookup\n",
+-		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
+-
+-	mock_timeline_destroy(tl);
+-	cond_resched();
+-
+-	tl = mock_timeline(0);
+-	if (!tl)
+-		return -ENOMEM;
+-
+-	/* Benchmark setting the first N (in order) contexts */
+-	count = 0;
+-	kt = ktime_get();
+-	end_time = jiffies + HZ/10;
+-	do {
+-		__intel_timeline_sync_set(tl, count++, 0);
+-	} while (!time_after(jiffies, end_time));
+-	kt = ktime_sub(ktime_get(), kt);
+-	pr_info("%s: %lu in-order insertions, %lluns/insert\n",
+-		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
+-
+-	/* Benchmark looking up the exact same context ids as we just set */
+-	end_time = count;
+-	kt = ktime_get();
+-	while (end_time--) {
+-		if (!__intel_timeline_sync_is_later(tl, end_time, 0)) {
+-			pr_err("Lookup of %lu failed\n", end_time);
+-			mock_timeline_destroy(tl);
+-			return -EINVAL;
+-		}
+-	}
+-	kt = ktime_sub(ktime_get(), kt);
+-	pr_info("%s: %lu in-order lookups, %lluns/lookup\n",
+-		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
+-
+-	mock_timeline_destroy(tl);
+-	cond_resched();
+-
+-	tl = mock_timeline(0);
+-	if (!tl)
+-		return -ENOMEM;
+-
+-	/* Benchmark searching for a random context id and maybe changing it */
+-	prandom_seed_state(&prng, i915_selftest.random_seed);
+-	count = 0;
+-	kt = ktime_get();
+-	end_time = jiffies + HZ/10;
+-	do {
+-		u32 id = random_engine(&prng);
+-		u32 seqno = prandom_u32_state(&prng);
+-
+-		if (!__intel_timeline_sync_is_later(tl, id, seqno))
+-			__intel_timeline_sync_set(tl, id, seqno);
+-
+-		count++;
+-	} while (!time_after(jiffies, end_time));
+-	kt = ktime_sub(ktime_get(), kt);
+-	kt = ktime_sub_ns(kt, (count * prng32_1M * 2) >> 20);
+-	pr_info("%s: %lu repeated insert/lookups, %lluns/op\n",
+-		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
+-	mock_timeline_destroy(tl);
+-	cond_resched();
+-
+-	/* Benchmark searching for a known context id and changing the seqno */
+-	for (last_order = 1, order = 1; order < 32;
+-	     ({ int tmp = last_order; last_order = order; order += tmp; })) {
+-		unsigned int mask = BIT(order) - 1;
+-
+-		tl = mock_timeline(0);
+-		if (!tl)
+-			return -ENOMEM;
+-
+-		count = 0;
+-		kt = ktime_get();
+-		end_time = jiffies + HZ/10;
+-		do {
+-			/* Without assuming too many details of the underlying
+-			 * implementation, try to identify its phase-changes
+-			 * (if any)!
+-			 */
+-			u64 id = (u64)(count & mask) << order;
+-
+-			__intel_timeline_sync_is_later(tl, id, 0);
+-			__intel_timeline_sync_set(tl, id, 0);
+-
+-			count++;
+-		} while (!time_after(jiffies, end_time));
+-		kt = ktime_sub(ktime_get(), kt);
+-		pr_info("%s: %lu cyclic/%d insert/lookups, %lluns/op\n",
+-			__func__, count, order,
+-			(long long)div64_ul(ktime_to_ns(kt), count));
+-		mock_timeline_destroy(tl);
+-		cond_resched();
+-	}
+-
+-	return 0;
+-}
+-
+-int i915_gem_timeline_mock_selftests(void)
+-{
+-	static const struct i915_subtest tests[] = {
+-		SUBTEST(igt_sync),
+-		SUBTEST(bench_sync),
+-	};
+-
+-	return i915_subtests(tests, NULL);
+-}
+--- /dev/null
++++ b/drivers/gpu/drm/i915/selftests/i915_timeline.c
+@@ -0,0 +1,267 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Copyright © 2017-2018 Intel Corporation
++ */
++
++#include "../i915_selftest.h"
++#include "i915_random.h"
++
++#include "mock_gem_device.h"
++#include "mock_timeline.h"
++
++struct __igt_sync {
++	const char *name;
++	u32 seqno;
++	bool expected;
++	bool set;
++};
++
++static int __igt_sync(struct i915_timeline *tl,
++		      u64 ctx,
++		      const struct __igt_sync *p,
++		      const char *name)
++{
++	int ret;
++
++	if (__i915_timeline_sync_is_later(tl, ctx, p->seqno) != p->expected) {
++		pr_err("%s: %s(ctx=%llu, seqno=%u) expected passed %s but failed\n",
++		       name, p->name, ctx, p->seqno, yesno(p->expected));
++		return -EINVAL;
++	}
++
++	if (p->set) {
++		ret = __i915_timeline_sync_set(tl, ctx, p->seqno);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static int igt_sync(void *arg)
++{
++	const struct __igt_sync pass[] = {
++		{ "unset", 0, false, false },
++		{ "new", 0, false, true },
++		{ "0a", 0, true, true },
++		{ "1a", 1, false, true },
++		{ "1b", 1, true, true },
++		{ "0b", 0, true, false },
++		{ "2a", 2, false, true },
++		{ "4", 4, false, true },
++		{ "INT_MAX", INT_MAX, false, true },
++		{ "INT_MAX-1", INT_MAX-1, true, false },
++		{ "INT_MAX+1", (u32)INT_MAX+1, false, true },
++		{ "INT_MAX", INT_MAX, true, false },
++		{ "UINT_MAX", UINT_MAX, false, true },
++		{ "wrap", 0, false, true },
++		{ "unwrap", UINT_MAX, true, false },
++		{},
++	}, *p;
++	struct i915_timeline tl;
++	int order, offset;
++	int ret = -ENODEV;
++
++	mock_timeline_init(&tl, 0);
++	for (p = pass; p->name; p++) {
++		for (order = 1; order < 64; order++) {
++			for (offset = -1; offset <= (order > 1); offset++) {
++				u64 ctx = BIT_ULL(order) + offset;
++
++				ret = __igt_sync(&tl, ctx, p, "1");
++				if (ret)
++					goto out;
++			}
++		}
++	}
++	mock_timeline_fini(&tl);
++
++	mock_timeline_init(&tl, 0);
++	for (order = 1; order < 64; order++) {
++		for (offset = -1; offset <= (order > 1); offset++) {
++			u64 ctx = BIT_ULL(order) + offset;
++
++			for (p = pass; p->name; p++) {
++				ret = __igt_sync(&tl, ctx, p, "2");
++				if (ret)
++					goto out;
++			}
++		}
++	}
++
++out:
++	mock_timeline_fini(&tl);
++	return ret;
++}
++
++static unsigned int random_engine(struct rnd_state *rnd)
++{
++	return i915_prandom_u32_max_state(I915_NUM_ENGINES, rnd);
++}
++
++static int bench_sync(void *arg)
++{
++	struct rnd_state prng;
++	struct i915_timeline tl;
++	unsigned long end_time, count;
++	u64 prng32_1M;
++	ktime_t kt;
++	int order, last_order;
++
++	mock_timeline_init(&tl, 0);
++
++	/* Lookups from cache are very fast and so the random number generation
++	 * and the loop itself becomes a significant factor in the per-iteration
++	 * timings. We try to compensate the results by measuring the overhead
++	 * of the prng and subtract it from the reported results.
++	 */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		u32 x;
++
++		/* Make sure the compiler doesn't optimise away the prng call */
++		WRITE_ONCE(x, prandom_u32_state(&prng));
++
++		count++;
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	pr_debug("%s: %lu random evaluations, %lluns/prng\n",
++		 __func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++	prng32_1M = div64_ul(ktime_to_ns(kt) << 20, count);
++
++	/* Benchmark (only) setting random context ids */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		u64 id = i915_prandom_u64_state(&prng);
++
++		__i915_timeline_sync_set(&tl, id, 0);
++		count++;
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	kt = ktime_sub_ns(kt, (count * prng32_1M * 2) >> 20);
++	pr_info("%s: %lu random insertions, %lluns/insert\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	/* Benchmark looking up the exact same context ids as we just set */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	end_time = count;
++	kt = ktime_get();
++	while (end_time--) {
++		u64 id = i915_prandom_u64_state(&prng);
++
++		if (!__i915_timeline_sync_is_later(&tl, id, 0)) {
++			mock_timeline_fini(&tl);
++			pr_err("Lookup of %llu failed\n", id);
++			return -EINVAL;
++		}
++	}
++	kt = ktime_sub(ktime_get(), kt);
++	kt = ktime_sub_ns(kt, (count * prng32_1M * 2) >> 20);
++	pr_info("%s: %lu random lookups, %lluns/lookup\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	mock_timeline_fini(&tl);
++	cond_resched();
++
++	mock_timeline_init(&tl, 0);
++
++	/* Benchmark setting the first N (in order) contexts */
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		__i915_timeline_sync_set(&tl, count++, 0);
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	pr_info("%s: %lu in-order insertions, %lluns/insert\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	/* Benchmark looking up the exact same context ids as we just set */
++	end_time = count;
++	kt = ktime_get();
++	while (end_time--) {
++		if (!__i915_timeline_sync_is_later(&tl, end_time, 0)) {
++			pr_err("Lookup of %lu failed\n", end_time);
++			mock_timeline_fini(&tl);
++			return -EINVAL;
++		}
++	}
++	kt = ktime_sub(ktime_get(), kt);
++	pr_info("%s: %lu in-order lookups, %lluns/lookup\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++
++	mock_timeline_fini(&tl);
++	cond_resched();
++
++	mock_timeline_init(&tl, 0);
++
++	/* Benchmark searching for a random context id and maybe changing it */
++	prandom_seed_state(&prng, i915_selftest.random_seed);
++	count = 0;
++	kt = ktime_get();
++	end_time = jiffies + HZ/10;
++	do {
++		u32 id = random_engine(&prng);
++		u32 seqno = prandom_u32_state(&prng);
++
++		if (!__i915_timeline_sync_is_later(&tl, id, seqno))
++			__i915_timeline_sync_set(&tl, id, seqno);
++
++		count++;
++	} while (!time_after(jiffies, end_time));
++	kt = ktime_sub(ktime_get(), kt);
++	kt = ktime_sub_ns(kt, (count * prng32_1M * 2) >> 20);
++	pr_info("%s: %lu repeated insert/lookups, %lluns/op\n",
++		__func__, count, (long long)div64_ul(ktime_to_ns(kt), count));
++	mock_timeline_fini(&tl);
++	cond_resched();
++
++	/* Benchmark searching for a known context id and changing the seqno */
++	for (last_order = 1, order = 1; order < 32;
++	     ({ int tmp = last_order; last_order = order; order += tmp; })) {
++		unsigned int mask = BIT(order) - 1;
++
++		mock_timeline_init(&tl, 0);
++
++		count = 0;
++		kt = ktime_get();
++		end_time = jiffies + HZ/10;
++		do {
++			/* Without assuming too many details of the underlying
++			 * implementation, try to identify its phase-changes
++			 * (if any)!
++			 */
++			u64 id = (u64)(count & mask) << order;
++
++			__i915_timeline_sync_is_later(&tl, id, 0);
++			__i915_timeline_sync_set(&tl, id, 0);
++
++			count++;
++		} while (!time_after(jiffies, end_time));
++		kt = ktime_sub(ktime_get(), kt);
++		pr_info("%s: %lu cyclic/%d insert/lookups, %lluns/op\n",
++			__func__, count, order,
++			(long long)div64_ul(ktime_to_ns(kt), count));
++		mock_timeline_fini(&tl);
++		cond_resched();
++	}
++
++	return 0;
++}
++
++int i915_gem_timeline_mock_selftests(void)
++{
++	static const struct i915_subtest tests[] = {
++		SUBTEST(igt_sync),
++		SUBTEST(bench_sync),
++	};
++
++	return i915_subtests(tests, NULL);
++}
+--- a/drivers/gpu/drm/i915/selftests/mock_engine.c
++++ b/drivers/gpu/drm/i915/selftests/mock_engine.c
+@@ -25,6 +25,11 @@
+ #include "mock_engine.h"
+ #include "mock_request.h"
+ 
++struct mock_ring {
++	struct intel_ring base;
++	struct i915_timeline timeline;
++};
++
+ static struct mock_request *first_request(struct mock_engine *engine)
+ {
+ 	return list_first_entry_or_null(&engine->hw_queue,
+@@ -132,7 +137,7 @@ static void mock_submit_request(struct i
+ static struct intel_ring *mock_ring(struct intel_engine_cs *engine)
+ {
+ 	const unsigned long sz = PAGE_SIZE / 2;
+-	struct intel_ring *ring;
++	struct mock_ring *ring;
+ 
+ 	BUILD_BUG_ON(MIN_SPACE_FOR_ADD_REQUEST > sz);
+ 
+@@ -140,20 +145,24 @@ static struct intel_ring *mock_ring(stru
+ 	if (!ring)
+ 		return NULL;
+ 
+-	ring->timeline = &engine->i915->gt.legacy_timeline.engine[engine->id];
++	i915_timeline_init(engine->i915, &ring->timeline, engine->name);
+ 
+-	ring->size = sz;
+-	ring->effective_size = sz;
+-	ring->vaddr = (void *)(ring + 1);
++	ring->base.size = sz;
++	ring->base.effective_size = sz;
++	ring->base.vaddr = (void *)(ring + 1);
++	ring->base.timeline = &ring->timeline;
+ 
+-	INIT_LIST_HEAD(&ring->request_list);
+-	intel_ring_update_space(ring);
++	INIT_LIST_HEAD(&ring->base.request_list);
++	intel_ring_update_space(&ring->base);
+ 
+-	return ring;
++	return &ring->base;
+ }
+ 
+-static void mock_ring_free(struct intel_ring *ring)
++static void mock_ring_free(struct intel_ring *base)
+ {
++	struct mock_ring *ring = container_of(base, typeof(*ring), base);
++
++	i915_timeline_fini(&ring->timeline);
+ 	kfree(ring);
+ }
+ 
+@@ -182,8 +191,7 @@ struct intel_engine_cs *mock_engine(stru
+ 	engine->base.emit_breadcrumb = mock_emit_breadcrumb;
+ 	engine->base.submit_request = mock_submit_request;
+ 
+-	intel_engine_init_timeline(&engine->base);
+-
++	i915_timeline_init(i915, &engine->base.timeline, engine->base.name);
+ 	intel_engine_init_breadcrumbs(&engine->base);
+ 	engine->base.breadcrumbs.mock = true; /* prevent touching HW for irqs */
+ 
+@@ -200,6 +208,7 @@ struct intel_engine_cs *mock_engine(stru
+ 
+ err_breadcrumbs:
+ 	intel_engine_fini_breadcrumbs(&engine->base);
++	i915_timeline_fini(&engine->base.timeline);
+ 	kfree(engine);
+ 	return NULL;
+ }
+@@ -238,6 +247,7 @@ void mock_engine_free(struct intel_engin
+ 	mock_ring_free(engine->buffer);
+ 
+ 	intel_engine_fini_breadcrumbs(engine);
++	i915_timeline_fini(&engine->timeline);
+ 
+ 	kfree(engine);
+ }
+--- a/drivers/gpu/drm/i915/selftests/mock_gem_device.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+@@ -73,10 +73,8 @@ static void mock_device_release(struct d
+ 
+ 	mutex_lock(&i915->drm.struct_mutex);
+ 	mock_fini_ggtt(i915);
+-	i915_gem_timeline_fini(&i915->gt.legacy_timeline);
+-	i915_gem_timeline_fini(&i915->gt.execution_timeline);
+-	WARN_ON(!list_empty(&i915->gt.timelines));
+ 	mutex_unlock(&i915->drm.struct_mutex);
++	WARN_ON(!list_empty(&i915->gt.timelines));
+ 
+ 	destroy_workqueue(i915->wq);
+ 
+@@ -230,12 +228,6 @@ struct drm_i915_private *mock_gem_device
+ 	INIT_LIST_HEAD(&i915->gt.active_rings);
+ 
+ 	mutex_lock(&i915->drm.struct_mutex);
+-	err = i915_gem_timeline_init__global(i915);
+-	if (err) {
+-		mutex_unlock(&i915->drm.struct_mutex);
+-		goto err_priorities;
+-	}
+-
+ 	mock_init_ggtt(i915);
+ 	mutex_unlock(&i915->drm.struct_mutex);
+ 
+--- a/drivers/gpu/drm/i915/selftests/mock_timeline.c
++++ b/drivers/gpu/drm/i915/selftests/mock_timeline.c
+@@ -1,45 +1,28 @@
+ /*
+- * Copyright © 2017 Intel Corporation
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+- * IN THE SOFTWARE.
++ * SPDX-License-Identifier: MIT
+  *
++ * Copyright © 2017-2018 Intel Corporation
+  */
+ 
++#include "../i915_timeline.h"
++
+ #include "mock_timeline.h"
+ 
+-struct intel_timeline *mock_timeline(u64 context)
++void mock_timeline_init(struct i915_timeline *timeline, u64 context)
+ {
+-	static struct lock_class_key class;
+-	struct intel_timeline *tl;
++	timeline->fence_context = context;
++
++	spin_lock_init(&timeline->lock);
+ 
+-	tl = kzalloc(sizeof(*tl), GFP_KERNEL);
+-	if (!tl)
+-		return NULL;
++	init_request_active(&timeline->last_request, NULL);
++	INIT_LIST_HEAD(&timeline->requests);
+ 
+-	__intel_timeline_init(tl, NULL, context, &class, "mock");
++	i915_syncmap_init(&timeline->sync);
+ 
+-	return tl;
++	INIT_LIST_HEAD(&timeline->link);
+ }
+ 
+-void mock_timeline_destroy(struct intel_timeline *tl)
++void mock_timeline_fini(struct i915_timeline *timeline)
+ {
+-	__intel_timeline_fini(tl);
+-	kfree(tl);
++	i915_timeline_fini(timeline);
+ }
+--- a/drivers/gpu/drm/i915/selftests/mock_timeline.h
++++ b/drivers/gpu/drm/i915/selftests/mock_timeline.h
+@@ -1,33 +1,15 @@
+ /*
+- * Copyright © 2017 Intel Corporation
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice (including the next
+- * paragraph) shall be included in all copies or substantial portions of the
+- * Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+- * IN THE SOFTWARE.
++ * SPDX-License-Identifier: MIT
+  *
++ * Copyright © 2017-2018 Intel Corporation
+  */
+ 
+ #ifndef __MOCK_TIMELINE__
+ #define __MOCK_TIMELINE__
+ 
+-#include "../i915_gem_timeline.h"
++struct i915_timeline;
+ 
+-struct intel_timeline *mock_timeline(u64 context);
+-void mock_timeline_destroy(struct intel_timeline *tl);
++void mock_timeline_init(struct i915_timeline *timeline, u64 context);
++void mock_timeline_fini(struct i915_timeline *timeline);
+ 
+ #endif /* !__MOCK_TIMELINE__ */
