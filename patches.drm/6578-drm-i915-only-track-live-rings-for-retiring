@@ -1,0 +1,169 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 30 Apr 2018 14:15:03 +0100
+Subject: drm/i915: Only track live rings for retiring
+Git-commit: 643b450a594e9cb57fbd2534d1571d244faddd01
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We don't need to track every ring for its lifetime as they are managed
+by the contexts/engines. What we do want to track are the live rings so
+that we can sporadically clean up requests if userspace falls behind. We
+can simply restrict the gt->rings list to being only gt->live_rings.
+
+v2: s/live/active/ for consistency with gt.active_requests
+
+Suggested-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180430131503.5375-4-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h                  |    3 ++-
+ drivers/gpu/drm/i915/i915_gem.c                  |    6 ++++--
+ drivers/gpu/drm/i915/i915_request.c              |   10 ++++++++--
+ drivers/gpu/drm/i915/intel_ringbuffer.c          |    4 ----
+ drivers/gpu/drm/i915/intel_ringbuffer.h          |    2 +-
+ drivers/gpu/drm/i915/selftests/mock_engine.c     |    4 ----
+ drivers/gpu/drm/i915/selftests/mock_gem_device.c |    5 +++--
+ 7 files changed, 18 insertions(+), 16 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2061,7 +2061,8 @@ struct drm_i915_private {
+ 
+ 		struct i915_gem_timeline global_timeline;
+ 		struct list_head timelines;
+-		struct list_head rings;
++
++		struct list_head active_rings;
+ 		u32 active_requests;
+ 		u32 request_serial;
+ 
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -141,6 +141,7 @@ static u32 __i915_gem_park(struct drm_i9
+ {
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 	GEM_BUG_ON(i915->gt.active_requests);
++	GEM_BUG_ON(!list_empty(&i915->gt.active_rings));
+ 
+ 	if (!i915->gt.awake)
+ 		return I915_EPOCH_INVALID;
+@@ -5599,9 +5600,10 @@ int i915_gem_init_early(struct drm_i915_
+ 	if (!dev_priv->priorities)
+ 		goto err_dependencies;
+ 
+-	mutex_lock(&dev_priv->drm.struct_mutex);
+-	INIT_LIST_HEAD(&dev_priv->gt.rings);
+ 	INIT_LIST_HEAD(&dev_priv->gt.timelines);
++	INIT_LIST_HEAD(&dev_priv->gt.active_rings);
++
++	mutex_lock(&dev_priv->drm.struct_mutex);
+ 	err = i915_gem_timeline_init__global(dev_priv);
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 	if (err)
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -322,6 +322,7 @@ static void advance_ring(struct i915_req
+ 		 * noops - they are safe to be replayed on a reset.
+ 		 */
+ 		tail = READ_ONCE(request->tail);
++		list_del(&ring->active_link);
+ 	} else {
+ 		tail = request->postfix;
+ 	}
+@@ -1096,6 +1097,8 @@ void __i915_request_add(struct i915_requ
+ 	i915_gem_active_set(&timeline->last_request, request);
+ 
+ 	list_add_tail(&request->ring_link, &ring->request_list);
++	if (list_is_first(&request->ring_link, &ring->request_list))
++		list_add(&ring->active_link, &request->i915->gt.active_rings);
+ 	request->emitted_jiffies = jiffies;
+ 
+ 	/*
+@@ -1418,14 +1421,17 @@ static void ring_retire_requests(struct
+ 
+ void i915_retire_requests(struct drm_i915_private *i915)
+ {
+-	struct intel_ring *ring, *next;
++	struct intel_ring *ring, *tmp;
+ 
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 
+ 	if (!i915->gt.active_requests)
+ 		return;
+ 
+-	list_for_each_entry_safe(ring, next, &i915->gt.rings, link)
++	/* An outstanding request must be on a still active ring somewhere */
++	GEM_BUG_ON(list_empty(&i915->gt.active_rings));
++
++	list_for_each_entry_safe(ring, tmp, &i915->gt.active_rings, active_link)
+ 		ring_retire_requests(ring);
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1150,8 +1150,6 @@ intel_engine_create_ring(struct intel_en
+ 	}
+ 	ring->vma = vma;
+ 
+-	list_add(&ring->link, &engine->i915->gt.rings);
+-
+ 	return ring;
+ }
+ 
+@@ -1163,8 +1161,6 @@ intel_ring_free(struct intel_ring *ring)
+ 	i915_vma_close(ring->vma);
+ 	__i915_gem_object_release_unless_active(obj);
+ 
+-	list_del(&ring->link);
+-
+ 	kfree(ring);
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -129,7 +129,7 @@ struct intel_ring {
+ 	void *vaddr;
+ 
+ 	struct list_head request_list;
+-	struct list_head link;
++	struct list_head active_link;
+ 
+ 	u32 head;
+ 	u32 tail;
+--- a/drivers/gpu/drm/i915/selftests/mock_engine.c
++++ b/drivers/gpu/drm/i915/selftests/mock_engine.c
+@@ -147,15 +147,11 @@ static struct intel_ring *mock_ring(stru
+ 	INIT_LIST_HEAD(&ring->request_list);
+ 	intel_ring_update_space(ring);
+ 
+-	list_add(&ring->link, &engine->i915->gt.rings);
+-
+ 	return ring;
+ }
+ 
+ static void mock_ring_free(struct intel_ring *ring)
+ {
+-	list_del(&ring->link);
+-
+ 	kfree(ring);
+ }
+ 
+--- a/drivers/gpu/drm/i915/selftests/mock_gem_device.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+@@ -224,9 +224,10 @@ struct drm_i915_private *mock_gem_device
+ 	if (!i915->priorities)
+ 		goto err_dependencies;
+ 
+-	mutex_lock(&i915->drm.struct_mutex);
+-	INIT_LIST_HEAD(&i915->gt.rings);
+ 	INIT_LIST_HEAD(&i915->gt.timelines);
++	INIT_LIST_HEAD(&i915->gt.active_rings);
++
++	mutex_lock(&i915->drm.struct_mutex);
+ 	err = i915_gem_timeline_init__global(i915);
+ 	if (err) {
+ 		mutex_unlock(&i915->drm.struct_mutex);
