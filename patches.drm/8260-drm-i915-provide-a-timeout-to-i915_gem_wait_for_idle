@@ -1,0 +1,336 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 9 Jul 2018 13:20:42 +0100
+Subject: drm/i915: Provide a timeout to i915_gem_wait_for_idle()
+Git-commit: ec625fb932bb057e2d3c2ed28eee56a827385ab8
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Usually we have no idea about the upper bound we need to wait to catch
+up with userspace when idling the device, but in a few situations we
+know the system was idle beforehand and can provide a short timeout in
+order to very quickly catch a failure, long before hangcheck kicks in.
+
+In the following patches, we will use the timeout to curtain two overly
+long waits, where we know we can expect the GPU to complete within a
+reasonable time or declare it broken.
+
+In particular, with a broken GPU we expect it to fail during the initial
+GPU setup where do a couple of context switches to record the defaults.
+This is a task that takes a few milliseconds even on the slowest of
+devices, but we may have to wait 60s for hangcheck to give in and
+declare the machine inoperable. In this a case where any gpu hang is
+unacceptable, both from a timeliness and practical standpoint.
+
+The other improvement is that in selftests, we do not need to arm an
+independent timer to inject a wedge, as we can just limit the timeout on
+the wait directly.
+
+v2: Include the timeout parameter in the trace.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180709122044.7028-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c               |    6 +-
+ drivers/gpu/drm/i915/i915_drv.h                   |    2 
+ drivers/gpu/drm/i915/i915_gem.c                   |   48 +++++++++++++---------
+ drivers/gpu/drm/i915/i915_gem_evict.c             |    3 -
+ drivers/gpu/drm/i915/i915_gem_gtt.c               |    2 
+ drivers/gpu/drm/i915/i915_gem_shrinker.c          |   11 +++--
+ drivers/gpu/drm/i915/i915_perf.c                  |    4 +
+ drivers/gpu/drm/i915/i915_request.c               |    6 +-
+ drivers/gpu/drm/i915/selftests/i915_gem_context.c |    4 +
+ drivers/gpu/drm/i915/selftests/i915_request.c     |    4 +
+ drivers/gpu/drm/i915/selftests/igt_flush_test.c   |    2 
+ 11 files changed, 59 insertions(+), 33 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4104,7 +4104,8 @@ fault_irq_set(struct drm_i915_private *i
+ 
+ 	err = i915_gem_wait_for_idle(i915,
+ 				     I915_WAIT_LOCKED |
+-				     I915_WAIT_INTERRUPTIBLE);
++				     I915_WAIT_INTERRUPTIBLE,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (err)
+ 		goto err_unlock;
+ 
+@@ -4209,7 +4210,8 @@ i915_drop_caches_set(void *data, u64 val
+ 		if (val & DROP_ACTIVE)
+ 			ret = i915_gem_wait_for_idle(dev_priv,
+ 						     I915_WAIT_INTERRUPTIBLE |
+-						     I915_WAIT_LOCKED);
++						     I915_WAIT_LOCKED,
++						     MAX_SCHEDULE_TIMEOUT);
+ 
+ 		if (val & DROP_RETIRE)
+ 			i915_retire_requests(dev_priv);
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3157,7 +3157,7 @@ void i915_gem_init_swizzling(struct drm_
+ void i915_gem_fini(struct drm_i915_private *dev_priv);
+ void i915_gem_cleanup_engines(struct drm_i915_private *dev_priv);
+ int i915_gem_wait_for_idle(struct drm_i915_private *dev_priv,
+-			   unsigned int flags);
++			   unsigned int flags, long timeout);
+ int __must_check i915_gem_suspend(struct drm_i915_private *dev_priv);
+ void i915_gem_suspend_late(struct drm_i915_private *dev_priv);
+ void i915_gem_resume(struct drm_i915_private *dev_priv);
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2274,7 +2274,9 @@ static int i915_gem_object_create_mmap_o
+ 
+ 	/* Attempt to reap some mmap space from dead objects */
+ 	do {
+-		err = i915_gem_wait_for_idle(dev_priv, I915_WAIT_INTERRUPTIBLE);
++		err = i915_gem_wait_for_idle(dev_priv,
++					     I915_WAIT_INTERRUPTIBLE,
++					     MAX_SCHEDULE_TIMEOUT);
+ 		if (err)
+ 			break;
+ 
+@@ -3749,14 +3751,14 @@ i915_gem_wait_ioctl(struct drm_device *d
+ 	return ret;
+ }
+ 
+-static int wait_for_timeline(struct i915_timeline *tl, unsigned int flags)
++static long wait_for_timeline(struct i915_timeline *tl,
++			      unsigned int flags, long timeout)
+ {
+ 	struct i915_request *rq;
+-	long ret;
+ 
+ 	rq = i915_gem_active_get_unlocked(&tl->last_request);
+ 	if (!rq)
+-		return 0;
++		return timeout;
+ 
+ 	/*
+ 	 * "Race-to-idle".
+@@ -3770,10 +3772,10 @@ static int wait_for_timeline(struct i915
+ 	if (flags & I915_WAIT_FOR_IDLE_BOOST)
+ 		gen6_rps_boost(rq, NULL);
+ 
+-	ret = i915_request_wait(rq, flags, MAX_SCHEDULE_TIMEOUT);
++	timeout = i915_request_wait(rq, flags, timeout);
+ 	i915_request_put(rq);
+ 
+-	return ret < 0 ? ret : 0;
++	return timeout;
+ }
+ 
+ static int wait_for_engines(struct drm_i915_private *i915)
+@@ -3789,10 +3791,12 @@ static int wait_for_engines(struct drm_i
+ 	return 0;
+ }
+ 
+-int i915_gem_wait_for_idle(struct drm_i915_private *i915, unsigned int flags)
++int i915_gem_wait_for_idle(struct drm_i915_private *i915,
++			   unsigned int flags, long timeout)
+ {
+-	GEM_TRACE("flags=%x (%s)\n",
+-		  flags, flags & I915_WAIT_LOCKED ? "locked" : "unlocked");
++	GEM_TRACE("flags=%x (%s), timeout=%ld%s\n",
++		  flags, flags & I915_WAIT_LOCKED ? "locked" : "unlocked",
++		  timeout, timeout == MAX_SCHEDULE_TIMEOUT ? " (forever)" : "");
+ 
+ 	/* If the device is asleep, we have no requests outstanding */
+ 	if (!READ_ONCE(i915->gt.awake))
+@@ -3805,9 +3809,9 @@ int i915_gem_wait_for_idle(struct drm_i9
+ 		lockdep_assert_held(&i915->drm.struct_mutex);
+ 
+ 		list_for_each_entry(tl, &i915->gt.timelines, link) {
+-			err = wait_for_timeline(tl, flags);
+-			if (err)
+-				return err;
++			timeout = wait_for_timeline(tl, flags, timeout);
++			if (timeout < 0)
++				return timeout;
+ 		}
+ 
+ 		err = wait_for_engines(i915);
+@@ -3819,12 +3823,13 @@ int i915_gem_wait_for_idle(struct drm_i9
+ 	} else {
+ 		struct intel_engine_cs *engine;
+ 		enum intel_engine_id id;
+-		int err;
+ 
+ 		for_each_engine(engine, i915, id) {
+-			err = wait_for_timeline(&engine->timeline, flags);
+-			if (err)
+-				return err;
++			struct i915_timeline *tl = &engine->timeline;
++
++			timeout = wait_for_timeline(tl, flags, timeout);
++			if (timeout < 0)
++				return timeout;
+ 		}
+ 	}
+ 
+@@ -5059,7 +5064,8 @@ int i915_gem_suspend(struct drm_i915_pri
+ 		ret = i915_gem_wait_for_idle(dev_priv,
+ 					     I915_WAIT_INTERRUPTIBLE |
+ 					     I915_WAIT_LOCKED |
+-					     I915_WAIT_FOR_IDLE_BOOST);
++					     I915_WAIT_FOR_IDLE_BOOST,
++					     MAX_SCHEDULE_TIMEOUT);
+ 		if (ret && ret != -EIO)
+ 			goto err_unlock;
+ 
+@@ -5363,7 +5369,9 @@ static int __intel_engines_record_defaul
+ 	if (err)
+ 		goto err_active;
+ 
+-	err = i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED);
++	err = i915_gem_wait_for_idle(i915,
++				     I915_WAIT_LOCKED,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (err)
+ 		goto err_active;
+ 
+@@ -5428,7 +5436,9 @@ err_active:
+ 	if (WARN_ON(i915_gem_switch_to_kernel_context(i915)))
+ 		goto out_ctx;
+ 
+-	if (WARN_ON(i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED)))
++	if (WARN_ON(i915_gem_wait_for_idle(i915,
++					   I915_WAIT_LOCKED,
++					   MAX_SCHEDULE_TIMEOUT)))
+ 		goto out_ctx;
+ 
+ 	i915_gem_contexts_lost(i915);
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -69,7 +69,8 @@ static int ggtt_flush(struct drm_i915_pr
+ 
+ 	err = i915_gem_wait_for_idle(i915,
+ 				     I915_WAIT_INTERRUPTIBLE |
+-				     I915_WAIT_LOCKED);
++				     I915_WAIT_LOCKED,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (err)
+ 		return err;
+ 
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -2793,7 +2793,7 @@ void i915_gem_gtt_finish_pages(struct dr
+ 	struct i915_ggtt *ggtt = &dev_priv->ggtt;
+ 
+ 	if (unlikely(ggtt->do_idle_maps)) {
+-		if (i915_gem_wait_for_idle(dev_priv, 0)) {
++		if (i915_gem_wait_for_idle(dev_priv, 0, MAX_SCHEDULE_TIMEOUT)) {
+ 			DRM_ERROR("Failed to wait for idle; VT'd may hang.\n");
+ 			/* Wait a bit, in hopes it avoids the hang */
+ 			udelay(10);
+--- a/drivers/gpu/drm/i915/i915_gem_shrinker.c
++++ b/drivers/gpu/drm/i915/i915_gem_shrinker.c
+@@ -172,7 +172,9 @@ i915_gem_shrink(struct drm_i915_private
+ 	 * we will free as much as we can and hope to get a second chance.
+ 	 */
+ 	if (flags & I915_SHRINK_ACTIVE)
+-		i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED);
++		i915_gem_wait_for_idle(i915,
++				       I915_WAIT_LOCKED,
++				       MAX_SCHEDULE_TIMEOUT);
+ 
+ 	trace_i915_gem_shrink(i915, target, flags);
+ 	i915_retire_requests(i915);
+@@ -392,7 +394,8 @@ shrinker_lock_uninterruptible(struct drm
+ 	unsigned long timeout = jiffies + msecs_to_jiffies_timeout(timeout_ms);
+ 
+ 	do {
+-		if (i915_gem_wait_for_idle(i915, 0) == 0 &&
++		if (i915_gem_wait_for_idle(i915,
++					   0, MAX_SCHEDULE_TIMEOUT) == 0 &&
+ 		    shrinker_lock(i915, unlock))
+ 			break;
+ 
+@@ -466,7 +469,9 @@ i915_gem_shrinker_vmap(struct notifier_b
+ 		return NOTIFY_DONE;
+ 
+ 	/* Force everything onto the inactive lists */
+-	ret = i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED);
++	ret = i915_gem_wait_for_idle(i915,
++				     I915_WAIT_LOCKED,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (ret)
+ 		goto out;
+ 
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -1836,7 +1836,9 @@ static int gen8_configure_all_contexts(s
+ 	 * So far the best way to work around this issue seems to be draining
+ 	 * the GPU from any submitted work.
+ 	 */
+-	ret = i915_gem_wait_for_idle(dev_priv, wait_flags);
++	ret = i915_gem_wait_for_idle(dev_priv,
++				     wait_flags,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (ret)
+ 		goto out;
+ 
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -206,7 +206,8 @@ static int reset_all_global_seqno(struct
+ 	/* Carefully retire all requests without writing to the rings */
+ 	ret = i915_gem_wait_for_idle(i915,
+ 				     I915_WAIT_INTERRUPTIBLE |
+-				     I915_WAIT_LOCKED);
++				     I915_WAIT_LOCKED,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -735,7 +736,8 @@ i915_request_alloc(struct intel_engine_c
+ 		/* Ratelimit ourselves to prevent oom from malicious clients */
+ 		ret = i915_gem_wait_for_idle(i915,
+ 					     I915_WAIT_LOCKED |
+-					     I915_WAIT_INTERRUPTIBLE);
++					     I915_WAIT_INTERRUPTIBLE,
++					     MAX_SCHEDULE_TIMEOUT);
+ 		if (ret)
+ 			goto err_unreserve;
+ 
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_context.c
+@@ -478,7 +478,9 @@ static int __igt_switch_to_kernel_contex
+ 		}
+ 	}
+ 
+-	err = i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED);
++	err = i915_gem_wait_for_idle(i915,
++				     I915_WAIT_LOCKED,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (err)
+ 		return err;
+ 
+--- a/drivers/gpu/drm/i915/selftests/i915_request.c
++++ b/drivers/gpu/drm/i915/selftests/i915_request.c
+@@ -286,7 +286,9 @@ static int begin_live_test(struct live_t
+ 	t->func = func;
+ 	t->name = name;
+ 
+-	err = i915_gem_wait_for_idle(i915, I915_WAIT_LOCKED);
++	err = i915_gem_wait_for_idle(i915,
++				     I915_WAIT_LOCKED,
++				     MAX_SCHEDULE_TIMEOUT);
+ 	if (err) {
+ 		pr_err("%s(%s): failed to idle before, with err=%d!",
+ 		       func, name, err);
+--- a/drivers/gpu/drm/i915/selftests/igt_flush_test.c
++++ b/drivers/gpu/drm/i915/selftests/igt_flush_test.c
+@@ -64,7 +64,7 @@ int igt_flush_test(struct drm_i915_priva
+ 	}
+ 
+ 	wedge_on_timeout(&w, i915, HZ)
+-		i915_gem_wait_for_idle(i915, flags);
++		i915_gem_wait_for_idle(i915, flags, MAX_SCHEDULE_TIMEOUT);
+ 
+ 	return i915_terminally_wedged(&i915->gpu_error) ? -EIO : 0;
+ }
