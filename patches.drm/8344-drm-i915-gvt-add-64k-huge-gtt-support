@@ -1,0 +1,168 @@
+From: Changbin Du <changbin.du@intel.com>
+Date: Tue, 15 May 2018 10:35:41 +0800
+Subject: drm/i915/gvt: Add 64K huge gtt support
+Git-commit: eb3a353014d2c2402e572ab7bef86bf5e328160f
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Finally, this add the first huge gtt support for GVTg - 64K pages. Since
+64K page and 4K page cannot be mixed on the same page table, so we always
+split a 64K entry into small 4K page. And when unshadow guest 64K entry,
+we need ensure all the shadowed entries in shadow page table also get
+cleared.
+
+For page table which has 64K gtt entry, only PTE#0, PTE#16, PTE#32, ...
+PTE#496 are used. Unused PTEs update should be ignored.
+
+Signed-off-by: Changbin Du <changbin.du@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/gvt/gtt.c |   86 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 80 insertions(+), 6 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/gtt.c
++++ b/drivers/gpu/drm/i915/gvt/gtt.c
+@@ -978,9 +978,12 @@ static int ppgtt_invalidate_spt(struct i
+ 			ppgtt_invalidate_pte(spt, &e);
+ 			break;
+ 		case GTT_TYPE_PPGTT_PTE_64K_ENTRY:
++			/* We don't setup 64K shadow entry so far. */
++			WARN(1, "suspicious 64K gtt entry\n");
++			continue;
+ 		case GTT_TYPE_PPGTT_PTE_2M_ENTRY:
+ 		case GTT_TYPE_PPGTT_PTE_1G_ENTRY:
+-			WARN(1, "GVT doesn't support 64K/2M/1GB page\n");
++			WARN(1, "GVT doesn't support 2M/1GB page\n");
+ 			continue;
+ 		case GTT_TYPE_PPGTT_PML4_ENTRY:
+ 		case GTT_TYPE_PPGTT_PDP_ENTRY:
+@@ -1075,9 +1078,44 @@ static inline void ppgtt_generate_shadow
+ 	se->type = ge->type;
+ 	se->val64 = ge->val64;
+ 
++	/* Because we always split 64KB pages, so clear IPS in shadow PDE. */
++	if (se->type == GTT_TYPE_PPGTT_PDE_ENTRY)
++		ops->clear_ips(se);
++
+ 	ops->set_pfn(se, s->shadow_page.mfn);
+ }
+ 
++static int split_64KB_gtt_entry(struct intel_vgpu *vgpu,
++	struct intel_vgpu_ppgtt_spt *spt, unsigned long index,
++	struct intel_gvt_gtt_entry *se)
++{
++	struct intel_gvt_gtt_pte_ops *ops = vgpu->gvt->gtt.pte_ops;
++	struct intel_gvt_gtt_entry entry = *se;
++	unsigned long start_gfn;
++	dma_addr_t dma_addr;
++	int i, ret;
++
++	gvt_vdbg_mm("Split 64K gtt entry, index %lu\n", index);
++
++	GEM_BUG_ON(index % GTT_64K_PTE_STRIDE);
++
++	start_gfn = ops->get_pfn(se);
++
++	entry.type = GTT_TYPE_PPGTT_PTE_4K_ENTRY;
++	ops->set_64k_splited(&entry);
++
++	for (i = 0; i < GTT_64K_PTE_STRIDE; i++) {
++		ret = intel_gvt_hypervisor_dma_map_guest_page(vgpu,
++						start_gfn + i, &dma_addr);
++		if (ret)
++			return ret;
++
++		ops->set_pfn(&entry, dma_addr >> PAGE_SHIFT);
++		ppgtt_set_shadow_entry(spt, &entry, index + i);
++	}
++	return 0;
++}
++
+ static int ppgtt_populate_shadow_entry(struct intel_vgpu *vgpu,
+ 	struct intel_vgpu_ppgtt_spt *spt, unsigned long index,
+ 	struct intel_gvt_gtt_entry *ge)
+@@ -1098,9 +1136,16 @@ static int ppgtt_populate_shadow_entry(s
+ 		gvt_vdbg_mm("shadow 4K gtt entry\n");
+ 		break;
+ 	case GTT_TYPE_PPGTT_PTE_64K_ENTRY:
++		gvt_vdbg_mm("shadow 64K gtt entry\n");
++		/*
++		 * The layout of 64K page is special, the page size is
++		 * controlled by uper PDE. To be simple, we always split
++		 * 64K page to smaller 4K pages in shadow PT.
++		 */
++		return split_64KB_gtt_entry(vgpu, spt, index, &se);
+ 	case GTT_TYPE_PPGTT_PTE_2M_ENTRY:
+ 	case GTT_TYPE_PPGTT_PTE_1G_ENTRY:
+-		gvt_vgpu_err("GVT doesn't support 64K/2M/1GB entry\n");
++		gvt_vgpu_err("GVT doesn't support 2M/1GB entry\n");
+ 		return -EINVAL;
+ 	default:
+ 		GEM_BUG_ON(1);
+@@ -1190,8 +1235,12 @@ static int ppgtt_handle_guest_entry_remo
+ 		ret = ppgtt_invalidate_spt(s);
+ 		if (ret)
+ 			goto fail;
+-	} else
++	} else {
++		/* We don't setup 64K shadow entry so far. */
++		WARN(se->type == GTT_TYPE_PPGTT_PTE_64K_ENTRY,
++		     "suspicious 64K entry\n");
+ 		ppgtt_invalidate_pte(spt, se);
++	}
+ 
+ 	return 0;
+ fail:
+@@ -1414,7 +1463,7 @@ static int ppgtt_handle_guest_write_page
+ 	struct intel_gvt_gtt_pte_ops *ops = vgpu->gvt->gtt.pte_ops;
+ 	struct intel_gvt_gtt_entry old_se;
+ 	int new_present;
+-	int ret;
++	int i, ret;
+ 
+ 	new_present = ops->test_present(we);
+ 
+@@ -1436,8 +1485,21 @@ static int ppgtt_handle_guest_write_page
+ 		goto fail;
+ 
+ 	if (!new_present) {
+-		ops->set_pfn(&old_se, vgpu->gtt.scratch_pt[type].page_mfn);
+-		ppgtt_set_shadow_entry(spt, &old_se, index);
++		/* For 64KB splited entries, we need clear them all. */
++		if (ops->test_64k_splited(&old_se) &&
++		    !(index % GTT_64K_PTE_STRIDE)) {
++			gvt_vdbg_mm("remove splited 64K shadow entries\n");
++			for (i = 0; i < GTT_64K_PTE_STRIDE; i++) {
++				ops->clear_64k_splited(&old_se);
++				ops->set_pfn(&old_se,
++					vgpu->gtt.scratch_pt[type].page_mfn);
++				ppgtt_set_shadow_entry(spt, &old_se, index + i);
++			}
++		} else {
++			ops->set_pfn(&old_se,
++				     vgpu->gtt.scratch_pt[type].page_mfn);
++			ppgtt_set_shadow_entry(spt, &old_se, index);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -1519,6 +1581,18 @@ static int ppgtt_handle_guest_write_page
+ 
+ 	ppgtt_get_guest_entry(spt, &we, index);
+ 
++	/*
++	 * For page table which has 64K gtt entry, only PTE#0, PTE#16,
++	 * PTE#32, ... PTE#496 are used. Unused PTEs update should be
++	 * ignored.
++	 */
++	if (we.type == GTT_TYPE_PPGTT_PTE_64K_ENTRY &&
++	    (index % GTT_64K_PTE_STRIDE)) {
++		gvt_vdbg_mm("Ignore write to unused PTE entry, index %lu\n",
++			    index);
++		return 0;
++	}
++
+ 	if (bytes == info->gtt_entry_size) {
+ 		ret = ppgtt_handle_guest_write_page_table(spt, &we, index);
+ 		if (ret)
