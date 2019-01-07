@@ -1,0 +1,454 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 2 May 2018 17:38:38 +0100
+Subject: drm/i915: Move timeline from GTT to ring
+Git-commit: 65fcb8064dd0e54d4674e8e2c6bf6ed7264a29e9
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+In the future, we want to move a request between engines. To achieve
+this, we first realise that we have two timelines in effect here. The
+first runs through the GTT is required for ordering vma access, which is
+tracked currently by engine. The second is implied by sequential
+execution of commands inside the ringbuffer. This timeline is one that
+maps to userspace's expectations when submitting requests (i.e. given the
+same context, batch A is executed before batch B). As the rings's
+timelines map to userspace and the GTT timeline an implementation
+detail, move the timeline from the GTT into the ring itself (per-context
+in logical-ring-contexts/execlists, or a global per-engine timeline for
+the shared ringbuffers in legacy submission.
+
+The two timelines are still assumed to be equivalent at the moment (no
+migrating requests between engines yet) and so we can simply move from
+one to the other without adding extra ordering.
+
+v2: Reinforce that one isn't allowed to mix the engine execution
+timeline with the client timeline from userspace (on the ring).
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180502163839.3248-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h                   |   13 -----
+ drivers/gpu/drm/i915/i915_gem.c                   |    9 ++-
+ drivers/gpu/drm/i915/i915_gem_context.c           |   15 +++++-
+ drivers/gpu/drm/i915/i915_gem_context.h           |    2 
+ drivers/gpu/drm/i915/i915_gem_gtt.c               |    3 -
+ drivers/gpu/drm/i915/i915_gem_gtt.h               |    1 
+ drivers/gpu/drm/i915/i915_gem_timeline.c          |   54 +++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_gem_timeline.h          |    4 +
+ drivers/gpu/drm/i915/i915_request.c               |   13 ++---
+ drivers/gpu/drm/i915/intel_engine_cs.c            |    3 -
+ drivers/gpu/drm/i915/intel_lrc.c                  |    2 
+ drivers/gpu/drm/i915/intel_ringbuffer.c           |   10 +++-
+ drivers/gpu/drm/i915/intel_ringbuffer.h           |    5 +-
+ drivers/gpu/drm/i915/selftests/i915_gem_context.c |   12 ++++
+ drivers/gpu/drm/i915/selftests/mock_engine.c      |    5 +-
+ drivers/gpu/drm/i915/selftests/mock_gem_device.c  |    4 +
+ drivers/gpu/drm/i915/selftests/mock_gtt.c         |    1 
+ 17 files changed, 115 insertions(+), 41 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2059,7 +2059,8 @@ struct drm_i915_private {
+ 		void (*resume)(struct drm_i915_private *);
+ 		void (*cleanup_engine)(struct intel_engine_cs *engine);
+ 
+-		struct i915_gem_timeline global_timeline;
++		struct i915_gem_timeline execution_timeline;
++		struct i915_gem_timeline legacy_timeline;
+ 		struct list_head timelines;
+ 
+ 		struct list_head active_rings;
+@@ -3235,16 +3236,6 @@ i915_gem_context_lookup(struct drm_i915_
+ 	return ctx;
+ }
+ 
+-static inline struct intel_timeline *
+-i915_gem_context_lookup_timeline(struct i915_gem_context *ctx,
+-				 struct intel_engine_cs *engine)
+-{
+-	struct i915_address_space *vm;
+-
+-	vm = ctx->ppgtt ? &ctx->ppgtt->base : &ctx->i915->ggtt.base;
+-	return &vm->timeline.engine[engine->id];
+-}
+-
+ int i915_perf_open_ioctl(struct drm_device *dev, void *data,
+ 			 struct drm_file *file);
+ int i915_perf_add_config_ioctl(struct drm_device *dev, void *data,
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3110,10 +3110,10 @@ static void engine_skip_context(struct i
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+ 	struct i915_gem_context *hung_ctx = request->ctx;
+-	struct intel_timeline *timeline;
++	struct intel_timeline *timeline = request->timeline;
+ 	unsigned long flags;
+ 
+-	timeline = i915_gem_context_lookup_timeline(hung_ctx, engine);
++	GEM_BUG_ON(timeline == engine->timeline);
+ 
+ 	spin_lock_irqsave(&engine->timeline->lock, flags);
+ 	spin_lock(&timeline->lock);
+@@ -3782,7 +3782,7 @@ int i915_gem_wait_for_idle(struct drm_i9
+ 
+ 		ret = wait_for_engines(i915);
+ 	} else {
+-		ret = wait_for_timeline(&i915->gt.global_timeline, flags);
++		ret = wait_for_timeline(&i915->gt.execution_timeline, flags);
+ 	}
+ 
+ 	return ret;
+@@ -5652,7 +5652,8 @@ void i915_gem_cleanup_early(struct drm_i
+ 	WARN_ON(dev_priv->mm.object_count);
+ 
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+-	i915_gem_timeline_fini(&dev_priv->gt.global_timeline);
++	i915_gem_timeline_fini(&dev_priv->gt.legacy_timeline);
++	i915_gem_timeline_fini(&dev_priv->gt.execution_timeline);
+ 	WARN_ON(!list_empty(&dev_priv->gt.timelines));
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+ 
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -122,6 +122,7 @@ static void i915_gem_context_free(struct
+ 	lockdep_assert_held(&ctx->i915->drm.struct_mutex);
+ 	GEM_BUG_ON(!i915_gem_context_is_closed(ctx));
+ 
++	i915_gem_timeline_free(ctx->timeline);
+ 	i915_ppgtt_put(ctx->ppgtt);
+ 
+ 	for (n = 0; n < ARRAY_SIZE(ctx->__engine); n++) {
+@@ -376,6 +377,18 @@ i915_gem_create_context(struct drm_i915_
+ 		ctx->desc_template = default_desc_template(dev_priv, ppgtt);
+ 	}
+ 
++	if (HAS_EXECLISTS(dev_priv)) {
++		struct i915_gem_timeline *timeline;
++
++		timeline = i915_gem_timeline_create(dev_priv, ctx->name);
++		if (IS_ERR(timeline)) {
++			__destroy_hw_context(ctx, file_priv);
++			return ERR_CAST(timeline);
++		}
++
++		ctx->timeline = timeline;
++	}
++
+ 	trace_i915_context_create(ctx);
+ 
+ 	return ctx;
+@@ -584,7 +597,7 @@ static bool engine_has_idle_kernel_conte
+ 	list_for_each_entry(timeline, &engine->i915->gt.timelines, link) {
+ 		struct intel_timeline *tl;
+ 
+-		if (timeline == &engine->i915->gt.global_timeline)
++		if (timeline == &engine->i915->gt.execution_timeline)
+ 			continue;
+ 
+ 		tl = &timeline->engine[engine->id];
+--- a/drivers/gpu/drm/i915/i915_gem_context.h
++++ b/drivers/gpu/drm/i915/i915_gem_context.h
+@@ -58,6 +58,8 @@ struct i915_gem_context {
+ 	/** file_priv: owning file descriptor */
+ 	struct drm_i915_file_private *file_priv;
+ 
++	struct i915_gem_timeline *timeline;
++
+ 	/**
+ 	 * @ppgtt: unique address space (GTT)
+ 	 *
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -2111,8 +2111,6 @@ static void i915_address_space_init(stru
+ 				    struct drm_i915_private *dev_priv,
+ 				    const char *name)
+ {
+-	i915_gem_timeline_init(dev_priv, &vm->timeline, name);
+-
+ 	drm_mm_init(&vm->mm, 0, vm->total);
+ 	vm->mm.head_node.color = I915_COLOR_UNEVICTABLE;
+ 
+@@ -2129,7 +2127,6 @@ static void i915_address_space_fini(stru
+ 	if (pagevec_count(&vm->free_pages))
+ 		vm_free_pages_release(vm, true);
+ 
+-	i915_gem_timeline_fini(&vm->timeline);
+ 	drm_mm_takedown(&vm->mm);
+ 	list_del(&vm->global_link);
+ }
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -257,7 +257,6 @@ struct i915_pml4 {
+ 
+ struct i915_address_space {
+ 	struct drm_mm mm;
+-	struct i915_gem_timeline timeline;
+ 	struct drm_i915_private *i915;
+ 	struct device *dma;
+ 	/* Every address space belongs to a struct file - except for the global
+--- a/drivers/gpu/drm/i915/i915_gem_timeline.c
++++ b/drivers/gpu/drm/i915/i915_gem_timeline.c
+@@ -95,12 +95,28 @@ int i915_gem_timeline_init(struct drm_i9
+ 
+ int i915_gem_timeline_init__global(struct drm_i915_private *i915)
+ {
+-	static struct lock_class_key class;
++	static struct lock_class_key class1, class2;
++	int err;
+ 
+-	return __i915_gem_timeline_init(i915,
+-					&i915->gt.global_timeline,
+-					"[execution]",
+-					&class, "&global_timeline->lock");
++	err = __i915_gem_timeline_init(i915,
++				       &i915->gt.execution_timeline,
++				       "[execution]", &class1,
++				       "i915_execution_timeline");
++	if (err)
++		return err;
++
++	err = __i915_gem_timeline_init(i915,
++				       &i915->gt.legacy_timeline,
++				       "[global]", &class2,
++				       "i915_global_timeline");
++	if (err)
++		goto err_exec_timeline;
++
++	return 0;
++
++err_exec_timeline:
++	i915_gem_timeline_fini(&i915->gt.execution_timeline);
++	return err;
+ }
+ 
+ /**
+@@ -148,6 +164,34 @@ void i915_gem_timeline_fini(struct i915_
+ 	kfree(timeline->name);
+ }
+ 
++struct i915_gem_timeline *
++i915_gem_timeline_create(struct drm_i915_private *i915, const char *name)
++{
++	struct i915_gem_timeline *timeline;
++	int err;
++
++	timeline = kzalloc(sizeof(*timeline), GFP_KERNEL);
++	if (!timeline)
++		return ERR_PTR(-ENOMEM);
++
++	err = i915_gem_timeline_init(i915, timeline, name);
++	if (err) {
++		kfree(timeline);
++		return ERR_PTR(err);
++	}
++
++	return timeline;
++}
++
++void i915_gem_timeline_free(struct i915_gem_timeline *timeline)
++{
++	if (!timeline)
++		return;
++
++	i915_gem_timeline_fini(timeline);
++	kfree(timeline);
++}
++
+ #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+ #include "selftests/mock_timeline.c"
+ #include "selftests/i915_gem_timeline.c"
+--- a/drivers/gpu/drm/i915/i915_gem_timeline.h
++++ b/drivers/gpu/drm/i915/i915_gem_timeline.h
+@@ -90,6 +90,10 @@ int i915_gem_timeline_init__global(struc
+ void i915_gem_timelines_park(struct drm_i915_private *i915);
+ void i915_gem_timeline_fini(struct i915_gem_timeline *tl);
+ 
++struct i915_gem_timeline *
++i915_gem_timeline_create(struct drm_i915_private *i915, const char *name);
++void i915_gem_timeline_free(struct i915_gem_timeline *timeline);
++
+ static inline int __intel_timeline_sync_set(struct intel_timeline *tl,
+ 					    u64 context, u32 seqno)
+ {
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -758,7 +758,12 @@ i915_request_alloc(struct intel_engine_c
+ 		}
+ 	}
+ 
+-	rq->timeline = i915_gem_context_lookup_timeline(ctx, engine);
++	INIT_LIST_HEAD(&rq->active_list);
++	rq->i915 = i915;
++	rq->engine = engine;
++	rq->ctx = ctx;
++	rq->ring = ring;
++	rq->timeline = ring->timeline;
+ 	GEM_BUG_ON(rq->timeline == engine->timeline);
+ 
+ 	spin_lock_init(&rq->lock);
+@@ -774,12 +779,6 @@ i915_request_alloc(struct intel_engine_c
+ 
+ 	i915_sched_node_init(&rq->sched);
+ 
+-	INIT_LIST_HEAD(&rq->active_list);
+-	rq->i915 = i915;
+-	rq->engine = engine;
+-	rq->ctx = ctx;
+-	rq->ring = ring;
+-
+ 	/* No zalloc, must clear what we need by hand */
+ 	rq->global_seqno = 0;
+ 	rq->signaling.wait.seqno = 0;
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -453,7 +453,8 @@ void intel_engine_init_global_seqno(stru
+ 
+ static void intel_engine_init_timeline(struct intel_engine_cs *engine)
+ {
+-	engine->timeline = &engine->i915->gt.global_timeline.engine[engine->id];
++	engine->timeline =
++		&engine->i915->gt.execution_timeline.engine[engine->id];
+ }
+ 
+ static void intel_engine_init_batch_pool(struct intel_engine_cs *engine)
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -2624,7 +2624,7 @@ static int execlists_context_deferred_al
+ 		goto error_deref_obj;
+ 	}
+ 
+-	ring = intel_engine_create_ring(engine, ctx->ring_size);
++	ring = intel_engine_create_ring(engine, ctx->timeline, ctx->ring_size);
+ 	if (IS_ERR(ring)) {
+ 		ret = PTR_ERR(ring);
+ 		goto error_deref_obj;
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1117,13 +1117,16 @@ err:
+ }
+ 
+ struct intel_ring *
+-intel_engine_create_ring(struct intel_engine_cs *engine, int size)
++intel_engine_create_ring(struct intel_engine_cs *engine,
++			 struct i915_gem_timeline *timeline,
++			 int size)
+ {
+ 	struct intel_ring *ring;
+ 	struct i915_vma *vma;
+ 
+ 	GEM_BUG_ON(!is_power_of_2(size));
+ 	GEM_BUG_ON(RING_CTL_SIZE(size) & ~RING_NR_PAGES);
++	GEM_BUG_ON(&timeline->engine[engine->id] == engine->timeline);
+ 	lockdep_assert_held(&engine->i915->drm.struct_mutex);
+ 
+ 	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
+@@ -1131,6 +1134,7 @@ intel_engine_create_ring(struct intel_en
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	INIT_LIST_HEAD(&ring->request_list);
++	ring->timeline = &timeline->engine[engine->id];
+ 
+ 	ring->size = size;
+ 	/* Workaround an erratum on the i830 which causes a hang if
+@@ -1327,7 +1331,9 @@ static int intel_init_ring_buffer(struct
+ 	if (err)
+ 		goto err;
+ 
+-	ring = intel_engine_create_ring(engine, 32 * PAGE_SIZE);
++	ring = intel_engine_create_ring(engine,
++					&engine->i915->gt.legacy_timeline,
++					32 * PAGE_SIZE);
+ 	if (IS_ERR(ring)) {
+ 		err = PTR_ERR(ring);
+ 		goto err;
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -128,6 +128,7 @@ struct intel_ring {
+ 	struct i915_vma *vma;
+ 	void *vaddr;
+ 
++	struct intel_timeline *timeline;
+ 	struct list_head request_list;
+ 	struct list_head active_link;
+ 
+@@ -767,7 +768,9 @@ intel_write_status_page(struct intel_eng
+ #define CNL_HWS_CSB_WRITE_INDEX		0x2f
+ 
+ struct intel_ring *
+-intel_engine_create_ring(struct intel_engine_cs *engine, int size);
++intel_engine_create_ring(struct intel_engine_cs *engine,
++			 struct i915_gem_timeline *timeline,
++			 int size);
+ int intel_ring_pin(struct intel_ring *ring,
+ 		   struct drm_i915_private *i915,
+ 		   unsigned int offset_bias);
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_context.c
+@@ -355,6 +355,18 @@ static int igt_ctx_exec(void *arg)
+ 
+ 		if (first_shared_gtt) {
+ 			ctx = __create_hw_context(i915, file->driver_priv);
++			if (!IS_ERR(ctx) && HAS_EXECLISTS(i915)) {
++				struct i915_gem_timeline *timeline;
++
++				timeline = i915_gem_timeline_create(i915, ctx->name);
++				if (IS_ERR(timeline)) {
++					__destroy_hw_context(ctx, file->driver_priv);
++					ctx = ERR_CAST(timeline);
++				} else {
++					ctx->timeline = timeline;
++				}
++			}
++
+ 			first_shared_gtt = false;
+ 		} else {
+ 			ctx = i915_gem_create_context(i915, file->driver_priv);
+--- a/drivers/gpu/drm/i915/selftests/mock_engine.c
++++ b/drivers/gpu/drm/i915/selftests/mock_engine.c
+@@ -140,6 +140,8 @@ static struct intel_ring *mock_ring(stru
+ 	if (!ring)
+ 		return NULL;
+ 
++	ring->timeline = &engine->i915->gt.legacy_timeline.engine[engine->id];
++
+ 	ring->size = sz;
+ 	ring->effective_size = sz;
+ 	ring->vaddr = (void *)(ring + 1);
+@@ -180,8 +182,7 @@ struct intel_engine_cs *mock_engine(stru
+ 	engine->base.emit_breadcrumb = mock_emit_breadcrumb;
+ 	engine->base.submit_request = mock_submit_request;
+ 
+-	engine->base.timeline =
+-		&i915->gt.global_timeline.engine[engine->base.id];
++	intel_engine_init_timeline(&engine->base);
+ 
+ 	intel_engine_init_breadcrumbs(&engine->base);
+ 	engine->base.breadcrumbs.mock = true; /* prevent touching HW for irqs */
+--- a/drivers/gpu/drm/i915/selftests/mock_gem_device.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gem_device.c
+@@ -73,7 +73,9 @@ static void mock_device_release(struct d
+ 
+ 	mutex_lock(&i915->drm.struct_mutex);
+ 	mock_fini_ggtt(i915);
+-	i915_gem_timeline_fini(&i915->gt.global_timeline);
++	i915_gem_timeline_fini(&i915->gt.legacy_timeline);
++	i915_gem_timeline_fini(&i915->gt.execution_timeline);
++	WARN_ON(!list_empty(&i915->gt.timelines));
+ 	mutex_unlock(&i915->drm.struct_mutex);
+ 
+ 	destroy_workqueue(i915->wq);
+--- a/drivers/gpu/drm/i915/selftests/mock_gtt.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gtt.c
+@@ -76,7 +76,6 @@ mock_ppgtt(struct drm_i915_private *i915
+ 
+ 	INIT_LIST_HEAD(&ppgtt->base.global_link);
+ 	drm_mm_init(&ppgtt->base.mm, 0, ppgtt->base.total);
+-	i915_gem_timeline_init(i915, &ppgtt->base.timeline, name);
+ 
+ 	ppgtt->base.clear_range = nop_clear_range;
+ 	ppgtt->base.insert_page = mock_insert_page;
