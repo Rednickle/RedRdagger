@@ -1,0 +1,211 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 21 May 2018 09:21:28 +0100
+Subject: drm/mm: Reject over-sized allocation requests early
+Git-commit: 2f7e87692e0441abf27a9714991edd136e87363a
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+As we keep an rbtree of available holes sorted by their size, we can
+very easily determine if there is any hole large enough that might
+satisfy the allocation request. This helps when dealing with a highly
+fragmented address space and a request for a search by address.
+
+To cache the largest size, we convert into the cached rbtree variant
+which tracks the leftmost node for us. However, currently we sorted into
+ascending size order so the leftmost node is the smallest, and so to
+make it the largest hole we need to invert our sorting.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180521082131.13744-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/drm_mm.c |   84 ++++++++++++++++++++++++++++++++---------------
+ include/drm/drm_mm.h     |    2 -
+ 2 files changed, 59 insertions(+), 27 deletions(-)
+
+--- a/drivers/gpu/drm/drm_mm.c
++++ b/drivers/gpu/drm/drm_mm.c
+@@ -235,6 +235,32 @@ static void drm_mm_interval_tree_add_nod
+ #define HOLE_SIZE(NODE) ((NODE)->hole_size)
+ #define HOLE_ADDR(NODE) (__drm_mm_hole_node_start(NODE))
+ 
++static u64 rb_to_hole_size(struct rb_node *rb)
++{
++	return rb_entry(rb, struct drm_mm_node, rb_hole_size)->hole_size;
++}
++
++static void insert_hole_size(struct rb_root_cached *root,
++			     struct drm_mm_node *node)
++{
++	struct rb_node **link = &root->rb_root.rb_node, *rb = NULL;
++	u64 x = node->hole_size;
++	bool first = true;
++
++	while (*link) {
++		rb = *link;
++		if (x > rb_to_hole_size(rb)) {
++			link = &rb->rb_left;
++		} else {
++			link = &rb->rb_right;
++			first = false;
++		}
++	}
++
++	rb_link_node(&node->rb_hole_size, rb, link);
++	rb_insert_color_cached(&node->rb_hole_size, root, first);
++}
++
+ static void add_hole(struct drm_mm_node *node)
+ {
+ 	struct drm_mm *mm = node->mm;
+@@ -243,7 +269,7 @@ static void add_hole(struct drm_mm_node
+ 		__drm_mm_hole_node_end(node) - __drm_mm_hole_node_start(node);
+ 	DRM_MM_BUG_ON(!drm_mm_hole_follows(node));
+ 
+-	RB_INSERT(mm->holes_size, rb_hole_size, HOLE_SIZE);
++	insert_hole_size(&mm->holes_size, node);
+ 	RB_INSERT(mm->holes_addr, rb_hole_addr, HOLE_ADDR);
+ 
+ 	list_add(&node->hole_stack, &mm->hole_stack);
+@@ -254,7 +280,7 @@ static void rm_hole(struct drm_mm_node *
+ 	DRM_MM_BUG_ON(!drm_mm_hole_follows(node));
+ 
+ 	list_del(&node->hole_stack);
+-	rb_erase(&node->rb_hole_size, &node->mm->holes_size);
++	rb_erase_cached(&node->rb_hole_size, &node->mm->holes_size);
+ 	rb_erase(&node->rb_hole_addr, &node->mm->holes_addr);
+ 	node->hole_size = 0;
+ 
+@@ -278,38 +304,39 @@ static inline u64 rb_hole_size(struct rb
+ 
+ static struct drm_mm_node *best_hole(struct drm_mm *mm, u64 size)
+ {
+-	struct rb_node *best = NULL;
+-	struct rb_node **link = &mm->holes_size.rb_node;
+-
+-	while (*link) {
+-		struct rb_node *rb = *link;
++	struct rb_node *rb = mm->holes_size.rb_root.rb_node;
++	struct drm_mm_node *best = NULL;
+ 
+-		if (size <= rb_hole_size(rb)) {
+-			link = &rb->rb_left;
+-			best = rb;
++	do {
++		struct drm_mm_node *node =
++			rb_entry(rb, struct drm_mm_node, rb_hole_size);
++
++		if (size <= node->hole_size) {
++			best = node;
++			rb = rb->rb_right;
+ 		} else {
+-			link = &rb->rb_right;
++			rb = rb->rb_left;
+ 		}
+-	}
++	} while (rb);
+ 
+-	return rb_hole_size_to_node(best);
++	return best;
+ }
+ 
+ static struct drm_mm_node *find_hole(struct drm_mm *mm, u64 addr)
+ {
++	struct rb_node *rb = mm->holes_addr.rb_node;
+ 	struct drm_mm_node *node = NULL;
+-	struct rb_node **link = &mm->holes_addr.rb_node;
+ 
+-	while (*link) {
++	while (rb) {
+ 		u64 hole_start;
+ 
+-		node = rb_hole_addr_to_node(*link);
++		node = rb_hole_addr_to_node(rb);
+ 		hole_start = __drm_mm_hole_node_start(node);
+ 
+ 		if (addr < hole_start)
+-			link = &node->rb_hole_addr.rb_left;
++			rb = node->rb_hole_addr.rb_left;
+ 		else if (addr > hole_start + node->hole_size)
+-			link = &node->rb_hole_addr.rb_right;
++			rb = node->rb_hole_addr.rb_right;
+ 		else
+ 			break;
+ 	}
+@@ -322,9 +349,6 @@ first_hole(struct drm_mm *mm,
+ 	   u64 start, u64 end, u64 size,
+ 	   enum drm_mm_insert_mode mode)
+ {
+-	if (RB_EMPTY_ROOT(&mm->holes_size))
+-		return NULL;
+-
+ 	switch (mode) {
+ 	default:
+ 	case DRM_MM_INSERT_BEST:
+@@ -351,7 +375,7 @@ next_hole(struct drm_mm *mm,
+ 	switch (mode) {
+ 	default:
+ 	case DRM_MM_INSERT_BEST:
+-		return rb_hole_size_to_node(rb_next(&node->rb_hole_size));
++		return rb_hole_size_to_node(rb_prev(&node->rb_hole_size));
+ 
+ 	case DRM_MM_INSERT_LOW:
+ 		return rb_hole_addr_to_node(rb_next(&node->rb_hole_addr));
+@@ -422,6 +446,11 @@ int drm_mm_reserve_node(struct drm_mm *m
+ }
+ EXPORT_SYMBOL(drm_mm_reserve_node);
+ 
++static u64 rb_to_hole_size_or_zero(struct rb_node *rb)
++{
++	return rb ? rb_to_hole_size(rb) : 0;
++}
++
+ /**
+  * drm_mm_insert_node_in_range - ranged search for space and insert @node
+  * @mm: drm_mm to allocate from
+@@ -453,6 +482,9 @@ int drm_mm_insert_node_in_range(struct d
+ 	if (unlikely(size == 0 || range_end - range_start < size))
+ 		return -ENOSPC;
+ 
++	if (rb_to_hole_size_or_zero(rb_first_cached(&mm->holes_size)) < size)
++		return -ENOSPC;
++
+ 	if (alignment <= 1)
+ 		alignment = 0;
+ 
+@@ -583,9 +615,9 @@ void drm_mm_replace_node(struct drm_mm_n
+ 
+ 	if (drm_mm_hole_follows(old)) {
+ 		list_replace(&old->hole_stack, &new->hole_stack);
+-		rb_replace_node(&old->rb_hole_size,
+-				&new->rb_hole_size,
+-				&mm->holes_size);
++		rb_replace_node_cached(&old->rb_hole_size,
++				       &new->rb_hole_size,
++				       &mm->holes_size);
+ 		rb_replace_node(&old->rb_hole_addr,
+ 				&new->rb_hole_addr,
+ 				&mm->holes_addr);
+@@ -881,7 +913,7 @@ void drm_mm_init(struct drm_mm *mm, u64
+ 
+ 	INIT_LIST_HEAD(&mm->hole_stack);
+ 	mm->interval_tree = RB_ROOT;
+-	mm->holes_size = RB_ROOT;
++	mm->holes_size = RB_ROOT_CACHED;
+ 	mm->holes_addr = RB_ROOT;
+ 
+ 	/* Clever trick to avoid a special case in the free hole tracking. */
+--- a/include/drm/drm_mm.h
++++ b/include/drm/drm_mm.h
+@@ -173,7 +173,7 @@ struct drm_mm {
+ 	struct drm_mm_node head_node;
+ 	/* Keep an interval_tree for fast lookup of drm_mm_nodes by address. */
+ 	struct rb_root interval_tree;
+-	struct rb_root holes_size;
++	struct rb_root_cached holes_size;
+ 	struct rb_root holes_addr;
+ 
+ 	unsigned long scan_active;
