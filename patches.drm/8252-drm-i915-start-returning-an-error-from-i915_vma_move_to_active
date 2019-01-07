@@ -1,0 +1,343 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 6 Jul 2018 11:39:44 +0100
+Subject: drm/i915: Start returning an error from i915_vma_move_to_active()
+Git-commit: a523697857cdfb6a548f6caf38f42f4fe0f7d757
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Handling such a late error in request construction is tricky, but to
+accommodate future patches which may allocate here, we potentially could
+err. To handle the error after already adjusting global state to track
+the new request, we must finish and submit the request. But we don't
+want to use the request as not everything is being tracked by it, so we
+opt to cancel the commands inside the request.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180706103947.15919-3-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/gvt/scheduler.c                |    6 ++++
+ drivers/gpu/drm/i915/i915_drv.h                     |    6 ++--
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c          |   25 ++++++++++++++------
+ drivers/gpu/drm/i915/i915_gem_render_state.c        |    2 -
+ drivers/gpu/drm/i915/selftests/huge_pages.c         |    9 +++++--
+ drivers/gpu/drm/i915/selftests/i915_gem_coherency.c |    4 +--
+ drivers/gpu/drm/i915/selftests/i915_gem_context.c   |   12 ++++++++-
+ drivers/gpu/drm/i915/selftests/i915_gem_object.c    |    7 +++--
+ drivers/gpu/drm/i915/selftests/i915_request.c       |    8 ++++--
+ drivers/gpu/drm/i915/selftests/intel_hangcheck.c    |   11 +++++++-
+ drivers/gpu/drm/i915/selftests/intel_lrc.c          |   11 +++++++-
+ drivers/gpu/drm/i915/selftests/intel_workarounds.c  |    6 +++-
+ 12 files changed, 78 insertions(+), 29 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -476,7 +476,11 @@ static int prepare_shadow_batch_buffer(s
+ 			i915_gem_obj_finish_shmem_access(bb->obj);
+ 			bb->accessing = false;
+ 
+-			i915_vma_move_to_active(bb->vma, workload->req, 0);
++			ret = i915_vma_move_to_active(bb->vma,
++						      workload->req,
++						      0);
++			if (ret)
++				goto err;
+ 		}
+ 	}
+ 	return 0;
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3090,9 +3090,9 @@ i915_gem_obj_finish_shmem_access(struct
+ }
+ 
+ int __must_check i915_mutex_lock_interruptible(struct drm_device *dev);
+-void i915_vma_move_to_active(struct i915_vma *vma,
+-			     struct i915_request *rq,
+-			     unsigned int flags);
++int __must_check i915_vma_move_to_active(struct i915_vma *vma,
++					 struct i915_request *rq,
++					 unsigned int flags);
+ int i915_gem_dumb_create(struct drm_file *file_priv,
+ 			 struct drm_device *dev,
+ 			 struct drm_mode_create_dumb *args);
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1165,12 +1165,16 @@ static int __reloc_gpu_alloc(struct i915
+ 		goto err_request;
+ 
+ 	GEM_BUG_ON(!reservation_object_test_signaled_rcu(batch->resv, true));
+-	i915_vma_move_to_active(batch, rq, 0);
+-	i915_vma_unpin(batch);
++	err = i915_vma_move_to_active(batch, rq, 0);
++	if (err)
++		goto skip_request;
+ 
+-	i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	if (err)
++		goto skip_request;
+ 
+ 	rq->batch = batch;
++	i915_vma_unpin(batch);
+ 
+ 	cache->rq = rq;
+ 	cache->rq_cmd = cmd;
+@@ -1179,6 +1183,8 @@ static int __reloc_gpu_alloc(struct i915
+ 	/* Return with batch mapping (cmd) still pinned */
+ 	return 0;
+ 
++skip_request:
++	i915_request_skip(rq, err);
+ err_request:
+ 	i915_request_add(rq);
+ err_unpin:
+@@ -1818,7 +1824,11 @@ static int eb_move_to_gpu(struct i915_ex
+ 		unsigned int flags = eb->flags[i];
+ 		struct i915_vma *vma = eb->vma[i];
+ 
+-		i915_vma_move_to_active(vma, eb->request, flags);
++		err = i915_vma_move_to_active(vma, eb->request, flags);
++		if (unlikely(err)) {
++			i915_request_skip(eb->request, err);
++			return err;
++		}
+ 
+ 		__eb_unreserve_vma(vma, flags);
+ 		vma->exec_flags = NULL;
+@@ -1877,9 +1887,9 @@ static void export_fence(struct i915_vma
+ 	reservation_object_unlock(resv);
+ }
+ 
+-void i915_vma_move_to_active(struct i915_vma *vma,
+-			     struct i915_request *rq,
+-			     unsigned int flags)
++int i915_vma_move_to_active(struct i915_vma *vma,
++			    struct i915_request *rq,
++			    unsigned int flags)
+ {
+ 	struct drm_i915_gem_object *obj = vma->obj;
+ 	const unsigned int idx = rq->engine->id;
+@@ -1916,6 +1926,7 @@ void i915_vma_move_to_active(struct i915
+ 		i915_gem_active_set(&vma->last_fence, rq);
+ 
+ 	export_fence(vma, rq, flags);
++	return 0;
+ }
+ 
+ static int i915_reset_gen7_sol_offsets(struct i915_request *rq)
+--- a/drivers/gpu/drm/i915/i915_gem_render_state.c
++++ b/drivers/gpu/drm/i915/i915_gem_render_state.c
+@@ -222,7 +222,7 @@ int i915_gem_render_state_emit(struct i9
+ 			goto err_unpin;
+ 	}
+ 
+-	i915_vma_move_to_active(so.vma, rq, 0);
++	err = i915_vma_move_to_active(so.vma, rq, 0);
+ err_unpin:
+ 	i915_vma_unpin(so.vma);
+ err_vma:
+--- a/drivers/gpu/drm/i915/selftests/huge_pages.c
++++ b/drivers/gpu/drm/i915/selftests/huge_pages.c
+@@ -985,7 +985,10 @@ static int gpu_write(struct i915_vma *vm
+ 		goto err_request;
+ 	}
+ 
+-	i915_vma_move_to_active(batch, rq, 0);
++	err = i915_vma_move_to_active(batch, rq, 0);
++	if (err)
++		goto err_request;
++
+ 	i915_gem_object_set_active_reference(batch->obj);
+ 	i915_vma_unpin(batch);
+ 	i915_vma_close(batch);
+@@ -996,7 +999,9 @@ static int gpu_write(struct i915_vma *vm
+ 	if (err)
+ 		goto err_request;
+ 
+-	i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	if (err)
++		i915_request_skip(rq, err);
+ 
+ err_request:
+ 	i915_request_add(rq);
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_coherency.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_coherency.c
+@@ -222,12 +222,12 @@ static int gpu_set(struct drm_i915_gem_o
+ 	}
+ 	intel_ring_advance(rq, cs);
+ 
+-	i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
+ 	i915_vma_unpin(vma);
+ 
+ 	i915_request_add(rq);
+ 
+-	return 0;
++	return err;
+ }
+ 
+ static bool always_valid(struct drm_i915_private *i915)
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_context.c
+@@ -170,18 +170,26 @@ static int gpu_fill(struct drm_i915_gem_
+ 	if (err)
+ 		goto err_request;
+ 
+-	i915_vma_move_to_active(batch, rq, 0);
++	err = i915_vma_move_to_active(batch, rq, 0);
++	if (err)
++		goto skip_request;
++
++	err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	if (err)
++		goto skip_request;
++
+ 	i915_gem_object_set_active_reference(batch->obj);
+ 	i915_vma_unpin(batch);
+ 	i915_vma_close(batch);
+ 
+-	i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
+ 	i915_vma_unpin(vma);
+ 
+ 	i915_request_add(rq);
+ 
+ 	return 0;
+ 
++skip_request:
++	i915_request_skip(rq, err);
+ err_request:
+ 	i915_request_add(rq);
+ err_batch:
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_object.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_object.c
+@@ -464,13 +464,14 @@ static int make_obj_busy(struct drm_i915
+ 		return PTR_ERR(rq);
+ 	}
+ 
+-	i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
+ 
+ 	i915_request_add(rq);
+ 
+-	i915_gem_object_set_active_reference(obj);
++	__i915_gem_object_release_unless_active(obj);
+ 	i915_vma_unpin(vma);
+-	return 0;
++
++	return err;
+ }
+ 
+ static bool assert_mmap_offset(struct drm_i915_private *i915,
+--- a/drivers/gpu/drm/i915/selftests/i915_request.c
++++ b/drivers/gpu/drm/i915/selftests/i915_request.c
+@@ -675,7 +675,9 @@ static int live_all_engines(void *arg)
+ 			i915_gem_object_set_active_reference(batch->obj);
+ 		}
+ 
+-		i915_vma_move_to_active(batch, request[id], 0);
++		err = i915_vma_move_to_active(batch, request[id], 0);
++		GEM_BUG_ON(err);
++
+ 		i915_request_get(request[id]);
+ 		i915_request_add(request[id]);
+ 	}
+@@ -785,7 +787,9 @@ static int live_sequential_engines(void
+ 		GEM_BUG_ON(err);
+ 		request[id]->batch = batch;
+ 
+-		i915_vma_move_to_active(batch, request[id], 0);
++		err = i915_vma_move_to_active(batch, request[id], 0);
++		GEM_BUG_ON(err);
++
+ 		i915_gem_object_set_active_reference(batch->obj);
+ 		i915_vma_get(batch);
+ 
+--- a/drivers/gpu/drm/i915/selftests/intel_hangcheck.c
++++ b/drivers/gpu/drm/i915/selftests/intel_hangcheck.c
+@@ -130,13 +130,19 @@ static int emit_recurse_batch(struct han
+ 	if (err)
+ 		goto unpin_vma;
+ 
+-	i915_vma_move_to_active(vma, rq, 0);
++	err = i915_vma_move_to_active(vma, rq, 0);
++	if (err)
++		goto unpin_hws;
++
+ 	if (!i915_gem_object_has_active_reference(vma->obj)) {
+ 		i915_gem_object_get(vma->obj);
+ 		i915_gem_object_set_active_reference(vma->obj);
+ 	}
+ 
+-	i915_vma_move_to_active(hws, rq, 0);
++	err = i915_vma_move_to_active(hws, rq, 0);
++	if (err)
++		goto unpin_hws;
++
+ 	if (!i915_gem_object_has_active_reference(hws->obj)) {
+ 		i915_gem_object_get(hws->obj);
+ 		i915_gem_object_set_active_reference(hws->obj);
+@@ -205,6 +211,7 @@ static int emit_recurse_batch(struct han
+ 
+ 	err = rq->engine->emit_bb_start(rq, vma->node.start, PAGE_SIZE, flags);
+ 
++unpin_hws:
+ 	i915_vma_unpin(hws);
+ unpin_vma:
+ 	i915_vma_unpin(vma);
+--- a/drivers/gpu/drm/i915/selftests/intel_lrc.c
++++ b/drivers/gpu/drm/i915/selftests/intel_lrc.c
+@@ -104,13 +104,19 @@ static int emit_recurse_batch(struct spi
+ 	if (err)
+ 		goto unpin_vma;
+ 
+-	i915_vma_move_to_active(vma, rq, 0);
++	err = i915_vma_move_to_active(vma, rq, 0);
++	if (err)
++		goto unpin_hws;
++
+ 	if (!i915_gem_object_has_active_reference(vma->obj)) {
+ 		i915_gem_object_get(vma->obj);
+ 		i915_gem_object_set_active_reference(vma->obj);
+ 	}
+ 
+-	i915_vma_move_to_active(hws, rq, 0);
++	err = i915_vma_move_to_active(hws, rq, 0);
++	if (err)
++		goto unpin_hws;
++
+ 	if (!i915_gem_object_has_active_reference(hws->obj)) {
+ 		i915_gem_object_get(hws->obj);
+ 		i915_gem_object_set_active_reference(hws->obj);
+@@ -134,6 +140,7 @@ static int emit_recurse_batch(struct spi
+ 
+ 	err = rq->engine->emit_bb_start(rq, vma->node.start, PAGE_SIZE, 0);
+ 
++unpin_hws:
+ 	i915_vma_unpin(hws);
+ unpin_vma:
+ 	i915_vma_unpin(vma);
+--- a/drivers/gpu/drm/i915/selftests/intel_workarounds.c
++++ b/drivers/gpu/drm/i915/selftests/intel_workarounds.c
+@@ -49,6 +49,10 @@ read_nonprivs(struct i915_gem_context *c
+ 		goto err_pin;
+ 	}
+ 
++	err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	if (err)
++		goto err_req;
++
+ 	srm = MI_STORE_REGISTER_MEM | MI_SRM_LRM_GLOBAL_GTT;
+ 	if (INTEL_GEN(ctx->i915) >= 8)
+ 		srm++;
+@@ -67,8 +71,6 @@ read_nonprivs(struct i915_gem_context *c
+ 	}
+ 	intel_ring_advance(rq, cs);
+ 
+-	i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
+-
+ 	i915_gem_object_get(result);
+ 	i915_gem_object_set_active_reference(result);
+ 
