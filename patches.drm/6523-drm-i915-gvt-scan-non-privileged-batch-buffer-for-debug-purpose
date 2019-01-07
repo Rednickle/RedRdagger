@@ -1,0 +1,419 @@
+From: Zhao Yan <yan.y.zhao@intel.com>
+Date: Wed, 4 Apr 2018 13:57:09 +0800
+Subject: drm/i915/gvt: scan non-privileged batch buffer for debug purpose
+Git-commit: 96bebe39b2f4533af14c509061cd2b551ca81e8d
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+For perfomance purpose, scanning of non-privileged batch buffer is turned
+off by default. But for debugging purpose, it can be turned on via debugfs.
+After scanning, we submit the original non-privileged batch buffer into
+hardware, so that the scanning is only a peeking window of guest submitted
+commands and will not affect the execution results.
+
+v4:
+- refine debugfs print format&content (zhenyu wang)
+- print engine id instread of engine name to prevent potential memory leak
+  in debugfs warning message. (zhenyu wang)
+
+v3:
+- change vgpu->scan_nonprivbb from type bool to u32, so it is able to
+  selectively turn on/off scanning of non-privileged batch buffer on engine
+  level. e.g.
+  if vgpu->scan_nonprivbb=3, then it will scan non-privileged batch buffer
+  on engine 0 and 1.
+- in debugfs interface to set vgpu->scan_nonprivbb, print warning message
+  to warn user and explicitly tell state change in kernel log (zhenyu wang)
+v2:
+- rebase
+- update comments for start_gma_offset (henry)
+
+Signed-off-by: Zhao Yan <yan.y.zhao@intel.com>
+Reviewed-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/gvt/cmd_parser.c |   55 +++++++++++++++++++++------
+ drivers/gpu/drm/i915/gvt/debugfs.c    |   67 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/gvt/gvt.h        |    1 
+ drivers/gpu/drm/i915/gvt/scheduler.c  |   68 ++++++++++++++++++++++------------
+ drivers/gpu/drm/i915/gvt/scheduler.h  |    1 
+ drivers/gpu/drm/i915/gvt/trace.h      |   24 +++++++++---
+ 6 files changed, 175 insertions(+), 41 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/cmd_parser.c
++++ b/drivers/gpu/drm/i915/gvt/cmd_parser.c
+@@ -1604,7 +1604,8 @@ static int batch_buffer_needs_scan(struc
+ 	if (IS_BROADWELL(gvt->dev_priv) || IS_SKYLAKE(gvt->dev_priv)
+ 		|| IS_KABYLAKE(gvt->dev_priv)) {
+ 		/* BDW decides privilege based on address space */
+-		if (cmd_val(s, 0) & (1 << 8))
++		if (cmd_val(s, 0) & (1 << 8) &&
++			!(s->vgpu->scan_nonprivbb & (1 << s->ring_id)))
+ 			return 0;
+ 	}
+ 	return 1;
+@@ -1618,6 +1619,8 @@ static int find_bb_size(struct parser_ex
+ 	bool bb_end = false;
+ 	struct intel_vgpu *vgpu = s->vgpu;
+ 	u32 cmd;
++	struct intel_vgpu_mm *mm = (s->buf_addr_type == GTT_BUFFER) ?
++		s->vgpu->gtt.ggtt_mm : s->workload->shadow_mm;
+ 
+ 	*bb_size = 0;
+ 
+@@ -1629,18 +1632,22 @@ static int find_bb_size(struct parser_ex
+ 	cmd = cmd_val(s, 0);
+ 	info = get_cmd_info(s->vgpu->gvt, cmd, s->ring_id);
+ 	if (info == NULL) {
+-		gvt_vgpu_err("unknown cmd 0x%x, opcode=0x%x\n",
+-				cmd, get_opcode(cmd, s->ring_id));
++		gvt_vgpu_err("unknown cmd 0x%x, opcode=0x%x, addr_type=%s, ring %d, workload=%p\n",
++				cmd, get_opcode(cmd, s->ring_id),
++				(s->buf_addr_type == PPGTT_BUFFER) ?
++				"ppgtt" : "ggtt", s->ring_id, s->workload);
+ 		return -EBADRQC;
+ 	}
+ 	do {
+-		if (copy_gma_to_hva(s->vgpu, s->vgpu->gtt.ggtt_mm,
++		if (copy_gma_to_hva(s->vgpu, mm,
+ 				gma, gma + 4, &cmd) < 0)
+ 			return -EFAULT;
+ 		info = get_cmd_info(s->vgpu->gvt, cmd, s->ring_id);
+ 		if (info == NULL) {
+-			gvt_vgpu_err("unknown cmd 0x%x, opcode=0x%x\n",
+-				cmd, get_opcode(cmd, s->ring_id));
++			gvt_vgpu_err("unknown cmd 0x%x, opcode=0x%x, addr_type=%s, ring %d, workload=%p\n",
++				cmd, get_opcode(cmd, s->ring_id),
++				(s->buf_addr_type == PPGTT_BUFFER) ?
++				"ppgtt" : "ggtt", s->ring_id, s->workload);
+ 			return -EBADRQC;
+ 		}
+ 
+@@ -1666,6 +1673,9 @@ static int perform_bb_shadow(struct pars
+ 	unsigned long gma = 0;
+ 	unsigned long bb_size;
+ 	int ret = 0;
++	struct intel_vgpu_mm *mm = (s->buf_addr_type == GTT_BUFFER) ?
++		s->vgpu->gtt.ggtt_mm : s->workload->shadow_mm;
++	unsigned long gma_start_offset = 0;
+ 
+ 	/* get the start gm address of the batch buffer */
+ 	gma = get_gma_bb_from_cmd(s, 1);
+@@ -1680,8 +1690,24 @@ static int perform_bb_shadow(struct pars
+ 	if (!bb)
+ 		return -ENOMEM;
+ 
++	bb->ppgtt = (s->buf_addr_type == GTT_BUFFER) ? false : true;
++
++	/* the gma_start_offset stores the batch buffer's start gma's
++	 * offset relative to page boundary. so for non-privileged batch
++	 * buffer, the shadowed gem object holds exactly the same page
++	 * layout as original gem object. This is for the convience of
++	 * replacing the whole non-privilged batch buffer page to this
++	 * shadowed one in PPGTT at the same gma address. (this replacing
++	 * action is not implemented yet now, but may be necessary in
++	 * future).
++	 * for prileged batch buffer, we just change start gma address to
++	 * that of shadowed page.
++	 */
++	if (bb->ppgtt)
++		gma_start_offset = gma & ~I915_GTT_PAGE_MASK;
++
+ 	bb->obj = i915_gem_object_create(s->vgpu->gvt->dev_priv,
+-					 roundup(bb_size, PAGE_SIZE));
++			 roundup(bb_size + gma_start_offset, PAGE_SIZE));
+ 	if (IS_ERR(bb->obj)) {
+ 		ret = PTR_ERR(bb->obj);
+ 		goto err_free_bb;
+@@ -1702,9 +1728,9 @@ static int perform_bb_shadow(struct pars
+ 		bb->clflush &= ~CLFLUSH_BEFORE;
+ 	}
+ 
+-	ret = copy_gma_to_hva(s->vgpu, s->vgpu->gtt.ggtt_mm,
++	ret = copy_gma_to_hva(s->vgpu, mm,
+ 			      gma, gma + bb_size,
+-			      bb->va);
++			      bb->va + gma_start_offset);
+ 	if (ret < 0) {
+ 		gvt_vgpu_err("fail to copy guest ring buffer\n");
+ 		ret = -EFAULT;
+@@ -1730,7 +1756,7 @@ static int perform_bb_shadow(struct pars
+ 	 * buffer's gma in pair. After all, we don't want to pin the shadow
+ 	 * buffer here (too early).
+ 	 */
+-	s->ip_va = bb->va;
++	s->ip_va = bb->va + gma_start_offset;
+ 	s->ip_gma = gma;
+ 	return 0;
+ err_unmap:
+@@ -2469,15 +2495,18 @@ static int cmd_parser_exec(struct parser
+ 
+ 	info = get_cmd_info(s->vgpu->gvt, cmd, s->ring_id);
+ 	if (info == NULL) {
+-		gvt_vgpu_err("unknown cmd 0x%x, opcode=0x%x\n",
+-				cmd, get_opcode(cmd, s->ring_id));
++		gvt_vgpu_err("unknown cmd 0x%x, opcode=0x%x, addr_type=%s, ring %d, workload=%p\n",
++				cmd, get_opcode(cmd, s->ring_id),
++				(s->buf_addr_type == PPGTT_BUFFER) ?
++				"ppgtt" : "ggtt", s->ring_id, s->workload);
+ 		return -EBADRQC;
+ 	}
+ 
+ 	s->info = info;
+ 
+ 	trace_gvt_command(vgpu->id, s->ring_id, s->ip_gma, s->ip_va,
+-			  cmd_length(s), s->buf_type);
++			  cmd_length(s), s->buf_type, s->buf_addr_type,
++			  s->workload, info->name);
+ 
+ 	if (info->handler) {
+ 		ret = info->handler(s);
+--- a/drivers/gpu/drm/i915/gvt/debugfs.c
++++ b/drivers/gpu/drm/i915/gvt/debugfs.c
+@@ -124,6 +124,68 @@ static int vgpu_mmio_diff_show(struct se
+ }
+ DEFINE_SHOW_ATTRIBUTE(vgpu_mmio_diff);
+ 
++static int
++vgpu_scan_nonprivbb_get(void *data, u64 *val)
++{
++	struct intel_vgpu *vgpu = (struct intel_vgpu *)data;
++	*val = vgpu->scan_nonprivbb;
++	return 0;
++}
++
++/*
++ * set/unset bit engine_id of vgpu->scan_nonprivbb to turn on/off scanning
++ * of non-privileged batch buffer. e.g.
++ * if vgpu->scan_nonprivbb=3, then it will scan non-privileged batch buffer
++ * on engine 0 and 1.
++ */
++static int
++vgpu_scan_nonprivbb_set(void *data, u64 val)
++{
++	struct intel_vgpu *vgpu = (struct intel_vgpu *)data;
++	struct drm_i915_private *dev_priv = vgpu->gvt->dev_priv;
++	enum intel_engine_id id;
++	char buf[128], *s;
++	int len;
++
++	val &= (1 << I915_NUM_ENGINES) - 1;
++
++	if (vgpu->scan_nonprivbb == val)
++		return 0;
++
++	if (!val)
++		goto done;
++
++	len = sprintf(buf,
++		"gvt: vgpu %d turns on non-privileged batch buffers scanning on Engines:",
++		vgpu->id);
++
++	s = buf + len;
++
++	for (id = 0; id < I915_NUM_ENGINES; id++) {
++		struct intel_engine_cs *engine;
++
++		engine = dev_priv->engine[id];
++		if (engine && (val & (1 << id))) {
++			len = snprintf(s, 4, "%d, ", engine->id);
++			s += len;
++		} else
++			val &=  ~(1 << id);
++	}
++
++	if (val)
++		sprintf(s, "low performance expected.");
++
++	pr_warn("%s\n", buf);
++
++done:
++	vgpu->scan_nonprivbb = val;
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(vgpu_scan_nonprivbb_fops,
++			vgpu_scan_nonprivbb_get, vgpu_scan_nonprivbb_set,
++			"0x%llx\n");
++
+ /**
+  * intel_gvt_debugfs_add_vgpu - register debugfs entries for a vGPU
+  * @vgpu: a vGPU
+@@ -151,6 +213,11 @@ int intel_gvt_debugfs_add_vgpu(struct in
+ 	if (!ent)
+ 		return -ENOMEM;
+ 
++	ent = debugfs_create_file("scan_nonprivbb", 0644, vgpu->debugfs,
++				 vgpu, &vgpu_scan_nonprivbb_fops);
++	if (!ent)
++		return -ENOMEM;
++
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -226,6 +226,7 @@ struct intel_vgpu {
+ 
+ 	struct completion vblank_done;
+ 
++	u32 scan_nonprivbb;
+ };
+ 
+ /* validating GM healthy status*/
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -452,12 +452,6 @@ static int prepare_shadow_batch_buffer(s
+ 	int ret;
+ 
+ 	list_for_each_entry(bb, &workload->shadow_bb, list) {
+-		bb->vma = i915_gem_object_ggtt_pin(bb->obj, NULL, 0, 0, 0);
+-		if (IS_ERR(bb->vma)) {
+-			ret = PTR_ERR(bb->vma);
+-			goto err;
+-		}
+-
+ 		/* For privilge batch buffer and not wa_ctx, the bb_start_cmd_va
+ 		 * is only updated into ring_scan_buffer, not real ring address
+ 		 * allocated in later copy_workload_to_ring_buffer. pls be noted
+@@ -469,25 +463,53 @@ static int prepare_shadow_batch_buffer(s
+ 			bb->bb_start_cmd_va = workload->shadow_ring_buffer_va
+ 				+ bb->bb_offset;
+ 
+-		/* relocate shadow batch buffer */
+-		bb->bb_start_cmd_va[1] = i915_ggtt_offset(bb->vma);
+-		if (gmadr_bytes == 8)
+-			bb->bb_start_cmd_va[2] = 0;
+-
+-		/* No one is going to touch shadow bb from now on. */
+-		if (bb->clflush & CLFLUSH_AFTER) {
+-			drm_clflush_virt_range(bb->va, bb->obj->base.size);
+-			bb->clflush &= ~CLFLUSH_AFTER;
+-		}
++		if (bb->ppgtt) {
++			/* for non-priv bb, scan&shadow is only for
++			 * debugging purpose, so the content of shadow bb
++			 * is the same as original bb. Therefore,
++			 * here, rather than switch to shadow bb's gma
++			 * address, we directly use original batch buffer's
++			 * gma address, and send original bb to hardware
++			 * directly
++			 */
++			if (bb->clflush & CLFLUSH_AFTER) {
++				drm_clflush_virt_range(bb->va,
++						bb->obj->base.size);
++				bb->clflush &= ~CLFLUSH_AFTER;
++			}
++			i915_gem_obj_finish_shmem_access(bb->obj);
++			bb->accessing = false;
++
++		} else {
++			bb->vma = i915_gem_object_ggtt_pin(bb->obj,
++					NULL, 0, 0, 0);
++			if (IS_ERR(bb->vma)) {
++				ret = PTR_ERR(bb->vma);
++				goto err;
++			}
++
++			/* relocate shadow batch buffer */
++			bb->bb_start_cmd_va[1] = i915_ggtt_offset(bb->vma);
++			if (gmadr_bytes == 8)
++				bb->bb_start_cmd_va[2] = 0;
++
++			/* No one is going to touch shadow bb from now on. */
++			if (bb->clflush & CLFLUSH_AFTER) {
++				drm_clflush_virt_range(bb->va,
++						bb->obj->base.size);
++				bb->clflush &= ~CLFLUSH_AFTER;
++			}
++
++			ret = i915_gem_object_set_to_gtt_domain(bb->obj,
++					false);
++			if (ret)
++				goto err;
+ 
+-		ret = i915_gem_object_set_to_gtt_domain(bb->obj, false);
+-		if (ret)
+-			goto err;
++			i915_gem_obj_finish_shmem_access(bb->obj);
++			bb->accessing = false;
+ 
+-		i915_gem_obj_finish_shmem_access(bb->obj);
+-		bb->accessing = false;
+-
+-		i915_vma_move_to_active(bb->vma, workload->req, 0);
++			i915_vma_move_to_active(bb->vma, workload->req, 0);
++		}
+ 	}
+ 	return 0;
+ err:
+--- a/drivers/gpu/drm/i915/gvt/scheduler.h
++++ b/drivers/gpu/drm/i915/gvt/scheduler.h
+@@ -125,6 +125,7 @@ struct intel_vgpu_shadow_bb {
+ 	unsigned int clflush;
+ 	bool accessing;
+ 	unsigned long bb_offset;
++	bool ppgtt;
+ };
+ 
+ #define workload_q_head(vgpu, ring_id) \
+--- a/drivers/gpu/drm/i915/gvt/trace.h
++++ b/drivers/gpu/drm/i915/gvt/trace.h
+@@ -224,19 +224,25 @@ TRACE_EVENT(oos_sync,
+ 	TP_printk("%s", __entry->buf)
+ );
+ 
++#define GVT_CMD_STR_LEN 40
+ TRACE_EVENT(gvt_command,
+-	TP_PROTO(u8 vgpu_id, u8 ring_id, u32 ip_gma, u32 *cmd_va, u32 cmd_len,
+-		 u32 buf_type),
++	TP_PROTO(u8 vgpu_id, u8 ring_id, u32 ip_gma, u32 *cmd_va,
++		u32 cmd_len,  u32 buf_type, u32 buf_addr_type,
++		void *workload, char *cmd_name),
+ 
+-	TP_ARGS(vgpu_id, ring_id, ip_gma, cmd_va, cmd_len, buf_type),
++	TP_ARGS(vgpu_id, ring_id, ip_gma, cmd_va, cmd_len, buf_type,
++		buf_addr_type, workload, cmd_name),
+ 
+ 	TP_STRUCT__entry(
+ 		__field(u8, vgpu_id)
+ 		__field(u8, ring_id)
+ 		__field(u32, ip_gma)
+ 		__field(u32, buf_type)
++		__field(u32, buf_addr_type)
+ 		__field(u32, cmd_len)
++		__field(void*, workload)
+ 		__dynamic_array(u32, raw_cmd, cmd_len)
++		__array(char, cmd_name, GVT_CMD_STR_LEN)
+ 	),
+ 
+ 	TP_fast_assign(
+@@ -244,17 +250,25 @@ TRACE_EVENT(gvt_command,
+ 		__entry->ring_id = ring_id;
+ 		__entry->ip_gma = ip_gma;
+ 		__entry->buf_type = buf_type;
++		__entry->buf_addr_type = buf_addr_type;
+ 		__entry->cmd_len = cmd_len;
++		__entry->workload = workload;
++		snprintf(__entry->cmd_name, GVT_CMD_STR_LEN, "%s", cmd_name);
+ 		memcpy(__get_dynamic_array(raw_cmd), cmd_va, cmd_len * sizeof(*cmd_va));
+ 	),
+ 
+ 
+-	TP_printk("vgpu%d ring %d: buf_type %u, ip_gma %08x, raw cmd %s",
++	TP_printk("vgpu%d ring %d: address_type %u, buf_type %u, ip_gma %08x,cmd (name=%s,len=%u,raw cmd=%s), workload=%p\n",
+ 		__entry->vgpu_id,
+ 		__entry->ring_id,
++		__entry->buf_addr_type,
+ 		__entry->buf_type,
+ 		__entry->ip_gma,
+-		__print_array(__get_dynamic_array(raw_cmd), __entry->cmd_len, 4))
++		__entry->cmd_name,
++		__entry->cmd_len,
++		__print_array(__get_dynamic_array(raw_cmd),
++			__entry->cmd_len, 4),
++		__entry->workload)
+ );
+ 
+ #define GVT_TEMP_STR_LEN 10
