@@ -1,0 +1,281 @@
+From: Mahesh Kumar <mahesh1.kumar@intel.com>
+Date: Thu, 26 Apr 2018 19:55:16 +0530
+Subject: drm/i915/icl: Enable 2nd DBuf slice only when needed
+Git-commit: aa9664ffe863f470efdbe40ea20ce96f2887ebcd
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+ICL has two slices of DBuf, each slice of size 1024 blocks.
+We should not always enable slice-2. It should be enabled only if
+display total required BW is > 12GBps OR more than 1 pipes are enabled.
+
+Changes since V1:
+ - typecast total_data_rate to u64 before multiplication to solve any
+   possible overflow (Rodrigo)
+ - fix where skl_wm_get_hw_state was memsetting ddb, resulting
+   enabled_slices to become zero
+ - Fix the logic of calculating ddb_size
+Changes since V2:
+ - If no-crtc is part of commit required_slices will have value "0",
+   don't try to disable DBuf slice.
+Changes since V3:
+ - Create a generic helper to enable/disable slice
+ - don't return early if total_data_rate is 0, it may be cursor only
+   commit, or atomic modeset without any plane.
+Changes since V4:
+ - Solve checkpatch warnings
+ - use kernel types u8/u64 instead of uint8_t/uint64_t
+Changes since V5:
+ - Rebase
+
+Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180426142517.16643-3-mahesh1.kumar@intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/intel_display.c    |   10 ++++
+ drivers/gpu/drm/i915/intel_drv.h        |    6 ++
+ drivers/gpu/drm/i915/intel_pm.c         |   57 ++++++++++++++++++++++------
+ drivers/gpu/drm/i915/intel_runtime_pm.c |   65 +++++++++++++++++++++++++-------
+ 4 files changed, 113 insertions(+), 25 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -12260,6 +12260,8 @@ static void skl_update_crtcs(struct drm_
+ 	bool progress;
+ 	enum pipe pipe;
+ 	int i;
++	u8 hw_enabled_slices = dev_priv->wm.skl_hw.ddb.enabled_slices;
++	u8 required_slices = intel_state->wm_results.ddb.enabled_slices;
+ 
+ 	const struct skl_ddb_entry *entries[I915_MAX_PIPES] = {};
+ 
+@@ -12268,6 +12270,10 @@ static void skl_update_crtcs(struct drm_
+ 		if (new_crtc_state->active)
+ 			entries[i] = &to_intel_crtc_state(old_crtc_state)->wm.skl.ddb;
+ 
++	/* If 2nd DBuf slice required, enable it here */
++	if (INTEL_GEN(dev_priv) >= 11 && required_slices > hw_enabled_slices)
++		icl_dbuf_slices_update(dev_priv, required_slices);
++
+ 	/*
+ 	 * Whenever the number of active pipes changes, we need to make sure we
+ 	 * update the pipes in the right order so that their ddb allocations
+@@ -12318,6 +12324,10 @@ static void skl_update_crtcs(struct drm_
+ 			progress = true;
+ 		}
+ 	} while (progress);
++
++	/* If 2nd DBuf slice is no more required disable it */
++	if (INTEL_GEN(dev_priv) >= 11 && required_slices < hw_enabled_slices)
++		icl_dbuf_slices_update(dev_priv, required_slices);
+ }
+ 
+ static void intel_atomic_helper_free_state(struct drm_i915_private *dev_priv)
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -144,6 +144,10 @@
+ #define KHz(x) (1000 * (x))
+ #define MHz(x) KHz(1000 * (x))
+ 
++#define KBps(x) (1000 * (x))
++#define MBps(x) KBps(1000 * (x))
++#define GBps(x) ((u64)1000 * MBps((x)))
++
+ /*
+  * Display related stuff
+  */
+@@ -1931,6 +1935,8 @@ bool intel_display_power_get_if_enabled(
+ 					enum intel_display_power_domain domain);
+ void intel_display_power_put(struct drm_i915_private *dev_priv,
+ 			     enum intel_display_power_domain domain);
++void icl_dbuf_slices_update(struct drm_i915_private *dev_priv,
++			    u8 req_slices);
+ 
+ static inline void
+ assert_rpm_device_not_suspended(struct drm_i915_private *dev_priv)
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3771,9 +3771,42 @@ bool intel_can_enable_sagv(struct drm_at
+ 	return true;
+ }
+ 
++static unsigned int intel_get_ddb_size(struct drm_i915_private *dev_priv,
++				       const struct intel_crtc_state *cstate,
++				       const unsigned int total_data_rate,
++				       const int num_active,
++				       struct skl_ddb_allocation *ddb)
++{
++	const struct drm_display_mode *adjusted_mode;
++	u64 total_data_bw;
++	u16 ddb_size = INTEL_INFO(dev_priv)->ddb_size;
++
++	WARN_ON(ddb_size == 0);
++
++	if (INTEL_GEN(dev_priv) < 11)
++		return ddb_size - 4; /* 4 blocks for bypass path allocation */
++
++	adjusted_mode = &cstate->base.adjusted_mode;
++	total_data_bw = (u64)total_data_rate * drm_mode_vrefresh(adjusted_mode);
++
++	/*
++	 * 12GB/s is maximum BW supported by single DBuf slice.
++	 */
++	if (total_data_bw >= GBps(12) || num_active > 1) {
++		ddb->enabled_slices = 2;
++	} else {
++		ddb->enabled_slices = 1;
++		ddb_size /= 2;
++	}
++
++	return ddb_size;
++}
++
+ static void
+ skl_ddb_get_pipe_allocation_limits(struct drm_device *dev,
+ 				   const struct intel_crtc_state *cstate,
++				   const unsigned int total_data_rate,
++				   struct skl_ddb_allocation *ddb,
+ 				   struct skl_ddb_entry *alloc, /* out */
+ 				   int *num_active /* out */)
+ {
+@@ -3796,11 +3829,8 @@ skl_ddb_get_pipe_allocation_limits(struc
+ 	else
+ 		*num_active = hweight32(dev_priv->active_crtcs);
+ 
+-	ddb_size = INTEL_INFO(dev_priv)->ddb_size;
+-	WARN_ON(ddb_size == 0);
+-
+-	if (INTEL_GEN(dev_priv) < 11)
+-		ddb_size -= 4; /* 4 blocks for bypass path allocation */
++	ddb_size = intel_get_ddb_size(dev_priv, cstate, total_data_rate,
++				      *num_active, ddb);
+ 
+ 	/*
+ 	 * If the state doesn't change the active CRTC's, then there's
+@@ -4261,7 +4291,11 @@ skl_allocate_pipe_ddb(struct intel_crtc_
+ 		return 0;
+ 	}
+ 
+-	skl_ddb_get_pipe_allocation_limits(dev, cstate, alloc, &num_active);
++	total_data_rate = skl_get_total_relative_data_rate(cstate,
++							   plane_data_rate,
++							   uv_plane_data_rate);
++	skl_ddb_get_pipe_allocation_limits(dev, cstate, total_data_rate, ddb,
++					   alloc, &num_active);
+ 	alloc_size = skl_ddb_entry_size(alloc);
+ 	if (alloc_size == 0)
+ 		return 0;
+@@ -4296,9 +4330,6 @@ skl_allocate_pipe_ddb(struct intel_crtc_
+ 	 *
+ 	 * FIXME: we may not allocate every single block here.
+ 	 */
+-	total_data_rate = skl_get_total_relative_data_rate(cstate,
+-							   plane_data_rate,
+-							   uv_plane_data_rate);
+ 	if (total_data_rate == 0)
+ 		return 0;
+ 
+@@ -5492,8 +5523,12 @@ void skl_wm_get_hw_state(struct drm_devi
+ 		/* Fully recompute DDB on first atomic commit */
+ 		dev_priv->wm.distrust_bios_wm = true;
+ 	} else {
+-		/* Easy/common case; just sanitize DDB now if everything off */
+-		memset(ddb, 0, sizeof(*ddb));
++		/*
++		 * Easy/common case; just sanitize DDB now if everything off
++		 * Keep dbuf slice info intact
++		 */
++		memset(ddb->plane, 0, sizeof(ddb->plane));
++		memset(ddb->uv_plane, 0, sizeof(ddb->uv_plane));
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_runtime_pm.c
++++ b/drivers/gpu/drm/i915/intel_runtime_pm.c
+@@ -2619,32 +2619,69 @@ static void intel_power_domains_sync_hw(
+ 	mutex_unlock(&power_domains->lock);
+ }
+ 
+-static void gen9_dbuf_enable(struct drm_i915_private *dev_priv)
++static inline
++bool intel_dbuf_slice_set(struct drm_i915_private *dev_priv,
++			  i915_reg_t reg, bool enable)
+ {
+-	I915_WRITE(DBUF_CTL, I915_READ(DBUF_CTL) | DBUF_POWER_REQUEST);
+-	POSTING_READ(DBUF_CTL);
++	u32 val, status;
+ 
++	val = I915_READ(reg);
++	val = enable ? (val | DBUF_POWER_REQUEST) : (val & ~DBUF_POWER_REQUEST);
++	I915_WRITE(reg, val);
++	POSTING_READ(reg);
+ 	udelay(10);
+ 
+-	if (!(I915_READ(DBUF_CTL) & DBUF_POWER_STATE))
+-		DRM_ERROR("DBuf power enable timeout\n");
++	status = I915_READ(reg) & DBUF_POWER_STATE;
++	if ((enable && !status) || (!enable && status)) {
++		DRM_ERROR("DBus power %s timeout!\n",
++			  enable ? "enable" : "disable");
++		return false;
++	}
++	return true;
++}
++
++static void gen9_dbuf_enable(struct drm_i915_private *dev_priv)
++{
++	intel_dbuf_slice_set(dev_priv, DBUF_CTL, true);
+ }
+ 
+ static void gen9_dbuf_disable(struct drm_i915_private *dev_priv)
+ {
+-	I915_WRITE(DBUF_CTL, I915_READ(DBUF_CTL) & ~DBUF_POWER_REQUEST);
+-	POSTING_READ(DBUF_CTL);
++	intel_dbuf_slice_set(dev_priv, DBUF_CTL, false);
++}
+ 
+-	udelay(10);
++static u8 intel_dbuf_max_slices(struct drm_i915_private *dev_priv)
++{
++	if (INTEL_GEN(dev_priv) < 11)
++		return 1;
++	return 2;
++}
++
++void icl_dbuf_slices_update(struct drm_i915_private *dev_priv,
++			    u8 req_slices)
++{
++	u8 hw_enabled_slices = dev_priv->wm.skl_hw.ddb.enabled_slices;
++	u32 val;
++	bool ret;
++
++	if (req_slices > intel_dbuf_max_slices(dev_priv)) {
++		DRM_ERROR("Invalid number of dbuf slices requested\n");
++		return;
++	}
++
++	if (req_slices == hw_enabled_slices || req_slices == 0)
++		return;
++
++	val = I915_READ(DBUF_CTL_S2);
++	if (req_slices > hw_enabled_slices)
++		ret = intel_dbuf_slice_set(dev_priv, DBUF_CTL_S2, true);
++	else
++		ret = intel_dbuf_slice_set(dev_priv, DBUF_CTL_S2, false);
+ 
+-	if (I915_READ(DBUF_CTL) & DBUF_POWER_STATE)
+-		DRM_ERROR("DBuf power disable timeout!\n");
++	if (ret)
++		dev_priv->wm.skl_hw.ddb.enabled_slices = req_slices;
+ }
+ 
+-/*
+- * TODO: we shouldn't always enable DBUF_CTL_S2, we should only enable it when
+- * needed and keep it disabled as much as possible.
+- */
+ static void icl_dbuf_enable(struct drm_i915_private *dev_priv)
+ {
+ 	I915_WRITE(DBUF_CTL_S1, I915_READ(DBUF_CTL_S1) | DBUF_POWER_REQUEST);
