@@ -1,0 +1,695 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Sat, 14 Apr 2018 13:27:54 +0100
+Subject: drm/i915: Check whitelist registers across resets
+Git-commit: f4ecfbfc32ed0cb502374164638d14c4fb03e916
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Add a selftest to ensure that we restore the whitelisted registers after
+rewrite the registers everytime they might be scrubbed, e.g. module
+load, reset and resume. For the other volatile workaround registers, we
+export their presence via debugfs and check in igt/gem_workarounds.
+However, we don't export the whitelist and rather than do so, let's test
+them directly in the kernel.
+
+The test we use is to read the registers back from the CS (this helps us
+be sure that the registers will be valid for MI_LRI etc). In order to
+generate the expected list, we split intel_whitelist_workarounds_emit
+into two phases, the first to build the list and the second to apply.
+Inside the test, we only build the list and then check that list against
+the hw.
+
+v2: Filter out pre-gen8 as they do not have RING_NONPRIV.
+v3: Drop unused engine parameter, no plans to use it now or future.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Oscar Mateo <oscar.mateo@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Reviewed-by: Oscar Mateo <oscar.mateo@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180414122754.569-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c                  |   14 
+ drivers/gpu/drm/i915/i915_drv.h                      |    1 
+ drivers/gpu/drm/i915/intel_lrc.c                     |    8 
+ drivers/gpu/drm/i915/intel_ringbuffer.c              |    4 
+ drivers/gpu/drm/i915/intel_workarounds.c             |  204 +++++--------
+ drivers/gpu/drm/i915/intel_workarounds.h             |    2 
+ drivers/gpu/drm/i915/selftests/i915_live_selftests.h |    1 
+ drivers/gpu/drm/i915/selftests/intel_workarounds.c   |  284 +++++++++++++++++++
+ 8 files changed, 379 insertions(+), 139 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -3303,24 +3303,13 @@ static int i915_shared_dplls_info(struct
+ 
+ static int i915_wa_registers(struct seq_file *m, void *unused)
+ {
+-	int i;
+-	int ret;
+-	struct intel_engine_cs *engine;
+ 	struct drm_i915_private *dev_priv = node_to_i915(m->private);
+-	struct drm_device *dev = &dev_priv->drm;
+ 	struct i915_workarounds *workarounds = &dev_priv->workarounds;
+-	enum intel_engine_id id;
+-
+-	ret = mutex_lock_interruptible(&dev->struct_mutex);
+-	if (ret)
+-		return ret;
++	int i;
+ 
+ 	intel_runtime_pm_get(dev_priv);
+ 
+ 	seq_printf(m, "Workarounds applied: %d\n", workarounds->count);
+-	for_each_engine(engine, dev_priv, id)
+-		seq_printf(m, "HW whitelist count for %s: %d\n",
+-			   engine->name, workarounds->hw_whitelist_count[id]);
+ 	for (i = 0; i < workarounds->count; ++i) {
+ 		i915_reg_t addr;
+ 		u32 mask, value, read;
+@@ -3336,7 +3325,6 @@ static int i915_wa_registers(struct seq_
+ 	}
+ 
+ 	intel_runtime_pm_put(dev_priv);
+-	mutex_unlock(&dev->struct_mutex);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1297,7 +1297,6 @@ struct i915_wa_reg {
+ struct i915_workarounds {
+ 	struct i915_wa_reg reg[I915_MAX_WA_REGS];
+ 	u32 count;
+-	u32 hw_whitelist_count[I915_NUM_ENGINES];
+ };
+ 
+ struct i915_virtual_gpu {
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1745,9 +1745,7 @@ static int gen8_init_render_ring(struct
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = intel_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
++	intel_whitelist_workarounds_apply(engine);
+ 
+ 	/* We need to disable the AsyncFlip performance optimisations in order
+ 	 * to use MI_WAIT_FOR_EVENT within the CS. It should already be
+@@ -1770,9 +1768,7 @@ static int gen9_init_render_ring(struct
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = intel_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
++	intel_whitelist_workarounds_apply(engine);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -618,9 +618,7 @@ static int init_render_ring(struct intel
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = intel_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
++	intel_whitelist_workarounds_apply(engine);
+ 
+ 	/* WaTimedSingleVertexDispatch:cl,bw,ctg,elk,ilk,snb */
+ 	if (IS_GEN(dev_priv, 4, 6))
+--- a/drivers/gpu/drm/i915/intel_workarounds.c
++++ b/drivers/gpu/drm/i915/intel_workarounds.c
+@@ -687,170 +687,144 @@ void intel_gt_workarounds_apply(struct d
+ 		MISSING_CASE(INTEL_GEN(dev_priv));
+ }
+ 
+-static int wa_ring_whitelist_reg(struct intel_engine_cs *engine,
+-				 i915_reg_t reg)
+-{
+-	struct drm_i915_private *dev_priv = engine->i915;
+-	struct i915_workarounds *wa = &dev_priv->workarounds;
+-	const unsigned int index = wa->hw_whitelist_count[engine->id];
++struct whitelist {
++	i915_reg_t reg[RING_MAX_NONPRIV_SLOTS];
++	unsigned int count;
++	u32 nopid;
++};
+ 
+-	if (WARN_ON(index >= RING_MAX_NONPRIV_SLOTS))
+-		return -EINVAL;
+-
+-	I915_WRITE(RING_FORCE_TO_NONPRIV(engine->mmio_base, index),
+-		   i915_mmio_reg_offset(reg));
+-	wa->hw_whitelist_count[engine->id]++;
++static void whitelist_reg(struct whitelist *w, i915_reg_t reg)
++{
++	if (GEM_WARN_ON(w->count >= RING_MAX_NONPRIV_SLOTS))
++		return;
+ 
+-	return 0;
++	w->reg[w->count++] = reg;
+ }
+ 
+-static int bdw_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void bdw_whitelist_build(struct whitelist *w)
+ {
+-	return 0;
+ }
+ 
+-static int chv_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void chv_whitelist_build(struct whitelist *w)
+ {
+-	return 0;
+ }
+ 
+-static int gen9_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void gen9_whitelist_build(struct whitelist *w)
+ {
+-	int ret;
+-
+ 	/* WaVFEStateAfterPipeControlwithMediaStateClear:skl,bxt,glk,cfl */
+-	ret = wa_ring_whitelist_reg(engine, GEN9_CTX_PREEMPT_REG);
+-	if (ret)
+-		return ret;
++	whitelist_reg(w, GEN9_CTX_PREEMPT_REG);
+ 
+ 	/* WaEnablePreemptionGranularityControlByUMD:skl,bxt,kbl,cfl,[cnl] */
+-	ret = wa_ring_whitelist_reg(engine, GEN8_CS_CHICKEN1);
+-	if (ret)
+-		return ret;
++	whitelist_reg(w, GEN8_CS_CHICKEN1);
+ 
+ 	/* WaAllowUMDToModifyHDCChicken1:skl,bxt,kbl,glk,cfl */
+-	ret = wa_ring_whitelist_reg(engine, GEN8_HDC_CHICKEN1);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	whitelist_reg(w, GEN8_HDC_CHICKEN1);
+ }
+ 
+-static int skl_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void skl_whitelist_build(struct whitelist *w)
+ {
+-	int ret;
+-
+-	ret = gen9_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
++	gen9_whitelist_build(w);
+ 
+ 	/* WaDisableLSQCROPERFforOCL:skl */
+-	ret = wa_ring_whitelist_reg(engine, GEN8_L3SQCREG4);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	whitelist_reg(w, GEN8_L3SQCREG4);
+ }
+ 
+-static int bxt_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void bxt_whitelist_build(struct whitelist *w)
+ {
+-	int ret;
+-
+-	ret = gen9_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	gen9_whitelist_build(w);
+ }
+ 
+-static int kbl_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void kbl_whitelist_build(struct whitelist *w)
+ {
+-	int ret;
+-
+-	ret = gen9_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
++	gen9_whitelist_build(w);
+ 
+ 	/* WaDisableLSQCROPERFforOCL:kbl */
+-	ret = wa_ring_whitelist_reg(engine, GEN8_L3SQCREG4);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	whitelist_reg(w, GEN8_L3SQCREG4);
+ }
+ 
+-static int glk_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void glk_whitelist_build(struct whitelist *w)
+ {
+-	int ret;
+-
+-	ret = gen9_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
++	gen9_whitelist_build(w);
+ 
+ 	/* WA #0862: Userspace has to set "Barrier Mode" to avoid hangs. */
+-	ret = wa_ring_whitelist_reg(engine, GEN9_SLICE_COMMON_ECO_CHICKEN1);
+-	if (ret)
+-		return ret;
+-
+-	return 0;
++	whitelist_reg(w, GEN9_SLICE_COMMON_ECO_CHICKEN1);
+ }
+ 
+-static int cfl_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void cfl_whitelist_build(struct whitelist *w)
+ {
+-	int ret;
+-
+-	ret = gen9_whitelist_workarounds_apply(engine);
+-	if (ret)
+-		return ret;
++	gen9_whitelist_build(w);
++}
+ 
+-	return 0;
++static void cnl_whitelist_build(struct whitelist *w)
++{
++	/* WaEnablePreemptionGranularityControlByUMD:cnl */
++	whitelist_reg(w, GEN8_CS_CHICKEN1);
+ }
+ 
+-static int cnl_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static struct whitelist *whitelist_build(struct intel_engine_cs *engine,
++					 struct whitelist *w)
+ {
+-	int ret;
++	struct drm_i915_private *i915 = engine->i915;
+ 
+-	/* WaEnablePreemptionGranularityControlByUMD:cnl */
+-	ret = wa_ring_whitelist_reg(engine, GEN8_CS_CHICKEN1);
+-	if (ret)
+-		return ret;
++	GEM_BUG_ON(engine->id != RCS);
++
++	w->count = 0;
++	w->nopid = i915_mmio_reg_offset(RING_NOPID(engine->mmio_base));
++
++	if (INTEL_GEN(i915) < 8)
++		return NULL;
++	else if (IS_BROADWELL(i915))
++		bdw_whitelist_build(w);
++	else if (IS_CHERRYVIEW(i915))
++		chv_whitelist_build(w);
++	else if (IS_SKYLAKE(i915))
++		skl_whitelist_build(w);
++	else if (IS_BROXTON(i915))
++		bxt_whitelist_build(w);
++	else if (IS_KABYLAKE(i915))
++		kbl_whitelist_build(w);
++	else if (IS_GEMINILAKE(i915))
++		glk_whitelist_build(w);
++	else if (IS_COFFEELAKE(i915))
++		cfl_whitelist_build(w);
++	else if (IS_CANNONLAKE(i915))
++		cnl_whitelist_build(w);
++	else
++		MISSING_CASE(INTEL_GEN(i915));
+ 
+-	return 0;
++	return w;
+ }
+ 
+-int intel_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++static void whitelist_apply(struct intel_engine_cs *engine,
++			    const struct whitelist *w)
+ {
+ 	struct drm_i915_private *dev_priv = engine->i915;
+-	int err = 0;
++	const u32 base = engine->mmio_base;
++	unsigned int i;
+ 
+-	WARN_ON(engine->id != RCS);
++	if (!w)
++		return;
+ 
+-	dev_priv->workarounds.hw_whitelist_count[engine->id] = 0;
++	intel_uncore_forcewake_get(engine->i915, FORCEWAKE_ALL);
+ 
+-	if (INTEL_GEN(dev_priv) < 8)
+-		err = 0;
+-	else if (IS_BROADWELL(dev_priv))
+-		err = bdw_whitelist_workarounds_apply(engine);
+-	else if (IS_CHERRYVIEW(dev_priv))
+-		err = chv_whitelist_workarounds_apply(engine);
+-	else if (IS_SKYLAKE(dev_priv))
+-		err = skl_whitelist_workarounds_apply(engine);
+-	else if (IS_BROXTON(dev_priv))
+-		err = bxt_whitelist_workarounds_apply(engine);
+-	else if (IS_KABYLAKE(dev_priv))
+-		err = kbl_whitelist_workarounds_apply(engine);
+-	else if (IS_GEMINILAKE(dev_priv))
+-		err = glk_whitelist_workarounds_apply(engine);
+-	else if (IS_COFFEELAKE(dev_priv))
+-		err = cfl_whitelist_workarounds_apply(engine);
+-	else if (IS_CANNONLAKE(dev_priv))
+-		err = cnl_whitelist_workarounds_apply(engine);
+-	else
+-		MISSING_CASE(INTEL_GEN(dev_priv));
+-	if (err)
+-		return err;
++	for (i = 0; i < w->count; i++)
++		I915_WRITE_FW(RING_FORCE_TO_NONPRIV(base, i),
++			      i915_mmio_reg_offset(w->reg[i]));
++
++	/* And clear the rest just in case of garbage */
++	for (; i < RING_MAX_NONPRIV_SLOTS; i++)
++		I915_WRITE_FW(RING_FORCE_TO_NONPRIV(base, i), w->nopid);
+ 
+-	DRM_DEBUG_DRIVER("%s: Number of whitelist w/a: %d\n", engine->name,
+-			 dev_priv->workarounds.hw_whitelist_count[engine->id]);
+-	return 0;
++	intel_uncore_forcewake_put(engine->i915, FORCEWAKE_ALL);
+ }
++
++void intel_whitelist_workarounds_apply(struct intel_engine_cs *engine)
++{
++	struct whitelist w;
++
++	whitelist_apply(engine, whitelist_build(engine, &w));
++}
++
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++#include "selftests/intel_workarounds.c"
++#endif
+--- a/drivers/gpu/drm/i915/intel_workarounds.h
++++ b/drivers/gpu/drm/i915/intel_workarounds.h
+@@ -12,6 +12,6 @@ int intel_ctx_workarounds_emit(struct i9
+ 
+ void intel_gt_workarounds_apply(struct drm_i915_private *dev_priv);
+ 
+-int intel_whitelist_workarounds_apply(struct intel_engine_cs *engine);
++void intel_whitelist_workarounds_apply(struct intel_engine_cs *engine);
+ 
+ #endif
+--- a/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
++++ b/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
+@@ -10,6 +10,7 @@
+  */
+ selftest(sanitycheck, i915_live_sanitycheck) /* keep first (igt selfcheck) */
+ selftest(uncore, intel_uncore_live_selftests)
++selftest(workarounds, intel_workarounds_live_selftests)
+ selftest(requests, i915_request_live_selftests)
+ selftest(objects, i915_gem_object_live_selftests)
+ selftest(dmabuf, i915_gem_dmabuf_live_selftests)
+--- /dev/null
++++ b/drivers/gpu/drm/i915/selftests/intel_workarounds.c
+@@ -0,0 +1,284 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Copyright © 2018 Intel Corporation
++ */
++
++#include "../i915_selftest.h"
++
++#include "mock_context.h"
++
++static struct drm_i915_gem_object *
++read_nonprivs(struct i915_gem_context *ctx, struct intel_engine_cs *engine)
++{
++	struct drm_i915_gem_object *result;
++	struct i915_request *rq;
++	struct i915_vma *vma;
++	const u32 base = engine->mmio_base;
++	u32 srm, *cs;
++	int err;
++	int i;
++
++	result = i915_gem_object_create_internal(engine->i915, PAGE_SIZE);
++	if (IS_ERR(result))
++		return result;
++
++	i915_gem_object_set_cache_level(result, I915_CACHE_LLC);
++
++	cs = i915_gem_object_pin_map(result, I915_MAP_WB);
++	if (IS_ERR(cs)) {
++		err = PTR_ERR(cs);
++		goto err_obj;
++	}
++	memset(cs, 0xc5, PAGE_SIZE);
++	i915_gem_object_unpin_map(result);
++
++	vma = i915_vma_instance(result, &engine->i915->ggtt.base, NULL);
++	if (IS_ERR(vma)) {
++		err = PTR_ERR(vma);
++		goto err_obj;
++	}
++
++	err = i915_vma_pin(vma, 0, 0, PIN_GLOBAL);
++	if (err)
++		goto err_obj;
++
++	rq = i915_request_alloc(engine, ctx);
++	if (IS_ERR(rq)) {
++		err = PTR_ERR(rq);
++		goto err_pin;
++	}
++
++	srm = MI_STORE_REGISTER_MEM | MI_SRM_LRM_GLOBAL_GTT;
++	if (INTEL_GEN(ctx->i915) >= 8)
++		srm++;
++
++	cs = intel_ring_begin(rq, 4 * RING_MAX_NONPRIV_SLOTS);
++	for (i = 0; i < RING_MAX_NONPRIV_SLOTS; i++) {
++		*cs++ = srm;
++		*cs++ = i915_mmio_reg_offset(RING_FORCE_TO_NONPRIV(base, i));
++		*cs++ = i915_ggtt_offset(vma) + sizeof(u32) * i;
++		*cs++ = 0;
++	}
++	intel_ring_advance(rq, cs);
++
++	i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
++	reservation_object_lock(vma->resv, NULL);
++	reservation_object_add_excl_fence(vma->resv, &rq->fence);
++	reservation_object_unlock(vma->resv);
++
++	i915_gem_object_get(result);
++	i915_gem_object_set_active_reference(result);
++
++	__i915_request_add(rq, true);
++	i915_vma_unpin(vma);
++
++	return result;
++
++err_pin:
++	i915_vma_unpin(vma);
++err_obj:
++	i915_gem_object_put(result);
++	return ERR_PTR(err);
++}
++
++static u32 get_whitelist_reg(const struct whitelist *w, unsigned int i)
++{
++	return i < w->count ? i915_mmio_reg_offset(w->reg[i]) : w->nopid;
++}
++
++static void print_results(const struct whitelist *w, const u32 *results)
++{
++	unsigned int i;
++
++	for (i = 0; i < RING_MAX_NONPRIV_SLOTS; i++) {
++		u32 expected = get_whitelist_reg(w, i);
++		u32 actual = results[i];
++
++		pr_info("RING_NONPRIV[%d]: expected 0x%08x, found 0x%08x\n",
++			i, expected, actual);
++	}
++}
++
++static int check_whitelist(const struct whitelist *w,
++			   struct i915_gem_context *ctx,
++			   struct intel_engine_cs *engine)
++{
++	struct drm_i915_gem_object *results;
++	u32 *vaddr;
++	int err;
++	int i;
++
++	results = read_nonprivs(ctx, engine);
++	if (IS_ERR(results))
++		return PTR_ERR(results);
++
++	err = i915_gem_object_set_to_cpu_domain(results, false);
++	if (err)
++		goto out_put;
++
++	vaddr = i915_gem_object_pin_map(results, I915_MAP_WB);
++	if (IS_ERR(vaddr)) {
++		err = PTR_ERR(vaddr);
++		goto out_put;
++	}
++
++	for (i = 0; i < RING_MAX_NONPRIV_SLOTS; i++) {
++		u32 expected = get_whitelist_reg(w, i);
++		u32 actual = vaddr[i];
++
++		if (expected != actual) {
++			print_results(w, vaddr);
++			pr_err("Invalid RING_NONPRIV[%d], expected 0x%08x, found 0x%08x\n",
++			       i, expected, actual);
++
++			err = -EINVAL;
++			break;
++		}
++	}
++
++	i915_gem_object_unpin_map(results);
++out_put:
++	i915_gem_object_put(results);
++	return err;
++}
++
++static int do_device_reset(struct intel_engine_cs *engine)
++{
++	i915_reset(engine->i915, ENGINE_MASK(engine->id), NULL);
++	return 0;
++}
++
++static int do_engine_reset(struct intel_engine_cs *engine)
++{
++	return i915_reset_engine(engine, NULL);
++}
++
++static int switch_to_scratch_context(struct intel_engine_cs *engine)
++{
++	struct i915_gem_context *ctx;
++	struct i915_request *rq;
++
++	ctx = kernel_context(engine->i915);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	rq = i915_request_alloc(engine, ctx);
++	kernel_context_close(ctx);
++	if (IS_ERR(rq))
++		return PTR_ERR(rq);
++
++	i915_request_add(rq);
++
++	return 0;
++}
++
++static int check_whitelist_across_reset(struct intel_engine_cs *engine,
++					int (*reset)(struct intel_engine_cs *),
++					const struct whitelist *w,
++					const char *name)
++{
++	struct i915_gem_context *ctx;
++	int err;
++
++	ctx = kernel_context(engine->i915);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	err = check_whitelist(w, ctx, engine);
++	if (err) {
++		pr_err("Invalid whitelist *before* %s reset!\n", name);
++		goto out;
++	}
++
++	err = switch_to_scratch_context(engine);
++	if (err)
++		goto out;
++
++	err = reset(engine);
++	if (err) {
++		pr_err("%s reset failed\n", name);
++		goto out;
++	}
++
++	err = check_whitelist(w, ctx, engine);
++	if (err) {
++		pr_err("Whitelist not preserved in context across %s reset!\n",
++		       name);
++		goto out;
++	}
++
++	kernel_context_close(ctx);
++
++	ctx = kernel_context(engine->i915);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	err = check_whitelist(w, ctx, engine);
++	if (err) {
++		pr_err("Invalid whitelist *after* %s reset in fresh context!\n",
++		       name);
++		goto out;
++	}
++
++out:
++	kernel_context_close(ctx);
++	return err;
++}
++
++static int live_reset_whitelist(void *arg)
++{
++	struct drm_i915_private *i915 = arg;
++	struct intel_engine_cs *engine = i915->engine[RCS];
++	struct i915_gpu_error *error = &i915->gpu_error;
++	struct whitelist w;
++	int err;
++
++	/* If we reset the gpu, we should not lose the RING_NONPRIV */
++
++	if (!engine)
++		return 0;
++
++	if (!whitelist_build(engine, &w))
++		return 0;
++
++	pr_info("Checking %d whitelisted registers (RING_NONPRIV)\n", w.count);
++
++	set_bit(I915_RESET_BACKOFF, &error->flags);
++	set_bit(I915_RESET_ENGINE + engine->id, &error->flags);
++
++	if (intel_has_reset_engine(i915)) {
++		err = check_whitelist_across_reset(engine,
++						   do_engine_reset, &w,
++						   "engine");
++		if (err)
++			goto out;
++	}
++
++	if (intel_has_gpu_reset(i915)) {
++		err = check_whitelist_across_reset(engine,
++						   do_device_reset, &w,
++						   "device");
++		if (err)
++			goto out;
++	}
++
++out:
++	clear_bit(I915_RESET_ENGINE + engine->id, &error->flags);
++	clear_bit(I915_RESET_BACKOFF, &error->flags);
++	return err;
++}
++
++int intel_workarounds_live_selftests(struct drm_i915_private *i915)
++{
++	static const struct i915_subtest tests[] = {
++		SUBTEST(live_reset_whitelist),
++	};
++	int err;
++
++	mutex_lock(&i915->drm.struct_mutex);
++	err = i915_subtests(tests, i915);
++	mutex_unlock(&i915->drm.struct_mutex);
++
++	return err;
++}
