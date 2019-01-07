@@ -1,0 +1,148 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 31 May 2018 09:22:43 +0100
+Subject: drm/i915: Switch to kernel context before idling at runtime
+Git-commit: 4dfacb0bcbee79fa2ef4b2e9e64a8f8a28598934
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We can reduce our exposure to random neutrinos by resting on the kernel
+context having flushed out the user contexts to system memory and
+beyond. The corollary is that we then we require two passes through the
+idle handler to go to sleep, which on a truly idle system involves an
+extra pass through the slow and irregular retire work handler.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180531082246.9763-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |    9 ++++++--
+ drivers/gpu/drm/i915/i915_gem.c         |   36 +++++++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_gem_context.c |    2 -
+ 3 files changed, 39 insertions(+), 8 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -4225,8 +4225,13 @@ i915_drop_caches_set(void *data, u64 val
+ 		i915_gem_shrink_all(dev_priv);
+ 	lockdep_clear_current_reclaim_state();
+ 
+-	if (val & DROP_IDLE)
+-		drain_delayed_work(&dev_priv->gt.idle_work);
++	if (val & DROP_IDLE) {
++		do {
++			if (READ_ONCE(dev_priv->gt.active_requests))
++				flush_delayed_work(&dev_priv->gt.retire_work);
++			drain_delayed_work(&dev_priv->gt.idle_work);
++		} while (READ_ONCE(dev_priv->gt.awake));
++	}
+ 
+ 	if (val & DROP_FREED)
+ 		i915_gem_drain_freed_objects(dev_priv);
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -139,6 +139,8 @@ int i915_mutex_lock_interruptible(struct
+ 
+ static u32 __i915_gem_park(struct drm_i915_private *i915)
+ {
++	GEM_TRACE("\n");
++
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 	GEM_BUG_ON(i915->gt.active_requests);
+ 	GEM_BUG_ON(!list_empty(&i915->gt.active_rings));
+@@ -181,6 +183,8 @@ static u32 __i915_gem_park(struct drm_i9
+ 
+ void i915_gem_park(struct drm_i915_private *i915)
+ {
++	GEM_TRACE("\n");
++
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 	GEM_BUG_ON(i915->gt.active_requests);
+ 
+@@ -193,6 +197,8 @@ void i915_gem_park(struct drm_i915_priva
+ 
+ void i915_gem_unpark(struct drm_i915_private *i915)
+ {
++	GEM_TRACE("\n");
++
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 	GEM_BUG_ON(!i915->gt.active_requests);
+ 
+@@ -3531,6 +3537,24 @@ i915_gem_idle_work_handler(struct work_s
+ 	if (!READ_ONCE(dev_priv->gt.awake))
+ 		return;
+ 
++	if (READ_ONCE(dev_priv->gt.active_requests))
++		return;
++
++	/*
++	 * Flush out the last user context, leaving only the pinned
++	 * kernel context resident. When we are idling on the kernel_context,
++	 * no more new requests (with a context switch) are emitted and we
++	 * can finally rest. A consequence is that the idle work handler is
++	 * always called at least twice before idling (and if the system is
++	 * idle that implies a round trip through the retire worker).
++	 */
++	mutex_lock(&dev_priv->drm.struct_mutex);
++	i915_gem_switch_to_kernel_context(dev_priv);
++	mutex_unlock(&dev_priv->drm.struct_mutex);
++
++	GEM_TRACE("active_requests=%d (after switch-to-kernel-context)\n",
++		  READ_ONCE(dev_priv->gt.active_requests));
++
+ 	/*
+ 	 * Wait for last execlists context complete, but bail out in case a
+ 	 * new request is submitted. As we don't trust the hardware, we
+@@ -4941,11 +4965,9 @@ static void assert_kernel_context_is_cur
+ 
+ void i915_gem_sanitize(struct drm_i915_private *i915)
+ {
+-	if (i915_terminally_wedged(&i915->gpu_error)) {
+-		mutex_lock(&i915->drm.struct_mutex);
++	mutex_lock(&i915->drm.struct_mutex);
++	if (i915_terminally_wedged(&i915->gpu_error))
+ 		i915_gem_unset_wedged(i915);
+-		mutex_unlock(&i915->drm.struct_mutex);
+-	}
+ 
+ 	/*
+ 	 * If we inherit context state from the BIOS or earlier occupants
+@@ -4957,6 +4979,9 @@ void i915_gem_sanitize(struct drm_i915_p
+ 	 */
+ 	if (INTEL_GEN(i915) >= 5 && intel_has_gpu_reset(i915))
+ 		WARN_ON(intel_gpu_reset(i915, ALL_ENGINES));
++
++	i915_gem_contexts_lost(i915);
++	mutex_unlock(&i915->drm.struct_mutex);
+ }
+ 
+ int i915_gem_suspend(struct drm_i915_private *dev_priv)
+@@ -4992,7 +5017,6 @@ int i915_gem_suspend(struct drm_i915_pri
+ 
+ 		assert_kernel_context_is_current(dev_priv);
+ 	}
+-	i915_gem_contexts_lost(dev_priv);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	intel_uc_suspend(dev_priv);
+@@ -5045,6 +5069,8 @@ err_unlock:
+ 
+ void i915_gem_resume(struct drm_i915_private *i915)
+ {
++	GEM_TRACE("\n");
++
+ 	WARN_ON(i915->gt.awake);
+ 
+ 	mutex_lock(&i915->drm.struct_mutex);
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -649,7 +649,7 @@ int i915_gem_switch_to_kernel_context(st
+ 	struct intel_engine_cs *engine;
+ 	enum intel_engine_id id;
+ 
+-	GEM_TRACE("\n");
++	GEM_TRACE("awake?=%s\n", yesno(i915->gt.awake));
+ 
+ 	lockdep_assert_held(&i915->drm.struct_mutex);
+ 	GEM_BUG_ON(!i915->kernel_context);
