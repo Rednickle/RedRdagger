@@ -1,0 +1,180 @@
+From: Dave Jiang <dave.jiang@intel.com>
+Date: Fri, 7 Dec 2018 13:29:09 -0700
+Subject: acpi/nfit, libnvdimm: Add enable/update passphrase support for Intel
+ nvdimms
+Git-commit: d2a4ac73f56a5d0709d28b41fec8d15e4500f8f1
+Patch-mainline: v5.0-rc1
+References: FATE#325581
+
+Add support for enabling and updating passphrase on the Intel nvdimms.
+The passphrase is the an encrypted key in the kernel user keyring.
+We trigger the update via writing "update <old_keyid> <new_keyid>" to the
+sysfs attribute "security". If no <old_keyid> exists (for enabling
+security) then a 0 should be used.
+
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/nvdimm/dimm_devs.c | 11 ++++++---
+ drivers/nvdimm/nd-core.h   |  7 ++++++
+ drivers/nvdimm/security.c  | 58 ++++++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 69 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 7f42cc4e119b..1cc3a6af3d0e 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -392,8 +392,9 @@ static ssize_t security_show(struct device *dev,
+ }
+ 
+ #define OPS						\
+-	C( OP_FREEZE,        "freeze",        1),	\
+-	C( OP_DISABLE,       "disable",       2)
++	C( OP_FREEZE,		"freeze",	1),	\
++	C( OP_DISABLE,		"disable",	2),	\
++	C( OP_UPDATE,		"update",	3)
+ #undef C
+ #define C(a, b, c) a
+ enum nvdimmsec_op_ids { OPS };
+@@ -444,6 +445,9 @@ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ 	} else if (i == OP_DISABLE) {
+ 		dev_dbg(dev, "disable %u\n", key);
+ 		rc = nvdimm_security_disable(nvdimm, key);
++	} else if (i == OP_UPDATE) {
++		dev_dbg(dev, "update %u %u\n", key, newkey);
++		rc = nvdimm_security_update(nvdimm, key, newkey);
+ 	} else
+ 		return -EINVAL;
+ 
+@@ -493,7 +497,8 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 	if (nvdimm->sec.state < 0)
+ 		return 0;
+ 	/* Are there any state mutation ops? */
+-	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable)
++	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable
++			|| nvdimm->sec.ops->change_key)
+ 		return a->mode;
+ 	return 0444;
+ }
+diff --git a/drivers/nvdimm/nd-core.h b/drivers/nvdimm/nd-core.h
+index d1351c0b1119..c2567f9ae07b 100644
+--- a/drivers/nvdimm/nd-core.h
++++ b/drivers/nvdimm/nd-core.h
+@@ -59,12 +59,19 @@ static inline enum nvdimm_security_state nvdimm_security_state(
+ int nvdimm_security_freeze(struct nvdimm *nvdimm);
+ #if IS_ENABLED(CONFIG_NVDIMM_KEYS)
+ int nvdimm_security_disable(struct nvdimm *nvdimm, unsigned int keyid);
++int nvdimm_security_update(struct nvdimm *nvdimm, unsigned int keyid,
++		unsigned int new_keyid);
+ #else
+ static inline int nvdimm_security_disable(struct nvdimm *nvdimm,
+ 		unsigned int keyid)
+ {
+ 	return -EOPNOTSUPP;
+ }
++static inline int nvdimm_security_update(struct nvdimm *nvdimm, unsigned int keyid,
++		unsigned int new_keyid)
++{
++	return -EOPNOTSUPP;
++}
+ #endif
+ 
+ /**
+diff --git a/drivers/nvdimm/security.c b/drivers/nvdimm/security.c
+index 647a99dd3182..df7f070e96fb 100644
+--- a/drivers/nvdimm/security.c
++++ b/drivers/nvdimm/security.c
+@@ -15,6 +15,9 @@
+ #include "nd-core.h"
+ #include "nd.h"
+ 
++#define NVDIMM_BASE_KEY		0
++#define NVDIMM_NEW_KEY		1
++
+ static bool key_revalidate = true;
+ module_param(key_revalidate, bool, 0444);
+ MODULE_PARM_DESC(key_revalidate, "Require key validation at init.");
+@@ -70,7 +73,7 @@ static struct key *nvdimm_request_key(struct nvdimm *nvdimm)
+ }
+ 
+ static struct key *nvdimm_lookup_user_key(struct nvdimm *nvdimm,
+-		key_serial_t id)
++		key_serial_t id, int subclass)
+ {
+ 	key_ref_t keyref;
+ 	struct key *key;
+@@ -86,10 +89,10 @@ static struct key *nvdimm_lookup_user_key(struct nvdimm *nvdimm,
+ 		key_put(key);
+ 		return NULL;
+ 	}
+-	dev_dbg(dev, "%s: key found: %#x\n", __func__, key_serial(key));
+ 
++	dev_dbg(dev, "%s: key found: %#x\n", __func__, key_serial(key));
+ 
+-	down_read(&key->sem);
++	down_read_nested(&key->sem, subclass);
+ 	epayload = dereference_key_locked(key);
+ 	if (epayload->decrypted_datalen != NVDIMM_PASSPHRASE_LEN) {
+ 		up_read(&key->sem);
+@@ -197,7 +200,7 @@ int nvdimm_security_disable(struct nvdimm *nvdimm, unsigned int keyid)
+ 		return -EIO;
+ 	}
+ 
+-	key = nvdimm_lookup_user_key(nvdimm, keyid);
++	key = nvdimm_lookup_user_key(nvdimm, keyid, NVDIMM_BASE_KEY);
+ 	if (!key)
+ 		return -ENOKEY;
+ 
+@@ -209,3 +212,50 @@ int nvdimm_security_disable(struct nvdimm *nvdimm, unsigned int keyid)
+ 	nvdimm->sec.state = nvdimm_security_state(nvdimm);
+ 	return rc;
+ }
++
++int nvdimm_security_update(struct nvdimm *nvdimm, unsigned int keyid,
++		unsigned int new_keyid)
++{
++	struct device *dev = &nvdimm->dev;
++	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(dev);
++	struct key *key, *newkey;
++	int rc;
++
++	/* The bus lock should be held at the top level of the call stack */
++	lockdep_assert_held(&nvdimm_bus->reconfig_mutex);
++
++	if (!nvdimm->sec.ops || !nvdimm->sec.ops->change_key
++			|| nvdimm->sec.state < 0)
++		return -EOPNOTSUPP;
++
++	if (nvdimm->sec.state >= NVDIMM_SECURITY_FROZEN) {
++		dev_warn(dev, "Incorrect security state: %d\n",
++				nvdimm->sec.state);
++		return -EIO;
++	}
++
++	if (keyid == 0)
++		key = NULL;
++	else {
++		key = nvdimm_lookup_user_key(nvdimm, keyid, NVDIMM_BASE_KEY);
++		if (!key)
++			return -ENOKEY;
++	}
++
++	newkey = nvdimm_lookup_user_key(nvdimm, new_keyid, NVDIMM_NEW_KEY);
++	if (!newkey) {
++		nvdimm_put_key(key);
++		return -ENOKEY;
++	}
++
++	rc = nvdimm->sec.ops->change_key(nvdimm, key ? key_data(key) : NULL,
++			key_data(newkey));
++	dev_dbg(dev, "key: %d %d update: %s\n",
++			key_serial(key), key_serial(newkey),
++			rc == 0 ? "success" : "fail");
++
++	nvdimm_put_key(newkey);
++	nvdimm_put_key(key);
++	nvdimm->sec.state = nvdimm_security_state(nvdimm);
++	return rc;
++}
+
