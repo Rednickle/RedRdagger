@@ -1,0 +1,252 @@
+From: Omar Sandoval <osandov@fb.com>
+Date: Fri, 11 May 2018 13:13:37 -0700
+Subject: Btrfs: fix ENOSPC caused by orphan items reservations
+Git-commit: 27919067f182c35f825406ad76a0e2e5644d33af
+Patch-mainline: v4.18-rc1
+References: bsc#1111469
+
+Currently, we keep space reserved for all inode orphan items until the
+inode is evicted (i.e., all references to it are dropped). We hit an
+issue where an application would keep a bunch of deleted files open (by
+design) and thus keep a large amount of space reserved, causing ENOSPC
+errors when other operations tried to reserve space. This long-standing
+reservation isn't absolutely necessary for a couple of reasons:
+
+- We can almost always make the reservation we need or steal from the
+  global reserve for the orphan item
+- If we can't, it's not the end of the world if we drop the orphan item
+  on the floor and let the next mount clean it up
+
+So, get rid of persistent reservation and just reserve space in
+btrfs_evict_inode().
+
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: Omar Sandoval <osandov@fb.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Acked-by: Nikolay Borisov <nborisov@suse.com>
+---
+ fs/btrfs/inode.c |  154 +++++++++++++------------------------------------------
+ 1 file changed, 38 insertions(+), 116 deletions(-)
+
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3294,72 +3294,15 @@ void btrfs_orphan_commit_root(struct btr
+  *	 this function.
+  */
+ int btrfs_orphan_add(struct btrfs_trans_handle *trans,
+-		struct btrfs_inode *inode)
++		     struct btrfs_inode *inode)
+ {
+-	struct btrfs_fs_info *fs_info = btrfs_sb(inode->vfs_inode.i_sb);
+-	struct btrfs_root *root = inode->root;
+-	struct btrfs_block_rsv *block_rsv = NULL;
+-	int reserve = 0;
+ 	int ret;
+ 
+-	if (!root->orphan_block_rsv) {
+-		block_rsv = btrfs_alloc_block_rsv(fs_info,
+-						  BTRFS_BLOCK_RSV_TEMP);
+-		if (!block_rsv)
+-			return -ENOMEM;
+-	}
+-
+-	if (!test_and_set_bit(BTRFS_INODE_ORPHAN_META_RESERVED,
+-			      &inode->runtime_flags))
+-		reserve = 1;
+-
+-	spin_lock(&root->orphan_lock);
+-	/* If someone has created ->orphan_block_rsv, be happy to use it. */
+-	if (!root->orphan_block_rsv) {
+-		root->orphan_block_rsv = block_rsv;
+-	} else if (block_rsv) {
+-		btrfs_free_block_rsv(fs_info, block_rsv);
+-		block_rsv = NULL;
+-	}
+-
+-	atomic_inc(&root->orphan_inodes);
+-	spin_unlock(&root->orphan_lock);
+-
+-	/* grab metadata reservation from transaction handle */
+-	if (reserve) {
+-		ret = btrfs_orphan_reserve_metadata(trans, inode);
+-		ASSERT(!ret);
+-		if (ret) {
+-			/*
+-			 * dec doesn't need spin_lock as ->orphan_block_rsv
+-			 * would be released only if ->orphan_inodes is
+-			 * zero.
+-			 */
+-			atomic_dec(&root->orphan_inodes);
+-			clear_bit(BTRFS_INODE_ORPHAN_META_RESERVED,
+-				  &inode->runtime_flags);
+-			return ret;
+-		}
+-	}
+-
+ 	/* insert an orphan item to track this unlinked file */
+-	ret = btrfs_insert_orphan_item(trans, root, btrfs_ino(inode));
+-	if (ret) {
+-		if (reserve) {
+-			clear_bit(BTRFS_INODE_ORPHAN_META_RESERVED,
+-				  &inode->runtime_flags);
+-			btrfs_orphan_release_metadata(inode);
+-		}
+-		/*
+-		 * btrfs_orphan_commit_root may race with us and set
+-		 * ->orphan_block_rsv to zero, in order to avoid that,
+-		 * decrease ->orphan_inodes after everything is done.
+-		 */
+-		atomic_dec(&root->orphan_inodes);
+-		if (ret != -EEXIST) {
+-			btrfs_abort_transaction(trans, ret);
+-			return ret;
+-		}
++	ret = btrfs_insert_orphan_item(trans, inode->root, btrfs_ino(inode));
++	if (ret && ret != -EEXIST) {
++		btrfs_abort_transaction(trans, ret);
++		return ret;
+ 	}
+ 
+ 	return 0;
+@@ -3372,24 +3315,7 @@ int btrfs_orphan_add(struct btrfs_trans_
+ static int btrfs_orphan_del(struct btrfs_trans_handle *trans,
+ 			    struct btrfs_inode *inode)
+ {
+-	struct btrfs_root *root = inode->root;
+-	int ret = 0;
+-
+-	if (trans)
+-		ret = btrfs_del_orphan_item(trans, root, btrfs_ino(inode));
+-
+-	if (test_and_clear_bit(BTRFS_INODE_ORPHAN_META_RESERVED,
+-			       &inode->runtime_flags))
+-		btrfs_orphan_release_metadata(inode);
+-
+-	/*
+-	 * btrfs_orphan_commit_root may race with us and set ->orphan_block_rsv
+-	 * to zero, in order to avoid that, decrease ->orphan_inodes after
+-	 * everything is done.
+-	 */
+-	atomic_dec(&root->orphan_inodes);
+-
+-	return ret;
++	return btrfs_del_orphan_item(trans, inode->root, btrfs_ino(inode));
+ }
+ 
+ /*
+@@ -3545,8 +3471,6 @@ int btrfs_orphan_cleanup(struct btrfs_ro
+ 			continue;
+ 		}
+ 
+-		atomic_inc(&root->orphan_inodes);
+-
+ 		nr_unlink++;
+ 
+ 		/* this will do delete_inode and everything for us */
+@@ -5218,10 +5142,8 @@ void btrfs_evict_inode(struct inode *ino
+ 	     btrfs_is_free_space_inode(BTRFS_I(inode))))
+ 		goto no_delete;
+ 
+-	if (is_bad_inode(inode)) {
+-		btrfs_orphan_del(NULL, BTRFS_I(inode));
++	if (is_bad_inode(inode))
+ 		goto no_delete;
+-	}
+ 	/* do we really want it for ->i_nlink > 0 and zero btrfs_root_refs? */
+ 	if (!special_file(inode->i_mode))
+ 		btrfs_wait_ordered_range(inode, 0, (u64)-1);
+@@ -5238,16 +5160,12 @@ void btrfs_evict_inode(struct inode *ino
+ 	}
+ 
+ 	ret = btrfs_commit_inode_delayed_inode(BTRFS_I(inode));
+-	if (ret) {
+-		btrfs_orphan_del(NULL, BTRFS_I(inode));
++	if (ret)
+ 		goto no_delete;
+-	}
+ 
+ 	rsv = btrfs_alloc_block_rsv(fs_info, BTRFS_BLOCK_RSV_TEMP);
+-	if (!rsv) {
+-		btrfs_orphan_del(NULL, BTRFS_I(inode));
++	if (!rsv)
+ 		goto no_delete;
+-	}
+ 	rsv->size = min_size;
+ 	rsv->failfast = 1;
+ 
+@@ -5255,46 +5173,50 @@ void btrfs_evict_inode(struct inode *ino
+ 
+ 	while (1) {
+ 		trans = evict_refill_and_join(root, rsv, min_size);
+-		if (IS_ERR(trans)) {
+-			btrfs_orphan_del(NULL, BTRFS_I(inode));
+-			btrfs_free_block_rsv(fs_info, rsv);
+-			goto no_delete;
+-		}
++		if (IS_ERR(trans))
++			goto free_rsv;
+ 
+ 		trans->block_rsv = rsv;
+ 
+ 		ret = btrfs_truncate_inode_items(trans, root, inode, 0, 0);
+-		if (ret) {
+-			trans->block_rsv = &fs_info->trans_block_rsv;
+-			btrfs_end_transaction(trans);
+-			btrfs_btree_balance_dirty(fs_info);
+-			if (ret != -ENOSPC && ret != -EAGAIN) {
+-				btrfs_orphan_del(NULL, BTRFS_I(inode));
+-				btrfs_free_block_rsv(fs_info, rsv);
+-				goto no_delete;
+-			}
+-		} else {
++		trans->block_rsv = &fs_info->trans_block_rsv;
++		btrfs_end_transaction(trans);
++		btrfs_btree_balance_dirty(fs_info);
++		if (ret && ret != -ENOSPC && ret != -EAGAIN)
++			goto free_rsv;
++		else if (!ret)
+ 			break;
+-		}
+ 	}
+ 
+-	btrfs_free_block_rsv(fs_info, rsv);
+-
+ 	/*
+-	 * Errors here aren't a big deal, it just means we leave orphan items
+-	 * in the tree.  They will be cleaned up on the next mount.
++	 * Errors here aren't a big deal, it just means we leave orphan items in
++	 * the tree. They will be cleaned up on the next mount. If the inode
++	 * number gets reused, cleanup deletes the orphan item without doing
++	 * anything, and unlink reuses the existing orphan item.
++	 *
++	 * If it turns out that we are dropping too many of these, we might want
++	 * to add a mechanism for retrying these after a commit.
+ 	 */
+-	trans->block_rsv = root->orphan_block_rsv;
+-	btrfs_orphan_del(trans, BTRFS_I(inode));
++	trans = evict_refill_and_join(root, rsv, min_size);
++	if (!IS_ERR(trans)) {
++		trans->block_rsv = rsv;
++		btrfs_orphan_del(trans, BTRFS_I(inode));
++		trans->block_rsv = &fs_info->trans_block_rsv;
++		btrfs_end_transaction(trans);
++	}
+ 
+-	trans->block_rsv = &fs_info->trans_block_rsv;
+ 	if (!(root == fs_info->tree_root ||
+ 	      root->root_key.objectid == BTRFS_TREE_RELOC_OBJECTID))
+ 		btrfs_return_ino(root, btrfs_ino(BTRFS_I(inode)));
+ 
+-	btrfs_end_transaction(trans);
+-	btrfs_btree_balance_dirty(fs_info);
++free_rsv:
++	btrfs_free_block_rsv(fs_info, rsv);
+ no_delete:
++	/*
++	 * If we didn't successfully delete, the orphan item will still be in
++	 * the tree and we'll retry on the next mount. Again, we might also want
++	 * to retry these periodically in the future.
++	 */
+ 	btrfs_remove_delayed_node(BTRFS_I(inode));
+ 	clear_inode(inode);
+ }
