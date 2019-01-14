@@ -1,0 +1,166 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 28 Jun 2018 21:12:10 +0100
+Subject: drm/i915/execlists: Trust the CSB
+Git-commit: fd8526e509020ed30298ab57d03edc97bef83962
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Now that we use the CSB stored in the CPU friendly HWSP, we do not need
+to track interrupts for when the mmio CSB registers are valid and can
+just check where we read up to last from the cached HWSP. This means we
+can forgo the atomic bit tracking from interrupt, and in the next patch
+it means we can check the CSB at any time.
+
+v2: Change the splitting inside reset_prepare, we only want to lose
+testing the interrupt in this patch, the next patch requires the change
+in locking
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180628201211.13837-8-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_irq.c         |   11 +++--------
+ drivers/gpu/drm/i915/intel_engine_cs.c  |    8 ++------
+ drivers/gpu/drm/i915/intel_lrc.c        |   29 ++++-------------------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    1 -
+ 4 files changed, 9 insertions(+), 40 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1493,15 +1493,10 @@ static void snb_gt_irq_handler(struct dr
+ static void
+ gen8_cs_irq_handler(struct intel_engine_cs *engine, u32 iir)
+ {
+-	struct intel_engine_execlists * const execlists = &engine->execlists;
+ 	bool tasklet = false;
+ 
+-	if (iir & GT_CONTEXT_SWITCH_INTERRUPT) {
+-		if (READ_ONCE(engine->execlists.active)) {
+-			set_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted);
+-			tasklet = true;
+-		}
+-	}
++	if (iir & GT_CONTEXT_SWITCH_INTERRUPT)
++		tasklet = true;
+ 
+ 	if (iir & GT_RENDER_USER_INTERRUPT) {
+ 		notify_ring(engine);
+@@ -1509,7 +1504,7 @@ gen8_cs_irq_handler(struct intel_engine_
+ 	}
+ 
+ 	if (tasklet)
+-		tasklet_hi_schedule(&execlists->tasklet);
++		tasklet_hi_schedule(&engine->execlists.tasklet);
+ }
+ 
+ static void gen8_gt_irq_ack(struct drm_i915_private *i915,
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -1353,12 +1353,10 @@ static void intel_engine_print_registers
+ 		ptr = I915_READ(RING_CONTEXT_STATUS_PTR(engine));
+ 		read = GEN8_CSB_READ_PTR(ptr);
+ 		write = GEN8_CSB_WRITE_PTR(ptr);
+-		drm_printf(m, "\tExeclist CSB read %d [%d cached], write %d [%d from hws], interrupt posted? %s, tasklet queued? %s (%s)\n",
++		drm_printf(m, "\tExeclist CSB read %d [%d cached], write %d [%d from hws], tasklet queued? %s (%s)\n",
+ 			   read, execlists->csb_head,
+ 			   write,
+ 			   intel_read_status_page(engine, intel_hws_csb_write_index(engine->i915)),
+-			   yesno(test_bit(ENGINE_IRQ_EXECLIST,
+-					  &engine->irq_posted)),
+ 			   yesno(test_bit(TASKLET_STATE_SCHED,
+ 					  &engine->execlists.tasklet.state)),
+ 			   enableddisabled(!atomic_read(&engine->execlists.tasklet.count)));
+@@ -1570,11 +1568,9 @@ void intel_engine_dump(struct intel_engi
+ 	spin_unlock(&b->rb_lock);
+ 	local_irq_restore(flags);
+ 
+-	drm_printf(m, "IRQ? 0x%lx (breadcrumbs? %s) (execlists? %s)\n",
++	drm_printf(m, "IRQ? 0x%lx (breadcrumbs? %s)\n",
+ 		   engine->irq_posted,
+ 		   yesno(test_bit(ENGINE_IRQ_BREADCRUMB,
+-				  &engine->irq_posted)),
+-		   yesno(test_bit(ENGINE_IRQ_EXECLIST,
+ 				  &engine->irq_posted)));
+ 
+ 	drm_printf(m, "HWSP:\n");
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -874,14 +874,6 @@ static void reset_irq(struct intel_engin
+ 	smp_store_mb(engine->execlists.active, 0);
+ 
+ 	clear_gtiir(engine);
+-
+-	/*
+-	 * The port is checked prior to scheduling a tasklet, but
+-	 * just in case we have suspended the tasklet to do the
+-	 * wedging make sure that when it wakes, it decides there
+-	 * is no work to do by clearing the irq_posted bit.
+-	 */
+-	clear_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted);
+ }
+ 
+ static void reset_csb_pointers(struct intel_engine_execlists *execlists)
+@@ -972,10 +964,6 @@ static void process_csb(struct intel_eng
+ 	const u32 * const buf = execlists->csb_status;
+ 	u8 head, tail;
+ 
+-	/* Clear before reading to catch new interrupts */
+-	clear_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted);
+-	smp_mb__after_atomic();
+-
+ 	/*
+ 	 * Note that csb_write, csb_status may be either in HWSP or mmio.
+ 	 * When reading from the csb_write mmio register, we have to be
+@@ -1128,11 +1116,10 @@ static void execlists_submission_tasklet
+ {
+ 	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
+ 
+-	GEM_TRACE("%s awake?=%d, active=%x, irq-posted?=%d\n",
++	GEM_TRACE("%s awake?=%d, active=%x\n",
+ 		  engine->name,
+ 		  engine->i915->gt.awake,
+-		  engine->execlists.active,
+-		  test_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted));
++		  engine->execlists.active);
+ 
+ 	/*
+ 	 * We can skip acquiring intel_runtime_pm_get() here as it was taken
+@@ -1144,14 +1131,7 @@ static void execlists_submission_tasklet
+ 	 */
+ 	GEM_BUG_ON(!engine->i915->gt.awake);
+ 
+-	/*
+-	 * Prefer doing test_and_clear_bit() as a two stage operation to avoid
+-	 * imposing the cost of a locked atomic transaction when submitting a
+-	 * new request (outside of the context-switch interrupt).
+-	 */
+-	if (test_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted))
+-		process_csb(engine);
+-
++	process_csb(engine);
+ 	if (!execlists_is_active(&engine->execlists, EXECLISTS_ACTIVE_PREEMPT))
+ 		execlists_dequeue(engine);
+ }
+@@ -1919,8 +1899,7 @@ execlists_reset_prepare(struct intel_eng
+ 	 * and avoid blaming an innocent request if the stall was due to the
+ 	 * preemption itself.
+ 	 */
+-	if (test_bit(ENGINE_IRQ_EXECLIST, &engine->irq_posted))
+-		process_csb(engine);
++	process_csb(engine);
+ 
+ 	/*
+ 	 * The last active request can then be no later than the last request
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -366,7 +366,6 @@ struct intel_engine_cs {
+ 
+ 	unsigned long irq_posted;
+ #define ENGINE_IRQ_BREADCRUMB 0
+-#define ENGINE_IRQ_EXECLIST 1
+ 
+ 	/* Rather than have every client wait upon all user interrupts,
+ 	 * with the herd waking after every interrupt and each doing the

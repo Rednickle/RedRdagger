@@ -1,0 +1,230 @@
+From: Thomas Daniel <thomas.daniel@intel.com>
+Date: Fri, 2 Mar 2018 18:14:59 +0200
+Subject: drm/i915/icl: Enhanced execution list support
+Git-commit: 05f0addd9b108d4dfa6853122f453a445f241c2b
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Enhanced Execlists is an upgraded version of execlists which supports
+up to 8 ports. The lrcs to be submitted are written to a submit queue
+(the ExecLists Submission Queue - ELSQ), which is then loaded on the
+HW. When writing to the ELSP register, the lrcs are written cyclically
+in the queue from position 0 to position 7. Alternatively, it is
+possible to write directly in the individual positions of the queue
+using the ELSQC registers. To be able to re-use all the existing code
+we're using the latter method and we're currently limiting ourself to
+only using 2 elements.
+
+v2: Rebase.
+v3: Switch from !IS_GEN11 to GEN < 11 (Daniele Ceraolo Spurio).
+v4: Use the elsq registers instead of elsp. (Daniele Ceraolo Spurio)
+v5: Reword commit, rename regs to be closer to specs, turn off
+    preemption (Daniele), reuse engine->execlists.elsp (Chris)
+v6: use has_logical_ring_elsq to differentiate the new paths
+v7: add preemption support, rename els to submit_reg (Chris)
+v8: save the ctrl register inside the execlists struct, drop CSB
+    handling updates (superseded by preempt_complete_status) (Chris)
+v9: s/drm_i915_gem_request/i915_request (Mika)
+v10: resolved conflict in inject_preempt_context (Mika)
+
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Signed-off-by: Thomas Daniel <thomas.daniel@intel.com>
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Signed-off-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180302161501.28594-4-mika.kuoppala@linux.intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h          |    2 +
+ drivers/gpu/drm/i915/i915_pci.c          |    3 +
+ drivers/gpu/drm/i915/intel_device_info.h |    1 
+ drivers/gpu/drm/i915/intel_lrc.c         |   58 +++++++++++++++++++++++--------
+ drivers/gpu/drm/i915/intel_lrc.h         |    3 +
+ drivers/gpu/drm/i915/intel_ringbuffer.h  |   12 +++++-
+ 6 files changed, 62 insertions(+), 17 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2772,6 +2772,8 @@ intel_info(const struct drm_i915_private
+ 
+ #define HAS_LOGICAL_RING_CONTEXTS(dev_priv) \
+ 		((dev_priv)->info.has_logical_ring_contexts)
++#define HAS_LOGICAL_RING_ELSQ(dev_priv) \
++		((dev_priv)->info.has_logical_ring_elsq)
+ #define HAS_LOGICAL_RING_PREEMPTION(dev_priv) \
+ 		((dev_priv)->info.has_logical_ring_preemption)
+ 
+--- a/drivers/gpu/drm/i915/i915_pci.c
++++ b/drivers/gpu/drm/i915/i915_pci.c
+@@ -594,7 +594,8 @@ static const struct intel_device_info in
+ 	GEN10_FEATURES, \
+ 	GEN(11), \
+ 	.ddb_size = 2048, \
+-	.has_csr = 0
++	.has_csr = 0, \
++	.has_logical_ring_elsq = 1
+ 
+ static const struct intel_device_info intel_icelake_11_info = {
+ 	GEN11_FEATURES,
+--- a/drivers/gpu/drm/i915/intel_device_info.h
++++ b/drivers/gpu/drm/i915/intel_device_info.h
+@@ -96,6 +96,7 @@ enum intel_platform {
+ 	func(has_l3_dpf); \
+ 	func(has_llc); \
+ 	func(has_logical_ring_contexts); \
++	func(has_logical_ring_elsq); \
+ 	func(has_logical_ring_preemption); \
+ 	func(has_overlay); \
+ 	func(has_pooled_eu); \
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -417,18 +417,30 @@ static u64 execlists_update_context(stru
+ 	return ce->lrc_desc;
+ }
+ 
+-static inline void elsp_write(u64 desc, u32 __iomem *elsp)
++static inline void write_desc(struct intel_engine_execlists *execlists, u64 desc, u32 port)
+ {
+-	writel(upper_32_bits(desc), elsp);
+-	writel(lower_32_bits(desc), elsp);
++	if (execlists->ctrl_reg) {
++		writel(lower_32_bits(desc), execlists->submit_reg + port * 2);
++		writel(upper_32_bits(desc), execlists->submit_reg + port * 2 + 1);
++	} else {
++		writel(upper_32_bits(desc), execlists->submit_reg);
++		writel(lower_32_bits(desc), execlists->submit_reg);
++	}
+ }
+ 
+ static void execlists_submit_ports(struct intel_engine_cs *engine)
+ {
+-	struct execlist_port *port = engine->execlists.port;
++	struct intel_engine_execlists *execlists = &engine->execlists;
++	struct execlist_port *port = execlists->port;
+ 	unsigned int n;
+ 
+-	for (n = execlists_num_ports(&engine->execlists); n--; ) {
++	/*
++	 * ELSQ note: the submit queue is not cleared after being submitted
++	 * to the HW so we need to make sure we always clean it up. This is
++	 * currently ensured by the fact that we always write the same number
++	 * of elsq entries, keep this in mind before changing the loop below.
++	 */
++	for (n = execlists_num_ports(execlists); n--; ) {
+ 		struct i915_request *rq;
+ 		unsigned int count;
+ 		u64 desc;
+@@ -452,9 +464,14 @@ static void execlists_submit_ports(struc
+ 			desc = 0;
+ 		}
+ 
+-		elsp_write(desc, engine->execlists.elsp);
++		write_desc(execlists, desc, n);
+ 	}
+-	execlists_clear_active(&engine->execlists, EXECLISTS_ACTIVE_HWACK);
++
++	/* we need to manually load the submit queue */
++	if (execlists->ctrl_reg)
++		writel(EL_CTRL_LOAD, execlists->ctrl_reg);
++
++	execlists_clear_active(execlists, EXECLISTS_ACTIVE_HWACK);
+ }
+ 
+ static bool ctx_single_port_submission(const struct i915_gem_context *ctx)
+@@ -487,11 +504,12 @@ static void port_assign(struct execlist_
+ 
+ static void inject_preempt_context(struct intel_engine_cs *engine)
+ {
++	struct intel_engine_execlists *execlists = &engine->execlists;
+ 	struct intel_context *ce =
+ 		&engine->i915->preempt_context->engine[engine->id];
+ 	unsigned int n;
+ 
+-	GEM_BUG_ON(engine->execlists.preempt_complete_status !=
++	GEM_BUG_ON(execlists->preempt_complete_status !=
+ 		   upper_32_bits(ce->lrc_desc));
+ 	GEM_BUG_ON((ce->lrc_reg_state[CTX_CONTEXT_CONTROL + 1] &
+ 		    _MASKED_BIT_ENABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT |
+@@ -504,10 +522,15 @@ static void inject_preempt_context(struc
+ 	 * the state of the GPU is known (idle).
+ 	 */
+ 	GEM_TRACE("%s\n", engine->name);
+-	for (n = execlists_num_ports(&engine->execlists); --n; )
+-		elsp_write(0, engine->execlists.elsp);
++	for (n = execlists_num_ports(execlists); --n; )
++		write_desc(execlists, 0, n);
++
++	write_desc(execlists, ce->lrc_desc, n);
++
++	/* we need to manually load the submit queue */
++	if (execlists->ctrl_reg)
++		writel(EL_CTRL_LOAD, execlists->ctrl_reg);
+ 
+-	elsp_write(ce->lrc_desc, engine->execlists.elsp);
+ 	execlists_clear_active(&engine->execlists, EXECLISTS_ACTIVE_HWACK);
+ 	execlists_set_active(&engine->execlists, EXECLISTS_ACTIVE_PREEMPT);
+ }
+@@ -2131,8 +2154,15 @@ static int logical_ring_init(struct inte
+ 	if (ret)
+ 		goto error;
+ 
+-	engine->execlists.elsp =
+-		engine->i915->regs + i915_mmio_reg_offset(RING_ELSP(engine));
++	if (HAS_LOGICAL_RING_ELSQ(engine->i915)) {
++		engine->execlists.submit_reg = engine->i915->regs +
++			i915_mmio_reg_offset(RING_EXECLIST_SQ_CONTENTS(engine));
++		engine->execlists.ctrl_reg = engine->i915->regs +
++			i915_mmio_reg_offset(RING_EXECLIST_CONTROL(engine));
++	} else {
++		engine->execlists.submit_reg = engine->i915->regs +
++			i915_mmio_reg_offset(RING_ELSP(engine));
++	}
+ 
+ 	engine->execlists.preempt_complete_status = ~0u;
+ 	if (engine->i915->preempt_context)
+@@ -2401,7 +2431,7 @@ populate_lr_context(struct i915_gem_cont
+ 	if (!engine->default_state)
+ 		regs[CTX_CONTEXT_CONTROL + 1] |=
+ 			_MASKED_BIT_ENABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT);
+-	if (ctx == ctx->i915->preempt_context)
++	if (ctx == ctx->i915->preempt_context && INTEL_GEN(engine->i915) < 11)
+ 		regs[CTX_CONTEXT_CONTROL + 1] |=
+ 			_MASKED_BIT_ENABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT |
+ 					   CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT);
+--- a/drivers/gpu/drm/i915/intel_lrc.h
++++ b/drivers/gpu/drm/i915/intel_lrc.h
+@@ -42,6 +42,9 @@
+ #define RING_CONTEXT_STATUS_BUF_LO(engine, i)	_MMIO((engine)->mmio_base + 0x370 + (i) * 8)
+ #define RING_CONTEXT_STATUS_BUF_HI(engine, i)	_MMIO((engine)->mmio_base + 0x370 + (i) * 8 + 4)
+ #define RING_CONTEXT_STATUS_PTR(engine)		_MMIO((engine)->mmio_base + 0x3a0)
++#define RING_EXECLIST_SQ_CONTENTS(engine)	_MMIO((engine)->mmio_base + 0x510)
++#define RING_EXECLIST_CONTROL(engine)		_MMIO((engine)->mmio_base + 0x550)
++#define	  EL_CTRL_LOAD				(1 << 0)
+ 
+ /* The docs specify that the write pointer wraps around after 5h, "After status
+  * is written out to the last available status QW at offset 5h, this pointer
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -208,9 +208,17 @@ struct intel_engine_execlists {
+ 	bool no_priolist;
+ 
+ 	/**
+-	 * @elsp: the ExecList Submission Port register
++	 * @submit_reg: gen-specific execlist submission register
++	 * set to the ExecList Submission Port (elsp) register pre-Gen11 and to
++	 * the ExecList Submission Queue Contents register array for Gen11+
+ 	 */
+-	u32 __iomem *elsp;
++	u32 __iomem *submit_reg;
++
++	/**
++	 * @ctrl_reg: the enhanced execlists control register, used to load the
++	 * submit queue on the HW and to request preemptions to idle
++	 */
++	u32 __iomem *ctrl_reg;
+ 
+ 	/**
+ 	 * @port: execlist port states

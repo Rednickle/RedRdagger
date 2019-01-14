@@ -1,0 +1,835 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Tue, 6 Feb 2018 20:32:45 -0500
+Subject: drm/amdkfd: Implement KFD process eviction/restore
+Git-commit: 26103436da003327017af325483b6150a3b855cc
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+When the TTM memory manager in KGD evicts BOs, all user mode queues
+potentially accessing these BOs must be evicted temporarily. Once
+user mode queues are evicted, the eviction fence is signaled,
+allowing the migration of the BO to proceed.
+
+A delayed worker is scheduled to restore all the BOs belonging to
+the evicted process and restart its queues.
+
+During suspend/resume of the GPU we also evict all processes to allow
+KGD to save BOs in system memory, since VRAM will be lost.
+
+v2:
+* Account for eviction when updating of q->is_active in MQD manager
+
+Signed-off-by: Harish Kasiviswanathan <Harish.Kasiviswanathan@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c               |   65 +++++
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c |  219 +++++++++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h |    9 
+ drivers/gpu/drm/amd/amdkfd/kfd_module.c               |    2 
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c      |    9 
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c       |    6 
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h                 |   32 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_process.c              |  213 +++++++++++++++++
+ 8 files changed, 547 insertions(+), 8 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -33,6 +33,7 @@
+ #include "kfd_iommu.h"
+ 
+ #define MQD_SIZE_ALIGNED 768
++static atomic_t kfd_device_suspended = ATOMIC_INIT(0);
+ 
+ #ifdef KFD_SUPPORT_IOMMU_V2
+ static const struct kfd_device_info kaveri_device_info = {
+@@ -469,6 +470,10 @@ void kgd2kfd_suspend(struct kfd_dev *kfd
+ 	if (!kfd->init_complete)
+ 		return;
+ 
++	/* For first KFD device suspend all the KFD processes */
++	if (atomic_inc_return(&kfd_device_suspended) == 1)
++		kfd_suspend_all_processes();
++
+ 	kfd->dqm->ops.stop(kfd->dqm);
+ 
+ 	kfd_iommu_suspend(kfd);
+@@ -476,11 +481,21 @@ void kgd2kfd_suspend(struct kfd_dev *kfd
+ 
+ int kgd2kfd_resume(struct kfd_dev *kfd)
+ {
++	int ret, count;
++
+ 	if (!kfd->init_complete)
+ 		return 0;
+ 
+-	return kfd_resume(kfd);
++	ret = kfd_resume(kfd);
++	if (ret)
++		return ret;
++
++	count = atomic_dec_return(&kfd_device_suspended);
++	WARN_ONCE(count < 0, "KFD suspend / resume ref. error");
++	if (count == 0)
++		ret = kfd_resume_all_processes();
+ 
++	return ret;
+ }
+ 
+ static int kfd_resume(struct kfd_dev *kfd)
+@@ -526,6 +541,54 @@ void kgd2kfd_interrupt(struct kfd_dev *k
+ 	spin_unlock(&kfd->interrupt_lock);
+ }
+ 
++/** kgd2kfd_schedule_evict_and_restore_process - Schedules work queue that will
++ *   prepare for safe eviction of KFD BOs that belong to the specified
++ *   process.
++ *
++ * @mm: mm_struct that identifies the specified KFD process
++ * @fence: eviction fence attached to KFD process BOs
++ *
++ */
++int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
++					       struct dma_fence *fence)
++{
++	struct kfd_process *p;
++	unsigned long active_time;
++	unsigned long delay_jiffies = msecs_to_jiffies(PROCESS_ACTIVE_TIME_MS);
++
++	if (!fence)
++		return -EINVAL;
++
++	if (dma_fence_is_signaled(fence))
++		return 0;
++
++	p = kfd_lookup_process_by_mm(mm);
++	if (!p)
++		return -ENODEV;
++
++	if (fence->seqno == p->last_eviction_seqno)
++		goto out;
++
++	p->last_eviction_seqno = fence->seqno;
++
++	/* Avoid KFD process starvation. Wait for at least
++	 * PROCESS_ACTIVE_TIME_MS before evicting the process again
++	 */
++	active_time = get_jiffies_64() - p->last_restore_timestamp;
++	if (delay_jiffies > active_time)
++		delay_jiffies -= active_time;
++	else
++		delay_jiffies = 0;
++
++	/* During process initialization eviction_work.dwork is initialized
++	 * to kfd_evict_bo_worker
++	 */
++	schedule_delayed_work(&p->eviction_work, delay_jiffies);
++out:
++	kfd_unref_process(p);
++	return 0;
++}
++
+ static int kfd_gtt_sa_init(struct kfd_dev *kfd, unsigned int buf_size,
+ 				unsigned int chunk_size)
+ {
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -21,10 +21,11 @@
+  *
+  */
+ 
++#include <linux/ratelimit.h>
++#include <linux/printk.h>
+ #include <linux/slab.h>
+ #include <linux/list.h>
+ #include <linux/types.h>
+-#include <linux/printk.h>
+ #include <linux/bitops.h>
+ #include <linux/sched.h>
+ #include "kfd_priv.h"
+@@ -180,6 +181,14 @@ static int create_queue_nocpsch(struct d
+ 			goto out_unlock;
+ 	}
+ 	q->properties.vmid = qpd->vmid;
++	/*
++	 * Eviction state logic: we only mark active queues as evicted
++	 * to avoid the overhead of restoring inactive queues later
++	 */
++	if (qpd->evicted)
++		q->properties.is_evicted = (q->properties.queue_size > 0 &&
++					    q->properties.queue_percent > 0 &&
++					    q->properties.queue_address != 0);
+ 
+ 	q->properties.tba_addr = qpd->tba_addr;
+ 	q->properties.tma_addr = qpd->tma_addr;
+@@ -377,15 +386,29 @@ static int update_queue(struct device_qu
+ {
+ 	int retval;
+ 	struct mqd_manager *mqd;
++	struct kfd_process_device *pdd;
+ 	bool prev_active = false;
+ 
+ 	mutex_lock(&dqm->lock);
++	pdd = kfd_get_process_device_data(q->device, q->process);
++	if (!pdd) {
++		retval = -ENODEV;
++		goto out_unlock;
++	}
+ 	mqd = dqm->ops.get_mqd_manager(dqm,
+ 			get_mqd_type_from_queue_type(q->properties.type));
+ 	if (!mqd) {
+ 		retval = -ENOMEM;
+ 		goto out_unlock;
+ 	}
++	/*
++	 * Eviction state logic: we only mark active queues as evicted
++	 * to avoid the overhead of restoring inactive queues later
++	 */
++	if (pdd->qpd.evicted)
++		q->properties.is_evicted = (q->properties.queue_size > 0 &&
++					    q->properties.queue_percent > 0 &&
++					    q->properties.queue_address != 0);
+ 
+ 	/* Save previous activity state for counters */
+ 	prev_active = q->properties.is_active;
+@@ -457,6 +480,187 @@ static struct mqd_manager *get_mqd_manag
+ 	return mqd;
+ }
+ 
++static int evict_process_queues_nocpsch(struct device_queue_manager *dqm,
++					struct qcm_process_device *qpd)
++{
++	struct queue *q;
++	struct mqd_manager *mqd;
++	struct kfd_process_device *pdd;
++	int retval = 0;
++
++	mutex_lock(&dqm->lock);
++	if (qpd->evicted++ > 0) /* already evicted, do nothing */
++		goto out;
++
++	pdd = qpd_to_pdd(qpd);
++	pr_info_ratelimited("Evicting PASID %u queues\n",
++			    pdd->process->pasid);
++
++	/* unactivate all active queues on the qpd */
++	list_for_each_entry(q, &qpd->queues_list, list) {
++		if (!q->properties.is_active)
++			continue;
++		mqd = dqm->ops.get_mqd_manager(dqm,
++			get_mqd_type_from_queue_type(q->properties.type));
++		if (!mqd) { /* should not be here */
++			pr_err("Cannot evict queue, mqd mgr is NULL\n");
++			retval = -ENOMEM;
++			goto out;
++		}
++		q->properties.is_evicted = true;
++		q->properties.is_active = false;
++		retval = mqd->destroy_mqd(mqd, q->mqd,
++				KFD_PREEMPT_TYPE_WAVEFRONT_DRAIN,
++				KFD_UNMAP_LATENCY_MS, q->pipe, q->queue);
++		if (retval)
++			goto out;
++		dqm->queue_count--;
++	}
++
++out:
++	mutex_unlock(&dqm->lock);
++	return retval;
++}
++
++static int evict_process_queues_cpsch(struct device_queue_manager *dqm,
++				      struct qcm_process_device *qpd)
++{
++	struct queue *q;
++	struct kfd_process_device *pdd;
++	int retval = 0;
++
++	mutex_lock(&dqm->lock);
++	if (qpd->evicted++ > 0) /* already evicted, do nothing */
++		goto out;
++
++	pdd = qpd_to_pdd(qpd);
++	pr_info_ratelimited("Evicting PASID %u queues\n",
++			    pdd->process->pasid);
++
++	/* unactivate all active queues on the qpd */
++	list_for_each_entry(q, &qpd->queues_list, list) {
++		if (!q->properties.is_active)
++			continue;
++		q->properties.is_evicted = true;
++		q->properties.is_active = false;
++		dqm->queue_count--;
++	}
++	retval = execute_queues_cpsch(dqm,
++				qpd->is_debug ?
++				KFD_UNMAP_QUEUES_FILTER_ALL_QUEUES :
++				KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0);
++
++out:
++	mutex_unlock(&dqm->lock);
++	return retval;
++}
++
++static int restore_process_queues_nocpsch(struct device_queue_manager *dqm,
++					  struct qcm_process_device *qpd)
++{
++	struct queue *q;
++	struct mqd_manager *mqd;
++	struct kfd_process_device *pdd;
++	uint32_t pd_base;
++	int retval = 0;
++
++	pdd = qpd_to_pdd(qpd);
++	/* Retrieve PD base */
++	pd_base = dqm->dev->kfd2kgd->get_process_page_dir(pdd->vm);
++
++	mutex_lock(&dqm->lock);
++	if (WARN_ON_ONCE(!qpd->evicted)) /* already restored, do nothing */
++		goto out;
++	if (qpd->evicted > 1) { /* ref count still > 0, decrement & quit */
++		qpd->evicted--;
++		goto out;
++	}
++
++	pr_info_ratelimited("Restoring PASID %u queues\n",
++			    pdd->process->pasid);
++
++	/* Update PD Base in QPD */
++	qpd->page_table_base = pd_base;
++	pr_debug("Updated PD address to 0x%08x\n", pd_base);
++
++	if (!list_empty(&qpd->queues_list)) {
++		dqm->dev->kfd2kgd->set_vm_context_page_table_base(
++				dqm->dev->kgd,
++				qpd->vmid,
++				qpd->page_table_base);
++		kfd_flush_tlb(pdd);
++	}
++
++	/* activate all active queues on the qpd */
++	list_for_each_entry(q, &qpd->queues_list, list) {
++		if (!q->properties.is_evicted)
++			continue;
++		mqd = dqm->ops.get_mqd_manager(dqm,
++			get_mqd_type_from_queue_type(q->properties.type));
++		if (!mqd) { /* should not be here */
++			pr_err("Cannot restore queue, mqd mgr is NULL\n");
++			retval = -ENOMEM;
++			goto out;
++		}
++		q->properties.is_evicted = false;
++		q->properties.is_active = true;
++		retval = mqd->load_mqd(mqd, q->mqd, q->pipe,
++				       q->queue, &q->properties,
++				       q->process->mm);
++		if (retval)
++			goto out;
++		dqm->queue_count++;
++	}
++	qpd->evicted = 0;
++out:
++	mutex_unlock(&dqm->lock);
++	return retval;
++}
++
++static int restore_process_queues_cpsch(struct device_queue_manager *dqm,
++					struct qcm_process_device *qpd)
++{
++	struct queue *q;
++	struct kfd_process_device *pdd;
++	uint32_t pd_base;
++	int retval = 0;
++
++	pdd = qpd_to_pdd(qpd);
++	/* Retrieve PD base */
++	pd_base = dqm->dev->kfd2kgd->get_process_page_dir(pdd->vm);
++
++	mutex_lock(&dqm->lock);
++	if (WARN_ON_ONCE(!qpd->evicted)) /* already restored, do nothing */
++		goto out;
++	if (qpd->evicted > 1) { /* ref count still > 0, decrement & quit */
++		qpd->evicted--;
++		goto out;
++	}
++
++	pr_info_ratelimited("Restoring PASID %u queues\n",
++			    pdd->process->pasid);
++
++	/* Update PD Base in QPD */
++	qpd->page_table_base = pd_base;
++	pr_debug("Updated PD address to 0x%08x\n", pd_base);
++
++	/* activate all active queues on the qpd */
++	list_for_each_entry(q, &qpd->queues_list, list) {
++		if (!q->properties.is_evicted)
++			continue;
++		q->properties.is_evicted = false;
++		q->properties.is_active = true;
++		dqm->queue_count++;
++	}
++	retval = execute_queues_cpsch(dqm,
++				KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0);
++	if (!retval)
++		qpd->evicted = 0;
++out:
++	mutex_unlock(&dqm->lock);
++	return retval;
++}
++
+ static int register_process(struct device_queue_manager *dqm,
+ 					struct qcm_process_device *qpd)
+ {
+@@ -853,6 +1057,14 @@ static int create_queue_cpsch(struct dev
+ 		retval = -ENOMEM;
+ 		goto out_deallocate_sdma_queue;
+ 	}
++	/*
++	 * Eviction state logic: we only mark active queues as evicted
++	 * to avoid the overhead of restoring inactive queues later
++	 */
++	if (qpd->evicted)
++		q->properties.is_evicted = (q->properties.queue_size > 0 &&
++					    q->properties.queue_percent > 0 &&
++					    q->properties.queue_address != 0);
+ 
+ 	dqm->asic_ops.init_sdma_vm(dqm, q, qpd);
+ 
+@@ -1299,6 +1511,8 @@ struct device_queue_manager *device_queu
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
+ 		dqm->ops.set_trap_handler = set_trap_handler;
+ 		dqm->ops.process_termination = process_termination_cpsch;
++		dqm->ops.evict_process_queues = evict_process_queues_cpsch;
++		dqm->ops.restore_process_queues = restore_process_queues_cpsch;
+ 		break;
+ 	case KFD_SCHED_POLICY_NO_HWS:
+ 		/* initialize dqm for no cp scheduling */
+@@ -1315,6 +1529,9 @@ struct device_queue_manager *device_queu
+ 		dqm->ops.set_cache_memory_policy = set_cache_memory_policy;
+ 		dqm->ops.set_trap_handler = set_trap_handler;
+ 		dqm->ops.process_termination = process_termination_nocpsch;
++		dqm->ops.evict_process_queues = evict_process_queues_nocpsch;
++		dqm->ops.restore_process_queues =
++			restore_process_queues_nocpsch;
+ 		break;
+ 	default:
+ 		pr_err("Invalid scheduling policy %d\n", dqm->sched_policy);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -79,6 +79,10 @@ struct device_process_node {
+  *
+  * @process_termination: Clears all process queues belongs to that device.
+  *
++ * @evict_process_queues: Evict all active queues of a process
++ *
++ * @restore_process_queues: Restore all evicted queues queues of a process
++ *
+  */
+ 
+ struct device_queue_manager_ops {
+@@ -129,6 +133,11 @@ struct device_queue_manager_ops {
+ 
+ 	int (*process_termination)(struct device_queue_manager *dqm,
+ 			struct qcm_process_device *qpd);
++
++	int (*evict_process_queues)(struct device_queue_manager *dqm,
++				    struct qcm_process_device *qpd);
++	int (*restore_process_queues)(struct device_queue_manager *dqm,
++				      struct qcm_process_device *qpd);
+ };
+ 
+ struct device_queue_manager_asic_ops {
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_module.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_module.c
+@@ -43,6 +43,8 @@ static const struct kgd2kfd_calls kgd2kf
+ 	.interrupt	= kgd2kfd_interrupt,
+ 	.suspend	= kgd2kfd_suspend,
+ 	.resume		= kgd2kfd_resume,
++	.schedule_evict_and_restore_process =
++			  kgd2kfd_schedule_evict_and_restore_process,
+ };
+ 
+ int sched_policy = KFD_SCHED_POLICY_HWS;
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -202,7 +202,8 @@ static int __update_mqd(struct mqd_manag
+ 
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+-			q->queue_percent > 0);
++			q->queue_percent > 0 &&
++			!q->is_evicted);
+ 
+ 	return 0;
+ }
+@@ -245,7 +246,8 @@ static int update_mqd_sdma(struct mqd_ma
+ 
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+-			q->queue_percent > 0);
++			q->queue_percent > 0 &&
++			!q->is_evicted);
+ 
+ 	return 0;
+ }
+@@ -377,7 +379,8 @@ static int update_mqd_hiq(struct mqd_man
+ 
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+-			q->queue_percent > 0);
++			q->queue_percent > 0 &&
++			!q->is_evicted);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -198,7 +198,8 @@ static int __update_mqd(struct mqd_manag
+ 
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+-			q->queue_percent > 0);
++			q->queue_percent > 0 &&
++			!q->is_evicted);
+ 
+ 	return 0;
+ }
+@@ -342,7 +343,8 @@ static int update_mqd_sdma(struct mqd_ma
+ 
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+-			q->queue_percent > 0);
++			q->queue_percent > 0 &&
++			!q->is_evicted);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -335,7 +335,11 @@ enum kfd_queue_format {
+  * @is_interop: Defines if this is a interop queue. Interop queue means that
+  * the queue can access both graphics and compute resources.
+  *
+- * @is_active: Defines if the queue is active or not.
++ * @is_evicted: Defines if the queue is evicted. Only active queues
++ * are evicted, rendering them inactive.
++ *
++ * @is_active: Defines if the queue is active or not. @is_active and
++ * @is_evicted are protected by the DQM lock.
+  *
+  * @vmid: If the scheduling mode is no cp scheduling the field defines the vmid
+  * of the queue.
+@@ -357,6 +361,7 @@ struct queue_properties {
+ 	uint32_t __iomem *doorbell_ptr;
+ 	uint32_t doorbell_off;
+ 	bool is_interop;
++	bool is_evicted;
+ 	bool is_active;
+ 	/* Not relevant for user mode queues in cp scheduling */
+ 	unsigned int vmid;
+@@ -460,6 +465,7 @@ struct qcm_process_device {
+ 	unsigned int queue_count;
+ 	unsigned int vmid;
+ 	bool is_debug;
++	unsigned int evicted; /* eviction counter, 0=active */
+ 
+ 	/* This flag tells if we should reset all wavefronts on
+ 	 * process termination
+@@ -486,6 +492,17 @@ struct qcm_process_device {
+ 	uint64_t tma_addr;
+ };
+ 
++/* KFD Memory Eviction */
++
++/* Approx. wait time before attempting to restore evicted BOs */
++#define PROCESS_RESTORE_TIME_MS 100
++/* Approx. back off time if restore fails due to lack of memory */
++#define PROCESS_BACK_OFF_TIME_MS 100
++/* Approx. time before evicting the process again */
++#define PROCESS_ACTIVE_TIME_MS 10
++
++int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
++					       struct dma_fence *fence);
+ 
+ enum kfd_pdd_bound {
+ 	PDD_UNBOUND = 0,
+@@ -600,6 +617,16 @@ struct kfd_process {
+ 	 * during restore
+ 	 */
+ 	struct dma_fence *ef;
++
++	/* Work items for evicting and restoring BOs */
++	struct delayed_work eviction_work;
++	struct delayed_work restore_work;
++	/* seqno of the last scheduled eviction */
++	unsigned int last_eviction_seqno;
++	/* Approx. the last timestamp (in jiffies) when the process was
++	 * restored after an eviction
++	 */
++	unsigned long last_restore_timestamp;
+ };
+ 
+ #define KFD_PROCESS_TABLE_SIZE 5 /* bits: 32 entries */
+@@ -629,7 +656,10 @@ void kfd_process_destroy_wq(void);
+ struct kfd_process *kfd_create_process(struct file *filep);
+ struct kfd_process *kfd_get_process(const struct task_struct *);
+ struct kfd_process *kfd_lookup_process_by_pasid(unsigned int pasid);
++struct kfd_process *kfd_lookup_process_by_mm(const struct mm_struct *mm);
+ void kfd_unref_process(struct kfd_process *p);
++void kfd_suspend_all_processes(void);
++int kfd_resume_all_processes(void);
+ 
+ struct kfd_process_device *kfd_bind_process_to_device(struct kfd_dev *dev,
+ 						struct kfd_process *p);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@ -55,6 +55,9 @@ static struct kfd_process *create_proces
+ 					struct file *filep);
+ static int kfd_process_init_cwsr(struct kfd_process *p, struct file *filep);
+ 
++static void evict_process_worker(struct work_struct *work);
++static void restore_process_worker(struct work_struct *work);
++
+ 
+ void kfd_process_create_wq(void)
+ {
+@@ -230,6 +233,9 @@ static void kfd_process_notifier_release
+ 	mutex_unlock(&kfd_processes_mutex);
+ 	synchronize_srcu(&kfd_processes_srcu);
+ 
++	cancel_delayed_work_sync(&p->eviction_work);
++	cancel_delayed_work_sync(&p->restore_work);
++
+ 	mutex_lock(&p->mutex);
+ 
+ 	/* Iterate over all process device data structures and if the
+@@ -351,6 +357,10 @@ static struct kfd_process *create_proces
+ 	if (err != 0)
+ 		goto err_init_apertures;
+ 
++	INIT_DELAYED_WORK(&process->eviction_work, evict_process_worker);
++	INIT_DELAYED_WORK(&process->restore_work, restore_process_worker);
++	process->last_restore_timestamp = get_jiffies_64();
++
+ 	err = kfd_process_init_cwsr(process, filep);
+ 	if (err)
+ 		goto err_init_cwsr;
+@@ -402,6 +412,7 @@ struct kfd_process_device *kfd_create_pr
+ 	INIT_LIST_HEAD(&pdd->qpd.priv_queue_list);
+ 	pdd->qpd.dqm = dev->dqm;
+ 	pdd->qpd.pqm = &p->pqm;
++	pdd->qpd.evicted = 0;
+ 	pdd->process = p;
+ 	pdd->bound = PDD_UNBOUND;
+ 	pdd->already_dequeued = false;
+@@ -490,6 +501,208 @@ struct kfd_process *kfd_lookup_process_b
+ 	return ret_p;
+ }
+ 
++/* This increments the process->ref counter. */
++struct kfd_process *kfd_lookup_process_by_mm(const struct mm_struct *mm)
++{
++	struct kfd_process *p;
++
++	int idx = srcu_read_lock(&kfd_processes_srcu);
++
++	p = find_process_by_mm(mm);
++	if (p)
++		kref_get(&p->ref);
++
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++
++	return p;
++}
++
++/* process_evict_queues - Evict all user queues of a process
++ *
++ * Eviction is reference-counted per process-device. This means multiple
++ * evictions from different sources can be nested safely.
++ */
++static int process_evict_queues(struct kfd_process *p)
++{
++	struct kfd_process_device *pdd;
++	int r = 0;
++	unsigned int n_evicted = 0;
++
++	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
++		r = pdd->dev->dqm->ops.evict_process_queues(pdd->dev->dqm,
++							    &pdd->qpd);
++		if (r) {
++			pr_err("Failed to evict process queues\n");
++			goto fail;
++		}
++		n_evicted++;
++	}
++
++	return r;
++
++fail:
++	/* To keep state consistent, roll back partial eviction by
++	 * restoring queues
++	 */
++	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
++		if (n_evicted == 0)
++			break;
++		if (pdd->dev->dqm->ops.restore_process_queues(pdd->dev->dqm,
++							      &pdd->qpd))
++			pr_err("Failed to restore queues\n");
++
++		n_evicted--;
++	}
++
++	return r;
++}
++
++/* process_restore_queues - Restore all user queues of a process */
++static  int process_restore_queues(struct kfd_process *p)
++{
++	struct kfd_process_device *pdd;
++	int r, ret = 0;
++
++	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
++		r = pdd->dev->dqm->ops.restore_process_queues(pdd->dev->dqm,
++							      &pdd->qpd);
++		if (r) {
++			pr_err("Failed to restore process queues\n");
++			if (!ret)
++				ret = r;
++		}
++	}
++
++	return ret;
++}
++
++static void evict_process_worker(struct work_struct *work)
++{
++	int ret;
++	struct kfd_process *p;
++	struct delayed_work *dwork;
++
++	dwork = to_delayed_work(work);
++
++	/* Process termination destroys this worker thread. So during the
++	 * lifetime of this thread, kfd_process p will be valid
++	 */
++	p = container_of(dwork, struct kfd_process, eviction_work);
++	WARN_ONCE(p->last_eviction_seqno != p->ef->seqno,
++		  "Eviction fence mismatch\n");
++
++	/* Narrow window of overlap between restore and evict work
++	 * item is possible. Once amdgpu_amdkfd_gpuvm_restore_process_bos
++	 * unreserves KFD BOs, it is possible to evicted again. But
++	 * restore has few more steps of finish. So lets wait for any
++	 * previous restore work to complete
++	 */
++	flush_delayed_work(&p->restore_work);
++
++	pr_debug("Started evicting pasid %d\n", p->pasid);
++	ret = process_evict_queues(p);
++	if (!ret) {
++		dma_fence_signal(p->ef);
++		dma_fence_put(p->ef);
++		p->ef = NULL;
++		schedule_delayed_work(&p->restore_work,
++				msecs_to_jiffies(PROCESS_RESTORE_TIME_MS));
++
++		pr_debug("Finished evicting pasid %d\n", p->pasid);
++	} else
++		pr_err("Failed to evict queues of pasid %d\n", p->pasid);
++}
++
++static void restore_process_worker(struct work_struct *work)
++{
++	struct delayed_work *dwork;
++	struct kfd_process *p;
++	struct kfd_process_device *pdd;
++	int ret = 0;
++
++	dwork = to_delayed_work(work);
++
++	/* Process termination destroys this worker thread. So during the
++	 * lifetime of this thread, kfd_process p will be valid
++	 */
++	p = container_of(dwork, struct kfd_process, restore_work);
++
++	/* Call restore_process_bos on the first KGD device. This function
++	 * takes care of restoring the whole process including other devices.
++	 * Restore can fail if enough memory is not available. If so,
++	 * reschedule again.
++	 */
++	pdd = list_first_entry(&p->per_device_data,
++			       struct kfd_process_device,
++			       per_device_list);
++
++	pr_debug("Started restoring pasid %d\n", p->pasid);
++
++	/* Setting last_restore_timestamp before successful restoration.
++	 * Otherwise this would have to be set by KGD (restore_process_bos)
++	 * before KFD BOs are unreserved. If not, the process can be evicted
++	 * again before the timestamp is set.
++	 * If restore fails, the timestamp will be set again in the next
++	 * attempt. This would mean that the minimum GPU quanta would be
++	 * PROCESS_ACTIVE_TIME_MS - (time to execute the following two
++	 * functions)
++	 */
++
++	p->last_restore_timestamp = get_jiffies_64();
++	ret = pdd->dev->kfd2kgd->restore_process_bos(p->kgd_process_info,
++						     &p->ef);
++	if (ret) {
++		pr_debug("Failed to restore BOs of pasid %d, retry after %d ms\n",
++			 p->pasid, PROCESS_BACK_OFF_TIME_MS);
++		ret = schedule_delayed_work(&p->restore_work,
++				msecs_to_jiffies(PROCESS_BACK_OFF_TIME_MS));
++		WARN(!ret, "reschedule restore work failed\n");
++		return;
++	}
++
++	ret = process_restore_queues(p);
++	if (!ret)
++		pr_debug("Finished restoring pasid %d\n", p->pasid);
++	else
++		pr_err("Failed to restore queues of pasid %d\n", p->pasid);
++}
++
++void kfd_suspend_all_processes(void)
++{
++	struct kfd_process *p;
++	unsigned int temp;
++	int idx = srcu_read_lock(&kfd_processes_srcu);
++
++	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++		cancel_delayed_work_sync(&p->eviction_work);
++		cancel_delayed_work_sync(&p->restore_work);
++
++		if (process_evict_queues(p))
++			pr_err("Failed to suspend process %d\n", p->pasid);
++		dma_fence_signal(p->ef);
++		dma_fence_put(p->ef);
++		p->ef = NULL;
++	}
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++}
++
++int kfd_resume_all_processes(void)
++{
++	struct kfd_process *p;
++	unsigned int temp;
++	int ret = 0, idx = srcu_read_lock(&kfd_processes_srcu);
++
++	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++		if (!schedule_delayed_work(&p->restore_work, 0)) {
++			pr_err("Restore process %d failed during resume\n",
++			       p->pasid);
++			ret = -EFAULT;
++		}
++	}
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++	return ret;
++}
++
+ int kfd_reserved_mem_mmap(struct kfd_process *process,
+ 			  struct vm_area_struct *vma)
+ {

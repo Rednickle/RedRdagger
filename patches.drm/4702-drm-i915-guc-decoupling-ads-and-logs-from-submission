@@ -1,0 +1,451 @@
+From: Sujaritha Sundaresan <sujaritha.sundaresan@intel.com>
+Date: Tue, 2 Jan 2018 13:20:24 -0800
+Subject: drm/i915/guc : Decoupling ADS and logs from submission
+Git-commit: c24f0c1de481c1c0f914e937f409bac2c90b90b3
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+The Additional Data Struct (ADS) contains objects that are required by
+GuC post FW load and are not necessarily submission-only. Even with
+submission disabled we may require something inside the ADS, so it
+makes more sense for them to be always created.
+
+Similarly, we need to access GuC logs and even if GuC submission
+is disabled, to debug issues with GuC loading or with whatever we're using
+GuC for.
+
+v2: re-wording commit message (Sagar)
+
+Signed-off-by: Sujaritha Sundaresan <sujaritha.sundaresan@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Sagar Arun Kamble <sagar.a.kamble@intel.com>
+Reviewed-by: Sagar Arun Kamble <sagar.a.kamble@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/1514928025-29659-1-git-send-email-sujaritha.sundaresan@intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/Makefile               |    1 
+ drivers/gpu/drm/i915/intel_guc.c            |   18 +++
+ drivers/gpu/drm/i915/intel_guc_ads.c        |  151 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_guc_ads.h        |   33 ++++++
+ drivers/gpu/drm/i915/intel_guc_submission.c |  134 ------------------------
+ 5 files changed, 203 insertions(+), 134 deletions(-)
+
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -82,6 +82,7 @@ i915-y += i915_cmd_parser.o \
+ i915-y += intel_uc.o \
+ 	  intel_uc_fw.o \
+ 	  intel_guc.o \
++	  intel_guc_ads.o \
+ 	  intel_guc_ct.o \
+ 	  intel_guc_fw.o \
+ 	  intel_guc_log.o \
+--- a/drivers/gpu/drm/i915/intel_guc.c
++++ b/drivers/gpu/drm/i915/intel_guc.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "intel_guc.h"
++#include "intel_guc_ads.h"
+ #include "intel_guc_submission.h"
+ #include "i915_drv.h"
+ 
+@@ -163,10 +164,25 @@ int intel_guc_init(struct intel_guc *guc
+ 		return ret;
+ 	GEM_BUG_ON(!guc->shared_data);
+ 
++	ret = intel_guc_log_create(guc);
++	if (ret)
++		goto err_shared;
++
++	ret = intel_guc_ads_create(guc);
++	if (ret)
++		goto err_log;
++	GEM_BUG_ON(!guc->ads_vma);
++
+ 	/* We need to notify the guc whenever we change the GGTT */
+ 	i915_ggtt_enable_guc(dev_priv);
+ 
+ 	return 0;
++
++err_log:
++	intel_guc_log_destroy(guc);
++err_shared:
++	guc_shared_data_destroy(guc);
++	return ret;
+ }
+ 
+ void intel_guc_fini(struct intel_guc *guc)
+@@ -174,6 +190,8 @@ void intel_guc_fini(struct intel_guc *gu
+ 	struct drm_i915_private *dev_priv = guc_to_i915(guc);
+ 
+ 	i915_ggtt_disable_guc(dev_priv);
++	intel_guc_ads_destroy(guc);
++	intel_guc_log_destroy(guc);
+ 	guc_shared_data_destroy(guc);
+ }
+ 
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_guc_ads.c
+@@ -0,0 +1,151 @@
++/*
++ * Copyright © 2014-2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#include "intel_guc_ads.h"
++#include "intel_uc.h"
++#include "i915_drv.h"
++
++/*
++ * The Additional Data Struct (ADS) has pointers for different buffers used by
++ * the GuC. One single gem object contains the ADS struct itself (guc_ads), the
++ * scheduling policies (guc_policies), a structure describing a collection of
++ * register sets (guc_mmio_reg_state) and some extra pages for the GuC to save
++ * its internal state for sleep.
++ */
++
++static void guc_policy_init(struct guc_policy *policy)
++{
++	policy->execution_quantum = POLICY_DEFAULT_EXECUTION_QUANTUM_US;
++	policy->preemption_time = POLICY_DEFAULT_PREEMPTION_TIME_US;
++	policy->fault_time = POLICY_DEFAULT_FAULT_TIME_US;
++	policy->policy_flags = 0;
++}
++
++static void guc_policies_init(struct guc_policies *policies)
++{
++	struct guc_policy *policy;
++	u32 p, i;
++
++	policies->dpc_promote_time = POLICY_DEFAULT_DPC_PROMOTE_TIME_US;
++	policies->max_num_work_items = POLICY_MAX_NUM_WI;
++
++	for (p = 0; p < GUC_CLIENT_PRIORITY_NUM; p++) {
++		for (i = GUC_RENDER_ENGINE; i < GUC_MAX_ENGINES_NUM; i++) {
++			policy = &policies->policy[p][i];
++
++			guc_policy_init(policy);
++		}
++	}
++
++	policies->is_valid = 1;
++}
++
++/*
++ * The first 80 dwords of the register state context, containing the
++ * execlists and ppgtt registers.
++ */
++#define LR_HW_CONTEXT_SIZE	(80 * sizeof(u32))
++
++/**
++ * intel_guc_ads_create() - creates GuC ADS
++ * @guc: intel_guc struct
++ *
++ */
++int intel_guc_ads_create(struct intel_guc *guc)
++{
++	struct drm_i915_private *dev_priv = guc_to_i915(guc);
++	struct i915_vma *vma;
++	struct page *page;
++	/* The ads obj includes the struct itself and buffers passed to GuC */
++	struct {
++		struct guc_ads ads;
++		struct guc_policies policies;
++		struct guc_mmio_reg_state reg_state;
++		u8 reg_state_buffer[GUC_S3_SAVE_SPACE_PAGES * PAGE_SIZE];
++	} __packed *blob;
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	const u32 skipped_offset = LRC_HEADER_PAGES * PAGE_SIZE;
++	const u32 skipped_size = LRC_PPHWSP_SZ * PAGE_SIZE + LR_HW_CONTEXT_SIZE;
++	u32 base;
++
++	GEM_BUG_ON(guc->ads_vma);
++
++	vma = intel_guc_allocate_vma(guc, PAGE_ALIGN(sizeof(*blob)));
++	if (IS_ERR(vma))
++		return PTR_ERR(vma);
++
++	guc->ads_vma = vma;
++
++	page = i915_vma_first_page(vma);
++	blob = kmap(page);
++
++	/* GuC scheduling policies */
++	guc_policies_init(&blob->policies);
++
++	/* MMIO reg state */
++	for_each_engine(engine, dev_priv, id) {
++		blob->reg_state.white_list[engine->guc_id].mmio_start =
++			engine->mmio_base + GUC_MMIO_WHITE_LIST_START;
++
++		/* Nothing to be saved or restored for now. */
++		blob->reg_state.white_list[engine->guc_id].count = 0;
++	}
++
++	/*
++	 * The GuC requires a "Golden Context" when it reinitialises
++	 * engines after a reset. Here we use the Render ring default
++	 * context, which must already exist and be pinned in the GGTT,
++	 * so its address won't change after we've told the GuC where
++	 * to find it. Note that we have to skip our header (1 page),
++	 * because our GuC shared data is there.
++	 */
++	blob->ads.golden_context_lrca =
++		guc_ggtt_offset(dev_priv->kernel_context->engine[RCS].state) +
++		skipped_offset;
++
++	/*
++	 * The GuC expects us to exclude the portion of the context image that
++	 * it skips from the size it is to read. It starts reading from after
++	 * the execlist context (so skipping the first page [PPHWSP] and 80
++	 * dwords). Weird guc is weird.
++	 */
++	for_each_engine(engine, dev_priv, id)
++		blob->ads.eng_state_size[engine->guc_id] =
++			engine->context_size - skipped_size;
++
++	base = guc_ggtt_offset(vma);
++	blob->ads.scheduler_policies = base + ptr_offset(blob, policies);
++	blob->ads.reg_state_buffer = base + ptr_offset(blob, reg_state_buffer);
++	blob->ads.reg_state_addr = base + ptr_offset(blob, reg_state);
++
++	kunmap(page);
++
++	return 0;
++}
++
++void intel_guc_ads_destroy(struct intel_guc *guc)
++{
++	i915_vma_unpin_and_release(&guc->ads_vma);
++}
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_guc_ads.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright © 2014-2017 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ */
++
++#ifndef _INTEL_GUC_ADS_H_
++#define _INTEL_GUC_ADS_H_
++
++struct intel_guc;
++
++int intel_guc_ads_create(struct intel_guc *guc);
++void intel_guc_ads_destroy(struct intel_guc *guc);
++
++#endif
+--- a/drivers/gpu/drm/i915/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/intel_guc_submission.c
+@@ -73,13 +73,6 @@
+  * ELSP context descriptor dword into Work Item.
+  * See guc_add_request()
+  *
+- * ADS:
+- * The Additional Data Struct (ADS) has pointers for different buffers used by
+- * the GuC. One single gem object contains the ADS struct itself (guc_ads), the
+- * scheduling policies (guc_policies), a structure describing a collection of
+- * register sets (guc_mmio_reg_state) and some extra pages for the GuC to save
+- * its internal state for sleep.
+- *
+  */
+ 
+ static inline bool is_high_priority(struct intel_guc_client *client)
+@@ -1012,117 +1005,6 @@ static void guc_clients_destroy(struct i
+ 	guc_client_free(client);
+ }
+ 
+-static void guc_policy_init(struct guc_policy *policy)
+-{
+-	policy->execution_quantum = POLICY_DEFAULT_EXECUTION_QUANTUM_US;
+-	policy->preemption_time = POLICY_DEFAULT_PREEMPTION_TIME_US;
+-	policy->fault_time = POLICY_DEFAULT_FAULT_TIME_US;
+-	policy->policy_flags = 0;
+-}
+-
+-static void guc_policies_init(struct guc_policies *policies)
+-{
+-	struct guc_policy *policy;
+-	u32 p, i;
+-
+-	policies->dpc_promote_time = POLICY_DEFAULT_DPC_PROMOTE_TIME_US;
+-	policies->max_num_work_items = POLICY_MAX_NUM_WI;
+-
+-	for (p = 0; p < GUC_CLIENT_PRIORITY_NUM; p++) {
+-		for (i = GUC_RENDER_ENGINE; i < GUC_MAX_ENGINES_NUM; i++) {
+-			policy = &policies->policy[p][i];
+-
+-			guc_policy_init(policy);
+-		}
+-	}
+-
+-	policies->is_valid = 1;
+-}
+-
+-/*
+- * The first 80 dwords of the register state context, containing the
+- * execlists and ppgtt registers.
+- */
+-#define LR_HW_CONTEXT_SIZE	(80 * sizeof(u32))
+-
+-static int guc_ads_create(struct intel_guc *guc)
+-{
+-	struct drm_i915_private *dev_priv = guc_to_i915(guc);
+-	struct i915_vma *vma;
+-	struct page *page;
+-	/* The ads obj includes the struct itself and buffers passed to GuC */
+-	struct {
+-		struct guc_ads ads;
+-		struct guc_policies policies;
+-		struct guc_mmio_reg_state reg_state;
+-		u8 reg_state_buffer[GUC_S3_SAVE_SPACE_PAGES * PAGE_SIZE];
+-	} __packed *blob;
+-	struct intel_engine_cs *engine;
+-	enum intel_engine_id id;
+-	const u32 skipped_offset = LRC_HEADER_PAGES * PAGE_SIZE;
+-	const u32 skipped_size = LRC_PPHWSP_SZ * PAGE_SIZE + LR_HW_CONTEXT_SIZE;
+-	u32 base;
+-
+-	GEM_BUG_ON(guc->ads_vma);
+-
+-	vma = intel_guc_allocate_vma(guc, PAGE_ALIGN(sizeof(*blob)));
+-	if (IS_ERR(vma))
+-		return PTR_ERR(vma);
+-
+-	guc->ads_vma = vma;
+-
+-	page = i915_vma_first_page(vma);
+-	blob = kmap(page);
+-
+-	/* GuC scheduling policies */
+-	guc_policies_init(&blob->policies);
+-
+-	/* MMIO reg state */
+-	for_each_engine(engine, dev_priv, id) {
+-		blob->reg_state.white_list[engine->guc_id].mmio_start =
+-			engine->mmio_base + GUC_MMIO_WHITE_LIST_START;
+-
+-		/* Nothing to be saved or restored for now. */
+-		blob->reg_state.white_list[engine->guc_id].count = 0;
+-	}
+-
+-	/*
+-	 * The GuC requires a "Golden Context" when it reinitialises
+-	 * engines after a reset. Here we use the Render ring default
+-	 * context, which must already exist and be pinned in the GGTT,
+-	 * so its address won't change after we've told the GuC where
+-	 * to find it. Note that we have to skip our header (1 page),
+-	 * because our GuC shared data is there.
+-	 */
+-	blob->ads.golden_context_lrca =
+-		guc_ggtt_offset(dev_priv->kernel_context->engine[RCS].state) +
+-		skipped_offset;
+-
+-	/*
+-	 * The GuC expects us to exclude the portion of the context image that
+-	 * it skips from the size it is to read. It starts reading from after
+-	 * the execlist context (so skipping the first page [PPHWSP] and 80
+-	 * dwords). Weird guc is weird.
+-	 */
+-	for_each_engine(engine, dev_priv, id)
+-		blob->ads.eng_state_size[engine->guc_id] =
+-			engine->context_size - skipped_size;
+-
+-	base = guc_ggtt_offset(vma);
+-	blob->ads.scheduler_policies = base + ptr_offset(blob, policies);
+-	blob->ads.reg_state_buffer = base + ptr_offset(blob, reg_state_buffer);
+-	blob->ads.reg_state_addr = base + ptr_offset(blob, reg_state);
+-
+-	kunmap(page);
+-
+-	return 0;
+-}
+-
+-static void guc_ads_destroy(struct intel_guc *guc)
+-{
+-	i915_vma_unpin_and_release(&guc->ads_vma);
+-}
+-
+ /*
+  * Set up the memory resources to be shared with the GuC (via the GGTT)
+  * at firmware loading time.
+@@ -1146,15 +1028,6 @@ int intel_guc_submission_init(struct int
+ 	 */
+ 	GEM_BUG_ON(!guc->stage_desc_pool);
+ 
+-	ret = intel_guc_log_create(guc);
+-	if (ret < 0)
+-		goto err_stage_desc_pool;
+-
+-	ret = guc_ads_create(guc);
+-	if (ret < 0)
+-		goto err_log;
+-	GEM_BUG_ON(!guc->ads_vma);
+-
+ 	WARN_ON(!guc_verify_doorbells(guc));
+ 	ret = guc_clients_create(guc);
+ 	if (ret)
+@@ -1167,11 +1040,6 @@ int intel_guc_submission_init(struct int
+ 
+ 	return 0;
+ 
+-err_log:
+-	intel_guc_log_destroy(guc);
+-err_stage_desc_pool:
+-	guc_stage_desc_pool_destroy(guc);
+-	return ret;
+ }
+ 
+ void intel_guc_submission_fini(struct intel_guc *guc)
+@@ -1186,8 +1054,6 @@ void intel_guc_submission_fini(struct in
+ 	guc_clients_destroy(guc);
+ 	WARN_ON(!guc_verify_doorbells(guc));
+ 
+-	guc_ads_destroy(guc);
+-	intel_guc_log_destroy(guc);
+ 	guc_stage_desc_pool_destroy(guc);
+ }
+ 

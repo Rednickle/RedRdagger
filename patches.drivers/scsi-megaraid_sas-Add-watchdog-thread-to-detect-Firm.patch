@@ -1,0 +1,395 @@
+From: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+Date: Tue, 16 Oct 2018 23:37:39 -0700
+Subject: [PATCH] scsi: megaraid_sas: Add watchdog thread to detect Firmware
+Git-commit: 3f6194af539464d83b29ed347aceddb336a3625c
+Patch-mainline: v5.0-rc1
+References: FATE#325920
+ fault
+
+Currently driver checks for Firmware state change from ISR context, and
+only when there are interrupts tied with no I/O completions.  We have seen
+multiple cases where doorbell interrupts sent by firmware to indicate FW
+state change are not processed by driver and it takes long time for driver
+to trigger OCR. And if there are no IOs running, since we only check the FW
+state as part of ISR code, fault goes undetected by driver and OCR will not
+be triggered.
+
+This patch introduces a separate workqueue that runs every one second to
+detect Firmware FAULT state and trigger reset immediately.  As an
+additional gain, removing PCI reads from ISR to check FW state results in
+improved performance as well.
+
+Signed-off-by: Sumit Saxena <sumit.saxena@broadcom.com>
+Signed-off-by: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/scsi/megaraid/megaraid_sas.h        |  12 +-
+ drivers/scsi/megaraid/megaraid_sas_base.c   |  34 +++++-
+ drivers/scsi/megaraid/megaraid_sas_fusion.c | 175 ++++++++++++++++++++--------
+ 3 files changed, 167 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index 67d356d84717..8c0f74a2740a 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -1544,6 +1544,10 @@ enum FW_BOOT_CONTEXT {
+ 
+ #define MR_CAN_HANDLE_64_BIT_DMA_OFFSET		(1 << 25)
+ 
++#define MEGASAS_WATCHDOG_THREAD_INTERVAL	1000
++#define MEGASAS_WAIT_FOR_NEXT_DMA_MSECS		20
++#define MEGASAS_WATCHDOG_WAIT_COUNT		50
++
+ enum MR_ADAPTER_TYPE {
+ 	MFI_SERIES = 1,
+ 	THUNDERBOLT_SERIES = 2,
+@@ -2250,7 +2254,9 @@ struct megasas_instance {
+ 	struct megasas_instance_template *instancet;
+ 	struct tasklet_struct isr_tasklet;
+ 	struct work_struct work_init;
+-	struct work_struct crash_init;
++	struct delayed_work fw_fault_work;
++	struct workqueue_struct *fw_fault_work_q;
++	char fault_handler_work_q_name[48];
+ 
+ 	u8 flag;
+ 	u8 unload;
+@@ -2539,7 +2545,6 @@ int megasas_get_target_prop(struct megasas_instance *instance,
+ int megasas_set_crash_dump_params(struct megasas_instance *instance,
+ 	u8 crash_buf_state);
+ void megasas_free_host_crash_buffer(struct megasas_instance *instance);
+-void megasas_fusion_crash_dump_wq(struct work_struct *work);
+ 
+ void megasas_return_cmd_fusion(struct megasas_instance *instance,
+ 	struct megasas_cmd_fusion *cmd);
+@@ -2560,6 +2565,9 @@ int megasas_reset_target_fusion(struct scsi_cmnd *scmd);
+ u32 mega_mod64(u64 dividend, u32 divisor);
+ int megasas_alloc_fusion_context(struct megasas_instance *instance);
+ void megasas_free_fusion_context(struct megasas_instance *instance);
++int megasas_fusion_start_watchdog(struct megasas_instance *instance);
++void megasas_fusion_stop_watchdog(struct megasas_instance *instance);
++
+ void megasas_set_dma_settings(struct megasas_instance *instance,
+ 			      struct megasas_dcmd_frame *dcmd,
+ 			      dma_addr_t dma_addr, u32 dma_len);
+diff --git a/drivers/scsi/megaraid/megaraid_sas_base.c b/drivers/scsi/megaraid/megaraid_sas_base.c
+index 9b90c716f06d..4dc29e055461 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -5582,8 +5582,20 @@ static int megasas_init_fw(struct megasas_instance *instance)
+ 			instance->skip_heartbeat_timer_del = 1;
+ 	}
+ 
++	/*
++	 * Create and start watchdog thread which will monitor
++	 * controller state every 1 sec and trigger OCR when
++	 * it enters fault state
++	 */
++	if (instance->adapter_type != MFI_SERIES)
++		if (megasas_fusion_start_watchdog(instance) != SUCCESS)
++			goto fail_start_watchdog;
++
+ 	return 0;
+ 
++fail_start_watchdog:
++	if (instance->requestorId && !instance->skip_heartbeat_timer_del)
++		del_timer_sync(&instance->sriov_heartbeat_timer);
+ fail_get_ld_pd_list:
+ 	instance->instancet->disable_intr(instance);
+ fail_init_adapter:
+@@ -6434,12 +6446,10 @@ static inline void megasas_init_ctrl_params(struct megasas_instance *instance)
+ 	instance->disableOnlineCtrlReset = 1;
+ 	instance->UnevenSpanSupport = 0;
+ 
+-	if (instance->adapter_type != MFI_SERIES) {
++	if (instance->adapter_type != MFI_SERIES)
+ 		INIT_WORK(&instance->work_init, megasas_fusion_ocr_wq);
+-		INIT_WORK(&instance->crash_init, megasas_fusion_crash_dump_wq);
+-	} else {
++	else
+ 		INIT_WORK(&instance->work_init, process_fw_state_change_wq);
+-	}
+ }
+ 
+ /**
+@@ -6708,6 +6718,10 @@ megasas_suspend(struct pci_dev *pdev, pm_message_t state)
+ 	if (instance->requestorId && !instance->skip_heartbeat_timer_del)
+ 		del_timer_sync(&instance->sriov_heartbeat_timer);
+ 
++	/* Stop the FW fault detection watchdog */
++	if (instance->adapter_type != MFI_SERIES)
++		megasas_fusion_stop_watchdog(instance);
++
+ 	megasas_flush_cache(instance);
+ 	megasas_shutdown_controller(instance, MR_DCMD_HIBERNATE_SHUTDOWN);
+ 
+@@ -6843,8 +6857,16 @@ megasas_resume(struct pci_dev *pdev)
+ 	if (megasas_start_aen(instance))
+ 		dev_err(&instance->pdev->dev, "Start AEN failed\n");
+ 
++	/* Re-launch FW fault watchdog */
++	if (instance->adapter_type != MFI_SERIES)
++		if (megasas_fusion_start_watchdog(instance) != SUCCESS)
++			goto fail_start_watchdog;
++
+ 	return 0;
+ 
++fail_start_watchdog:
++	if (instance->requestorId && !instance->skip_heartbeat_timer_del)
++		del_timer_sync(&instance->sriov_heartbeat_timer);
+ fail_init_mfi:
+ 	megasas_free_ctrl_dma_buffers(instance);
+ 	megasas_free_ctrl_mem(instance);
+@@ -6912,6 +6934,10 @@ static void megasas_detach_one(struct pci_dev *pdev)
+ 	if (instance->requestorId && !instance->skip_heartbeat_timer_del)
+ 		del_timer_sync(&instance->sriov_heartbeat_timer);
+ 
++	/* Stop the FW fault detection watchdog */
++	if (instance->adapter_type != MFI_SERIES)
++		megasas_fusion_stop_watchdog(instance);
++
+ 	if (instance->fw_crash_state != UNAVAILABLE)
+ 		megasas_free_host_crash_buffer(instance);
+ 	scsi_remove_host(instance->host);
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index f74b5ea24f0f..9ca4a52164bd 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -48,6 +48,7 @@
+ #include <linux/mutex.h>
+ #include <linux/poll.h>
+ #include <linux/vmalloc.h>
++#include <linux/workqueue.h>
+ 
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_cmnd.h>
+@@ -95,6 +96,7 @@ static void megasas_free_rdpq_fusion(struct megasas_instance *instance);
+ static void megasas_free_reply_fusion(struct megasas_instance *instance);
+ static inline
+ void megasas_configure_queue_sizes(struct megasas_instance *instance);
++static void megasas_fusion_crash_dump(struct megasas_instance *instance);
+ 
+ /**
+  * megasas_check_same_4gb_region -	check if allocation
+@@ -1759,6 +1761,90 @@ megasas_init_adapter_fusion(struct megasas_instance *instance)
+ 	return 1;
+ }
+ 
++/**
++ * megasas_fault_detect_work	-	Worker function of
++ *					FW fault handling workqueue.
++ */
++static void
++megasas_fault_detect_work(struct work_struct *work)
++{
++	struct megasas_instance *instance =
++		container_of(work, struct megasas_instance,
++			     fw_fault_work.work);
++	u32 fw_state, dma_state, status;
++
++	/* Check the fw state */
++	fw_state = instance->instancet->read_fw_status_reg(instance->reg_set) &
++			MFI_STATE_MASK;
++
++	if (fw_state == MFI_STATE_FAULT) {
++		dma_state = instance->instancet->read_fw_status_reg(
++				instance->reg_set) & MFI_STATE_DMADONE;
++		/* Start collecting crash, if DMA bit is done */
++		if (instance->crash_dump_drv_support &&
++		    instance->crash_dump_app_support && dma_state) {
++			megasas_fusion_crash_dump(instance);
++		} else {
++			if (instance->unload == 0) {
++				status = megasas_reset_fusion(instance->host, 0);
++				if (status != SUCCESS) {
++					dev_err(&instance->pdev->dev,
++						"Failed from %s %d, do not re-arm timer\n",
++						__func__, __LINE__);
++					return;
++				}
++			}
++		}
++	}
++
++	if (instance->fw_fault_work_q)
++		queue_delayed_work(instance->fw_fault_work_q,
++			&instance->fw_fault_work,
++			msecs_to_jiffies(MEGASAS_WATCHDOG_THREAD_INTERVAL));
++}
++
++int
++megasas_fusion_start_watchdog(struct megasas_instance *instance)
++{
++	/* Check if the Fault WQ is already started */
++	if (instance->fw_fault_work_q)
++		return SUCCESS;
++
++	INIT_DELAYED_WORK(&instance->fw_fault_work, megasas_fault_detect_work);
++
++	snprintf(instance->fault_handler_work_q_name,
++		 sizeof(instance->fault_handler_work_q_name),
++		 "poll_megasas%d_status", instance->host->host_no);
++
++	instance->fw_fault_work_q =
++		create_singlethread_workqueue(instance->fault_handler_work_q_name);
++	if (!instance->fw_fault_work_q) {
++		dev_err(&instance->pdev->dev, "Failed from %s %d\n",
++			__func__, __LINE__);
++		return FAILED;
++	}
++
++	queue_delayed_work(instance->fw_fault_work_q,
++			   &instance->fw_fault_work,
++			   msecs_to_jiffies(MEGASAS_WATCHDOG_THREAD_INTERVAL));
++
++	return SUCCESS;
++}
++
++void
++megasas_fusion_stop_watchdog(struct megasas_instance *instance)
++{
++	struct workqueue_struct *wq;
++
++	if (instance->fw_fault_work_q) {
++		wq = instance->fw_fault_work_q;
++		instance->fw_fault_work_q = NULL;
++		if (!cancel_delayed_work_sync(&instance->fw_fault_work))
++			flush_workqueue(wq);
++		destroy_workqueue(wq);
++	}
++}
++
+ /**
+  * map_cmd_status -	Maps FW cmd status to OS cmd status
+  * @cmd :		Pointer to cmd
+@@ -3525,7 +3611,7 @@ irqreturn_t megasas_isr_fusion(int irq, void *devp)
+ {
+ 	struct megasas_irq_context *irq_context = devp;
+ 	struct megasas_instance *instance = irq_context->instance;
+-	u32 mfiStatus, fw_state, dma_state;
++	u32 mfiStatus;
+ 
+ 	if (instance->mask_interrupts)
+ 		return IRQ_NONE;
+@@ -3542,31 +3628,7 @@ irqreturn_t megasas_isr_fusion(int irq, void *devp)
+ 		return IRQ_HANDLED;
+ 	}
+ 
+-	if (!complete_cmd_fusion(instance, irq_context->MSIxIndex)) {
+-		instance->instancet->clear_intr(instance->reg_set);
+-		/* If we didn't complete any commands, check for FW fault */
+-		fw_state = instance->instancet->read_fw_status_reg(
+-			instance->reg_set) & MFI_STATE_MASK;
+-		dma_state = instance->instancet->read_fw_status_reg
+-			(instance->reg_set) & MFI_STATE_DMADONE;
+-		if (instance->crash_dump_drv_support &&
+-			instance->crash_dump_app_support) {
+-			/* Start collecting crash, if DMA bit is done */
+-			if ((fw_state == MFI_STATE_FAULT) && dma_state)
+-				schedule_work(&instance->crash_init);
+-			else if (fw_state == MFI_STATE_FAULT) {
+-				if (instance->unload == 0)
+-					schedule_work(&instance->work_init);
+-			}
+-		} else if (fw_state == MFI_STATE_FAULT) {
+-			dev_warn(&instance->pdev->dev, "Iop2SysDoorbellInt"
+-			       "for scsi%d\n", instance->host->host_no);
+-			if (instance->unload == 0)
+-				schedule_work(&instance->work_init);
+-		}
+-	}
+-
+-	return IRQ_HANDLED;
++	return complete_cmd_fusion(instance, irq_context->MSIxIndex);
+ }
+ 
+ /**
+@@ -4752,13 +4814,12 @@ int megasas_reset_fusion(struct Scsi_Host *shost, int reason)
+ 	return retval;
+ }
+ 
+-/* Fusion Crash dump collection work queue */
+-void  megasas_fusion_crash_dump_wq(struct work_struct *work)
++/* Fusion Crash dump collection */
++void  megasas_fusion_crash_dump(struct megasas_instance *instance)
+ {
+-	struct megasas_instance *instance =
+-		container_of(work, struct megasas_instance, crash_init);
+ 	u32 status_reg;
+ 	u8 partial_copy = 0;
++	int wait = 0;
+ 
+ 
+ 	status_reg = instance->instancet->read_fw_status_reg(instance->reg_set);
+@@ -4786,21 +4847,42 @@ void  megasas_fusion_crash_dump_wq(struct work_struct *work)
+ 			"allocated: %d\n", instance->drv_buf_alloc);
+ 	}
+ 
+-	/*
+-	 * Driver has allocated max buffers, which can be allocated
+-	 * and FW has more crash dump data, then driver will
+-	 * ignore the data.
+-	 */
+-	if (instance->drv_buf_index >= (instance->drv_buf_alloc)) {
+-		dev_info(&instance->pdev->dev, "Driver is done copying "
+-			"the buffer: %d\n", instance->drv_buf_alloc);
+-		status_reg |= MFI_STATE_CRASH_DUMP_DONE;
+-		partial_copy = 1;
+-	} else {
+-		memcpy(instance->crash_buf[instance->drv_buf_index],
+-			instance->crash_dump_buf, CRASH_DMA_BUF_SIZE);
+-		instance->drv_buf_index++;
+-		status_reg &= ~MFI_STATE_DMADONE;
++	while (!(status_reg & MFI_STATE_CRASH_DUMP_DONE) &&
++	       (wait < MEGASAS_WATCHDOG_WAIT_COUNT)) {
++		if (!(status_reg & MFI_STATE_DMADONE)) {
++			/*
++			 * Next crash dump buffer is not yet DMA'd by FW
++			 * Check after 10ms. Wait for 1 second for FW to
++			 * post the next buffer. If not bail out.
++			 */
++			wait++;
++			msleep(MEGASAS_WAIT_FOR_NEXT_DMA_MSECS);
++			status_reg = instance->instancet->read_fw_status_reg(
++					instance->reg_set);
++			continue;
++		}
++
++		wait = 0;
++		if (instance->drv_buf_index >= instance->drv_buf_alloc) {
++			dev_info(&instance->pdev->dev,
++				 "Driver is done copying the buffer: %d\n",
++				 instance->drv_buf_alloc);
++			status_reg |= MFI_STATE_CRASH_DUMP_DONE;
++			partial_copy = 1;
++			break;
++		} else {
++			memcpy(instance->crash_buf[instance->drv_buf_index],
++			       instance->crash_dump_buf, CRASH_DMA_BUF_SIZE);
++			instance->drv_buf_index++;
++			status_reg &= ~MFI_STATE_DMADONE;
++		}
++
++		writel(status_reg, &instance->reg_set->outbound_scratch_pad);
++		readl(&instance->reg_set->outbound_scratch_pad);
++
++		msleep(MEGASAS_WAIT_FOR_NEXT_DMA_MSECS);
++		status_reg = instance->instancet->read_fw_status_reg(
++				instance->reg_set);
+ 	}
+ 
+ 	if (status_reg & MFI_STATE_CRASH_DUMP_DONE) {
+@@ -4813,9 +4895,6 @@ void  megasas_fusion_crash_dump_wq(struct work_struct *work)
+ 		readl(&instance->reg_set->outbound_scratch_pad);
+ 		if (!partial_copy)
+ 			megasas_reset_fusion(instance->host, 0);
+-	} else {
+-		writel(status_reg, &instance->reg_set->outbound_scratch_pad);
+-		readl(&instance->reg_set->outbound_scratch_pad);
+ 	}
+ }
+ 
+-- 
+2.16.4
+

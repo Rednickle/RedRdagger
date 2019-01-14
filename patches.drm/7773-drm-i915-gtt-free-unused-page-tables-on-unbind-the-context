@@ -1,0 +1,127 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 14 Jun 2018 14:43:15 +0100
+Subject: drm/i915/gtt: Free unused page tables on unbind the context
+Git-commit: 4a192c7e8b14a2bf8f30b1fac3599a7d391dfcf9
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+As we cannot reliably change used page tables while the context is
+active, the earliest opportunity we have to recover excess pages is when
+the context becomes idle. So whenever we unbind the context (it must be
+idle, and indeed being evicted) free the unused ptes.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Matthew Auld <matthew.william.auld@gmail.com>
+Reviewed-by: Matthew Auld <matthew.william.auld@gmail.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180614134315.5900-2-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   44 +++++++++++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_gem_gtt.h |    1 
+ 2 files changed, 40 insertions(+), 5 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -1753,20 +1753,28 @@ static void gen6_ppgtt_enable(struct drm
+ static void gen6_ppgtt_clear_range(struct i915_address_space *vm,
+ 				   u64 start, u64 length)
+ {
+-	struct i915_hw_ppgtt *ppgtt = i915_vm_to_ppgtt(vm);
++	struct gen6_hw_ppgtt *ppgtt = to_gen6_ppgtt(i915_vm_to_ppgtt(vm));
+ 	unsigned int first_entry = start >> PAGE_SHIFT;
+ 	unsigned int pde = first_entry / GEN6_PTES;
+ 	unsigned int pte = first_entry % GEN6_PTES;
+ 	unsigned int num_entries = length >> PAGE_SHIFT;
+-	gen6_pte_t scratch_pte =
++	const gen6_pte_t scratch_pte =
+ 		vm->pte_encode(vm->scratch_page.daddr, I915_CACHE_LLC, 0);
+ 
+ 	while (num_entries) {
+-		struct i915_page_table *pt = ppgtt->pd.page_table[pde++];
+-		unsigned int end = min(pte + num_entries, GEN6_PTES);
++		struct i915_page_table *pt = ppgtt->base.pd.page_table[pde++];
++		const unsigned int end = min(pte + num_entries, GEN6_PTES);
++		const unsigned int count = end - pte;
+ 		gen6_pte_t *vaddr;
+ 
+-		num_entries -= end - pte;
++		GEM_BUG_ON(pt == vm->scratch_pt);
++
++		num_entries -= count;
++
++		GEM_BUG_ON(count > pt->used_ptes);
++		pt->used_ptes -= count;
++		if (!pt->used_ptes)
++			ppgtt->scan_for_unused_pt = true;
+ 
+ 		/*
+ 		 * Note that the hw doesn't support removing PDE on the fly
+@@ -1798,6 +1806,8 @@ static void gen6_ppgtt_insert_entries(st
+ 	struct sgt_dma iter = sgt_dma(vma);
+ 	gen6_pte_t *vaddr;
+ 
++	GEM_BUG_ON(ppgtt->pd.page_table[act_pt] == vm->scratch_pt);
++
+ 	vaddr = kmap_atomic_px(ppgtt->pd.page_table[act_pt]);
+ 	do {
+ 		vaddr[act_pte] = pte_encode | GEN6_PTE_ADDR_ENCODE(iter.dma);
+@@ -1833,6 +1843,8 @@ static int gen6_alloc_va_range(struct i9
+ 	bool flush = false;
+ 
+ 	gen6_for_each_pde(pt, &ppgtt->base.pd, start, length, pde) {
++		const unsigned int count = gen6_pte_count(start, length);
++
+ 		if (pt == vm->scratch_pt) {
+ 			pt = alloc_pt(vm);
+ 			if (IS_ERR(pt))
+@@ -1846,7 +1858,11 @@ static int gen6_alloc_va_range(struct i9
+ 				gen6_write_pde(ppgtt, pde, pt);
+ 				flush = true;
+ 			}
++
++			GEM_BUG_ON(pt->used_ptes);
+ 		}
++
++		pt->used_ptes += count;
+ 	}
+ 
+ 	if (flush) {
+@@ -1948,6 +1964,24 @@ static int pd_vma_bind(struct i915_vma *
+ 
+ static void pd_vma_unbind(struct i915_vma *vma)
+ {
++	struct gen6_hw_ppgtt *ppgtt = vma->private;
++	struct i915_page_table * const scratch_pt = ppgtt->base.vm.scratch_pt;
++	struct i915_page_table *pt;
++	unsigned int pde;
++
++	if (!ppgtt->scan_for_unused_pt)
++		return;
++
++	/* Free all no longer used page tables */
++	gen6_for_all_pdes(pt, &ppgtt->base.pd, pde) {
++		if (pt->used_ptes || pt == scratch_pt)
++			continue;
++
++		free_pt(&ppgtt->base.vm, pt);
++		ppgtt->base.pd.page_table[pde] = scratch_pt;
++	}
++
++	ppgtt->scan_for_unused_pt = false;
+ }
+ 
+ static const struct i915_vma_ops pd_vma_ops = {
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -414,6 +414,7 @@ struct gen6_hw_ppgtt {
+ 	gen6_pte_t __iomem *pd_addr;
+ 
+ 	unsigned int pin_count;
++	bool scan_for_unused_pt;
+ };
+ 
+ #define __to_gen6_ppgtt(base) container_of(base, struct gen6_hw_ppgtt, base)

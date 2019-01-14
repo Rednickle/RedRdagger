@@ -1,0 +1,180 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 14 Jun 2018 10:41:03 +0100
+Subject: drm/i915/gtt: Only keep gen6 page directories pinned while active
+Git-commit: a2bbf714834288da0ed4668d4e4d895ffef73de2
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+In order to be able to evict the gen6 ppgtt, we have to unpin it at some
+point. We can simply use our context activity tracking to know when the
+ppgtt is no longer in use by hardware, and so only keep it pinned while
+being used a request.
+
+For the kernel_context (and thus aliasing_ppgtt), it remains pinned at
+all times, as the kernel_context itself is pinned at all times.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Matthew Auld <matthew.william.auld@gmail.com>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180614094103.18025-5-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_gem_gtt.c     |   36 ++++++++++++++++++--------------
+ drivers/gpu/drm/i915/i915_gem_gtt.h     |    5 ++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   28 ++++++++++++++++++++++++
+ 3 files changed, 54 insertions(+), 15 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -1912,7 +1912,6 @@ static void gen6_ppgtt_cleanup(struct i9
+ {
+ 	struct gen6_hw_ppgtt *ppgtt = to_gen6_ppgtt(i915_vm_to_ppgtt(vm));
+ 
+-	i915_vma_unpin(ppgtt->vma);
+ 	i915_vma_destroy(ppgtt->vma);
+ 
+ 	gen6_ppgtt_free_pd(ppgtt);
+@@ -1998,11 +1997,20 @@ static struct i915_vma *pd_vma_create(st
+ 	return vma;
+ }
+ 
+-static int gen6_ppgtt_pin(struct i915_hw_ppgtt *base)
++int gen6_ppgtt_pin(struct i915_hw_ppgtt *base)
+ {
+ 	struct gen6_hw_ppgtt *ppgtt = to_gen6_ppgtt(base);
+ 
+ 	/*
++	 * Workaround the limited maximum vma->pin_count and the aliasing_ppgtt
++	 * which will be pinned into every active context.
++	 * (When vma->pin_count becomes atomic, I expect we will naturally
++	 * need a larger, unpacked, type and kill this redundancy.)
++	 */
++	if (ppgtt->pin_count++)
++		return 0;
++
++	/*
+ 	 * PPGTT PDEs reside in the GGTT and consists of 512 entries. The
+ 	 * allocator works in address space sizes, so it's multiplied by page
+ 	 * size. We allocate at the top of the GTT to avoid fragmentation.
+@@ -2012,6 +2020,17 @@ static int gen6_ppgtt_pin(struct i915_hw
+ 			    PIN_GLOBAL | PIN_HIGH);
+ }
+ 
++void gen6_ppgtt_unpin(struct i915_hw_ppgtt *base)
++{
++	struct gen6_hw_ppgtt *ppgtt = to_gen6_ppgtt(base);
++
++	GEM_BUG_ON(!ppgtt->pin_count);
++	if (--ppgtt->pin_count)
++		return;
++
++	i915_vma_unpin(ppgtt->vma);
++}
++
+ static struct i915_hw_ppgtt *gen6_ppgtt_create(struct drm_i915_private *i915)
+ {
+ 	struct i915_ggtt * const ggtt = &i915->ggtt;
+@@ -2053,21 +2072,8 @@ static struct i915_hw_ppgtt *gen6_ppgtt_
+ 	if (err)
+ 		goto err_vma;
+ 
+-	err = gen6_ppgtt_pin(&ppgtt->base);
+-	if (err)
+-		goto err_pd;
+-
+-	DRM_DEBUG_DRIVER("Allocated pde space (%lldM) at GTT entry: %llx\n",
+-			 ppgtt->vma->node.size >> 20,
+-			 ppgtt->vma->node.start / PAGE_SIZE);
+-
+-	DRM_DEBUG_DRIVER("Adding PPGTT at offset %x\n",
+-			 ppgtt->base.pd.base.ggtt_offset << 10);
+-
+ 	return &ppgtt->base;
+ 
+-err_pd:
+-	gen6_ppgtt_free_pd(ppgtt);
+ err_vma:
+ 	i915_vma_destroy(ppgtt->vma);
+ err_scratch:
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -412,6 +412,8 @@ struct gen6_hw_ppgtt {
+ 
+ 	struct i915_vma *vma;
+ 	gen6_pte_t __iomem *pd_addr;
++
++	unsigned int pin_count;
+ };
+ 
+ #define __to_gen6_ppgtt(base) container_of(base, struct gen6_hw_ppgtt, base)
+@@ -625,6 +627,9 @@ static inline void i915_ppgtt_put(struct
+ 		kref_put(&ppgtt->ref, i915_ppgtt_release);
+ }
+ 
++int gen6_ppgtt_pin(struct i915_hw_ppgtt *base);
++void gen6_ppgtt_unpin(struct i915_hw_ppgtt *base);
++
+ void i915_check_and_clear_faults(struct drm_i915_private *dev_priv);
+ void i915_gem_suspend_gtt_mappings(struct drm_i915_private *dev_priv);
+ void i915_gem_restore_gtt_mappings(struct drm_i915_private *dev_priv);
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1181,6 +1181,27 @@ static void intel_ring_context_destroy(s
+ 		__i915_gem_object_release_unless_active(ce->state->obj);
+ }
+ 
++static int __context_pin_ppgtt(struct i915_gem_context *ctx)
++{
++	struct i915_hw_ppgtt *ppgtt;
++	int err = 0;
++
++	ppgtt = ctx->ppgtt ?: ctx->i915->mm.aliasing_ppgtt;
++	if (ppgtt)
++		err = gen6_ppgtt_pin(ppgtt);
++
++	return err;
++}
++
++static void __context_unpin_ppgtt(struct i915_gem_context *ctx)
++{
++	struct i915_hw_ppgtt *ppgtt;
++
++	ppgtt = ctx->ppgtt ?: ctx->i915->mm.aliasing_ppgtt;
++	if (ppgtt)
++		gen6_ppgtt_unpin(ppgtt);
++}
++
+ static int __context_pin(struct intel_context *ce)
+ {
+ 	struct i915_vma *vma;
+@@ -1229,6 +1250,7 @@ static void __context_unpin(struct intel
+ 
+ static void intel_ring_context_unpin(struct intel_context *ce)
+ {
++	__context_unpin_ppgtt(ce->gem_context);
+ 	__context_unpin(ce);
+ 
+ 	i915_gem_context_put(ce->gem_context);
+@@ -1326,6 +1348,10 @@ __ring_context_pin(struct intel_engine_c
+ 	if (err)
+ 		goto err;
+ 
++	err = __context_pin_ppgtt(ce->gem_context);
++	if (err)
++		goto err_unpin;
++
+ 	i915_gem_context_get(ctx);
+ 
+ 	/* One ringbuffer to rule them all */
+@@ -1334,6 +1360,8 @@ __ring_context_pin(struct intel_engine_c
+ 
+ 	return ce;
+ 
++err_unpin:
++	__context_unpin(ce);
+ err:
+ 	ce->pin_count = 0;
+ 	return ERR_PTR(err);

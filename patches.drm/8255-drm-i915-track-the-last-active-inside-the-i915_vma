@@ -1,0 +1,144 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 6 Jul 2018 13:31:57 +0100
+Subject: drm/i915: Track the last-active inside the i915_vma
+Git-commit: 8b293eb53a7d7605f762351918083a4e402dc784
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Using a VMA on more than one timeline concurrently is the exception
+rather than the rule (using it concurrently on multiple engines). As we
+expect to only use one active tracker, store the most recently used
+tracker inside the i915_vma itself and only fallback to the rbtree if
+we need a second or more concurrent active trackers.
+
+v2: Comments on how we overwrite any existing last_active cache.
+v3: __list_del_entry() before list_replace_init() is confusing and, much
+more important, entirely redundant.
+v4: Note that both last_active and the rbtree may be simultaneously
+tracking this timeline, albeit with different requests, and so the vma
+may be retired twice for the same timeline.
+v5: No, that list_del is required!
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180706123157.9645-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_vma.c |   58 ++++++++++++++++++++++++++++++++++++++--
+ drivers/gpu/drm/i915/i915_vma.h |    1 
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -119,6 +119,12 @@ i915_vma_retire(struct i915_gem_active *
+ 	__i915_vma_retire(active->vma, rq);
+ }
+ 
++static void
++i915_vma_last_retire(struct i915_gem_active *base, struct i915_request *rq)
++{
++	__i915_vma_retire(container_of(base, struct i915_vma, last_active), rq);
++}
++
+ static struct i915_vma *
+ vma_create(struct drm_i915_gem_object *obj,
+ 	   struct i915_address_space *vm,
+@@ -136,6 +142,7 @@ vma_create(struct drm_i915_gem_object *o
+ 
+ 	vma->active = RB_ROOT;
+ 
++	init_request_active(&vma->last_active, i915_vma_last_retire);
+ 	init_request_active(&vma->last_fence, NULL);
+ 	vma->vm = vm;
+ 	vma->ops = &vm->vma_ops;
+@@ -895,6 +902,29 @@ static struct i915_gem_active *active_in
+ {
+ 	struct i915_vma_active *active;
+ 	struct rb_node **p, *parent;
++	struct i915_request *old;
++
++	/*
++	 * We track the most recently used timeline to skip a rbtree search
++	 * for the common case, under typical loads we never need the rbtree
++	 * at all. We can reuse the last_active slot if it is empty, that is
++	 * after the previous activity has been retired, or if the active
++	 * matches the current timeline.
++	 *
++	 * Note that we allow the timeline to be active simultaneously in
++	 * the rbtree and the last_active cache. We do this to avoid having
++	 * to search and replace the rbtree element for a new timeline, with
++	 * the cost being that we must be aware that the vma may be retired
++	 * twice for the same timeline (as the older rbtree element will be
++	 * retired before the new request added to last_active).
++	 */
++	old = i915_gem_active_raw(&vma->last_active,
++				  &vma->vm->i915->drm.struct_mutex);
++	if (!old || old->fence.context == idx)
++		goto out;
++
++	/* Move the currently active fence into the rbtree */
++	idx = old->fence.context;
+ 
+ 	parent = NULL;
+ 	p = &vma->active.rb_node;
+@@ -903,7 +933,7 @@ static struct i915_gem_active *active_in
+ 
+ 		active = rb_entry(parent, struct i915_vma_active, node);
+ 		if (active->timeline == idx)
+-			return &active->base;
++			goto replace;
+ 
+ 		if (active->timeline < idx)
+ 			p = &parent->rb_right;
+@@ -922,7 +952,26 @@ static struct i915_gem_active *active_in
+ 	rb_link_node(&active->node, parent, p);
+ 	rb_insert_color(&active->node, &vma->active);
+ 
+-	return &active->base;
++replace:
++	/*
++	 * Overwrite the previous active slot in the rbtree with last_active,
++	 * leaving last_active zeroed. If the previous slot is still active,
++	 * we must be careful as we now only expect to receive one retire
++	 * callback not two, and so much undo the active counting for the
++	 * overwritten slot.
++	 */
++	if (i915_gem_active_isset(&active->base)) {
++		/* Retire ourselves from the old rq->active_list */
++		__list_del_entry(&active->base.link);
++		vma->active_count--;
++		GEM_BUG_ON(!vma->active_count);
++	}
++	GEM_BUG_ON(list_empty(&vma->last_active.link));
++	list_replace_init(&vma->last_active.link, &active->base.link);
++	active->base.request = fetch_and_zero(&vma->last_active.request);
++
++out:
++	return &vma->last_active;
+ }
+ 
+ int i915_vma_move_to_active(struct i915_vma *vma,
+@@ -1002,6 +1051,11 @@ int i915_vma_unbind(struct i915_vma *vma
+ 		 */
+ 		__i915_vma_pin(vma);
+ 
++		ret = i915_gem_active_retire(&vma->last_active,
++					     &vma->vm->i915->drm.struct_mutex);
++		if (ret)
++			goto unpin;
++
+ 		rbtree_postorder_for_each_entry_safe(active, n,
+ 						     &vma->active, node) {
+ 			ret = i915_gem_active_retire(&active->base,
+--- a/drivers/gpu/drm/i915/i915_vma.h
++++ b/drivers/gpu/drm/i915/i915_vma.h
+@@ -97,6 +97,7 @@ struct i915_vma {
+ 
+ 	unsigned int active_count;
+ 	struct rb_root active;
++	struct i915_gem_active last_active;
+ 	struct i915_gem_active last_fence;
+ 
+ 	/**

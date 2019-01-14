@@ -1,0 +1,381 @@
+From: Jordan Crouse <jcrouse@codeaurora.org>
+Date: Tue, 24 Jul 2018 10:33:27 -0600
+Subject: drm/msm/gpu: Capture the GPU state on a GPU hang
+Git-commit: c0fec7f562ec76404ef0f074a89113a703587f3d
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Capture the GPU state on a GPU hang and store it for later playback
+via the devcoredump facility. Only one crash state is stored at a
+time on the assumption that the first hang is usually the most
+interesting. The existing crash state can be cleared after capturing
+it and then a new one will be captured on the next hang.
+
+Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/Kconfig             |    1 
+ drivers/gpu/drm/msm/adreno/a3xx_gpu.c   |    2 
+ drivers/gpu/drm/msm/adreno/a4xx_gpu.c   |    2 
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c   |    4 +
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c |   36 +++++++++----
+ drivers/gpu/drm/msm/adreno/adreno_gpu.h |    6 +-
+ drivers/gpu/drm/msm/msm_debugfs.c       |    5 +
+ drivers/gpu/drm/msm/msm_gpu.c           |   83 +++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/msm/msm_gpu.h           |   38 +++++++++++++-
+ 9 files changed, 154 insertions(+), 23 deletions(-)
+
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -12,6 +12,7 @@ config DRM_MSM
+ 	select SHMEM
+ 	select TMPFS
+ 	select QCOM_SCM
++	select WANT_DEV_COREDUMP
+ 	select SND_SOC_HDMI_CODEC if SND_SOC
+ 	select SYNC_FILE
+ 	select PM_OPP
+--- a/drivers/gpu/drm/msm/adreno/a3xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a3xx_gpu.c
+@@ -454,7 +454,7 @@ static const struct adreno_gpu_funcs fun
+ 		.active_ring = adreno_active_ring,
+ 		.irq = a3xx_irq,
+ 		.destroy = a3xx_destroy,
+-#ifdef CONFIG_DEBUG_FS
++#if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
+ 		.show = adreno_show,
+ #endif
+ 		.gpu_state_get = a3xx_gpu_state_get,
+--- a/drivers/gpu/drm/msm/adreno/a4xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a4xx_gpu.c
+@@ -540,7 +540,7 @@ static const struct adreno_gpu_funcs fun
+ 		.active_ring = adreno_active_ring,
+ 		.irq = a4xx_irq,
+ 		.destroy = a4xx_destroy,
+-#ifdef CONFIG_DEBUG_FS
++#if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
+ 		.show = adreno_show,
+ #endif
+ 		.gpu_state_get = a4xx_gpu_state_get,
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -1243,8 +1243,10 @@ static const struct adreno_gpu_funcs fun
+ 		.active_ring = a5xx_active_ring,
+ 		.irq = a5xx_irq,
+ 		.destroy = a5xx_destroy,
+-#ifdef CONFIG_DEBUG_FS
++#if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
+ 		.show = adreno_show,
++#endif
++#if defined(CONFIG_DEBUG_FS)
+ 		.debugfs_init = a5xx_debugfs_init,
+ #endif
+ 		.gpu_busy = a5xx_gpu_busy,
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -378,6 +378,8 @@ struct msm_gpu_state *adreno_gpu_state_g
+ 	if (!state)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	kref_init(&state->ref);
++
+ 	do_gettimeofday(&state->time);
+ 
+ 	for (i = 0; i < gpu->nr_rings; i++) {
+@@ -414,18 +416,28 @@ struct msm_gpu_state *adreno_gpu_state_g
+ 	return state;
+ }
+ 
+-void adreno_gpu_state_put(struct msm_gpu_state *state)
++static void adreno_gpu_state_destroy(struct kref *kref)
+ {
+-	if (IS_ERR_OR_NULL(state))
+-		return;
++	struct msm_gpu_state *state = container_of(kref,
++		struct msm_gpu_state, ref);
+ 
++	kfree(state->comm);
++	kfree(state->cmd);
+ 	kfree(state->registers);
+ 	kfree(state);
+ }
+ 
+-#ifdef CONFIG_DEBUG_FS
++int adreno_gpu_state_put(struct msm_gpu_state *state)
++{
++	if (IS_ERR_OR_NULL(state))
++		return 1;
++
++	return kref_put(&state->ref, adreno_gpu_state_destroy);
++}
++
++#if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
+ void adreno_show(struct msm_gpu *gpu, struct msm_gpu_state *state,
+-		struct seq_file *m)
++		struct drm_printer *p)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+ 	int i;
+@@ -433,23 +445,23 @@ void adreno_show(struct msm_gpu *gpu, st
+ 	if (IS_ERR_OR_NULL(state))
+ 		return;
+ 
+-	seq_printf(m, "status:   %08x\n", state->rbbm_status);
+-	seq_printf(m, "revision: %d (%d.%d.%d.%d)\n",
++	drm_printf(p, "status:   %08x\n", state->rbbm_status);
++	drm_printf(p, "revision: %d (%d.%d.%d.%d)\n",
+ 			adreno_gpu->info->revn, adreno_gpu->rev.core,
+ 			adreno_gpu->rev.major, adreno_gpu->rev.minor,
+ 			adreno_gpu->rev.patchid);
+ 
+ 	for (i = 0; i < gpu->nr_rings; i++) {
+-		seq_printf(m, "rb %d: fence:    %d/%d\n", i,
++		drm_printf(p, "rb %d: fence:    %d/%d\n", i,
+ 			state->ring[i].fence, state->ring[i].seqno);
+ 
+-		seq_printf(m, "      rptr:     %d\n", state->ring[i].rptr);
+-		seq_printf(m, "rb wptr:  %d\n", state->ring[i].wptr);
++		drm_printf(p, "      rptr:     %d\n", state->ring[i].rptr);
++		drm_printf(p, "rb wptr:  %d\n", state->ring[i].wptr);
+ 	}
+ 
+-	seq_printf(m, "IO:region %s 00000000 00020000\n", gpu->name);
++	drm_printf(p, "IO:region %s 00000000 00020000\n", gpu->name);
+ 	for (i = 0; i < state->nr_registers; i++) {
+-		seq_printf(m, "IO:R %08x %08x\n",
++		drm_printf(p, "IO:R %08x %08x\n",
+ 			state->registers[i * 2] << 2,
+ 			state->registers[(i * 2) + 1]);
+ 	}
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.h
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.h
+@@ -215,9 +215,9 @@ void adreno_submit(struct msm_gpu *gpu,
+ 		struct msm_file_private *ctx);
+ void adreno_flush(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+ bool adreno_idle(struct msm_gpu *gpu, struct msm_ringbuffer *ring);
+-#ifdef CONFIG_DEBUG_FS
++#if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
+ void adreno_show(struct msm_gpu *gpu, struct msm_gpu_state *state,
+-		struct seq_file *m);
++		struct drm_printer *p);
+ #endif
+ void adreno_dump_info(struct msm_gpu *gpu);
+ void adreno_dump(struct msm_gpu *gpu);
+@@ -231,7 +231,7 @@ void adreno_gpu_cleanup(struct adreno_gp
+ 
+ 
+ struct msm_gpu_state *adreno_gpu_state_get(struct msm_gpu *gpu);
+-void adreno_gpu_state_put(struct msm_gpu_state *state);
++int adreno_gpu_state_put(struct msm_gpu_state *state);
+ 
+ /* ringbuffer helpers (the parts that are adreno specific) */
+ 
+--- a/drivers/gpu/drm/msm/msm_debugfs.c
++++ b/drivers/gpu/drm/msm/msm_debugfs.c
+@@ -29,6 +29,7 @@ struct msm_gpu_show_priv {
+ 
+ static int msm_gpu_show(struct seq_file *m, void *arg)
+ {
++	struct drm_printer p = drm_seq_file_printer(m);
+ 	struct msm_gpu_show_priv *show_priv = m->private;
+ 	struct msm_drm_private *priv = show_priv->dev->dev_private;
+ 	struct msm_gpu *gpu = priv->gpu;
+@@ -38,8 +39,8 @@ static int msm_gpu_show(struct seq_file
+ 	if (ret)
+ 		return ret;
+ 
+-	seq_printf(m, "%s Status:\n", gpu->name);
+-	gpu->funcs->show(gpu, show_priv->state, m);
++	drm_printf(&p, "%s Status:\n", gpu->name);
++	gpu->funcs->show(gpu, show_priv->state, &p);
+ 
+ 	mutex_unlock(&show_priv->dev->struct_mutex);
+ 
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -20,10 +20,11 @@
+ #include "msm_mmu.h"
+ #include "msm_fence.h"
+ 
++#include <generated/utsrelease.h>
+ #include <linux/string_helpers.h>
+ #include <linux/pm_opp.h>
+ #include <linux/devfreq.h>
+-
++#include <linux/devcoredump.h>
+ 
+ /*
+  * Power Management:
+@@ -273,6 +274,81 @@ int msm_gpu_hw_init(struct msm_gpu *gpu)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_DEV_COREDUMP
++static ssize_t msm_gpu_devcoredump_read(char *buffer, loff_t offset,
++		size_t count, void *data, size_t datalen)
++{
++	struct msm_gpu *gpu = data;
++	struct drm_print_iterator iter;
++	struct drm_printer p;
++	struct msm_gpu_state *state;
++
++	state = msm_gpu_crashstate_get(gpu);
++	if (!state)
++		return 0;
++
++	iter.data = buffer;
++	iter.offset = 0;
++	iter.start = offset;
++	iter.remain = count;
++
++	p = drm_coredump_printer(&iter);
++
++	drm_printf(&p, "---\n");
++	drm_printf(&p, "kernel: " UTS_RELEASE "\n");
++	drm_printf(&p, "module: " KBUILD_MODNAME "\n");
++	drm_printf(&p, "time: %ld.%ld\n",
++		state->time.tv_sec, state->time.tv_usec);
++	if (state->comm)
++		drm_printf(&p, "comm: %s\n", state->comm);
++	if (state->cmd)
++		drm_printf(&p, "cmdline: %s\n", state->cmd);
++
++	gpu->funcs->show(gpu, state, &p);
++
++	msm_gpu_crashstate_put(gpu);
++
++	return count - iter.remain;
++}
++
++static void msm_gpu_devcoredump_free(void *data)
++{
++	struct msm_gpu *gpu = data;
++
++	msm_gpu_crashstate_put(gpu);
++}
++
++static void msm_gpu_crashstate_capture(struct msm_gpu *gpu, char *comm,
++		char *cmd)
++{
++	struct msm_gpu_state *state;
++
++	/* Only save one crash state at a time */
++	if (gpu->crashstate)
++		return;
++
++	state = gpu->funcs->gpu_state_get(gpu);
++	if (IS_ERR_OR_NULL(state))
++		return;
++
++	/* Fill in the additional crash state information */
++	state->comm = kstrdup(comm, GFP_KERNEL);
++	state->cmd = kstrdup(cmd, GFP_KERNEL);
++
++	/* Set the active crash state to be dumped on failure */
++	gpu->crashstate = state;
++
++	/* FIXME: Release the crashstate if this errors out? */
++	dev_coredumpm(gpu->dev->dev, THIS_MODULE, gpu, 0, GFP_KERNEL,
++		msm_gpu_devcoredump_read, msm_gpu_devcoredump_free);
++}
++#else
++static void msm_gpu_crashstate_capture(struct msm_gpu *gpu, char *comm,
++		char *cmd)
++{
++}
++#endif
++
+ /*
+  * Hangcheck detection for locked gpu:
+  */
+@@ -356,6 +432,11 @@ static void recover_worker(struct work_s
+ 			msm_rd_dump_submit(priv->hangrd, submit, NULL);
+ 	}
+ 
++	/* Record the crash state */
++	pm_runtime_get_sync(&gpu->pdev->dev);
++	msm_gpu_crashstate_capture(gpu, comm, cmd);
++	pm_runtime_put_sync(&gpu->pdev->dev);
++
+ 	kfree(cmd);
+ 	kfree(comm);
+ 
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -66,13 +66,13 @@ struct msm_gpu_funcs {
+ #ifdef CONFIG_DEBUG_FS
+ 	/* show GPU status in debugfs: */
+ 	void (*show)(struct msm_gpu *gpu, struct msm_gpu_state *state,
+-			struct seq_file *m);
++			struct drm_printer *p);
+ 	/* for generation specific debugfs: */
+ 	int (*debugfs_init)(struct msm_gpu *gpu, struct drm_minor *minor);
+ #endif
+ 	int (*gpu_busy)(struct msm_gpu *gpu, uint64_t *value);
+ 	struct msm_gpu_state *(*gpu_state_get)(struct msm_gpu *gpu);
+-	void (*gpu_state_put)(struct msm_gpu_state *state);
++	int (*gpu_state_put)(struct msm_gpu_state *state);
+ };
+ 
+ struct msm_gpu {
+@@ -133,6 +133,8 @@ struct msm_gpu {
+ 		u64 busy_cycles;
+ 		ktime_t time;
+ 	} devfreq;
++
++	struct msm_gpu_state *crashstate;
+ };
+ 
+ /* It turns out that all targets use the same ringbuffer size */
+@@ -180,6 +182,7 @@ struct msm_gpu_submitqueue {
+ };
+ 
+ struct msm_gpu_state {
++	struct kref ref;
+ 	struct timeval time;
+ 
+ 	struct {
+@@ -194,6 +197,9 @@ struct msm_gpu_state {
+ 	u32 *registers;
+ 
+ 	u32 rbbm_status;
++
++	char *comm;
++	char *cmd;
+ };
+ 
+ static inline void gpu_write(struct msm_gpu *gpu, u32 reg, u32 data)
+@@ -275,4 +281,32 @@ static inline void msm_submitqueue_put(s
+ 		kref_put(&queue->ref, msm_submitqueue_destroy);
+ }
+ 
++static inline struct msm_gpu_state *msm_gpu_crashstate_get(struct msm_gpu *gpu)
++{
++	struct msm_gpu_state *state = NULL;
++
++	mutex_lock(&gpu->dev->struct_mutex);
++
++	if (gpu->crashstate) {
++		kref_get(&gpu->crashstate->ref);
++		state = gpu->crashstate;
++	}
++
++	mutex_unlock(&gpu->dev->struct_mutex);
++
++	return state;
++}
++
++static inline void msm_gpu_crashstate_put(struct msm_gpu *gpu)
++{
++	mutex_lock(&gpu->dev->struct_mutex);
++
++	if (gpu->crashstate) {
++		if (gpu->funcs->gpu_state_put(gpu->crashstate))
++			gpu->crashstate = NULL;
++	}
++
++	mutex_unlock(&gpu->dev->struct_mutex);
++}
++
+ #endif /* __MSM_GPU_H__ */

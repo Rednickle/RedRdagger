@@ -1,0 +1,131 @@
+From 1223de2968ede7023a62528e49b78db41678e1cd Mon Sep 17 00:00:00 2001
+From: Mike Christie <mchristi@redhat.com>
+Date: Tue, 28 Nov 2017 12:40:31 -0600
+Subject: [PATCH] tcmu: move expired command completion to unmap thread
+Git-commit: 488ebe4c355fdead39dbb3f6a51329c16cbfcc60
+Patch-mainline: v4.16-rc1
+References: bsc#1118978
+
+This moves the expired command completion handling to
+the unmap wq, so the next patch can use a mutex
+in tcmu_check_expired_cmd.
+
+Note:
+tcmu_device_timedout's use of spin_lock_irq was not needed.
+The commands_lock is used between thread context (tcmu_queue_cmd_ring
+and tcmu_irqcontrol (even though this is named irqcontrol it is not
+run in irq context)) and timer/bh context. In the timer/bh context
+bhs are disabled, so you need to use the _bh lock calls from the
+thread context callers.
+
+Signed-off-by: Mike Christie <mchristi@redhat.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Acked-by: David Disseldorp <ddiss@suse.de>
+[ddiss@suse.de: rebase against SLE kernel without e99e88a9d2b06]
+
+---
+ drivers/target/target_core_user.c | 48 +++++++++++++++++++++++++++++++--------
+ 1 file changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/target/target_core_user.c b/drivers/target/target_core_user.c
+index bb1902686357..da88619658a0 100644
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@ -143,6 +143,7 @@ struct tcmu_dev {
+ 
+ 	struct timer_list timeout;
+ 	unsigned int cmd_time_out;
++	struct list_head timedout_entry;
+ 
+ 	spinlock_t nl_cmd_lock;
+ 	struct tcmu_nl_cmd curr_nl_cmd;
+@@ -179,6 +180,9 @@ struct tcmu_cmd {
+ static DEFINE_MUTEX(root_udev_mutex);
+ static LIST_HEAD(root_udev);
+ 
++static DEFINE_SPINLOCK(timed_out_udevs_lock);
++static LIST_HEAD(timed_out_udevs);
++
+ static atomic_t global_db_count = ATOMIC_INIT(0);
+ static struct work_struct tcmu_unmap_work;
+ 
+@@ -1085,18 +1089,15 @@ static int tcmu_check_expired_cmd(int id, void *p, void *data)
+ static void tcmu_device_timedout(unsigned long data)
+ {
+ 	struct tcmu_dev *udev = (struct tcmu_dev *)data;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&udev->commands_lock, flags);
+-	idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
+-	spin_unlock_irqrestore(&udev->commands_lock, flags);
++	pr_debug("%s cmd timeout has expired\n", udev->name);
+ 
+-	schedule_work(&tcmu_unmap_work);
++	spin_lock(&timed_out_udevs_lock);
++	if (list_empty(&udev->timedout_entry))
++		list_add_tail(&udev->timedout_entry, &timed_out_udevs);
++	spin_unlock(&timed_out_udevs_lock);
+ 
+-	/*
+-	 * We don't need to wakeup threads on wait_cmdr since they have their
+-	 * own timeout.
+-	 */
++	schedule_work(&tcmu_unmap_work);
+ }
+ 
+ static int tcmu_attach_hba(struct se_hba *hba, u32 host_id)
+@@ -1140,6 +1141,7 @@ static struct se_device *tcmu_alloc_device(struct se_hba *hba, const char *name)
+ 	init_waitqueue_head(&udev->wait_cmdr);
+ 	mutex_init(&udev->cmdr_lock);
+ 
++	INIT_LIST_HEAD(&udev->timedout_entry);
+ 	idr_init(&udev->commands);
+ 	spin_lock_init(&udev->commands_lock);
+ 
+@@ -1354,6 +1356,11 @@ static void tcmu_dev_kref_release(struct kref *kref)
+ 	vfree(udev->mb_addr);
+ 	udev->mb_addr = NULL;
+ 
++	spin_lock_bh(&timed_out_udevs_lock);
++	if (!list_empty(&udev->timedout_entry))
++		list_del(&udev->timedout_entry);
++	spin_unlock_bh(&timed_out_udevs_lock);
++
+ 	/* Upper layer should drain all requests before calling this */
+ 	spin_lock_irq(&udev->commands_lock);
+ 	idr_for_each_entry(&udev->commands, cmd, i) {
+@@ -2070,8 +2077,31 @@ static void run_cmdr_queues(void)
+ 	mutex_unlock(&root_udev_mutex);
+ }
+ 
++static void check_timedout_devices(void)
++{
++	struct tcmu_dev *udev, *tmp_dev;
++	LIST_HEAD(devs);
++
++	spin_lock_bh(&timed_out_udevs_lock);
++	list_splice_init(&timed_out_udevs, &devs);
++
++	list_for_each_entry_safe(udev, tmp_dev, &devs, timedout_entry) {
++		list_del_init(&udev->timedout_entry);
++		spin_unlock_bh(&timed_out_udevs_lock);
++
++		spin_lock(&udev->commands_lock);
++		idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
++		spin_unlock(&udev->commands_lock);
++
++		spin_lock_bh(&timed_out_udevs_lock);
++	}
++
++	spin_unlock_bh(&timed_out_udevs_lock);
++}
++
+ static void tcmu_unmap_work_fn(struct work_struct *work)
+ {
++	check_timedout_devices();
+ 	find_free_blocks();
+ 	run_cmdr_queues();
+ }
+-- 
+2.13.7
+

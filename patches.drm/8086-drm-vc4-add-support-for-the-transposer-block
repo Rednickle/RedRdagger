@@ -1,0 +1,842 @@
+From: Boris Brezillon <boris.brezillon@free-electrons.com>
+Date: Tue, 3 Jul 2018 09:50:22 +0200
+Subject: drm/vc4: Add support for the transposer block
+Git-commit: 008095e065a85a13ffb41b9c98149456267c30b8
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+The transposer block is providing support for mem-to-mem composition,
+which is exposed as a drm_writeback connector in DRM.
+
+Add a driver to support this feature.
+
+Signed-off-by: Boris Brezillon <boris.brezillon@free-electrons.com>
+Reviewed-by: Eric Anholt <eric@anholt.net>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180703075022.15138-9-boris.brezillon@bootlin.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ Documentation/devicetree/bindings/display/brcm,bcm-vc4.txt |    6 
+ drivers/gpu/drm/vc4/Makefile                               |    1 
+ drivers/gpu/drm/vc4/vc4_crtc.c                             |  138 +++
+ drivers/gpu/drm/vc4/vc4_debugfs.c                          |    1 
+ drivers/gpu/drm/vc4/vc4_drv.c                              |    1 
+ drivers/gpu/drm/vc4/vc4_drv.h                              |    7 
+ drivers/gpu/drm/vc4/vc4_txp.c                              |  477 +++++++++++++
+ 7 files changed, 607 insertions(+), 24 deletions(-)
+
+--- a/Documentation/devicetree/bindings/display/brcm,bcm-vc4.txt
++++ b/Documentation/devicetree/bindings/display/brcm,bcm-vc4.txt
+@@ -74,6 +74,12 @@ Required properties for DSI:
+ 		The 3 clocks output from the DSI analog PHY: dsi[01]_byte,
+ 		dsi[01]_ddr2, and dsi[01]_ddr
+ 
++Required properties for the TXP (writeback) block:
++- compatible:	Should be "brcm,bcm2835-txp"
++- reg:		Physical base address and length of the TXP block's registers
++- interrupts:	The interrupt number
++		  See bindings/interrupt-controller/brcm,bcm2835-armctrl-ic.txt
++
+ [1] Documentation/devicetree/bindings/media/video-interfaces.txt
+ 
+ Example:
+--- a/drivers/gpu/drm/vc4/Makefile
++++ b/drivers/gpu/drm/vc4/Makefile
+@@ -18,6 +18,7 @@ vc4-y := \
+ 	vc4_plane.o \
+ 	vc4_render_cl.o \
+ 	vc4_trace_points.o \
++	vc4_txp.o \
+ 	vc4_v3d.o \
+ 	vc4_validate.o \
+ 	vc4_validate_shaders.o
+--- a/drivers/gpu/drm/vc4/vc4_crtc.c
++++ b/drivers/gpu/drm/vc4/vc4_crtc.c
+@@ -46,6 +46,8 @@ struct vc4_crtc_state {
+ 	struct drm_crtc_state base;
+ 	/* Dlist area for this CRTC configuration. */
+ 	struct drm_mm_node mm;
++	bool feed_txp;
++	bool txp_armed;
+ };
+ 
+ static inline struct vc4_crtc_state *
+@@ -324,10 +326,8 @@ static struct drm_encoder *vc4_get_crtc_
+ 	return NULL;
+ }
+ 
+-static void vc4_crtc_mode_set_nofb(struct drm_crtc *crtc)
++static void vc4_crtc_config_pv(struct drm_crtc *crtc)
+ {
+-	struct drm_device *dev = crtc->dev;
+-	struct vc4_dev *vc4 = to_vc4_dev(dev);
+ 	struct drm_encoder *encoder = vc4_get_crtc_encoder(crtc);
+ 	struct vc4_encoder *vc4_encoder = to_vc4_encoder(encoder);
+ 	struct vc4_crtc *vc4_crtc = to_vc4_crtc(crtc);
+@@ -338,12 +338,6 @@ static void vc4_crtc_mode_set_nofb(struc
+ 	bool is_dsi = (vc4_encoder->type == VC4_ENCODER_TYPE_DSI0 ||
+ 		       vc4_encoder->type == VC4_ENCODER_TYPE_DSI1);
+ 	u32 format = is_dsi ? PV_CONTROL_FORMAT_DSIV_24 : PV_CONTROL_FORMAT_24;
+-	bool debug_dump_regs = false;
+-
+-	if (debug_dump_regs) {
+-		DRM_INFO("CRTC %d regs before:\n", drm_crtc_index(crtc));
+-		vc4_crtc_dump_regs(vc4_crtc);
+-	}
+ 
+ 	/* Reset the PV fifo. */
+ 	CRTC_WRITE(PV_CONTROL, 0);
+@@ -419,6 +413,49 @@ static void vc4_crtc_mode_set_nofb(struc
+ 				 PV_CONTROL_CLK_SELECT) |
+ 		   PV_CONTROL_FIFO_CLR |
+ 		   PV_CONTROL_EN);
++}
++
++static void vc4_crtc_mode_set_nofb(struct drm_crtc *crtc)
++{
++	struct drm_device *dev = crtc->dev;
++	struct vc4_dev *vc4 = to_vc4_dev(dev);
++	struct vc4_crtc *vc4_crtc = to_vc4_crtc(crtc);
++	struct vc4_crtc_state *vc4_state = to_vc4_crtc_state(crtc->state);
++	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
++	bool interlace = mode->flags & DRM_MODE_FLAG_INTERLACE;
++	bool debug_dump_regs = false;
++
++	if (debug_dump_regs) {
++		DRM_INFO("CRTC %d regs before:\n", drm_crtc_index(crtc));
++		vc4_crtc_dump_regs(vc4_crtc);
++	}
++
++	if (vc4_crtc->channel == 2) {
++		u32 dispctrl;
++		u32 dsp3_mux;
++
++		/*
++		 * SCALER_DISPCTRL_DSP3 = X, where X < 2 means 'connect DSP3 to
++		 * FIFO X'.
++		 * SCALER_DISPCTRL_DSP3 = 3 means 'disable DSP 3'.
++		 *
++		 * DSP3 is connected to FIFO2 unless the transposer is
++		 * enabled. In this case, FIFO 2 is directly accessed by the
++		 * TXP IP, and we need to disable the FIFO2 -> pixelvalve1
++		 * route.
++		 */
++		if (vc4_state->feed_txp)
++			dsp3_mux = VC4_SET_FIELD(3, SCALER_DISPCTRL_DSP3_MUX);
++		else
++			dsp3_mux = VC4_SET_FIELD(2, SCALER_DISPCTRL_DSP3_MUX);
++
++		dispctrl = HVS_READ(SCALER_DISPCTRL) &
++			   ~SCALER_DISPCTRL_DSP3_MUX_MASK;
++		HVS_WRITE(SCALER_DISPCTRL, dispctrl | dsp3_mux);
++	}
++
++	if (!vc4_state->feed_txp)
++		vc4_crtc_config_pv(crtc);
+ 
+ 	HVS_WRITE(SCALER_DISPBKGNDX(vc4_crtc->channel),
+ 		  SCALER_DISPBKGND_AUTOHS |
+@@ -499,6 +536,13 @@ static void vc4_crtc_atomic_disable(stru
+ 	}
+ }
+ 
++void vc4_crtc_txp_armed(struct drm_crtc_state *state)
++{
++	struct vc4_crtc_state *vc4_state = to_vc4_crtc_state(state);
++
++	vc4_state->txp_armed = true;
++}
++
+ static void vc4_crtc_update_dlist(struct drm_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->dev;
+@@ -514,8 +558,11 @@ static void vc4_crtc_update_dlist(struct
+ 		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+ 
+ 		spin_lock_irqsave(&dev->event_lock, flags);
+-		vc4_crtc->event = crtc->state->event;
+-		crtc->state->event = NULL;
++
++		if (!vc4_state->feed_txp || vc4_state->txp_armed) {
++			vc4_crtc->event = crtc->state->event;
++			crtc->state->event = NULL;
++		}
+ 
+ 		HVS_WRITE(SCALER_DISPLISTX(vc4_crtc->channel),
+ 			  vc4_state->mm.start);
+@@ -533,8 +580,8 @@ static void vc4_crtc_atomic_enable(struc
+ 	struct drm_device *dev = crtc->dev;
+ 	struct vc4_dev *vc4 = to_vc4_dev(dev);
+ 	struct vc4_crtc *vc4_crtc = to_vc4_crtc(crtc);
+-	struct drm_crtc_state *state = crtc->state;
+-	struct drm_display_mode *mode = &state->adjusted_mode;
++	struct vc4_crtc_state *vc4_state = to_vc4_crtc_state(crtc->state);
++	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
+ 
+ 	require_hvs_enabled(dev);
+ 
+@@ -546,15 +593,21 @@ static void vc4_crtc_atomic_enable(struc
+ 
+ 	/* Turn on the scaler, which will wait for vstart to start
+ 	 * compositing.
++	 * When feeding the transposer, we should operate in oneshot
++	 * mode.
+ 	 */
+ 	HVS_WRITE(SCALER_DISPCTRLX(vc4_crtc->channel),
+ 		  VC4_SET_FIELD(mode->hdisplay, SCALER_DISPCTRLX_WIDTH) |
+ 		  VC4_SET_FIELD(mode->vdisplay, SCALER_DISPCTRLX_HEIGHT) |
+-		  SCALER_DISPCTRLX_ENABLE);
++		  SCALER_DISPCTRLX_ENABLE |
++		  (vc4_state->feed_txp ? SCALER_DISPCTRLX_ONESHOT : 0));
+ 
+-	/* Turn on the pixel valve, which will emit the vstart signal. */
+-	CRTC_WRITE(PV_V_CONTROL,
+-		   CRTC_READ(PV_V_CONTROL) | PV_VCONTROL_VIDEN);
++	/* When feeding the transposer block the pixelvalve is unneeded and
++	 * should not be enabled.
++	 */
++	if (!vc4_state->feed_txp)
++		CRTC_WRITE(PV_V_CONTROL,
++			   CRTC_READ(PV_V_CONTROL) | PV_VCONTROL_VIDEN);
+ }
+ 
+ static enum drm_mode_status vc4_crtc_mode_valid(struct drm_crtc *crtc,
+@@ -579,8 +632,10 @@ static int vc4_crtc_atomic_check(struct
+ 	struct drm_plane *plane;
+ 	unsigned long flags;
+ 	const struct drm_plane_state *plane_state;
++	struct drm_connector *conn;
++	struct drm_connector_state *conn_state;
+ 	u32 dlist_count = 0;
+-	int ret;
++	int ret, i;
+ 
+ 	/* The pixelvalve can only feed one encoder (and encoders are
+ 	 * 1:1 with connectors.)
+@@ -600,6 +655,24 @@ static int vc4_crtc_atomic_check(struct
+ 	if (ret)
+ 		return ret;
+ 
++	for_each_new_connector_in_state(state->state, conn, conn_state, i) {
++		if (conn_state->crtc != crtc)
++			continue;
++
++		/* The writeback connector is implemented using the transposer
++		 * block which is directly taking its data from the HVS FIFO.
++		 */
++		if (conn->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
++			state->no_vblank = true;
++			vc4_state->feed_txp = true;
++		} else {
++			state->no_vblank = false;
++			vc4_state->feed_txp = false;
++		}
++
++		break;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -713,7 +786,8 @@ static void vc4_crtc_handle_page_flip(st
+ 
+ 	spin_lock_irqsave(&dev->event_lock, flags);
+ 	if (vc4_crtc->event &&
+-	    (vc4_state->mm.start == HVS_READ(SCALER_DISPLACTX(chan)))) {
++	    (vc4_state->mm.start == HVS_READ(SCALER_DISPLACTX(chan)) ||
++	     vc4_state->feed_txp)) {
+ 		drm_crtc_send_vblank_event(crtc, vc4_crtc->event);
+ 		vc4_crtc->event = NULL;
+ 		drm_crtc_vblank_put(crtc);
+@@ -721,6 +795,13 @@ static void vc4_crtc_handle_page_flip(st
+ 	spin_unlock_irqrestore(&dev->event_lock, flags);
+ }
+ 
++void vc4_crtc_handle_vblank(struct vc4_crtc *crtc)
++{
++	crtc->t_vblank = ktime_get();
++	drm_crtc_handle_vblank(&crtc->base);
++	vc4_crtc_handle_page_flip(crtc);
++}
++
+ static irqreturn_t vc4_crtc_irq_handler(int irq, void *data)
+ {
+ 	struct vc4_crtc *vc4_crtc = data;
+@@ -728,10 +809,8 @@ static irqreturn_t vc4_crtc_irq_handler(
+ 	irqreturn_t ret = IRQ_NONE;
+ 
+ 	if (stat & PV_INT_VFP_START) {
+-		vc4_crtc->t_vblank = ktime_get();
+ 		CRTC_WRITE(PV_INTSTAT, PV_INT_VFP_START);
+-		drm_crtc_handle_vblank(&vc4_crtc->base);
+-		vc4_crtc_handle_page_flip(vc4_crtc);
++		vc4_crtc_handle_vblank(vc4_crtc);
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+@@ -884,12 +963,15 @@ static int vc4_page_flip(struct drm_crtc
+ 
+ static struct drm_crtc_state *vc4_crtc_duplicate_state(struct drm_crtc *crtc)
+ {
+-	struct vc4_crtc_state *vc4_state;
++	struct vc4_crtc_state *vc4_state, *old_vc4_state;
+ 
+ 	vc4_state = kzalloc(sizeof(*vc4_state), GFP_KERNEL);
+ 	if (!vc4_state)
+ 		return NULL;
+ 
++	old_vc4_state = to_vc4_crtc_state(crtc->state);
++	vc4_state->feed_txp = old_vc4_state->feed_txp;
++
+ 	__drm_atomic_helper_crtc_duplicate_state(crtc, &vc4_state->base);
+ 	return &vc4_state->base;
+ }
+@@ -987,9 +1069,17 @@ static void vc4_set_crtc_possible_masks(
+ 	struct drm_encoder *encoder;
+ 
+ 	drm_for_each_encoder(encoder, drm) {
+-		struct vc4_encoder *vc4_encoder = to_vc4_encoder(encoder);
++		struct vc4_encoder *vc4_encoder;
+ 		int i;
+ 
++		/* HVS FIFO2 can feed the TXP IP. */
++		if (crtc_data->hvs_channel == 2 &&
++		    encoder->encoder_type == DRM_MODE_ENCODER_VIRTUAL) {
++			encoder->possible_crtcs |= drm_crtc_mask(crtc);
++			continue;
++		}
++
++		vc4_encoder = to_vc4_encoder(encoder);
+ 		for (i = 0; i < ARRAY_SIZE(crtc_data->encoder_types); i++) {
+ 			if (vc4_encoder->type == encoder_types[i]) {
+ 				vc4_encoder->clock_select = i;
+--- a/drivers/gpu/drm/vc4/vc4_debugfs.c
++++ b/drivers/gpu/drm/vc4/vc4_debugfs.c
+@@ -21,6 +21,7 @@ static const struct drm_info_list vc4_de
+ 	{"dsi1_regs", vc4_dsi_debugfs_regs, 0, (void *)(uintptr_t)1},
+ 	{"hdmi_regs", vc4_hdmi_debugfs_regs, 0},
+ 	{"vec_regs", vc4_vec_debugfs_regs, 0},
++	{"txp_regs", vc4_txp_debugfs_regs, 0},
+ 	{"hvs_regs", vc4_hvs_debugfs_regs, 0},
+ 	{"crtc0_regs", vc4_crtc_debugfs_regs, 0, (void *)(uintptr_t)0},
+ 	{"crtc1_regs", vc4_crtc_debugfs_regs, 0, (void *)(uintptr_t)1},
+--- a/drivers/gpu/drm/vc4/vc4_drv.c
++++ b/drivers/gpu/drm/vc4/vc4_drv.c
+@@ -344,6 +344,7 @@ static struct platform_driver *const com
+ 	&vc4_vec_driver,
+ 	&vc4_dpi_driver,
+ 	&vc4_dsi_driver,
++	&vc4_txp_driver,
+ 	&vc4_hvs_driver,
+ 	&vc4_crtc_driver,
+ 	&vc4_v3d_driver,
+--- a/drivers/gpu/drm/vc4/vc4_drv.h
++++ b/drivers/gpu/drm/vc4/vc4_drv.h
+@@ -72,6 +72,7 @@ struct vc4_dev {
+ 	struct vc4_dpi *dpi;
+ 	struct vc4_dsi *dsi1;
+ 	struct vc4_vec *vec;
++	struct vc4_txp *txp;
+ 
+ 	struct vc4_hang_state *hang_state;
+ 
+@@ -697,6 +698,8 @@ bool vc4_crtc_get_scanoutpos(struct drm_
+ 			     bool in_vblank_irq, int *vpos, int *hpos,
+ 			     ktime_t *stime, ktime_t *etime,
+ 			     const struct drm_display_mode *mode);
++void vc4_crtc_handle_vblank(struct vc4_crtc *crtc);
++void vc4_crtc_txp_armed(struct drm_crtc_state *state);
+ 
+ /* vc4_debugfs.c */
+ int vc4_debugfs_init(struct drm_minor *minor);
+@@ -744,6 +747,10 @@ int vc4_hdmi_debugfs_regs(struct seq_fil
+ extern struct platform_driver vc4_vec_driver;
+ int vc4_vec_debugfs_regs(struct seq_file *m, void *unused);
+ 
++/* vc4_txp.c */
++extern struct platform_driver vc4_txp_driver;
++int vc4_txp_debugfs_regs(struct seq_file *m, void *unused);
++
+ /* vc4_irq.c */
+ irqreturn_t vc4_irq(int irq, void *arg);
+ void vc4_irq_preinstall(struct drm_device *dev);
+--- /dev/null
++++ b/drivers/gpu/drm/vc4/vc4_txp.c
+@@ -0,0 +1,477 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2018 Broadcom
++ *
++ * Authors:
++ *	Eric Anholt <eric@anholt.net>
++ *	Boris Brezillon <boris.brezillon@bootlin.com>
++ */
++
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_fb_cma_helper.h>
++#include <drm/drm_crtc_helper.h>
++#include <drm/drm_edid.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_writeback.h>
++#include <linux/clk.h>
++#include <linux/component.h>
++#include <linux/of_graph.h>
++#include <linux/of_platform.h>
++#include <linux/pm_runtime.h>
++
++#include "vc4_drv.h"
++#include "vc4_regs.h"
++
++/* Base address of the output.  Raster formats must be 4-byte aligned,
++ * T and LT must be 16-byte aligned or maybe utile-aligned (docs are
++ * inconsistent, but probably utile).
++ */
++#define TXP_DST_PTR		0x00
++
++/* Pitch in bytes for raster images, 16-byte aligned.  For tiled, it's
++ * the width in tiles.
++ */
++#define TXP_DST_PITCH		0x04
++/* For T-tiled imgaes, DST_PITCH should be the number of tiles wide,
++ * shifted up.
++ */
++# define TXP_T_TILE_WIDTH_SHIFT		7
++/* For LT-tiled images, DST_PITCH should be the number of utiles wide,
++ * shifted up.
++ */
++# define TXP_LT_TILE_WIDTH_SHIFT	4
++
++/* Pre-rotation width/height of the image.  Must match HVS config.
++ *
++ * If TFORMAT and 32-bit, limit is 1920 for 32-bit and 3840 to 16-bit
++ * and width/height must be tile or utile-aligned as appropriate.  If
++ * transposing (rotating), width is limited to 1920.
++ *
++ * Height is limited to various numbers between 4088 and 4095.  I'd
++ * just use 4088 to be safe.
++ */
++#define TXP_DIM			0x08
++# define TXP_HEIGHT_SHIFT		16
++# define TXP_HEIGHT_MASK		GENMASK(31, 16)
++# define TXP_WIDTH_SHIFT		0
++# define TXP_WIDTH_MASK			GENMASK(15, 0)
++
++#define TXP_DST_CTRL		0x0c
++/* These bits are set to 0x54 */
++#define TXP_PILOT_SHIFT			24
++#define TXP_PILOT_MASK			GENMASK(31, 24)
++/* Bits 22-23 are set to 0x01 */
++#define TXP_VERSION_SHIFT		22
++#define TXP_VERSION_MASK		GENMASK(23, 22)
++
++/* Powers down the internal memory. */
++# define TXP_POWERDOWN			BIT(21)
++
++/* Enables storing the alpha component in 8888/4444, instead of
++ * filling with ~ALPHA_INVERT.
++ */
++# define TXP_ALPHA_ENABLE		BIT(20)
++
++/* 4 bits, each enables stores for a channel in each set of 4 bytes.
++ * Set to 0xf for normal operation.
++ */
++# define TXP_BYTE_ENABLE_SHIFT		16
++# define TXP_BYTE_ENABLE_MASK		GENMASK(19, 16)
++
++/* Debug: Generate VSTART again at EOF. */
++# define TXP_VSTART_AT_EOF		BIT(15)
++
++/* Debug: Terminate the current frame immediately.  Stops AXI
++ * writes.
++ */
++# define TXP_ABORT			BIT(14)
++
++# define TXP_DITHER			BIT(13)
++
++/* Inverts alpha if TXP_ALPHA_ENABLE, chooses fill value for
++ * !TXP_ALPHA_ENABLE.
++ */
++# define TXP_ALPHA_INVERT		BIT(12)
++
++/* Note: I've listed the channels here in high bit (in byte 3/2/1) to
++ * low bit (in byte 0) order.
++ */
++# define TXP_FORMAT_SHIFT		8
++# define TXP_FORMAT_MASK		GENMASK(11, 8)
++# define TXP_FORMAT_ABGR4444		0
++# define TXP_FORMAT_ARGB4444		1
++# define TXP_FORMAT_BGRA4444		2
++# define TXP_FORMAT_RGBA4444		3
++# define TXP_FORMAT_BGR565		6
++# define TXP_FORMAT_RGB565		7
++/* 888s are non-rotated, raster-only */
++# define TXP_FORMAT_BGR888		8
++# define TXP_FORMAT_RGB888		9
++# define TXP_FORMAT_ABGR8888		12
++# define TXP_FORMAT_ARGB8888		13
++# define TXP_FORMAT_BGRA8888		14
++# define TXP_FORMAT_RGBA8888		15
++
++/* If TFORMAT is set, generates LT instead of T format. */
++# define TXP_LINEAR_UTILE		BIT(7)
++
++/* Rotate output by 90 degrees. */
++# define TXP_TRANSPOSE			BIT(6)
++
++/* Generate a tiled format for V3D. */
++# define TXP_TFORMAT			BIT(5)
++
++/* Generates some undefined test mode output. */
++# define TXP_TEST_MODE			BIT(4)
++
++/* Request odd field from HVS. */
++# define TXP_FIELD			BIT(3)
++
++/* Raise interrupt when idle. */
++# define TXP_EI				BIT(2)
++
++/* Set when generating a frame, clears when idle. */
++# define TXP_BUSY			BIT(1)
++
++/* Starts a frame.  Self-clearing. */
++# define TXP_GO				BIT(0)
++
++/* Number of lines received and committed to memory. */
++#define TXP_PROGRESS		0x10
++
++#define TXP_READ(offset) readl(txp->regs + (offset))
++#define TXP_WRITE(offset, val) writel(val, txp->regs + (offset))
++
++struct vc4_txp {
++	struct platform_device *pdev;
++
++	struct drm_writeback_connector connector;
++
++	void __iomem *regs;
++};
++
++static inline struct vc4_txp *encoder_to_vc4_txp(struct drm_encoder *encoder)
++{
++	return container_of(encoder, struct vc4_txp, connector.encoder);
++}
++
++static inline struct vc4_txp *connector_to_vc4_txp(struct drm_connector *conn)
++{
++	return container_of(conn, struct vc4_txp, connector.base);
++}
++
++#define TXP_REG(reg) { reg, #reg }
++static const struct {
++	u32 reg;
++	const char *name;
++} txp_regs[] = {
++	TXP_REG(TXP_DST_PTR),
++	TXP_REG(TXP_DST_PITCH),
++	TXP_REG(TXP_DIM),
++	TXP_REG(TXP_DST_CTRL),
++	TXP_REG(TXP_PROGRESS),
++};
++
++#ifdef CONFIG_DEBUG_FS
++int vc4_txp_debugfs_regs(struct seq_file *m, void *unused)
++{
++	struct drm_info_node *node = (struct drm_info_node *)m->private;
++	struct drm_device *dev = node->minor->dev;
++	struct vc4_dev *vc4 = to_vc4_dev(dev);
++	struct vc4_txp *txp = vc4->txp;
++	int i;
++
++	if (!txp)
++		return 0;
++
++	for (i = 0; i < ARRAY_SIZE(txp_regs); i++) {
++		seq_printf(m, "%s (0x%04x): 0x%08x\n",
++			   txp_regs[i].name, txp_regs[i].reg,
++			   TXP_READ(txp_regs[i].reg));
++	}
++
++	return 0;
++}
++#endif
++
++static int vc4_txp_connector_get_modes(struct drm_connector *connector)
++{
++	struct drm_device *dev = connector->dev;
++
++	return drm_add_modes_noedid(connector, dev->mode_config.max_width,
++				    dev->mode_config.max_height);
++}
++
++static enum drm_mode_status
++vc4_txp_connector_mode_valid(struct drm_connector *connector,
++			     struct drm_display_mode *mode)
++{
++	struct drm_device *dev = connector->dev;
++	struct drm_mode_config *mode_config = &dev->mode_config;
++	int w = mode->hdisplay, h = mode->vdisplay;
++
++	if (w < mode_config->min_width || w > mode_config->max_width)
++		return MODE_BAD_HVALUE;
++
++	if (h < mode_config->min_height || h > mode_config->max_height)
++		return MODE_BAD_VVALUE;
++
++	return MODE_OK;
++}
++
++static const u32 drm_fmts[] = {
++	DRM_FORMAT_RGB888,
++	DRM_FORMAT_BGR888,
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_RGBX8888,
++	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_RGBA8888,
++	DRM_FORMAT_BGRA8888,
++};
++
++static const u32 txp_fmts[] = {
++	TXP_FORMAT_RGB888,
++	TXP_FORMAT_BGR888,
++	TXP_FORMAT_ARGB8888,
++	TXP_FORMAT_ABGR8888,
++	TXP_FORMAT_ARGB8888,
++	TXP_FORMAT_ABGR8888,
++	TXP_FORMAT_RGBA8888,
++	TXP_FORMAT_BGRA8888,
++	TXP_FORMAT_RGBA8888,
++	TXP_FORMAT_BGRA8888,
++};
++
++static int vc4_txp_connector_atomic_check(struct drm_connector *conn,
++					struct drm_connector_state *conn_state)
++{
++	struct drm_crtc_state *crtc_state;
++	struct drm_gem_cma_object *gem;
++	struct drm_framebuffer *fb;
++	int i;
++
++	if (!conn_state->writeback_job || !conn_state->writeback_job->fb)
++		return 0;
++
++	crtc_state = drm_atomic_get_new_crtc_state(conn_state->state,
++						   conn_state->crtc);
++
++	fb = conn_state->writeback_job->fb;
++	if (fb->width != crtc_state->mode.hdisplay ||
++	    fb->height != crtc_state->mode.vdisplay) {
++		DRM_DEBUG_KMS("Invalid framebuffer size %ux%u\n",
++			      fb->width, fb->height);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(drm_fmts); i++) {
++		if (fb->format->format == drm_fmts[i])
++			break;
++	}
++
++	if (i == ARRAY_SIZE(drm_fmts))
++		return -EINVAL;
++
++	gem = drm_fb_cma_get_gem_obj(fb, 0);
++
++	/* Pitch must be aligned on 16 bytes. */
++	if (fb->pitches[0] & GENMASK(3, 0))
++		return -EINVAL;
++
++	vc4_crtc_txp_armed(crtc_state);
++
++	return 0;
++}
++
++static void vc4_txp_connector_atomic_commit(struct drm_connector *conn,
++					struct drm_connector_state *conn_state)
++{
++	struct vc4_txp *txp = connector_to_vc4_txp(conn);
++	struct drm_gem_cma_object *gem;
++	struct drm_display_mode *mode;
++	struct drm_framebuffer *fb;
++	u32 ctrl;
++	int i;
++
++	if (WARN_ON(!conn_state->writeback_job ||
++		    !conn_state->writeback_job->fb))
++		return;
++
++	mode = &conn_state->crtc->state->adjusted_mode;
++	fb = conn_state->writeback_job->fb;
++
++	for (i = 0; i < ARRAY_SIZE(drm_fmts); i++) {
++		if (fb->format->format == drm_fmts[i])
++			break;
++	}
++
++	if (WARN_ON(i == ARRAY_SIZE(drm_fmts)))
++		return;
++
++	ctrl = TXP_GO | TXP_VSTART_AT_EOF | TXP_EI |
++	       VC4_SET_FIELD(0xf, TXP_BYTE_ENABLE) |
++	       VC4_SET_FIELD(txp_fmts[i], TXP_FORMAT);
++
++	if (fb->format->has_alpha)
++		ctrl |= TXP_ALPHA_ENABLE;
++
++	gem = drm_fb_cma_get_gem_obj(fb, 0);
++	TXP_WRITE(TXP_DST_PTR, gem->paddr + fb->offsets[0]);
++	TXP_WRITE(TXP_DST_PITCH, fb->pitches[0]);
++	TXP_WRITE(TXP_DIM,
++		  VC4_SET_FIELD(mode->hdisplay, TXP_WIDTH) |
++		  VC4_SET_FIELD(mode->vdisplay, TXP_HEIGHT));
++
++	TXP_WRITE(TXP_DST_CTRL, ctrl);
++
++	drm_writeback_queue_job(&txp->connector, conn_state->writeback_job);
++}
++
++static const struct drm_connector_helper_funcs vc4_txp_connector_helper_funcs = {
++	.get_modes = vc4_txp_connector_get_modes,
++	.mode_valid = vc4_txp_connector_mode_valid,
++	.atomic_check = vc4_txp_connector_atomic_check,
++	.atomic_commit = vc4_txp_connector_atomic_commit,
++};
++
++static enum drm_connector_status
++vc4_txp_connector_detect(struct drm_connector *connector, bool force)
++{
++	return connector_status_connected;
++}
++
++static void vc4_txp_connector_destroy(struct drm_connector *connector)
++{
++	drm_connector_unregister(connector);
++	drm_connector_cleanup(connector);
++}
++
++static const struct drm_connector_funcs vc4_txp_connector_funcs = {
++	.detect = vc4_txp_connector_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.destroy = vc4_txp_connector_destroy,
++	.reset = drm_atomic_helper_connector_reset,
++	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
++};
++
++static void vc4_txp_encoder_disable(struct drm_encoder *encoder)
++{
++	struct vc4_txp *txp = encoder_to_vc4_txp(encoder);
++
++	if (TXP_READ(TXP_DST_CTRL) & TXP_BUSY) {
++		unsigned long timeout = jiffies + msecs_to_jiffies(1000);
++
++		TXP_WRITE(TXP_DST_CTRL, TXP_ABORT);
++
++		while (TXP_READ(TXP_DST_CTRL) & TXP_BUSY &&
++		       time_before(jiffies, timeout))
++			;
++
++		WARN_ON(TXP_READ(TXP_DST_CTRL) & TXP_BUSY);
++	}
++
++	TXP_WRITE(TXP_DST_CTRL, TXP_POWERDOWN);
++}
++
++static const struct drm_encoder_helper_funcs vc4_txp_encoder_helper_funcs = {
++	.disable = vc4_txp_encoder_disable,
++};
++
++static irqreturn_t vc4_txp_interrupt(int irq, void *data)
++{
++	struct vc4_txp *txp = data;
++
++	TXP_WRITE(TXP_DST_CTRL, TXP_READ(TXP_DST_CTRL) & ~TXP_EI);
++	vc4_crtc_handle_vblank(to_vc4_crtc(txp->connector.base.state->crtc));
++	drm_writeback_signal_completion(&txp->connector, 0);
++
++	return IRQ_HANDLED;
++}
++
++static int vc4_txp_bind(struct device *dev, struct device *master, void *data)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct drm_device *drm = dev_get_drvdata(master);
++	struct vc4_dev *vc4 = to_vc4_dev(drm);
++	struct vc4_txp *txp;
++	int ret, irq;
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	txp = devm_kzalloc(dev, sizeof(*txp), GFP_KERNEL);
++	if (!txp)
++		return -ENOMEM;
++
++	txp->pdev = pdev;
++
++	txp->regs = vc4_ioremap_regs(pdev, 0);
++	if (IS_ERR(txp->regs))
++		return PTR_ERR(txp->regs);
++
++	drm_connector_helper_add(&txp->connector.base,
++				 &vc4_txp_connector_helper_funcs);
++	ret = drm_writeback_connector_init(drm, &txp->connector,
++					   &vc4_txp_connector_funcs,
++					   &vc4_txp_encoder_helper_funcs,
++					   drm_fmts, ARRAY_SIZE(drm_fmts));
++	if (ret)
++		return ret;
++
++	ret = devm_request_irq(dev, irq, vc4_txp_interrupt, 0,
++			       dev_name(dev), txp);
++	if (ret)
++		return ret;
++
++	dev_set_drvdata(dev, txp);
++	vc4->txp = txp;
++
++	return 0;
++}
++
++static void vc4_txp_unbind(struct device *dev, struct device *master,
++			   void *data)
++{
++	struct drm_device *drm = dev_get_drvdata(master);
++	struct vc4_dev *vc4 = to_vc4_dev(drm);
++	struct vc4_txp *txp = dev_get_drvdata(dev);
++
++	vc4_txp_connector_destroy(&txp->connector.base);
++
++	vc4->txp = NULL;
++}
++
++static const struct component_ops vc4_txp_ops = {
++	.bind   = vc4_txp_bind,
++	.unbind = vc4_txp_unbind,
++};
++
++static int vc4_txp_probe(struct platform_device *pdev)
++{
++	return component_add(&pdev->dev, &vc4_txp_ops);
++}
++
++static int vc4_txp_remove(struct platform_device *pdev)
++{
++	component_del(&pdev->dev, &vc4_txp_ops);
++	return 0;
++}
++
++static const struct of_device_id vc4_txp_dt_match[] = {
++	{ .compatible = "brcm,bcm2835-txp" },
++	{ /* sentinel */ },
++};
++
++struct platform_driver vc4_txp_driver = {
++	.probe = vc4_txp_probe,
++	.remove = vc4_txp_remove,
++	.driver = {
++		.name = "vc4_txp",
++		.of_match_table = vc4_txp_dt_match,
++	},
++};

@@ -1,0 +1,256 @@
+From: Rob Clark <robdclark@gmail.com>
+Date: Mon, 19 Feb 2018 08:17:06 -0500
+Subject: drm/msm/mdp5: rework CTL START signal handling
+Git-commit: f9cb8d8d836e155f361c3f1bbe0802ae1f98a17e
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+For DSI cmd-mode and writeback, we need to write the CTL's START
+register to kick things off, but we only want to do that once both
+the encoder and the crtc have a chance to write their corresponding
+flush bits.  The difficulty is that when there is a full modeset
+(ie. encoder state has changed) we want to defer the start until
+encoder->enable().  But if only plane's have changed, we want to do
+this from crtc->commit().
+
+The start_mask was a previous attempt to handle this, but it didn't
+really do the right thing since atomic conversion.
+
+Instead track in the crtc state that the start should be deferred,
+set to try from encoder's (or in future writeback's) atomic_check().
+This way the state is part of the atomic state, and rollback can
+work properly if an atomic test fails.
+
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_cmd_encoder.c |    4 -
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_crtc.c        |    6 ++
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.c         |   52 ++++++-----------------
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.h         |    2 
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c     |    5 +-
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_kms.h         |    8 +++
+ drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c       |    2 
+ 7 files changed, 35 insertions(+), 44 deletions(-)
+
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_cmd_encoder.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_cmd_encoder.c
+@@ -159,7 +159,7 @@ void mdp5_cmd_encoder_disable(struct drm
+ 	pingpong_tearcheck_disable(encoder);
+ 
+ 	mdp5_ctl_set_encoder_state(ctl, pipeline, false);
+-	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf));
++	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
+ 
+ 	bs_set(mdp5_cmd_enc, 0);
+ 
+@@ -180,7 +180,7 @@ void mdp5_cmd_encoder_enable(struct drm_
+ 	if (pingpong_tearcheck_enable(encoder))
+ 		return;
+ 
+-	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf));
++	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
+ 
+ 	mdp5_ctl_set_encoder_state(ctl, pipeline, true);
+ 
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_crtc.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_crtc.c
+@@ -97,9 +97,13 @@ static u32 crtc_flush(struct drm_crtc *c
+ 	struct mdp5_crtc_state *mdp5_cstate = to_mdp5_crtc_state(crtc->state);
+ 	struct mdp5_ctl *ctl = mdp5_cstate->ctl;
+ 	struct mdp5_pipeline *pipeline = &mdp5_cstate->pipeline;
++	bool start = !mdp5_cstate->defer_start;
++
++	mdp5_cstate->defer_start = false;
+ 
+ 	DBG("%s: flush=%08x", crtc->name, flush_mask);
+-	return mdp5_ctl_commit(ctl, pipeline, flush_mask);
++
++	return mdp5_ctl_commit(ctl, pipeline, flush_mask, start);
+ }
+ 
+ /*
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.c
+@@ -41,7 +41,9 @@ struct mdp5_ctl {
+ 	u32 status;
+ 
+ 	bool encoder_enabled;
+-	uint32_t start_mask;
++
++	/* pending flush_mask bits */
++	u32 flush_mask;
+ 
+ 	/* REG_MDP5_CTL_*(<id>) registers access info + lock: */
+ 	spinlock_t hw_lock;
+@@ -173,16 +175,8 @@ static void set_ctl_op(struct mdp5_ctl *
+ 
+ int mdp5_ctl_set_pipeline(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline)
+ {
+-	struct mdp5_ctl_manager *ctl_mgr = ctl->ctlm;
+-	struct mdp5_kms *mdp5_kms = get_kms(ctl_mgr);
++	struct mdp5_kms *mdp5_kms = get_kms(ctl->ctlm);
+ 	struct mdp5_interface *intf = pipeline->intf;
+-	struct mdp5_hw_mixer *mixer = pipeline->mixer;
+-	struct mdp5_hw_mixer *r_mixer = pipeline->r_mixer;
+-
+-	ctl->start_mask = mdp_ctl_flush_mask_lm(mixer->lm) |
+-			  mdp_ctl_flush_mask_encoder(intf);
+-	if (r_mixer)
+-		ctl->start_mask |= mdp_ctl_flush_mask_lm(r_mixer->lm);
+ 
+ 	/* Virtual interfaces need not set a display intf (e.g.: Writeback) */
+ 	if (!mdp5_cfg_intf_is_virtual(intf->type))
+@@ -198,7 +192,7 @@ static bool start_signal_needed(struct m
+ {
+ 	struct mdp5_interface *intf = pipeline->intf;
+ 
+-	if (!ctl->encoder_enabled || ctl->start_mask != 0)
++	if (!ctl->encoder_enabled)
+ 		return false;
+ 
+ 	switch (intf->type) {
+@@ -227,25 +221,6 @@ static void send_start_signal(struct mdp
+ 	spin_unlock_irqrestore(&ctl->hw_lock, flags);
+ }
+ 
+-static void refill_start_mask(struct mdp5_ctl *ctl,
+-			      struct mdp5_pipeline *pipeline)
+-{
+-	struct mdp5_interface *intf = pipeline->intf;
+-	struct mdp5_hw_mixer *mixer = pipeline->mixer;
+-	struct mdp5_hw_mixer *r_mixer = pipeline->r_mixer;
+-
+-	ctl->start_mask = mdp_ctl_flush_mask_lm(mixer->lm);
+-	if (r_mixer)
+-		ctl->start_mask |= mdp_ctl_flush_mask_lm(r_mixer->lm);
+-
+-	/*
+-	 * Writeback encoder needs to program & flush
+-	 * address registers for each page flip..
+-	 */
+-	if (intf->type == INTF_WB)
+-		ctl->start_mask |= mdp_ctl_flush_mask_encoder(intf);
+-}
+-
+ /**
+  * mdp5_ctl_set_encoder_state() - set the encoder state
+  *
+@@ -268,7 +243,6 @@ int mdp5_ctl_set_encoder_state(struct md
+ 
+ 	if (start_signal_needed(ctl, pipeline)) {
+ 		send_start_signal(ctl);
+-		refill_start_mask(ctl, pipeline);
+ 	}
+ 
+ 	return 0;
+@@ -557,17 +531,14 @@ static void fix_for_single_flush(struct
+  */
+ u32 mdp5_ctl_commit(struct mdp5_ctl *ctl,
+ 		    struct mdp5_pipeline *pipeline,
+-		    u32 flush_mask)
++		    u32 flush_mask, bool start)
+ {
+ 	struct mdp5_ctl_manager *ctl_mgr = ctl->ctlm;
+ 	unsigned long flags;
+ 	u32 flush_id = ctl->id;
+ 	u32 curr_ctl_flush_mask;
+ 
+-	ctl->start_mask &= ~flush_mask;
+-
+-	VERB("flush_mask=%x, start_mask=%x, trigger=%x", flush_mask,
+-			ctl->start_mask, ctl->pending_ctl_trigger);
++	VERB("flush_mask=%x, trigger=%x", flush_mask, ctl->pending_ctl_trigger);
+ 
+ 	if (ctl->pending_ctl_trigger & flush_mask) {
+ 		flush_mask |= MDP5_CTL_FLUSH_CTL;
+@@ -582,6 +553,14 @@ u32 mdp5_ctl_commit(struct mdp5_ctl *ctl
+ 
+ 	fix_for_single_flush(ctl, &flush_mask, &flush_id);
+ 
++	if (!start) {
++		ctl->flush_mask |= flush_mask;
++		return curr_ctl_flush_mask;
++	} else {
++		flush_mask |= ctl->flush_mask;
++		ctl->flush_mask = 0;
++	}
++
+ 	if (flush_mask) {
+ 		spin_lock_irqsave(&ctl->hw_lock, flags);
+ 		ctl_write(ctl, REG_MDP5_CTL_FLUSH(flush_id), flush_mask);
+@@ -590,7 +569,6 @@ u32 mdp5_ctl_commit(struct mdp5_ctl *ctl
+ 
+ 	if (start_signal_needed(ctl, pipeline)) {
+ 		send_start_signal(ctl);
+-		refill_start_mask(ctl, pipeline);
+ 	}
+ 
+ 	return curr_ctl_flush_mask;
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.h
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_ctl.h
+@@ -78,7 +78,7 @@ u32 mdp_ctl_flush_mask_encoder(struct md
+ 
+ /* @flush_mask: see CTL flush masks definitions below */
+ u32 mdp5_ctl_commit(struct mdp5_ctl *ctl, struct mdp5_pipeline *pipeline,
+-		    u32 flush_mask);
++		    u32 flush_mask, bool start);
+ u32 mdp5_ctl_get_commit_status(struct mdp5_ctl *ctl);
+ 
+ 
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_encoder.c
+@@ -228,7 +228,7 @@ static void mdp5_vid_encoder_disable(str
+ 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 0);
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+-	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf));
++	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
+ 
+ 	/*
+ 	 * Wait for a vsync so we know the ENABLE=0 latched before
+@@ -262,7 +262,7 @@ static void mdp5_vid_encoder_enable(stru
+ 	spin_lock_irqsave(&mdp5_encoder->intf_lock, flags);
+ 	mdp5_write(mdp5_kms, REG_MDP5_INTF_TIMING_ENGINE_EN(intfn), 1);
+ 	spin_unlock_irqrestore(&mdp5_encoder->intf_lock, flags);
+-	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf));
++	mdp5_ctl_commit(ctl, pipeline, mdp_ctl_flush_mask_encoder(intf), true);
+ 
+ 	mdp5_ctl_set_encoder_state(ctl, pipeline, true);
+ 
+@@ -319,6 +319,7 @@ static int mdp5_encoder_atomic_check(str
+ 
+ 	mdp5_cstate->ctl = ctl;
+ 	mdp5_cstate->pipeline.intf = intf;
++	mdp5_cstate->defer_start = true;
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_kms.h
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_kms.h
+@@ -133,6 +133,14 @@ struct mdp5_crtc_state {
+ 	u32 pp_done_irqmask;
+ 
+ 	bool cmd_mode;
++
++	/* should we not write CTL[n].START register on flush?  If the
++	 * encoder has changed this is set to true, since encoder->enable()
++	 * is called after crtc state is committed, but we only want to
++	 * write the CTL[n].START register once.  This lets us defer
++	 * writing CTL[n].START until encoder->enable()
++	 */
++	bool defer_start;
+ };
+ #define to_mdp5_crtc_state(x) \
+ 		container_of(x, struct mdp5_crtc_state, base)
+--- a/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
++++ b/drivers/gpu/drm/msm/disp/mdp5/mdp5_plane.c
+@@ -535,7 +535,7 @@ static void mdp5_plane_atomic_async_upda
+ 
+ 		ctl = mdp5_crtc_get_ctl(new_state->crtc);
+ 
+-		mdp5_ctl_commit(ctl, pipeline, mdp5_plane_get_flush(plane));
++		mdp5_ctl_commit(ctl, pipeline, mdp5_plane_get_flush(plane), true);
+ 	}
+ 
+ 	*to_mdp5_plane_state(plane->state) =

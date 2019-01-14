@@ -1,0 +1,148 @@
+From: Archit Taneja <architt@codeaurora.org>
+Date: Fri, 28 Jul 2017 16:17:02 +0530
+Subject: drm/msm/hdmi: Set up runtime PM for HDMI
+Git-commit: 6ed9ed484d04c2f6db0f68b0a31ef24db27d6454
+Patch-mainline: v4.14-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Enable rudimentary runtime PM in the HDMI driver. We can't really do
+agressive PM toggling at the moment because we need to leave the hpd
+clocks enabled all the time. There isn't much benefit of creating
+suspend/resume ops to toggle clocks either.
+
+We just make sure that we configure the power domain in the HDMI bridge's
+enable/disable paths, and the HDMI connector's detect() op.
+
+Signed-off-by: Archit Taneja <architt@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/hdmi/hdmi.c           |    2 
+ drivers/gpu/drm/msm/hdmi/hdmi_bridge.c    |    4 +
+ drivers/gpu/drm/msm/hdmi/hdmi_connector.c |   63 ++++++++++++++++++++----------
+ 3 files changed, 50 insertions(+), 19 deletions(-)
+
+--- a/drivers/gpu/drm/msm/hdmi/hdmi.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi.c
+@@ -239,6 +239,8 @@ static struct hdmi *msm_hdmi_init(struct
+ 		hdmi->pwr_clks[i] = clk;
+ 	}
+ 
++	pm_runtime_enable(&pdev->dev);
++
+ 	hdmi->workq = alloc_ordered_workqueue("msm_hdmi", 0);
+ 
+ 	hdmi->i2c = msm_hdmi_i2c_init(hdmi);
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_bridge.c
+@@ -35,6 +35,8 @@ static void msm_hdmi_power_on(struct drm
+ 	const struct hdmi_platform_config *config = hdmi->config;
+ 	int i, ret;
+ 
++	pm_runtime_get_sync(&hdmi->pdev->dev);
++
+ 	for (i = 0; i < config->pwr_reg_cnt; i++) {
+ 		ret = regulator_enable(hdmi->pwr_regs[i]);
+ 		if (ret) {
+@@ -84,6 +86,8 @@ static void power_off(struct drm_bridge
+ 					config->pwr_reg_names[i], ret);
+ 		}
+ 	}
++
++	pm_runtime_put_autosuspend(&hdmi->pdev->dev);
+ }
+ 
+ #define AVI_IFRAME_LINE_NUMBER 1
+--- a/drivers/gpu/drm/msm/hdmi/hdmi_connector.c
++++ b/drivers/gpu/drm/msm/hdmi/hdmi_connector.c
+@@ -137,6 +137,36 @@ err:
+ 	return ret;
+ }
+ 
++static void enable_hpd_clocks(struct hdmi *hdmi, bool enable)
++{
++	const struct hdmi_platform_config *config = hdmi->config;
++	struct device *dev = &hdmi->pdev->dev;
++	int i, ret;
++
++	if (enable) {
++		for (i = 0; i < config->hpd_clk_cnt; i++) {
++			if (config->hpd_freq && config->hpd_freq[i]) {
++				ret = clk_set_rate(hdmi->hpd_clks[i],
++						   config->hpd_freq[i]);
++				if (ret)
++					dev_warn(dev,
++						 "failed to set clk %s (%d)\n",
++						 config->hpd_clk_names[i], ret);
++			}
++
++			ret = clk_prepare_enable(hdmi->hpd_clks[i]);
++			if (ret) {
++				dev_err(dev,
++					"failed to enable hpd clk: %s (%d)\n",
++					config->hpd_clk_names[i], ret);
++			}
++		}
++	} else {
++		for (i = config->hpd_clk_cnt - 1; i >= 0; i--)
++			clk_disable_unprepare(hdmi->hpd_clks[i]);
++	}
++}
++
+ static int hpd_enable(struct hdmi_connector *hdmi_connector)
+ {
+ 	struct hdmi *hdmi = hdmi_connector->hdmi;
+@@ -167,22 +197,8 @@ static int hpd_enable(struct hdmi_connec
+ 		goto fail;
+ 	}
+ 
+-	for (i = 0; i < config->hpd_clk_cnt; i++) {
+-		if (config->hpd_freq && config->hpd_freq[i]) {
+-			ret = clk_set_rate(hdmi->hpd_clks[i],
+-					config->hpd_freq[i]);
+-			if (ret)
+-				dev_warn(dev, "failed to set clk %s (%d)\n",
+-						config->hpd_clk_names[i], ret);
+-		}
+-
+-		ret = clk_prepare_enable(hdmi->hpd_clks[i]);
+-		if (ret) {
+-			dev_err(dev, "failed to enable hpd clk: %s (%d)\n",
+-					config->hpd_clk_names[i], ret);
+-			goto fail;
+-		}
+-	}
++	pm_runtime_get_sync(dev);
++	enable_hpd_clocks(hdmi, true);
+ 
+ 	msm_hdmi_set_mode(hdmi, false);
+ 	msm_hdmi_phy_reset(hdmi);
+@@ -225,8 +241,8 @@ static void hdp_disable(struct hdmi_conn
+ 
+ 	msm_hdmi_set_mode(hdmi, false);
+ 
+-	for (i = 0; i < config->hpd_clk_cnt; i++)
+-		clk_disable_unprepare(hdmi->hpd_clks[i]);
++	enable_hpd_clocks(hdmi, false);
++	pm_runtime_put_autosuspend(dev);
+ 
+ 	ret = gpio_config(hdmi, false);
+ 	if (ret)
+@@ -285,7 +301,16 @@ void msm_hdmi_connector_irq(struct drm_c
+ 
+ static enum drm_connector_status detect_reg(struct hdmi *hdmi)
+ {
+-	uint32_t hpd_int_status = hdmi_read(hdmi, REG_HDMI_HPD_INT_STATUS);
++	uint32_t hpd_int_status;
++
++	pm_runtime_get_sync(&hdmi->pdev->dev);
++	enable_hpd_clocks(hdmi, true);
++
++	hpd_int_status = hdmi_read(hdmi, REG_HDMI_HPD_INT_STATUS);
++
++	enable_hpd_clocks(hdmi, false);
++	pm_runtime_put_autosuspend(&hdmi->pdev->dev);
++
+ 	return (hpd_int_status & HDMI_HPD_INT_STATUS_CABLE_DETECTED) ?
+ 			connector_status_connected : connector_status_disconnected;
+ }

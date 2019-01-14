@@ -1,0 +1,382 @@
+From: Yonghong Song <yhs@fb.com>
+Date: Wed, 5 Sep 2018 16:58:05 -0700
+Subject: tools/bpf: add more netlink functionalities in lib/bpf
+Patch-mainline: v4.20-rc1
+Git-commit: 36f1678d9e0b5d2e0236046d9659e0348b4719a8
+References: bsc#1109837
+
+This patch added a few netlink attribute parsing functions
+and the netlink API functions to query networking links, tc classes,
+tc qdiscs and tc filters. For example, the following API is
+to get networking links:
+  int nl_get_link(int sock, unsigned int nl_pid,
+                  dump_nlmsg_t dump_link_nlmsg,
+                  void *cookie);
+
+Note that when the API is called, the user also provided a
+callback function with the following signature:
+  int (*dump_nlmsg_t)(void *cookie, void *msg, struct nlattr **tb);
+
+The "cookie" is the parameter the user passed to the API and will
+be available for the callback function.
+The "msg" is the information about the result, e.g., ifinfomsg or
+tcmsg. The "tb" is the parsed netlink attributes.
+
+Signed-off-by: Yonghong Song <yhs@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ tools/lib/bpf/libbpf.h       |   16 ++++
+ tools/lib/bpf/libbpf_errno.c |    1 
+ tools/lib/bpf/netlink.c      |  165 ++++++++++++++++++++++++++++++++++++++++++-
+ tools/lib/bpf/nlattr.c       |   33 +++++---
+ tools/lib/bpf/nlattr.h       |   38 +++++++++
+ 5 files changed, 238 insertions(+), 15 deletions(-)
+
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -46,6 +46,7 @@ enum libbpf_errno {
+ 	LIBBPF_ERRNO__PROGTYPE,	/* Kernel doesn't support this program type */
+ 	LIBBPF_ERRNO__WRNGPID,	/* Wrong pid in netlink message */
+ 	LIBBPF_ERRNO__INVSEQ,	/* Invalid netlink sequence */
++	LIBBPF_ERRNO__NLPARSE,	/* netlink parsing error */
+ 	__LIBBPF_ERRNO__END,
+ };
+ 
+@@ -297,4 +298,19 @@ int bpf_perf_event_read_simple(void *mem
+ 			       unsigned long page_size,
+ 			       void **buf, size_t *buf_len,
+ 			       bpf_perf_event_print_t fn, void *priv);
++
++struct nlmsghdr;
++struct nlattr;
++typedef int (*dump_nlmsg_t)(void *cookie, void *msg, struct nlattr **tb);
++typedef int (*__dump_nlmsg_t)(struct nlmsghdr *nlmsg, dump_nlmsg_t,
++			      void *cookie);
++int bpf_netlink_open(unsigned int *nl_pid);
++int nl_get_link(int sock, unsigned int nl_pid, dump_nlmsg_t dump_link_nlmsg,
++		void *cookie);
++int nl_get_class(int sock, unsigned int nl_pid, int ifindex,
++		 dump_nlmsg_t dump_class_nlmsg, void *cookie);
++int nl_get_qdisc(int sock, unsigned int nl_pid, int ifindex,
++		 dump_nlmsg_t dump_qdisc_nlmsg, void *cookie);
++int nl_get_filter(int sock, unsigned int nl_pid, int ifindex, int handle,
++		  dump_nlmsg_t dump_filter_nlmsg, void *cookie);
+ #endif
+--- a/tools/lib/bpf/libbpf_errno.c
++++ b/tools/lib/bpf/libbpf_errno.c
+@@ -42,6 +42,7 @@ static const char *libbpf_strerror_table
+ 	[ERRCODE_OFFSET(PROGTYPE)]	= "Kernel doesn't support this program type",
+ 	[ERRCODE_OFFSET(WRNGPID)]	= "Wrong pid in netlink message",
+ 	[ERRCODE_OFFSET(INVSEQ)]	= "Invalid netlink sequence",
++	[ERRCODE_OFFSET(NLPARSE)]	= "Incorrect netlink message parsing",
+ };
+ 
+ int libbpf_strerror(int err, char *buf, size_t size)
+--- a/tools/lib/bpf/netlink.c
++++ b/tools/lib/bpf/netlink.c
+@@ -18,7 +18,7 @@
+ #define SOL_NETLINK 270
+ #endif
+ 
+-static int bpf_netlink_open(__u32 *nl_pid)
++int bpf_netlink_open(__u32 *nl_pid)
+ {
+ 	struct sockaddr_nl sa;
+ 	socklen_t addrlen;
+@@ -61,7 +61,9 @@ cleanup:
+ 	return ret;
+ }
+ 
+-static int bpf_netlink_recv(int sock, __u32 nl_pid, int seq)
++static int bpf_netlink_recv(int sock, __u32 nl_pid, int seq,
++			    __dump_nlmsg_t _fn, dump_nlmsg_t fn,
++			    void *cookie)
+ {
+ 	struct nlmsgerr *err;
+ 	struct nlmsghdr *nh;
+@@ -98,6 +100,11 @@ static int bpf_netlink_recv(int sock, __
+ 			default:
+ 				break;
+ 			}
++			if (_fn) {
++				ret = _fn(nh, fn, cookie);
++				if (ret)
++					return ret;
++			}
+ 		}
+ 	}
+ 	ret = 0;
+@@ -157,9 +164,161 @@ int bpf_set_link_xdp_fd(int ifindex, int
+ 		ret = -errno;
+ 		goto cleanup;
+ 	}
+-	ret = bpf_netlink_recv(sock, nl_pid, seq);
++	ret = bpf_netlink_recv(sock, nl_pid, seq, NULL, NULL, NULL);
+ 
+ cleanup:
+ 	close(sock);
+ 	return ret;
+ }
++
++static int __dump_link_nlmsg(struct nlmsghdr *nlh, dump_nlmsg_t dump_link_nlmsg,
++			     void *cookie)
++{
++	struct nlattr *tb[IFLA_MAX + 1], *attr;
++	struct ifinfomsg *ifi = NLMSG_DATA(nlh);
++	int len;
++
++	len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
++	attr = (struct nlattr *) ((void *) ifi + NLMSG_ALIGN(sizeof(*ifi)));
++	if (nla_parse(tb, IFLA_MAX, attr, len, NULL) != 0)
++		return -LIBBPF_ERRNO__NLPARSE;
++
++	return dump_link_nlmsg(cookie, ifi, tb);
++}
++
++int nl_get_link(int sock, unsigned int nl_pid, dump_nlmsg_t dump_link_nlmsg,
++		void *cookie)
++{
++	struct {
++		struct nlmsghdr nlh;
++		struct ifinfomsg ifm;
++	} req = {
++		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
++		.nlh.nlmsg_type = RTM_GETLINK,
++		.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
++		.ifm.ifi_family = AF_PACKET,
++	};
++	int seq = time(NULL);
++
++	req.nlh.nlmsg_seq = seq;
++	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0)
++		return -errno;
++
++	return bpf_netlink_recv(sock, nl_pid, seq, __dump_link_nlmsg,
++				dump_link_nlmsg, cookie);
++}
++
++static int __dump_class_nlmsg(struct nlmsghdr *nlh,
++			      dump_nlmsg_t dump_class_nlmsg, void *cookie)
++{
++	struct nlattr *tb[TCA_MAX + 1], *attr;
++	struct tcmsg *t = NLMSG_DATA(nlh);
++	int len;
++
++	len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*t));
++	attr = (struct nlattr *) ((void *) t + NLMSG_ALIGN(sizeof(*t)));
++	if (nla_parse(tb, TCA_MAX, attr, len, NULL) != 0)
++		return -LIBBPF_ERRNO__NLPARSE;
++
++	return dump_class_nlmsg(cookie, t, tb);
++}
++
++int nl_get_class(int sock, unsigned int nl_pid, int ifindex,
++		 dump_nlmsg_t dump_class_nlmsg, void *cookie)
++{
++	struct {
++		struct nlmsghdr nlh;
++		struct tcmsg t;
++	} req = {
++		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg)),
++		.nlh.nlmsg_type = RTM_GETTCLASS,
++		.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
++		.t.tcm_family = AF_UNSPEC,
++		.t.tcm_ifindex = ifindex,
++	};
++	int seq = time(NULL);
++
++	req.nlh.nlmsg_seq = seq;
++	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0)
++		return -errno;
++
++	return bpf_netlink_recv(sock, nl_pid, seq, __dump_class_nlmsg,
++				dump_class_nlmsg, cookie);
++}
++
++static int __dump_qdisc_nlmsg(struct nlmsghdr *nlh,
++			      dump_nlmsg_t dump_qdisc_nlmsg, void *cookie)
++{
++	struct nlattr *tb[TCA_MAX + 1], *attr;
++	struct tcmsg *t = NLMSG_DATA(nlh);
++	int len;
++
++	len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*t));
++	attr = (struct nlattr *) ((void *) t + NLMSG_ALIGN(sizeof(*t)));
++	if (nla_parse(tb, TCA_MAX, attr, len, NULL) != 0)
++		return -LIBBPF_ERRNO__NLPARSE;
++
++	return dump_qdisc_nlmsg(cookie, t, tb);
++}
++
++int nl_get_qdisc(int sock, unsigned int nl_pid, int ifindex,
++		 dump_nlmsg_t dump_qdisc_nlmsg, void *cookie)
++{
++	struct {
++		struct nlmsghdr nlh;
++		struct tcmsg t;
++	} req = {
++		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg)),
++		.nlh.nlmsg_type = RTM_GETQDISC,
++		.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
++		.t.tcm_family = AF_UNSPEC,
++		.t.tcm_ifindex = ifindex,
++	};
++	int seq = time(NULL);
++
++	req.nlh.nlmsg_seq = seq;
++	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0)
++		return -errno;
++
++	return bpf_netlink_recv(sock, nl_pid, seq, __dump_qdisc_nlmsg,
++				dump_qdisc_nlmsg, cookie);
++}
++
++static int __dump_filter_nlmsg(struct nlmsghdr *nlh,
++			       dump_nlmsg_t dump_filter_nlmsg, void *cookie)
++{
++	struct nlattr *tb[TCA_MAX + 1], *attr;
++	struct tcmsg *t = NLMSG_DATA(nlh);
++	int len;
++
++	len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*t));
++	attr = (struct nlattr *) ((void *) t + NLMSG_ALIGN(sizeof(*t)));
++	if (nla_parse(tb, TCA_MAX, attr, len, NULL) != 0)
++		return -LIBBPF_ERRNO__NLPARSE;
++
++	return dump_filter_nlmsg(cookie, t, tb);
++}
++
++int nl_get_filter(int sock, unsigned int nl_pid, int ifindex, int handle,
++		  dump_nlmsg_t dump_filter_nlmsg, void *cookie)
++{
++	struct {
++		struct nlmsghdr nlh;
++		struct tcmsg t;
++	} req = {
++		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg)),
++		.nlh.nlmsg_type = RTM_GETTFILTER,
++		.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
++		.t.tcm_family = AF_UNSPEC,
++		.t.tcm_ifindex = ifindex,
++		.t.tcm_parent = handle,
++	};
++	int seq = time(NULL);
++
++	req.nlh.nlmsg_seq = seq;
++	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0)
++		return -errno;
++
++	return bpf_netlink_recv(sock, nl_pid, seq, __dump_filter_nlmsg,
++				dump_filter_nlmsg, cookie);
++}
+--- a/tools/lib/bpf/nlattr.c
++++ b/tools/lib/bpf/nlattr.c
+@@ -26,11 +26,6 @@ static uint16_t nla_attr_minlen[NLA_TYPE
+ 	[NLA_FLAG]	= 0,
+ };
+ 
+-static int nla_len(const struct nlattr *nla)
+-{
+-	return nla->nla_len - NLA_HDRLEN;
+-}
+-
+ static struct nlattr *nla_next(const struct nlattr *nla, int *remaining)
+ {
+ 	int totlen = NLA_ALIGN(nla->nla_len);
+@@ -46,11 +41,6 @@ static int nla_ok(const struct nlattr *n
+ 	       nla->nla_len <= remaining;
+ }
+ 
+-static void *nla_data(const struct nlattr *nla)
+-{
+-	return (char *) nla + NLA_HDRLEN;
+-}
+-
+ static int nla_type(const struct nlattr *nla)
+ {
+ 	return nla->nla_type & NLA_TYPE_MASK;
+@@ -114,8 +104,8 @@ static inline int nlmsg_len(const struct
+  * @see nla_validate
+  * @return 0 on success or a negative error code.
+  */
+-static int nla_parse(struct nlattr *tb[], int maxtype, struct nlattr *head, int len,
+-		     struct nla_policy *policy)
++int nla_parse(struct nlattr *tb[], int maxtype, struct nlattr *head, int len,
++	      struct nla_policy *policy)
+ {
+ 	struct nlattr *nla;
+ 	int rem, err;
+@@ -146,6 +136,25 @@ errout:
+ 	return err;
+ }
+ 
++/**
++ * Create attribute index based on nested attribute
++ * @arg tb              Index array to be filled (maxtype+1 elements).
++ * @arg maxtype         Maximum attribute type expected and accepted.
++ * @arg nla             Nested Attribute.
++ * @arg policy          Attribute validation policy.
++ *
++ * Feeds the stream of attributes nested into the specified attribute
++ * to nla_parse().
++ *
++ * @see nla_parse
++ * @return 0 on success or a negative error code.
++ */
++int nla_parse_nested(struct nlattr *tb[], int maxtype, struct nlattr *nla,
++		     struct nla_policy *policy)
++{
++	return nla_parse(tb, maxtype, nla_data(nla), nla_len(nla), policy);
++}
++
+ /* dump netlink extended ack error message */
+ int nla_dump_errormsg(struct nlmsghdr *nlh)
+ {
+--- a/tools/lib/bpf/nlattr.h
++++ b/tools/lib/bpf/nlattr.h
+@@ -67,6 +67,44 @@ struct nla_policy {
+ 	     nla_ok(pos, rem); \
+ 	     pos = nla_next(pos, &(rem)))
+ 
++/**
++ * nla_data - head of payload
++ * @nla: netlink attribute
++ */
++static inline void *nla_data(const struct nlattr *nla)
++{
++	return (char *) nla + NLA_HDRLEN;
++}
++
++static inline uint8_t nla_getattr_u8(const struct nlattr *nla)
++{
++	return *(uint8_t *)nla_data(nla);
++}
++
++static inline uint32_t nla_getattr_u32(const struct nlattr *nla)
++{
++	return *(uint32_t *)nla_data(nla);
++}
++
++static inline const char *nla_getattr_str(const struct nlattr *nla)
++{
++	return (const char *)nla_data(nla);
++}
++
++/**
++ * nla_len - length of payload
++ * @nla: netlink attribute
++ */
++static inline int nla_len(const struct nlattr *nla)
++{
++	return nla->nla_len - NLA_HDRLEN;
++}
++
++int nla_parse(struct nlattr *tb[], int maxtype, struct nlattr *head, int len,
++	      struct nla_policy *policy);
++int nla_parse_nested(struct nlattr *tb[], int maxtype, struct nlattr *nla,
++		     struct nla_policy *policy);
++
+ int nla_dump_errormsg(struct nlmsghdr *nlh);
+ 
+ #endif /* __NLATTR_H */

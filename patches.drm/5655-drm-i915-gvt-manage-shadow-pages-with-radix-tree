@@ -1,0 +1,170 @@
+From: Changbin Du <changbin.du@intel.com>
+Date: Tue, 30 Jan 2018 19:19:54 +0800
+Subject: drm/i915/gvt: Manage shadow pages with radix tree
+Git-commit: b6c126a39345f7286bb25135efd9154419127427
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We don't know how many page tables will be shadowed. It varies
+considerably corresponding to guest load. Radix tree is a better
+choice for us. Since Page Frame Number is used as key so most of
+the bits are common.
+
+Here is some performance data (duration in us) of looking up a
+element:
+Before: (aka. ppgtt_find_shadow_page)
+ 0.308 0.292 0.246 0.432 0.143 ... 0.311 0.225 0.382 0.199 0.325
+After: (aka. intel_vgpu_find_spt_by_mfn)
+ 0.106 0.106 0.107 0.106 0.105 0.107 ... 0.107 0.109 0.105 0.108
+
+This time I didn't get the early data of hash table. The data is
+measured when desktop is shown.
+
+As last change, the overall benchmark almost is not changed, but
+we get better scalability.
+
+Signed-off-by: Changbin Du <changbin.du@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/gvt/gtt.c |   50 +++++++++++++++++++++--------------------
+ drivers/gpu/drm/i915/gvt/gtt.h |    4 ---
+ 2 files changed, 27 insertions(+), 27 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/gtt.c
++++ b/drivers/gpu/drm/i915/gvt/gtt.c
+@@ -640,8 +640,8 @@ static void ppgtt_free_spt(struct intel_
+ 
+ 	dma_unmap_page(kdev, spt->shadow_page.mfn << I915_GTT_PAGE_SHIFT, 4096,
+ 		       PCI_DMA_BIDIRECTIONAL);
+-	if (!hlist_unhashed(&spt->node))
+-		hash_del(&spt->node);
++
++	radix_tree_delete(&spt->vgpu->gtt.spt_tree, spt->shadow_page.mfn);
+ 
+ 	if (spt->guest_page.oos_page)
+ 		detach_oos_page(spt->vgpu, spt->guest_page.oos_page);
+@@ -654,12 +654,14 @@ static void ppgtt_free_spt(struct intel_
+ 
+ static void ppgtt_free_all_spt(struct intel_vgpu *vgpu)
+ {
+-	struct hlist_node *n;
+ 	struct intel_vgpu_ppgtt_spt *spt;
+-	int i;
++	struct radix_tree_iter iter;
++	void **slot;
+ 
+-	hash_for_each_safe(vgpu->gtt.spt_hash_table, i, n, spt, node)
++	radix_tree_for_each_slot(slot, &vgpu->gtt.spt_tree, &iter, 0) {
++		spt = radix_tree_deref_slot(slot);
+ 		ppgtt_free_spt(spt);
++	}
+ }
+ 
+ static int ppgtt_handle_guest_write_page_table_bytes(
+@@ -697,16 +699,10 @@ static struct intel_vgpu_ppgtt_spt *inte
+ }
+ 
+ /* Find the spt by shadow page mfn. */
+-static struct intel_vgpu_ppgtt_spt *intel_vgpu_find_spt_by_mfn(
++static inline struct intel_vgpu_ppgtt_spt *intel_vgpu_find_spt_by_mfn(
+ 		struct intel_vgpu *vgpu, unsigned long mfn)
+ {
+-	struct intel_vgpu_ppgtt_spt *spt;
+-
+-	hash_for_each_possible(vgpu->gtt.spt_hash_table, spt, node, mfn) {
+-		if (spt->shadow_page.mfn == mfn)
+-			return spt;
+-	}
+-	return NULL;
++	return radix_tree_lookup(&vgpu->gtt.spt_tree, mfn);
+ }
+ 
+ static int reclaim_one_ppgtt_mm(struct intel_gvt *gvt);
+@@ -741,8 +737,8 @@ retry:
+ 			     0, 4096, PCI_DMA_BIDIRECTIONAL);
+ 	if (dma_mapping_error(kdev, daddr)) {
+ 		gvt_vgpu_err("fail to map dma addr\n");
+-		free_spt(spt);
+-		return ERR_PTR(-EINVAL);
++		ret = -EINVAL;
++		goto err_free_spt;
+ 	}
+ 	spt->shadow_page.vaddr = page_address(spt->shadow_page.page);
+ 	spt->shadow_page.mfn = daddr >> I915_GTT_PAGE_SHIFT;
+@@ -755,17 +751,23 @@ retry:
+ 
+ 	ret = intel_vgpu_register_page_track(vgpu, spt->guest_page.gfn,
+ 					ppgtt_write_protection_handler, spt);
+-	if (ret) {
+-		free_spt(spt);
+-		dma_unmap_page(kdev, daddr, PAGE_SIZE, PCI_DMA_BIDIRECTIONAL);
+-		return ERR_PTR(ret);
+-	}
++	if (ret)
++		goto err_unmap_dma;
+ 
+-	INIT_HLIST_NODE(&spt->node);
+-	hash_add(vgpu->gtt.spt_hash_table, &spt->node, spt->shadow_page.mfn);
++	ret = radix_tree_insert(&vgpu->gtt.spt_tree, spt->shadow_page.mfn, spt);
++	if (ret)
++		goto err_unreg_page_track;
+ 
+ 	trace_spt_alloc(vgpu->id, spt, type, spt->shadow_page.mfn, gfn);
+ 	return spt;
++
++err_unreg_page_track:
++	intel_vgpu_unregister_page_track(vgpu, spt->guest_page.gfn);
++err_unmap_dma:
++	dma_unmap_page(kdev, daddr, PAGE_SIZE, PCI_DMA_BIDIRECTIONAL);
++err_free_spt:
++	free_spt(spt);
++	return ERR_PTR(ret);
+ }
+ 
+ #define pt_entry_size_shift(spt) \
+@@ -1994,7 +1996,7 @@ int intel_vgpu_init_gtt(struct intel_vgp
+ {
+ 	struct intel_vgpu_gtt *gtt = &vgpu->gtt;
+ 
+-	hash_init(gtt->spt_hash_table);
++	INIT_RADIX_TREE(&gtt->spt_tree, GFP_KERNEL);
+ 
+ 	INIT_LIST_HEAD(&gtt->ppgtt_mm_list_head);
+ 	INIT_LIST_HEAD(&gtt->oos_page_list_head);
+@@ -2024,7 +2026,7 @@ static void intel_vgpu_destroy_all_ppgtt
+ 	if (GEM_WARN_ON(!list_empty(&vgpu->gtt.ppgtt_mm_list_head)))
+ 		gvt_err("vgpu ppgtt mm is not fully destoried\n");
+ 
+-	if (GEM_WARN_ON(!hlist_empty(vgpu->gtt.spt_hash_table))) {
++	if (GEM_WARN_ON(!radix_tree_empty(&vgpu->gtt.spt_tree))) {
+ 		gvt_err("Why we still has spt not freed?\n");
+ 		ppgtt_free_all_spt(vgpu);
+ 	}
+--- a/drivers/gpu/drm/i915/gvt/gtt.h
++++ b/drivers/gpu/drm/i915/gvt/gtt.h
+@@ -39,7 +39,6 @@
+ 
+ struct intel_vgpu_mm;
+ 
+-#define INTEL_GVT_GTT_HASH_BITS 8
+ #define INTEL_GVT_INVALID_ADDR (~0UL)
+ 
+ struct intel_gvt_gtt_entry {
+@@ -186,7 +185,7 @@ struct intel_vgpu_gtt {
+ 	struct intel_vgpu_mm *ggtt_mm;
+ 	unsigned long active_ppgtt_mm_bitmap;
+ 	struct list_head ppgtt_mm_list_head;
+-	DECLARE_HASHTABLE(spt_hash_table, INTEL_GVT_GTT_HASH_BITS);
++	struct radix_tree_root spt_tree;
+ 	struct list_head oos_page_list_head;
+ 	struct list_head post_shadow_list_head;
+ 	struct intel_vgpu_scratch_pt scratch_pt[GTT_TYPE_MAX];
+@@ -217,7 +216,6 @@ struct intel_vgpu_oos_page {
+ struct intel_vgpu_ppgtt_spt {
+ 	atomic_t refcount;
+ 	struct intel_vgpu *vgpu;
+-	struct hlist_node node;
+ 
+ 	struct {
+ 		intel_gvt_gtt_type_t type;

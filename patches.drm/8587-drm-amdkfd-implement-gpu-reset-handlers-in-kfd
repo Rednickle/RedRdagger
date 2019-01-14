@@ -1,0 +1,179 @@
+From: Shaoyun Liu <Shaoyun.Liu@amd.com>
+Date: Wed, 11 Jul 2018 22:32:56 -0400
+Subject: drm/amdkfd: Implement GPU reset handlers in KFD
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: e42051d2133b7912db99bd3a307c9219a88fe7c2
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Lock KFD and evict existing queues on reset. Notify user mode by
+signaling hw_exception events.
+
+Signed-off-by: Shaoyun Liu <Shaoyun.Liu@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c |    3 ++
+ drivers/gpu/drm/amd/amdkfd/kfd_device.c  |   43 ++++++++++++++++++++++++++++---
+ drivers/gpu/drm/amd/amdkfd/kfd_events.c  |   27 +++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_events.h  |    1 
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h    |    4 ++
+ 5 files changed, 75 insertions(+), 3 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -122,6 +122,9 @@ static int kfd_open(struct inode *inode,
+ 	if (IS_ERR(process))
+ 		return PTR_ERR(process);
+ 
++	if (kfd_is_locked())
++		return -EAGAIN;
++
+ 	dev_dbg(kfd_device, "process %d opened, compat mode (32 bit) - %d\n",
+ 		process->pasid, process->is_32bit_user_mode);
+ 
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -30,7 +30,13 @@
+ #include "kfd_iommu.h"
+ 
+ #define MQD_SIZE_ALIGNED 768
+-static atomic_t kfd_device_suspended = ATOMIC_INIT(0);
++
++/*
++ * kfd_locked is used to lock the kfd driver during suspend or reset
++ * once locked, kfd driver will stop any further GPU execution.
++ * create process (open) will return -EAGAIN.
++ */
++static atomic_t kfd_locked = ATOMIC_INIT(0);
+ 
+ #ifdef KFD_SUPPORT_IOMMU_V2
+ static const struct kfd_device_info kaveri_device_info = {
+@@ -516,21 +522,52 @@ void kgd2kfd_device_exit(struct kfd_dev
+ 
+ int kgd2kfd_pre_reset(struct kfd_dev *kfd)
+ {
++	if (!kfd->init_complete)
++		return 0;
++	kgd2kfd_suspend(kfd);
++
++	/* hold dqm->lock to prevent further execution*/
++	dqm_lock(kfd->dqm);
++
++	kfd_signal_reset_event(kfd);
+ 	return 0;
+ }
+ 
++/*
++ * Fix me. KFD won't be able to resume existing process for now.
++ * We will keep all existing process in a evicted state and
++ * wait the process to be terminated.
++ */
++
+ int kgd2kfd_post_reset(struct kfd_dev *kfd)
+ {
++	int ret, count;
++
++	if (!kfd->init_complete)
++		return 0;
++
++	dqm_unlock(kfd->dqm);
++
++	ret = kfd_resume(kfd);
++	if (ret)
++		return ret;
++	count = atomic_dec_return(&kfd_locked);
++	WARN_ONCE(count != 0, "KFD reset ref. error");
+ 	return 0;
+ }
+ 
++bool kfd_is_locked(void)
++{
++	return  (atomic_read(&kfd_locked) > 0);
++}
++
+ void kgd2kfd_suspend(struct kfd_dev *kfd)
+ {
+ 	if (!kfd->init_complete)
+ 		return;
+ 
+ 	/* For first KFD device suspend all the KFD processes */
+-	if (atomic_inc_return(&kfd_device_suspended) == 1)
++	if (atomic_inc_return(&kfd_locked) == 1)
+ 		kfd_suspend_all_processes();
+ 
+ 	kfd->dqm->ops.stop(kfd->dqm);
+@@ -549,7 +586,7 @@ int kgd2kfd_resume(struct kfd_dev *kfd)
+ 	if (ret)
+ 		return ret;
+ 
+-	count = atomic_dec_return(&kfd_device_suspended);
++	count = atomic_dec_return(&kfd_locked);
+ 	WARN_ONCE(count < 0, "KFD suspend / resume ref. error");
+ 	if (count == 0)
+ 		ret = kfd_resume_all_processes();
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.c
+@@ -1000,3 +1000,30 @@ void kfd_signal_vm_fault_event(struct kf
+ 	mutex_unlock(&p->event_mutex);
+ 	kfd_unref_process(p);
+ }
++
++void kfd_signal_reset_event(struct kfd_dev *dev)
++{
++	struct kfd_hsa_hw_exception_data hw_exception_data;
++	struct kfd_process *p;
++	struct kfd_event *ev;
++	unsigned int temp;
++	uint32_t id, idx;
++
++	/* Whole gpu reset caused by GPU hang and memory is lost */
++	memset(&hw_exception_data, 0, sizeof(hw_exception_data));
++	hw_exception_data.gpu_id = dev->id;
++	hw_exception_data.memory_lost = 1;
++
++	idx = srcu_read_lock(&kfd_processes_srcu);
++	hash_for_each_rcu(kfd_processes_table, temp, p, kfd_processes) {
++		mutex_lock(&p->event_mutex);
++		id = KFD_FIRST_NONSIGNAL_EVENT_ID;
++		idr_for_each_entry_continue(&p->event_idr, ev, id)
++			if (ev->type == KFD_EVENT_TYPE_HW_EXCEPTION) {
++				ev->hw_exception_data = hw_exception_data;
++				set_event(ev);
++			}
++		mutex_unlock(&p->event_mutex);
++	}
++	srcu_read_unlock(&kfd_processes_srcu, idx);
++}
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_events.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_events.h
+@@ -66,6 +66,7 @@ struct kfd_event {
+ 	/* type specific data */
+ 	union {
+ 		struct kfd_hsa_memory_exception_data memory_exception_data;
++		struct kfd_hsa_hw_exception_data hw_exception_data;
+ 	};
+ };
+ 
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -975,10 +975,14 @@ int kfd_event_destroy(struct kfd_process
+ void kfd_signal_vm_fault_event(struct kfd_dev *dev, unsigned int pasid,
+ 				struct kfd_vm_fault_info *info);
+ 
++void kfd_signal_reset_event(struct kfd_dev *dev);
++
+ void kfd_flush_tlb(struct kfd_process_device *pdd);
+ 
+ int dbgdev_wave_reset_wavefronts(struct kfd_dev *dev, struct kfd_process *p);
+ 
++bool kfd_is_locked(void);
++
+ /* Debugfs */
+ #if defined(CONFIG_DEBUG_FS)
+ 

@@ -1,0 +1,534 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Thu, 29 Nov 2018 16:09:30 -0800
+Subject: [PATCH] scsi: lpfc: Fix discovery failures during port failovers with
+ lots of vports
+Git-commit: dea16bdae2f1ab629702ca912dabe00f3dcdac25
+Patch-mainline: v5.0-rc1
+References: bsc#1118215
+
+The driver is getting hit with 100s of RSCNs during remote port address
+changes. Each of those RSCN's ends up generating UNREG_RPI and REG_PRI
+mailbox commands.  The discovery engine within the driver doesn't wait for
+the mailbox command completions. Instead it sets state flags and moves
+forward. At some point, there's a massive backlog of mailbox commands which
+take time for the adapter to process. Additionally, it appears there were
+duplicate events from the switch so the driver generated duplicate mailbox
+commands for the same remote port.  During this window, failures on PLOGI
+and PRLI ELS's are see as the adapter is rejecting them as they are for
+remote ports that still have pending mailbox commands.
+
+Streamline the discovery engine so that PLOGI log checks for outstanding
+UNREG_RPIs and defer the processing until the commands complete. This
+better synchronizes the ELS transmission vs the RPI registrations.
+
+Filter out multiple UNREG_RPIs being queued up for the same remote port.
+
+Beef up log messages in this area.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <jsmart2021@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/scsi/lpfc/lpfc_crtn.h      |  1 -
+ drivers/scsi/lpfc/lpfc_debugfs.c   |  2 ++
+ drivers/scsi/lpfc/lpfc_disc.h      |  4 ++-
+ drivers/scsi/lpfc/lpfc_els.c       | 69 ++++++++++++++++++++++++++++++++------
+ drivers/scsi/lpfc/lpfc_hbadisc.c   | 62 ++++++++++++++++++++++++++++++----
+ drivers/scsi/lpfc/lpfc_nportdisc.c | 44 +++++++++++++++++++-----
+ drivers/scsi/lpfc/lpfc_sli.c       | 59 ++++++++++++++++++++++++++++----
+ 7 files changed, 207 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc_crtn.h b/drivers/scsi/lpfc/lpfc_crtn.h
+index a4b1bc2782eb..5edea80fd7f1 100644
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -74,7 +74,6 @@ void lpfc_mbx_cmpl_read_topology(struct lpfc_hba *, LPFC_MBOXQ_t *);
+ void lpfc_init_vpi_cmpl(struct lpfc_hba *, LPFC_MBOXQ_t *);
+ void lpfc_cancel_all_vport_retry_delay_timer(struct lpfc_hba *);
+ void lpfc_retry_pport_discovery(struct lpfc_hba *);
+-void lpfc_release_rpi(struct lpfc_hba *, struct lpfc_vport *, uint16_t);
+ int lpfc_init_iocb_list(struct lpfc_hba *phba, int cnt);
+ void lpfc_free_iocb_list(struct lpfc_hba *phba);
+ int lpfc_post_rq_buffer(struct lpfc_hba *phba, struct lpfc_queue *hrq,
+diff --git a/drivers/scsi/lpfc/lpfc_debugfs.c b/drivers/scsi/lpfc/lpfc_debugfs.c
+index 0c8005bb0f53..a8fc3cf0fea1 100644
+--- a/drivers/scsi/lpfc/lpfc_debugfs.c
++++ b/drivers/scsi/lpfc/lpfc_debugfs.c
+@@ -645,6 +645,8 @@ lpfc_debugfs_nodelist_data(struct lpfc_vport *vport, char *buf, int size)
+ 					i, ndlp->cmd_qdepth);
+ 			outio += i;
+ 		}
++		len += snprintf(buf + len, size - len, "defer:%x ",
++			ndlp->nlp_defer_did);
+ 		len +=  snprintf(buf+len, size-len, "\n");
+ 	}
+ 	spin_unlock_irq(shost->host_lock);
+diff --git a/drivers/scsi/lpfc/lpfc_disc.h b/drivers/scsi/lpfc/lpfc_disc.h
+index 28e2b60fc5c0..1c89c9f314fa 100644
+--- a/drivers/scsi/lpfc/lpfc_disc.h
++++ b/drivers/scsi/lpfc/lpfc_disc.h
+@@ -138,6 +138,7 @@ struct lpfc_nodelist {
+ 
+ 	uint32_t nvme_fb_size; /* NVME target's supported byte cnt */
+ #define NVME_FB_BIT_SHIFT 9    /* PRLI Rsp first burst in 512B units. */
++	uint32_t nlp_defer_did;
+ };
+ struct lpfc_node_rrq {
+ 	struct list_head list;
+@@ -165,6 +166,7 @@ struct lpfc_node_rrq {
+ #define NLP_ELS_SND_MASK   0x000007e0	/* sent ELS request for this entry */
+ #define NLP_NVMET_RECOV    0x00001000   /* NVMET auditing node for recovery. */
+ #define NLP_FCP_PRLI_RJT   0x00002000   /* Rport does not support FCP PRLI. */
++#define NLP_UNREG_INP      0x00008000	/* UNREG_RPI cmd is in progress */
+ #define NLP_DEFER_RM       0x00010000	/* Remove this ndlp if no longer used */
+ #define NLP_DELAY_TMO      0x00020000	/* delay timeout is running for node */
+ #define NLP_NPR_2B_DISC    0x00040000	/* node is included in num_disc_nodes */
+@@ -293,4 +295,4 @@ struct lpfc_node_rrq {
+ #define NLP_EVT_DEVICE_RM         0xb	/* Device not found in NS / ALPAmap */
+ #define NLP_EVT_DEVICE_RECOVERY   0xc	/* Device existence unknown */
+ #define NLP_EVT_MAX_EVENT         0xd
+-
++#define NLP_EVT_NOTHING_PENDING   0xff
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index a2caa9e67890..902234a1fcfb 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -315,20 +315,20 @@ lpfc_prep_els_iocb(struct lpfc_vport *vport, uint8_t expectRsp,
+ 		/* Xmit ELS command <elsCmd> to remote NPORT <did> */
+ 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
+ 				 "0116 Xmit ELS command x%x to remote "
+-				 "NPORT x%x I/O tag: x%x, port state:x%x"
+-				 " fc_flag:x%x\n",
++				 "NPORT x%x I/O tag: x%x, port state:x%x "
++				 "rpi x%x fc_flag:x%x\n",
+ 				 elscmd, did, elsiocb->iotag,
+-				 vport->port_state,
++				 vport->port_state, ndlp->nlp_rpi,
+ 				 vport->fc_flag);
+ 	} else {
+ 		/* Xmit ELS response <elsCmd> to remote NPORT <did> */
+ 		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
+ 				 "0117 Xmit ELS response x%x to remote "
+ 				 "NPORT x%x I/O tag: x%x, size: x%x "
+-				 "port_state x%x fc_flag x%x\n",
++				 "port_state x%x  rpi x%x fc_flag x%x\n",
+ 				 elscmd, ndlp->nlp_DID, elsiocb->iotag,
+ 				 cmdSize, vport->port_state,
+-				 vport->fc_flag);
++				 ndlp->nlp_rpi, vport->fc_flag);
+ 	}
+ 	return elsiocb;
+ 
+@@ -1642,7 +1642,19 @@ lpfc_plogi_confirm_nport(struct lpfc_hba *phba, uint32_t *prsp,
+ 	spin_lock_irq(shost->host_lock);
+ 	keep_nlp_flag = new_ndlp->nlp_flag;
+ 	new_ndlp->nlp_flag = ndlp->nlp_flag;
+-	ndlp->nlp_flag = keep_nlp_flag;
++
++	/* if new_ndlp had NLP_UNREG_INP set, keep it */
++	if (keep_nlp_flag & NLP_UNREG_INP)
++		new_ndlp->nlp_flag |= NLP_UNREG_INP;
++	else
++		new_ndlp->nlp_flag &= ~NLP_UNREG_INP;
++
++	/* if ndlp had NLP_UNREG_INP set, keep it */
++	if (ndlp->nlp_flag & NLP_UNREG_INP)
++		ndlp->nlp_flag = keep_nlp_flag | NLP_UNREG_INP;
++	else
++		ndlp->nlp_flag = keep_nlp_flag & ~NLP_UNREG_INP;
++
+ 	spin_unlock_irq(shost->host_lock);
+ 
+ 	/* Set nlp_states accordingly */
+@@ -1919,7 +1931,7 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
+ 	disc = (ndlp->nlp_flag & NLP_NPR_2B_DISC);
+ 	ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
+ 	spin_unlock_irq(shost->host_lock);
+-	rc   = 0;
++	rc = 0;
+ 
+ 	/* PLOGI completes to NPort <nlp_DID> */
+ 	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
+@@ -2026,8 +2038,29 @@ lpfc_issue_els_plogi(struct lpfc_vport *vport, uint32_t did, uint8_t retry)
+ 	int ret;
+ 
+ 	ndlp = lpfc_findnode_did(vport, did);
+-	if (ndlp && !NLP_CHK_NODE_ACT(ndlp))
+-		ndlp = NULL;
++
++	if (ndlp) {
++		/* Defer the processing of the issue PLOGI until after the
++		 * outstanding UNREG_RPI mbox command completes, unless we
++		 * are going offline. This logic does not apply for Fabric DIDs
++		 */
++		if ((ndlp->nlp_flag & NLP_UNREG_INP) &&
++		    ((ndlp->nlp_DID & Fabric_DID_MASK) != Fabric_DID_MASK) &&
++		    !(vport->fc_flag & FC_OFFLINE_MODE)) {
++			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++					 "4110 Issue PLOGI x%x deferred "
++					 "on NPort x%x rpi x%x Data: %p\n",
++					 ndlp->nlp_defer_did, ndlp->nlp_DID,
++					 ndlp->nlp_rpi, ndlp);
++
++			/* We can only defer 1st PLOGI */
++			if (ndlp->nlp_defer_did == NLP_EVT_NOTHING_PENDING)
++				ndlp->nlp_defer_did = did;
++			return 0;
++		}
++		if (!NLP_CHK_NODE_ACT(ndlp))
++			ndlp = NULL;
++	}
+ 
+ 	/* If ndlp is not NULL, we will bump the reference count on it */
+ 	cmdsize = (sizeof(uint32_t) + sizeof(struct serv_parm));
+@@ -2161,7 +2194,7 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
+ 		else
+ 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
+ 						NLP_EVT_CMPL_PRLI);
+-	} else
++	} else {
+ 		/* Good status, call state machine.  However, if another
+ 		 * PRLI is outstanding, don't call the state machine
+ 		 * because final disposition to Mapped or Unmapped is
+@@ -2169,6 +2202,7 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
+ 		 */
+ 		lpfc_disc_state_machine(vport, ndlp, cmdiocb,
+ 					NLP_EVT_CMPL_PRLI);
++	}
+ 
+ out:
+ 	lpfc_els_free_iocb(phba, cmdiocb);
+@@ -2227,7 +2261,7 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	ndlp->nlp_type &= ~(NLP_FCP_TARGET | NLP_FCP_INITIATOR);
+ 	ndlp->nlp_type &= ~(NLP_NVME_TARGET | NLP_NVME_INITIATOR);
+ 	ndlp->nlp_fcp_info &= ~NLP_FCP_2_DEVICE;
+-	ndlp->nlp_flag &= ~NLP_FIRSTBURST;
++	ndlp->nlp_flag &= ~(NLP_FIRSTBURST | NLP_NPR_2B_DISC);
+ 	ndlp->nvme_fb_size = 0;
+ 
+  send_next_prli:
+@@ -6112,6 +6146,19 @@ lpfc_rscn_recovery_check(struct lpfc_vport *vport)
+ 		if (vport->phba->nvmet_support)
+ 			continue;
+ 
++		/* If we are in the process of doing discovery on this
++		 * NPort, let it continue on its own.
++		 */
++		switch (ndlp->nlp_state) {
++		case  NLP_STE_PLOGI_ISSUE:
++		case  NLP_STE_ADISC_ISSUE:
++		case  NLP_STE_REG_LOGIN_ISSUE:
++		case  NLP_STE_PRLI_ISSUE:
++		case  NLP_STE_LOGO_ISSUE:
++			continue;
++		}
++
++
+ 		lpfc_disc_state_machine(vport, ndlp, NULL,
+ 					NLP_EVT_DEVICE_RECOVERY);
+ 		lpfc_cancel_retry_delay_tmo(vport, ndlp);
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index 6fe29150de27..4cc63139dafa 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -4444,6 +4444,7 @@ lpfc_initialize_node(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	NLP_INT_NODE_ACT(ndlp);
+ 	atomic_set(&ndlp->cmd_pending, 0);
+ 	ndlp->cmd_qdepth = vport->cfg_tgt_queue_depth;
++	ndlp->nlp_defer_did = NLP_EVT_NOTHING_PENDING;
+ }
+ 
+ struct lpfc_nodelist *
+@@ -4451,10 +4452,11 @@ lpfc_enable_node(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 		 int state)
+ {
+ 	struct lpfc_hba *phba = vport->phba;
+-	uint32_t did;
++	uint32_t did, flag;
+ 	unsigned long flags;
+ 	unsigned long *active_rrqs_xri_bitmap = NULL;
+ 	int rpi = LPFC_RPI_ALLOC_ERROR;
++	uint32_t defer_did = 0;
+ 
+ 	if (!ndlp)
+ 		return NULL;
+@@ -4487,16 +4489,23 @@ lpfc_enable_node(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 		goto free_rpi;
+ 	}
+ 
+-	/* Keep the original DID */
++	/* First preserve the orginal DID, xri_bitmap and some flags */
+ 	did = ndlp->nlp_DID;
++	flag = (ndlp->nlp_flag & NLP_UNREG_INP);
++	if (flag & NLP_UNREG_INP)
++		defer_did = ndlp->nlp_defer_did;
+ 	if (phba->sli_rev == LPFC_SLI_REV4)
+ 		active_rrqs_xri_bitmap = ndlp->active_rrqs_xri_bitmap;
+ 
+-	/* re-initialize ndlp except of ndlp linked list pointer */
++	/* Zero ndlp except of ndlp linked list pointer */
+ 	memset((((char *)ndlp) + sizeof (struct list_head)), 0,
+ 		sizeof (struct lpfc_nodelist) - sizeof (struct list_head));
+-	lpfc_initialize_node(vport, ndlp, did);
+ 
++	/* Next reinitialize and restore saved objects */
++	lpfc_initialize_node(vport, ndlp, did);
++	ndlp->nlp_flag |= flag;
++	if (flag & NLP_UNREG_INP)
++		ndlp->nlp_defer_did = defer_did;
+ 	if (phba->sli_rev == LPFC_SLI_REV4)
+ 		ndlp->active_rrqs_xri_bitmap = active_rrqs_xri_bitmap;
+ 
+@@ -4761,6 +4770,20 @@ lpfc_nlp_logo_unreg(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ 		return;
+ 	lpfc_issue_els_logo(vport, ndlp, 0);
+ 	mempool_free(pmb, phba->mbox_mem_pool);
++
++	/* Check to see if there are any deferred events to process */
++	if ((ndlp->nlp_flag & NLP_UNREG_INP) &&
++	    (ndlp->nlp_defer_did != NLP_EVT_NOTHING_PENDING)) {
++		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++				 "1434 UNREG cmpl deferred logo x%x "
++				 "on NPort x%x Data: x%x %p\n",
++				 ndlp->nlp_rpi, ndlp->nlp_DID,
++				 ndlp->nlp_defer_did, ndlp);
++
++		ndlp->nlp_flag &= ~NLP_UNREG_INP;
++		ndlp->nlp_defer_did = NLP_EVT_NOTHING_PENDING;
++		lpfc_issue_els_plogi(vport, ndlp->nlp_DID, 0);
++	}
+ }
+ 
+ /*
+@@ -4789,6 +4812,21 @@ lpfc_unreg_rpi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
+ 					 "did x%x\n",
+ 					 ndlp->nlp_rpi, ndlp->nlp_flag,
+ 					 ndlp->nlp_DID);
++
++		/* If there is already an UNREG in progress for this ndlp,
++		 * no need to queue up another one.
++		 */
++		if (ndlp->nlp_flag & NLP_UNREG_INP) {
++			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++					 "1436 unreg_rpi SKIP UNREG x%x on "
++					 "NPort x%x deferred x%x  flg x%x "
++					 "Data: %p\n",
++					 ndlp->nlp_rpi, ndlp->nlp_DID,
++					 ndlp->nlp_defer_did,
++					 ndlp->nlp_flag, ndlp);
++			goto out;
++		}
++
+ 		mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
+ 		if (mbox) {
+ 			/* SLI4 ports require the physical rpi value. */
+@@ -4815,10 +4853,22 @@ lpfc_unreg_rpi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
+ 					 * accept PLOGIs after unreg_rpi_cmpl
+ 					 */
+ 					acc_plogi = 0;
+-				} else
++				} else {
++					mbox->ctx_ndlp = ndlp;
+ 					mbox->mbox_cmpl =
+ 						lpfc_sli_def_mbox_cmpl;
++				}
+ 			}
++			if (((ndlp->nlp_DID & Fabric_DID_MASK) !=
++			    Fabric_DID_MASK) &&
++			    (!(vport->fc_flag & FC_OFFLINE_MODE)))
++				ndlp->nlp_flag |= NLP_UNREG_INP;
++
++			lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++					 "1433 unreg_rpi UNREG x%x on "
++					 "NPort x%x deferred flg x%x Data:%p\n",
++					 ndlp->nlp_rpi, ndlp->nlp_DID,
++					 ndlp->nlp_flag, ndlp);
+ 
+ 			rc = lpfc_sli_issue_mbox(phba, mbox, MBX_NOWAIT);
+ 			if (rc == MBX_NOT_FINISHED) {
+@@ -4827,7 +4877,7 @@ lpfc_unreg_rpi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
+ 			}
+ 		}
+ 		lpfc_no_rpi(phba, ndlp);
+-
++out:
+ 		if (phba->sli_rev != LPFC_SLI_REV4)
+ 			ndlp->nlp_rpi = 0;
+ 		ndlp->nlp_flag &= ~NLP_RPI_REGISTERED;
+diff --git a/drivers/scsi/lpfc/lpfc_nportdisc.c b/drivers/scsi/lpfc/lpfc_nportdisc.c
+index 9cb93b50dd43..96bc3789a166 100644
+--- a/drivers/scsi/lpfc/lpfc_nportdisc.c
++++ b/drivers/scsi/lpfc/lpfc_nportdisc.c
+@@ -871,13 +871,26 @@ lpfc_disc_set_adisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
+  * to release a rpi.
+  **/
+ void
+-lpfc_release_rpi(struct lpfc_hba *phba,
+-		struct lpfc_vport *vport,
+-		uint16_t rpi)
++lpfc_release_rpi(struct lpfc_hba *phba, struct lpfc_vport *vport,
++		 struct lpfc_nodelist *ndlp, uint16_t rpi)
+ {
+ 	LPFC_MBOXQ_t *pmb;
+ 	int rc;
+ 
++	/* If there is already an UNREG in progress for this ndlp,
++	 * no need to queue up another one.
++	 */
++	if (ndlp->nlp_flag & NLP_UNREG_INP) {
++		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++				 "1435 release_rpi SKIP UNREG x%x on "
++				 "NPort x%x deferred x%x  flg x%x "
++				 "Data: %p\n",
++				 ndlp->nlp_rpi, ndlp->nlp_DID,
++				 ndlp->nlp_defer_did,
++				 ndlp->nlp_flag, ndlp);
++		return;
++	}
++
+ 	pmb = (LPFC_MBOXQ_t *) mempool_alloc(phba->mbox_mem_pool,
+ 			GFP_KERNEL);
+ 	if (!pmb)
+@@ -886,6 +899,18 @@ lpfc_release_rpi(struct lpfc_hba *phba,
+ 	else {
+ 		lpfc_unreg_login(phba, vport->vpi, rpi, pmb);
+ 		pmb->mbox_cmpl = lpfc_sli_def_mbox_cmpl;
++		pmb->vport = vport;
++		pmb->ctx_ndlp = ndlp;
++
++		if (((ndlp->nlp_DID & Fabric_DID_MASK) != Fabric_DID_MASK) &&
++		    (!(vport->fc_flag & FC_OFFLINE_MODE)))
++			ndlp->nlp_flag |= NLP_UNREG_INP;
++
++		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
++				 "1437 release_rpi UNREG x%x "
++				 "on NPort x%x flg x%x\n",
++				 ndlp->nlp_rpi, ndlp->nlp_DID, ndlp->nlp_flag);
++
+ 		rc = lpfc_sli_issue_mbox(phba, pmb, MBX_NOWAIT);
+ 		if (rc == MBX_NOT_FINISHED)
+ 			mempool_free(pmb, phba->mbox_mem_pool);
+@@ -906,7 +931,7 @@ lpfc_disc_illegal(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 		(evt == NLP_EVT_CMPL_REG_LOGIN) &&
+ 		(!pmb->u.mb.mbxStatus)) {
+ 		rpi = pmb->u.mb.un.varWords[0];
+-		lpfc_release_rpi(phba, vport, rpi);
++		lpfc_release_rpi(phba, vport, ndlp, rpi);
+ 	}
+ 	lpfc_printf_vlog(vport, KERN_ERR, LOG_DISCOVERY,
+ 			 "0271 Illegal State Transition: node x%x "
+@@ -1334,7 +1359,7 @@ lpfc_cmpl_reglogin_plogi_issue(struct lpfc_vport *vport,
+ 	if (!(phba->pport->load_flag & FC_UNLOADING) &&
+ 		!mb->mbxStatus) {
+ 		rpi = pmb->u.mb.un.varWords[0];
+-		lpfc_release_rpi(phba, vport, rpi);
++		lpfc_release_rpi(phba, vport, ndlp, rpi);
+ 	}
+ 	return ndlp->nlp_state;
+ }
+@@ -2875,8 +2900,8 @@ lpfc_disc_state_machine(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	/* DSM in event <evt> on NPort <nlp_DID> in state <cur_state> */
+ 	lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
+ 			 "0211 DSM in event x%x on NPort x%x in "
+-			 "state %d Data: x%x x%x\n",
+-			 evt, ndlp->nlp_DID, cur_state,
++			 "state %d rpi x%x Data: x%x x%x\n",
++			 evt, ndlp->nlp_DID, cur_state, ndlp->nlp_rpi,
+ 			 ndlp->nlp_flag, ndlp->nlp_fc4_type);
+ 
+ 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_DSM,
+@@ -2889,8 +2914,9 @@ lpfc_disc_state_machine(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	/* DSM out state <rc> on NPort <nlp_DID> */
+ 	if (got_ndlp) {
+ 		lpfc_printf_vlog(vport, KERN_INFO, LOG_DISCOVERY,
+-			 "0212 DSM out state %d on NPort x%x Data: x%x\n",
+-			 rc, ndlp->nlp_DID, ndlp->nlp_flag);
++			 "0212 DSM out state %d on NPort x%x "
++			 "rpi x%x Data: x%x\n",
++			 rc, ndlp->nlp_DID, ndlp->nlp_rpi, ndlp->nlp_flag);
+ 
+ 		lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_DSM,
+ 			"DSM out:         ste:%d did:x%x flg:x%x",
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 0653f29af4a5..353652fbc954 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -2493,6 +2493,30 @@ lpfc_sli_def_mbox_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ 	if (pmb->u.mb.mbxCommand == MBX_REG_LOGIN64) {
+ 		ndlp = (struct lpfc_nodelist *)pmb->ctx_ndlp;
+ 		lpfc_nlp_put(ndlp);
++		pmb->ctx_buf = NULL;
++		pmb->ctx_ndlp = NULL;
++	}
++
++	if (pmb->u.mb.mbxCommand == MBX_UNREG_LOGIN) {
++		ndlp = (struct lpfc_nodelist *)pmb->ctx_ndlp;
++
++		/* Check to see if there are any deferred events to process */
++		if (ndlp) {
++			lpfc_printf_vlog(
++				vport,
++				KERN_INFO, LOG_MBOX | LOG_DISCOVERY,
++				"1438 UNREG cmpl deferred mbox x%x "
++				"on NPort x%x Data: x%x x%x %p\n",
++				ndlp->nlp_rpi, ndlp->nlp_DID,
++				ndlp->nlp_flag, ndlp->nlp_defer_did, ndlp);
++
++			if ((ndlp->nlp_flag & NLP_UNREG_INP) &&
++			    (ndlp->nlp_defer_did != NLP_EVT_NOTHING_PENDING)) {
++				ndlp->nlp_defer_did = NLP_EVT_NOTHING_PENDING;
++				lpfc_issue_els_plogi(vport, ndlp->nlp_DID, 0);
++			}
++			ndlp->nlp_flag &= ~NLP_UNREG_INP;
++		}
+ 		pmb->ctx_ndlp = NULL;
+ 	}
+ 
+@@ -2534,14 +2558,37 @@ lpfc_sli4_unreg_rpi_cmpl_clr(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ 		     &phba->sli4_hba.sli_intf) >=
+ 		     LPFC_SLI_INTF_IF_TYPE_2)) {
+ 			if (ndlp) {
+-				lpfc_printf_vlog(vport, KERN_INFO, LOG_SLI,
+-						 "0010 UNREG_LOGIN vpi:%x "
+-						 "rpi:%x DID:%x map:%x %p\n",
+-						 vport->vpi, ndlp->nlp_rpi,
+-						 ndlp->nlp_DID,
+-						 ndlp->nlp_usg_map, ndlp);
++				lpfc_printf_vlog(
++					vport, KERN_INFO, LOG_MBOX | LOG_SLI,
++					 "0010 UNREG_LOGIN vpi:%x "
++					 "rpi:%x DID:%x defer x%x flg x%x "
++					 "map:%x %p\n",
++					 vport->vpi, ndlp->nlp_rpi,
++					 ndlp->nlp_DID, ndlp->nlp_defer_did,
++					 ndlp->nlp_flag,
++					 ndlp->nlp_usg_map, ndlp);
+ 				ndlp->nlp_flag &= ~NLP_LOGO_ACC;
+ 				lpfc_nlp_put(ndlp);
++
++				/* Check to see if there are any deferred
++				 * events to process
++				 */
++				if ((ndlp->nlp_flag & NLP_UNREG_INP) &&
++				    (ndlp->nlp_defer_did !=
++				    NLP_EVT_NOTHING_PENDING)) {
++					lpfc_printf_vlog(
++						vport, KERN_INFO, LOG_DISCOVERY,
++						"4111 UNREG cmpl deferred "
++						"clr x%x on "
++						"NPort x%x Data: x%x %p\n",
++						ndlp->nlp_rpi, ndlp->nlp_DID,
++						ndlp->nlp_defer_did, ndlp);
++					ndlp->nlp_defer_did =
++						NLP_EVT_NOTHING_PENDING;
++					lpfc_issue_els_plogi(
++						vport, ndlp->nlp_DID, 0);
++				}
++				ndlp->nlp_flag &= ~NLP_UNREG_INP;
+ 			}
+ 		}
+ 	}
+-- 
+2.16.4
+

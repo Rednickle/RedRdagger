@@ -1,0 +1,426 @@
+From: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+Date: Tue, 16 Oct 2018 23:37:40 -0700
+Subject: [PATCH] scsi: megaraid_sas: Add support for FW snap dump
+Git-commit: f0c21df6528601f5f43b449d08faf1bed6858df6
+Patch-mainline: v5.0-rc1
+References: FATE#325920
+
+Latest firmware adds a mechanism to save firmware logs just before
+controller reset on pre-allocated internal controller DRAM. This feature is
+called snapdump which will help debugging firmware issues.  This feature
+requires extra time and firmware reports these values through new driver
+interface. Before initiating an OCR, driver needs to inform FW to save a
+snapdump and then wait for a specified time for the snapdump to complete.
+
+Signed-off-by: Sumit Saxena <sumit.saxena@broadcom.com>
+Signed-off-by: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/scsi/megaraid/megaraid_sas.h        |  25 +++++-
+ drivers/scsi/megaraid/megaraid_sas_base.c   | 118 +++++++++++++++++++++++++++-
+ drivers/scsi/megaraid/megaraid_sas_fusion.c |  66 ++++++++++++++--
+ drivers/scsi/megaraid/megaraid_sas_fusion.h |  12 +++
+ 4 files changed, 208 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index 8c0f74a2740a..a2df9827e932 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -142,6 +142,7 @@
+  * CLR_HANDSHAKE: FW is waiting for HANDSHAKE from BIOS or Driver
+  * HOTPLUG	: Resume from Hotplug
+  * MFI_STOP_ADP	: Send signal to FW to stop processing
++ * MFI_ADP_TRIGGER_SNAP_DUMP: Inform firmware to initiate snap dump
+  */
+ #define WRITE_SEQUENCE_OFFSET		(0x0000000FC) /* I20 */
+ #define HOST_DIAGNOSTIC_OFFSET		(0x000000F8)  /* I20 */
+@@ -158,6 +159,7 @@
+ #define MFI_RESET_FLAGS				MFI_INIT_READY| \
+ 						MFI_INIT_MFIMODE| \
+ 						MFI_INIT_ABORT
++#define MFI_ADP_TRIGGER_SNAP_DUMP		0x00000100
+ #define MPI2_IOCINIT_MSGFLAG_RDPQ_ARRAY_MODE    (0x01)
+ 
+ /*
+@@ -860,8 +862,22 @@ struct megasas_ctrl_prop {
+ 		u32     reserved:18;
+ #endif
+ 	} OnOffProperties;
+-	u8 autoSnapVDSpace;
+-	u8 viewSpace;
++
++	union {
++		u8 autoSnapVDSpace;
++		u8 viewSpace;
++		struct {
++#if   defined(__BIG_ENDIAN_BITFIELD)
++			u16 reserved2:11;
++			u16 enable_snap_dump:1;
++			u16 reserved1:4;
++#else
++			u16 reserved1:4;
++			u16 enable_snap_dump:1;
++			u16 reserved2:11;
++#endif
++		} on_off_properties2;
++	};
+ 	__le16 spinDownTime;
+ 	u8  reserved[24];
+ } __packed;
+@@ -2185,6 +2201,9 @@ struct megasas_instance {
+ 	struct MR_LD_TARGETID_LIST *ld_targetid_list_buf;
+ 	dma_addr_t ld_targetid_list_buf_h;
+ 
++	struct MR_SNAPDUMP_PROPERTIES *snapdump_prop;
++	dma_addr_t snapdump_prop_h;
++
+ 	void *crash_buf[MAX_CRASH_DUMP_SIZE];
+ 	unsigned int    fw_crash_buffer_size;
+ 	unsigned int    fw_crash_state;
+@@ -2316,6 +2335,7 @@ struct megasas_instance {
+ 	bool support_nvme_passthru;
+ 	u8 task_abort_tmo;
+ 	u8 max_reset_tmo;
++	u8 snapdump_wait_time;
+ };
+ struct MR_LD_VF_MAP {
+ 	u32 size;
+@@ -2541,6 +2561,7 @@ void megasas_set_dynamic_target_properties(struct scsi_device *sdev,
+ 					   bool is_target_prop);
+ int megasas_get_target_prop(struct megasas_instance *instance,
+ 			    struct scsi_device *sdev);
++void megasas_get_snapdump_properties(struct megasas_instance *instance);
+ 
+ int megasas_set_crash_dump_params(struct megasas_instance *instance,
+ 	u8 crash_buf_state);
+diff --git a/drivers/scsi/megaraid/megaraid_sas_base.c b/drivers/scsi/megaraid/megaraid_sas_base.c
+index 4dc29e055461..3ddf71b8c38d 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -4661,6 +4661,87 @@ static void megasas_update_ext_vd_details(struct megasas_instance *instance)
+ 	fusion->drv_map_sz = sizeof(struct MR_DRV_RAID_MAP_ALL);
+ }
+ 
++/*
++ * dcmd.opcode                - MR_DCMD_CTRL_SNAPDUMP_GET_PROPERTIES
++ * dcmd.hdr.length            - number of bytes to read
++ * dcmd.sge                   - Ptr to MR_SNAPDUMP_PROPERTIES
++ * Desc:			 Fill in snapdump properties
++ * Status:			 MFI_STAT_OK- Command successful
++ */
++void megasas_get_snapdump_properties(struct megasas_instance *instance)
++{
++	int ret = 0;
++	struct megasas_cmd *cmd;
++	struct megasas_dcmd_frame *dcmd;
++	struct MR_SNAPDUMP_PROPERTIES *ci;
++	dma_addr_t ci_h = 0;
++
++	ci = instance->snapdump_prop;
++	ci_h = instance->snapdump_prop_h;
++
++	if (!ci)
++		return;
++
++	cmd = megasas_get_cmd(instance);
++
++	if (!cmd) {
++		dev_dbg(&instance->pdev->dev, "Failed to get a free cmd\n");
++		return;
++	}
++
++	dcmd = &cmd->frame->dcmd;
++
++	memset(ci, 0, sizeof(*ci));
++	memset(dcmd->mbox.b, 0, MFI_MBOX_SIZE);
++
++	dcmd->cmd = MFI_CMD_DCMD;
++	dcmd->cmd_status = MFI_STAT_INVALID_STATUS;
++	dcmd->sge_count = 1;
++	dcmd->flags = MFI_FRAME_DIR_READ;
++	dcmd->timeout = 0;
++	dcmd->pad_0 = 0;
++	dcmd->data_xfer_len = cpu_to_le32(sizeof(struct MR_SNAPDUMP_PROPERTIES));
++	dcmd->opcode = cpu_to_le32(MR_DCMD_CTRL_SNAPDUMP_GET_PROPERTIES);
++
++	megasas_set_dma_settings(instance, dcmd, ci_h,
++				 sizeof(struct MR_SNAPDUMP_PROPERTIES));
++
++	if (!instance->mask_interrupts) {
++		ret = megasas_issue_blocked_cmd(instance, cmd,
++						MFI_IO_TIMEOUT_SECS);
++	} else {
++		ret = megasas_issue_polled(instance, cmd);
++		cmd->flags |= DRV_DCMD_SKIP_REFIRE;
++	}
++
++	switch (ret) {
++	case DCMD_SUCCESS:
++		instance->snapdump_wait_time =
++			min_t(u8, ci->trigger_min_num_sec_before_ocr,
++				MEGASAS_MAX_SNAP_DUMP_WAIT_TIME);
++		break;
++
++	case DCMD_TIMEOUT:
++		switch (dcmd_timeout_ocr_possible(instance)) {
++		case INITIATE_OCR:
++			cmd->flags |= DRV_DCMD_SKIP_REFIRE;
++			megasas_reset_fusion(instance->host,
++				MFI_IO_TIMEOUT_OCR);
++			break;
++		case KILL_ADAPTER:
++			megaraid_sas_kill_hba(instance);
++			break;
++		case IGNORE_TIMEOUT:
++			dev_info(&instance->pdev->dev, "Ignore DCMD timeout: %s %d\n",
++				__func__, __LINE__);
++			break;
++		}
++	}
++
++	if (ret != DCMD_TIMEOUT)
++		megasas_return_cmd(instance, cmd);
++}
++
+ /**
+  * megasas_get_controller_info -	Returns FW's controller structure
+  * @instance:				Adapter soft state
+@@ -4720,6 +4801,7 @@ megasas_get_ctrl_info(struct megasas_instance *instance)
+ 		 * CPU endianness format.
+ 		 */
+ 		le32_to_cpus((u32 *)&ci->properties.OnOffProperties);
++		le16_to_cpus((u16 *)&ci->properties.on_off_properties2);
+ 		le32_to_cpus((u32 *)&ci->adapterOperations2);
+ 		le32_to_cpus((u32 *)&ci->adapterOperations3);
+ 		le16_to_cpus((u16 *)&ci->adapter_operations4);
+@@ -4741,6 +4823,11 @@ megasas_get_ctrl_info(struct megasas_instance *instance)
+ 
+ 		/*Check whether controller is iMR or MR */
+ 		instance->is_imr = (ci->memory_size ? 0 : 1);
++
++		instance->snapdump_wait_time =
++			(ci->properties.on_off_properties2.enable_snap_dump ?
++			 MEGASAS_DEFAULT_SNAP_DUMP_WAIT_TIME : 0);
++
+ 		dev_info(&instance->pdev->dev,
+ 			"controller type\t: %s(%dMB)\n",
+ 			instance->is_imr ? "iMR" : "MR",
+@@ -5539,6 +5626,11 @@ static int megasas_init_fw(struct megasas_instance *instance)
+ 		instance->crash_dump_buf = NULL;
+ 	}
+ 
++	if (instance->snapdump_wait_time) {
++		megasas_get_snapdump_properties(instance);
++		dev_info(&instance->pdev->dev, "Snap dump wait time\t: %d\n",
++			 instance->snapdump_wait_time);
++	}
+ 
+ 	dev_info(&instance->pdev->dev,
+ 		"pci id\t\t: (0x%04x)/(0x%04x)/(0x%04x)/(0x%04x)\n",
+@@ -5553,7 +5645,6 @@ static int megasas_init_fw(struct megasas_instance *instance)
+ 	dev_info(&instance->pdev->dev, "jbod sync map		: %s\n",
+ 		instance->use_seqnum_jbod_fp ? "yes" : "no");
+ 
+-
+ 	instance->max_sectors_per_req = instance->max_num_sge *
+ 						SGE_BUFFER_SIZE / 512;
+ 	if (tmp_sectors && (instance->max_sectors_per_req > tmp_sectors))
+@@ -6257,6 +6348,14 @@ int megasas_alloc_ctrl_dma_buffers(struct megasas_instance *instance)
+ 				"Failed to allocate PD list buffer\n");
+ 			return -ENOMEM;
+ 		}
++
++		instance->snapdump_prop = dma_alloc_coherent(&pdev->dev,
++				sizeof(struct MR_SNAPDUMP_PROPERTIES),
++				&instance->snapdump_prop_h, GFP_KERNEL);
++
++		if (!instance->snapdump_prop)
++			dev_err(&pdev->dev,
++				"Failed to allocate snapdump properties buffer\n");
+ 	}
+ 
+ 	instance->pd_list_buf =
+@@ -6400,6 +6499,12 @@ void megasas_free_ctrl_dma_buffers(struct megasas_instance *instance)
+ 		dma_free_coherent(&pdev->dev, CRASH_DMA_BUF_SIZE,
+ 				    instance->crash_dump_buf,
+ 				    instance->crash_dump_h);
++
++	if (instance->snapdump_prop)
++		dma_free_coherent(&pdev->dev,
++				  sizeof(struct MR_SNAPDUMP_PROPERTIES),
++				  instance->snapdump_prop,
++				  instance->snapdump_prop_h);
+ }
+ 
+ /*
+@@ -7763,8 +7868,15 @@ megasas_aen_polling(struct work_struct *work)
+ 			break;
+ 
+ 		case MR_EVT_CTRL_PROP_CHANGED:
+-				dcmd_ret = megasas_get_ctrl_info(instance);
+-				break;
++			dcmd_ret = megasas_get_ctrl_info(instance);
++			if (dcmd_ret == DCMD_SUCCESS &&
++			    instance->snapdump_wait_time) {
++				megasas_get_snapdump_properties(instance);
++				dev_info(&instance->pdev->dev,
++					 "Snap dump wait time\t: %d\n",
++					 instance->snapdump_wait_time);
++			}
++			break;
+ 		default:
+ 			doscan = 0;
+ 			break;
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 9ca4a52164bd..2868b71add2d 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -3884,14 +3884,57 @@ megasas_check_reset_fusion(struct megasas_instance *instance,
+ 	return 0;
+ }
+ 
++/**
++ * megasas_trigger_snap_dump -	Trigger snap dump in FW
++ * @instance:			Soft instance of adapter
++ */
++static inline void megasas_trigger_snap_dump(struct megasas_instance *instance)
++{
++	int j;
++	u32 fw_state;
++
++	if (!instance->disableOnlineCtrlReset) {
++		dev_info(&instance->pdev->dev, "Trigger snap dump\n");
++		writel(MFI_ADP_TRIGGER_SNAP_DUMP,
++		       &instance->reg_set->doorbell);
++		readl(&instance->reg_set->doorbell);
++	}
++
++	for (j = 0; j < instance->snapdump_wait_time; j++) {
++		fw_state = instance->instancet->read_fw_status_reg(
++			instance->reg_set) & MFI_STATE_MASK;
++		if (fw_state == MFI_STATE_FAULT) {
++			dev_err(&instance->pdev->dev,
++				"Found FW in FAULT state, after snap dump trigger\n");
++			return;
++		}
++		msleep(1000);
++	}
++}
++
+ /* This function waits for outstanding commands on fusion to complete */
+ int megasas_wait_for_outstanding_fusion(struct megasas_instance *instance,
+ 					int reason, int *convert)
+ {
+ 	int i, outstanding, retval = 0, hb_seconds_missed = 0;
+ 	u32 fw_state;
++	u32 waittime_for_io_completion;
+ 
+-	for (i = 0; i < resetwaittime; i++) {
++	waittime_for_io_completion =
++		min_t(u32, resetwaittime,
++			(resetwaittime - instance->snapdump_wait_time));
++
++	if (reason == MFI_IO_TIMEOUT_OCR) {
++		dev_info(&instance->pdev->dev,
++			"MFI command is timed out\n");
++		megasas_complete_cmd_dpc_fusion((unsigned long)instance);
++		if (instance->snapdump_wait_time)
++			megasas_trigger_snap_dump(instance);
++		retval = 1;
++		goto out;
++	}
++
++	for (i = 0; i < waittime_for_io_completion; i++) {
+ 		/* Check if firmware is in fault state */
+ 		fw_state = instance->instancet->read_fw_status_reg(
+ 			instance->reg_set) & MFI_STATE_MASK;
+@@ -3912,13 +3955,6 @@ int megasas_wait_for_outstanding_fusion(struct megasas_instance *instance,
+ 			goto out;
+ 		}
+ 
+-		if (reason == MFI_IO_TIMEOUT_OCR) {
+-			dev_info(&instance->pdev->dev,
+-				"MFI IO is timed out, initiating OCR\n");
+-			megasas_complete_cmd_dpc_fusion((unsigned long)instance);
+-			retval = 1;
+-			goto out;
+-		}
+ 
+ 		/* If SR-IOV VF mode & heartbeat timeout, don't wait */
+ 		if (instance->requestorId && !reason) {
+@@ -3963,6 +3999,12 @@ int megasas_wait_for_outstanding_fusion(struct megasas_instance *instance,
+ 		msleep(1000);
+ 	}
+ 
++	if (instance->snapdump_wait_time) {
++		megasas_trigger_snap_dump(instance);
++		retval = 1;
++		goto out;
++	}
++
+ 	if (atomic_read(&instance->fw_outstanding)) {
+ 		dev_err(&instance->pdev->dev, "pending commands remain after waiting, "
+ 		       "will reset adapter scsi%d.\n",
+@@ -3970,6 +4012,7 @@ int megasas_wait_for_outstanding_fusion(struct megasas_instance *instance,
+ 		*convert = 1;
+ 		retval = 1;
+ 	}
++
+ out:
+ 	return retval;
+ }
+@@ -4783,6 +4826,13 @@ int megasas_reset_fusion(struct Scsi_Host *shost, int reason)
+ 				megasas_set_crash_dump_params(instance,
+ 					MR_CRASH_BUF_TURN_OFF);
+ 
++			if (instance->snapdump_wait_time) {
++				megasas_get_snapdump_properties(instance);
++				dev_info(&instance->pdev->dev,
++					 "Snap dump wait time\t: %d\n",
++					 instance->snapdump_wait_time);
++			}
++
+ 			retval = SUCCESS;
+ 
+ 			/* Adapter reset completed successfully */
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.h b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+index 8e5ebee6517f..14d8e409832c 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.h
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+@@ -725,6 +725,7 @@ struct MPI2_IOC_INIT_REQUEST {
+ #define MR_DCMD_CTRL_SHARED_HOST_MEM_ALLOC  0x010e8485   /* SR-IOV HB alloc*/
+ #define MR_DCMD_LD_VF_MAP_GET_ALL_LDS_111   0x03200200
+ #define MR_DCMD_LD_VF_MAP_GET_ALL_LDS       0x03150200
++#define MR_DCMD_CTRL_SNAPDUMP_GET_PROPERTIES	0x01200100
+ 
+ struct MR_DEV_HANDLE_INFO {
+ 	__le16	curDevHdl;
+@@ -1063,6 +1064,9 @@ struct MR_FW_RAID_MAP_DYNAMIC {
+ #define MPI26_IEEE_SGE_FLAGS_NSF_NVME_PRP       (0x08)
+ #define MPI26_IEEE_SGE_FLAGS_NSF_NVME_SGL       (0x10)
+ 
++#define MEGASAS_DEFAULT_SNAP_DUMP_WAIT_TIME 15
++#define MEGASAS_MAX_SNAP_DUMP_WAIT_TIME 60
++
+ struct megasas_register_set;
+ struct megasas_instance;
+ 
+@@ -1350,6 +1354,14 @@ enum CMD_RET_VALUES {
+ 	RETURN_CMD = 3,
+ };
+ 
++struct  MR_SNAPDUMP_PROPERTIES {
++	u8       offload_num;
++	u8       max_num_supported;
++	u8       cur_num_supported;
++	u8       trigger_min_num_sec_before_ocr;
++	u8       reserved[12];
++};
++
+ void megasas_free_cmds_fusion(struct megasas_instance *instance);
+ int megasas_ioc_init_fusion(struct megasas_instance *instance);
+ u8 megasas_get_map_info(struct megasas_instance *instance);
+-- 
+2.16.4
+

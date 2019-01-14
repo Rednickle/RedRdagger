@@ -1,0 +1,163 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 16 May 2018 19:33:55 +0100
+Subject: drm/i915: Stop parking the signaler around reset
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 3f6e9822308127104a7bb007ca569f2c57d03b67
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We cannot call kthread_park() from softirq context, so let's avoid it
+entirely during the reset. We wanted to suspend the signaler so that it
+would not mark a request as complete at the same time as we marked it as
+being in error. Instead of parking the signaling, stop the engine from
+advancing so that the GPU doesn't emit the breadcrumb for our chosen
+"guilty" request.
+
+v2: Refactor setting STOP_RING so that we don't have the same code thrice
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Michałt Winiarski <michal.winiarski@intel.com>
+CC: Michel Thierry <michel.thierry@intel.com>
+Cc: Jeff McGee <jeff.mcgee@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180516183355.10553-8-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c         |   14 --------------
+ drivers/gpu/drm/i915/intel_engine_cs.c  |   29 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_lrc.c        |    6 ++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    2 ++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    2 ++
+ drivers/gpu/drm/i915/intel_uncore.c     |   10 ++--------
+ 6 files changed, 41 insertions(+), 22 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3042,18 +3042,6 @@ i915_gem_reset_prepare_engine(struct int
+ 	 */
+ 	intel_uncore_forcewake_get(engine->i915, FORCEWAKE_ALL);
+ 
+-	/*
+-	 * Prevent the signaler thread from updating the request
+-	 * state (by calling dma_fence_signal) as we are processing
+-	 * the reset. The write from the GPU of the seqno is
+-	 * asynchronous and the signaler thread may see a different
+-	 * value to us and declare the request complete, even though
+-	 * the reset routine have picked that request as the active
+-	 * (incomplete) request. This conflict is not handled
+-	 * gracefully!
+-	 */
+-	kthread_park(engine->breadcrumbs.signaler);
+-
+ 	request = engine->reset.prepare(engine);
+ 	if (request && request->fence.error == -EIO)
+ 		request = ERR_PTR(-EIO); /* Previous reset failed! */
+@@ -3256,8 +3244,6 @@ void i915_gem_reset_finish_engine(struct
+ {
+ 	engine->reset.finish(engine);
+ 
+-	kthread_unpark(engine->breadcrumbs.signaler);
+-
+ 	intel_uncore_forcewake_put(engine->i915, FORCEWAKE_ALL);
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -769,6 +769,35 @@ u64 intel_engine_get_last_batch_head(con
+ 	return bbaddr;
+ }
+ 
++int intel_engine_stop_cs(struct intel_engine_cs *engine)
++{
++	struct drm_i915_private *dev_priv = engine->i915;
++	const u32 base = engine->mmio_base;
++	const i915_reg_t mode = RING_MI_MODE(base);
++	int err;
++
++	if (INTEL_GEN(dev_priv) < 3)
++		return -ENODEV;
++
++	GEM_TRACE("%s\n", engine->name);
++
++	I915_WRITE_FW(mode, _MASKED_BIT_ENABLE(STOP_RING));
++
++	err = 0;
++	if (__intel_wait_for_register_fw(dev_priv,
++					 mode, MODE_IDLE, MODE_IDLE,
++					 1000, 0,
++					 NULL)) {
++		GEM_TRACE("%s: timed out on STOP_RING -> IDLE\n", engine->name);
++		err = -ETIMEDOUT;
++	}
++
++	/* A final mmio read to let GPU writes be hopefully flushed to memory */
++	POSTING_READ_FW(mode);
++
++	return err;
++}
++
+ const char *i915_cache_level_str(struct drm_i915_private *i915, int type)
+ {
+ 	switch (type) {
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1888,6 +1888,12 @@ execlists_reset_prepare(struct intel_eng
+ 	if (request) {
+ 		unsigned long flags;
+ 
++		/*
++		 * Prevent the breadcrumb from advancing before we decide
++		 * which request is currently active.
++		 */
++		intel_engine_stop_cs(engine);
++
+ 		spin_lock_irqsave(&engine->timeline.lock, flags);
+ 		list_for_each_entry_from_reverse(request,
+ 						 &engine->timeline.requests,
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -533,6 +533,8 @@ out:
+ 
+ static struct i915_request *reset_prepare(struct intel_engine_cs *engine)
+ {
++	intel_engine_stop_cs(engine);
++
+ 	if (engine->irq_seqno_barrier)
+ 		engine->irq_seqno_barrier(engine);
+ 
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -877,6 +877,8 @@ int intel_init_bsd_ring_buffer(struct in
+ int intel_init_blt_ring_buffer(struct intel_engine_cs *engine);
+ int intel_init_vebox_ring_buffer(struct intel_engine_cs *engine);
+ 
++int intel_engine_stop_cs(struct intel_engine_cs *engine);
++
+ u64 intel_engine_get_active_head(const struct intel_engine_cs *engine);
+ u64 intel_engine_get_last_batch_head(const struct intel_engine_cs *engine);
+ 
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -1702,15 +1702,9 @@ static void gen3_stop_engine(struct inte
+ {
+ 	struct drm_i915_private *dev_priv = engine->i915;
+ 	const u32 base = engine->mmio_base;
+-	const i915_reg_t mode = RING_MI_MODE(base);
+ 
+-	I915_WRITE_FW(mode, _MASKED_BIT_ENABLE(STOP_RING));
+-	if (__intel_wait_for_register_fw(dev_priv,
+-					 mode, MODE_IDLE, MODE_IDLE,
+-					 500, 0,
+-					 NULL))
+-		DRM_DEBUG_DRIVER("%s: timed out on STOP_RING\n",
+-				 engine->name);
++	if (intel_engine_stop_cs(engine))
++		DRM_DEBUG_DRIVER("%s: timed out on STOP_RING\n", engine->name);
+ 
+ 	I915_WRITE_FW(RING_HEAD(base), I915_READ_FW(RING_TAIL(base)));
+ 	POSTING_READ_FW(RING_HEAD(base)); /* paranoia */

@@ -1,0 +1,812 @@
+From: Boris Brezillon <boris.brezillon@free-electrons.com>
+Date: Fri, 12 Jan 2018 10:09:26 +0100
+Subject: drm/vc4: Expose performance counters to userspace
+Git-commit: 65101d8c9108201118efa7e08f4e2c57f438deb9
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+The V3D engine has various hardware counters which might be interesting
+to userspace performance analysis tools.
+
+Expose new ioctls to create/destroy a performance monitor object and
+query the counter values of this perfmance monitor.
+
+Note that a perfomance monitor is given an ID that is only valid on the
+file descriptor it has been allocated from. A performance monitor can be
+attached to a CL submission and the driver will enable HW counters for
+this request and update the performance monitor values at the end of the
+job.
+
+Signed-off-by: Boris Brezillon <boris.brezillon@free-electrons.com>
+Reviewed-by: Eric Anholt <eric@anholt.net>
+Signed-off-by: Eric Anholt <eric@anholt.net>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180112090926.12538-1-boris.brezillon@free-electrons.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/vc4/Makefile      |    1 
+ drivers/gpu/drm/vc4/vc4_drv.c     |   26 +++++
+ drivers/gpu/drm/vc4/vc4_drv.h     |   68 +++++++++++++
+ drivers/gpu/drm/vc4/vc4_gem.c     |   48 ++++++++-
+ drivers/gpu/drm/vc4/vc4_irq.c     |   40 +++++++-
+ drivers/gpu/drm/vc4/vc4_perfmon.c |  188 ++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/vc4/vc4_regs.h    |   35 -------
+ drivers/gpu/drm/vc4/vc4_v3d.c     |   64 ++++++------
+ include/uapi/drm/vc4_drm.h        |   76 +++++++++++++++
+ 9 files changed, 474 insertions(+), 72 deletions(-)
+
+--- a/drivers/gpu/drm/vc4/Makefile
++++ b/drivers/gpu/drm/vc4/Makefile
+@@ -14,6 +14,7 @@ vc4-y := \
+ 	vc4_vec.o \
+ 	vc4_hvs.o \
+ 	vc4_irq.o \
++	vc4_perfmon.o \
+ 	vc4_plane.o \
+ 	vc4_render_cl.o \
+ 	vc4_trace_points.o \
+--- a/drivers/gpu/drm/vc4/vc4_drv.c
++++ b/drivers/gpu/drm/vc4/vc4_drv.c
+@@ -101,6 +101,7 @@ static int vc4_get_param_ioctl(struct dr
+ 	case DRM_VC4_PARAM_SUPPORTS_THREADED_FS:
+ 	case DRM_VC4_PARAM_SUPPORTS_FIXED_RCL_ORDER:
+ 	case DRM_VC4_PARAM_SUPPORTS_MADVISE:
++	case DRM_VC4_PARAM_SUPPORTS_PERFMON:
+ 		args->value = true;
+ 		break;
+ 	default:
+@@ -111,6 +112,26 @@ static int vc4_get_param_ioctl(struct dr
+ 	return 0;
+ }
+ 
++static int vc4_open(struct drm_device *dev, struct drm_file *file)
++{
++	struct vc4_file *vc4file;
++
++	vc4file = kzalloc(sizeof(*vc4file), GFP_KERNEL);
++	if (!vc4file)
++		return -ENOMEM;
++
++	vc4_perfmon_open_file(vc4file);
++	file->driver_priv = vc4file;
++	return 0;
++}
++
++static void vc4_close(struct drm_device *dev, struct drm_file *file)
++{
++	struct vc4_file *vc4file = file->driver_priv;
++
++	vc4_perfmon_close_file(vc4file);
++}
++
+ static const struct vm_operations_struct vc4_vm_ops = {
+ 	.fault = vc4_fault,
+ 	.open = drm_gem_vm_open,
+@@ -143,6 +164,9 @@ static const struct drm_ioctl_desc vc4_d
+ 	DRM_IOCTL_DEF_DRV(VC4_GET_TILING, vc4_get_tiling_ioctl, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(VC4_LABEL_BO, vc4_label_bo_ioctl, DRM_RENDER_ALLOW),
+ 	DRM_IOCTL_DEF_DRV(VC4_GEM_MADVISE, vc4_gem_madvise_ioctl, DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(VC4_PERFMON_CREATE, vc4_perfmon_create_ioctl, DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(VC4_PERFMON_DESTROY, vc4_perfmon_destroy_ioctl, DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(VC4_PERFMON_GET_VALUES, vc4_perfmon_get_values_ioctl, DRM_RENDER_ALLOW),
+ };
+ 
+ static struct drm_driver vc4_drm_driver = {
+@@ -153,6 +177,8 @@ static struct drm_driver vc4_drm_driver
+ 			    DRIVER_RENDER |
+ 			    DRIVER_PRIME),
+ 	.lastclose = drm_fb_helper_lastclose,
++	.open = vc4_open,
++	.postclose = vc4_close,
+ 	.irq_handler = vc4_irq,
+ 	.irq_preinstall = vc4_irq_preinstall,
+ 	.irq_postinstall = vc4_irq_postinstall,
+--- a/drivers/gpu/drm/vc4/vc4_drv.h
++++ b/drivers/gpu/drm/vc4/vc4_drv.h
+@@ -11,6 +11,8 @@
+ #include <drm/drm_encoder.h>
+ #include <drm/drm_gem_cma_helper.h>
+ 
++#include "uapi/drm/vc4_drm.h"
++
+ /* Don't forget to update vc4_bo.c: bo_type_names[] when adding to
+  * this.
+  */
+@@ -29,6 +31,36 @@ enum vc4_kernel_bo_type {
+ 	VC4_BO_TYPE_COUNT
+ };
+ 
++/* Performance monitor object. The perform lifetime is controlled by userspace
++ * using perfmon related ioctls. A perfmon can be attached to a submit_cl
++ * request, and when this is the case, HW perf counters will be activated just
++ * before the submit_cl is submitted to the GPU and disabled when the job is
++ * done. This way, only events related to a specific job will be counted.
++ */
++struct vc4_perfmon {
++	/* Tracks the number of users of the perfmon, when this counter reaches
++	 * zero the perfmon is destroyed.
++	 */
++	refcount_t refcnt;
++
++	/* Number of counters activated in this perfmon instance
++	 * (should be less than DRM_VC4_MAX_PERF_COUNTERS).
++	 */
++	u8 ncounters;
++
++	/* Events counted by the HW perf counters. */
++	u8 events[DRM_VC4_MAX_PERF_COUNTERS];
++
++	/* Storage for counter values. Counters are incremented by the HW
++	 * perf counter values every time the perfmon is attached to a GPU job.
++	 * This way, perfmon users don't have to retrieve the results after
++	 * each job if they want to track events covering several submissions.
++	 * Note that counter values can't be reset, but you can fake a reset by
++	 * destroying the perfmon and creating a new one.
++	 */
++	u64 counters[0];
++};
++
+ struct vc4_dev {
+ 	struct drm_device *dev;
+ 
+@@ -121,6 +153,11 @@ struct vc4_dev {
+ 	wait_queue_head_t job_wait_queue;
+ 	struct work_struct job_done_work;
+ 
++	/* Used to track the active perfmon if any. Access to this field is
++	 * protected by job_lock.
++	 */
++	struct vc4_perfmon *active_perfmon;
++
+ 	/* List of struct vc4_seqno_cb for callbacks to be made from a
+ 	 * workqueue when the given seqno is passed.
+ 	 */
+@@ -406,6 +443,21 @@ struct vc4_exec_info {
+ 	void *uniforms_v;
+ 	uint32_t uniforms_p;
+ 	uint32_t uniforms_size;
++
++	/* Pointer to a performance monitor object if the user requested it,
++	 * NULL otherwise.
++	 */
++	struct vc4_perfmon *perfmon;
++};
++
++/* Per-open file private data. Any driver-specific resource that has to be
++ * released when the DRM file is closed should be placed here.
++ */
++struct vc4_file {
++	struct {
++		struct idr idr;
++		struct mutex lock;
++	} perfmon;
+ };
+ 
+ static inline struct vc4_exec_info *
+@@ -646,3 +698,19 @@ bool vc4_check_tex_size(struct vc4_exec_
+ /* vc4_validate_shader.c */
+ struct vc4_validated_shader_info *
+ vc4_validate_shader(struct drm_gem_cma_object *shader_obj);
++
++/* vc4_perfmon.c */
++void vc4_perfmon_get(struct vc4_perfmon *perfmon);
++void vc4_perfmon_put(struct vc4_perfmon *perfmon);
++void vc4_perfmon_start(struct vc4_dev *vc4, struct vc4_perfmon *perfmon);
++void vc4_perfmon_stop(struct vc4_dev *vc4, struct vc4_perfmon *perfmon,
++		      bool capture);
++struct vc4_perfmon *vc4_perfmon_find(struct vc4_file *vc4file, int id);
++void vc4_perfmon_open_file(struct vc4_file *vc4file);
++void vc4_perfmon_close_file(struct vc4_file *vc4file);
++int vc4_perfmon_create_ioctl(struct drm_device *dev, void *data,
++			     struct drm_file *file_priv);
++int vc4_perfmon_destroy_ioctl(struct drm_device *dev, void *data,
++			      struct drm_file *file_priv);
++int vc4_perfmon_get_values_ioctl(struct drm_device *dev, void *data,
++				 struct drm_file *file_priv);
+--- a/drivers/gpu/drm/vc4/vc4_gem.c
++++ b/drivers/gpu/drm/vc4/vc4_gem.c
+@@ -467,14 +467,30 @@ again:
+ 
+ 	vc4_flush_caches(dev);
+ 
++	/* Only start the perfmon if it was not already started by a previous
++	 * job.
++	 */
++	if (exec->perfmon && vc4->active_perfmon != exec->perfmon)
++		vc4_perfmon_start(vc4, exec->perfmon);
++
+ 	/* Either put the job in the binner if it uses the binner, or
+ 	 * immediately move it to the to-be-rendered queue.
+ 	 */
+ 	if (exec->ct0ca != exec->ct0ea) {
+ 		submit_cl(dev, 0, exec->ct0ca, exec->ct0ea);
+ 	} else {
++		struct vc4_exec_info *next;
++
+ 		vc4_move_job_to_render(dev, exec);
+-		goto again;
++		next = vc4_first_bin_job(vc4);
++
++		/* We can't start the next bin job if the previous job had a
++		 * different perfmon instance attached to it. The same goes
++		 * if one of them had a perfmon attached to it and the other
++		 * one doesn't.
++		 */
++		if (next && next->perfmon == exec->perfmon)
++			goto again;
+ 	}
+ }
+ 
+@@ -642,6 +658,7 @@ vc4_queue_submit(struct drm_device *dev,
+ 		 struct ww_acquire_ctx *acquire_ctx)
+ {
+ 	struct vc4_dev *vc4 = to_vc4_dev(dev);
++	struct vc4_exec_info *renderjob;
+ 	uint64_t seqno;
+ 	unsigned long irqflags;
+ 	struct vc4_fence *fence;
+@@ -667,11 +684,14 @@ vc4_queue_submit(struct drm_device *dev,
+ 
+ 	list_add_tail(&exec->head, &vc4->bin_job_list);
+ 
+-	/* If no job was executing, kick ours off.  Otherwise, it'll
+-	 * get started when the previous job's flush done interrupt
+-	 * occurs.
++	/* If no bin job was executing and if the render job (if any) has the
++	 * same perfmon as our job attached to it (or if both jobs don't have
++	 * perfmon activated), then kick ours off.  Otherwise, it'll get
++	 * started when the previous job's flush/render done interrupt occurs.
+ 	 */
+-	if (vc4_first_bin_job(vc4) == exec) {
++	renderjob = vc4_first_render_job(vc4);
++	if (vc4_first_bin_job(vc4) == exec &&
++	    (!renderjob || renderjob->perfmon == exec->perfmon)) {
+ 		vc4_submit_next_bin_job(dev);
+ 		vc4_queue_hangcheck(dev);
+ 	}
+@@ -936,6 +956,9 @@ vc4_complete_exec(struct drm_device *dev
+ 	vc4->bin_alloc_used &= ~exec->bin_slots;
+ 	spin_unlock_irqrestore(&vc4->job_lock, irqflags);
+ 
++	/* Release the reference we had on the perf monitor. */
++	vc4_perfmon_put(exec->perfmon);
++
+ 	mutex_lock(&vc4->power_lock);
+ 	if (--vc4->power_refcount == 0) {
+ 		pm_runtime_mark_last_busy(&vc4->v3d->pdev->dev);
+@@ -1088,6 +1111,7 @@ vc4_submit_cl_ioctl(struct drm_device *d
+ 		    struct drm_file *file_priv)
+ {
+ 	struct vc4_dev *vc4 = to_vc4_dev(dev);
++	struct vc4_file *vc4file = file_priv->driver_priv;
+ 	struct drm_vc4_submit_cl *args = data;
+ 	struct vc4_exec_info *exec;
+ 	struct ww_acquire_ctx acquire_ctx;
+@@ -1101,6 +1125,11 @@ vc4_submit_cl_ioctl(struct drm_device *d
+ 		return -EINVAL;
+ 	}
+ 
++	if (args->pad2 != 0) {
++		DRM_DEBUG("->pad2 must be set to zero\n");
++		return -EINVAL;
++	}
++
+ 	exec = kcalloc(1, sizeof(*exec), GFP_KERNEL);
+ 	if (!exec) {
+ 		DRM_ERROR("malloc failure on exec struct\n");
+@@ -1126,6 +1155,15 @@ vc4_submit_cl_ioctl(struct drm_device *d
+ 	if (ret)
+ 		goto fail;
+ 
++	if (args->perfmonid) {
++		exec->perfmon = vc4_perfmon_find(vc4file,
++						 args->perfmonid);
++		if (!exec->perfmon) {
++			ret = -ENOENT;
++			goto fail;
++		}
++	}
++
+ 	if (exec->args->bin_cl_size != 0) {
+ 		ret = vc4_get_bcl(dev, exec);
+ 		if (ret)
+--- a/drivers/gpu/drm/vc4/vc4_irq.c
++++ b/drivers/gpu/drm/vc4/vc4_irq.c
+@@ -104,13 +104,20 @@ static void
+ vc4_irq_finish_bin_job(struct drm_device *dev)
+ {
+ 	struct vc4_dev *vc4 = to_vc4_dev(dev);
+-	struct vc4_exec_info *exec = vc4_first_bin_job(vc4);
++	struct vc4_exec_info *next, *exec = vc4_first_bin_job(vc4);
+ 
+ 	if (!exec)
+ 		return;
+ 
+ 	vc4_move_job_to_render(dev, exec);
+-	vc4_submit_next_bin_job(dev);
++	next = vc4_first_bin_job(vc4);
++
++	/* Only submit the next job in the bin list if it matches the perfmon
++	 * attached to the one that just finished (or if both jobs don't have
++	 * perfmon attached to them).
++	 */
++	if (next && next->perfmon == exec->perfmon)
++		vc4_submit_next_bin_job(dev);
+ }
+ 
+ static void
+@@ -122,6 +129,10 @@ vc4_cancel_bin_job(struct drm_device *de
+ 	if (!exec)
+ 		return;
+ 
++	/* Stop the perfmon so that the next bin job can be started. */
++	if (exec->perfmon)
++		vc4_perfmon_stop(vc4, exec->perfmon, false);
++
+ 	list_move_tail(&exec->head, &vc4->bin_job_list);
+ 	vc4_submit_next_bin_job(dev);
+ }
+@@ -131,18 +142,41 @@ vc4_irq_finish_render_job(struct drm_dev
+ {
+ 	struct vc4_dev *vc4 = to_vc4_dev(dev);
+ 	struct vc4_exec_info *exec = vc4_first_render_job(vc4);
++	struct vc4_exec_info *nextbin, *nextrender;
+ 
+ 	if (!exec)
+ 		return;
+ 
+ 	vc4->finished_seqno++;
+ 	list_move_tail(&exec->head, &vc4->job_done_list);
++
++	nextbin = vc4_first_bin_job(vc4);
++	nextrender = vc4_first_render_job(vc4);
++
++	/* Only stop the perfmon if following jobs in the queue don't expect it
++	 * to be enabled.
++	 */
++	if (exec->perfmon && !nextrender &&
++	    (!nextbin || nextbin->perfmon != exec->perfmon))
++		vc4_perfmon_stop(vc4, exec->perfmon, true);
++
++	/* If there's a render job waiting, start it. If this is not the case
++	 * we may have to unblock the binner if it's been stalled because of
++	 * perfmon (this can be checked by comparing the perfmon attached to
++	 * the finished renderjob to the one attached to the next bin job: if
++	 * they don't match, this means the binner is stalled and should be
++	 * restarted).
++	 */
++	if (nextrender)
++		vc4_submit_next_render_job(dev);
++	else if (nextbin && nextbin->perfmon != exec->perfmon)
++		vc4_submit_next_bin_job(dev);
++
+ 	if (exec->fence) {
+ 		dma_fence_signal_locked(exec->fence);
+ 		dma_fence_put(exec->fence);
+ 		exec->fence = NULL;
+ 	}
+-	vc4_submit_next_render_job(dev);
+ 
+ 	wake_up_all(&vc4->job_wait_queue);
+ 	schedule_work(&vc4->job_done_work);
+--- /dev/null
++++ b/drivers/gpu/drm/vc4/vc4_perfmon.c
+@@ -0,0 +1,188 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2018 Broadcom
++ */
++
++/**
++ * DOC: VC4 V3D performance monitor module
++ *
++ * The V3D block provides 16 hardware counters which can count various events.
++ */
++
++#include "vc4_drv.h"
++#include "vc4_regs.h"
++
++#define VC4_PERFMONID_MIN	1
++#define VC4_PERFMONID_MAX	U32_MAX
++
++void vc4_perfmon_get(struct vc4_perfmon *perfmon)
++{
++	if (perfmon)
++		refcount_inc(&perfmon->refcnt);
++}
++
++void vc4_perfmon_put(struct vc4_perfmon *perfmon)
++{
++	if (perfmon && refcount_dec_and_test(&perfmon->refcnt))
++		kfree(perfmon);
++}
++
++void vc4_perfmon_start(struct vc4_dev *vc4, struct vc4_perfmon *perfmon)
++{
++	unsigned int i;
++	u32 mask;
++
++	if (WARN_ON_ONCE(!perfmon || vc4->active_perfmon))
++		return;
++
++	for (i = 0; i < perfmon->ncounters; i++)
++		V3D_WRITE(V3D_PCTRS(i), perfmon->events[i]);
++
++	mask = GENMASK(perfmon->ncounters - 1, 0);
++	V3D_WRITE(V3D_PCTRC, mask);
++	V3D_WRITE(V3D_PCTRE, V3D_PCTRE_EN | mask);
++	vc4->active_perfmon = perfmon;
++}
++
++void vc4_perfmon_stop(struct vc4_dev *vc4, struct vc4_perfmon *perfmon,
++		      bool capture)
++{
++	unsigned int i;
++
++	if (WARN_ON_ONCE(!vc4->active_perfmon ||
++			 perfmon != vc4->active_perfmon))
++		return;
++
++	if (capture) {
++		for (i = 0; i < perfmon->ncounters; i++)
++			perfmon->counters[i] += V3D_READ(V3D_PCTR(i));
++	}
++
++	V3D_WRITE(V3D_PCTRE, 0);
++	vc4->active_perfmon = NULL;
++}
++
++struct vc4_perfmon *vc4_perfmon_find(struct vc4_file *vc4file, int id)
++{
++	struct vc4_perfmon *perfmon;
++
++	mutex_lock(&vc4file->perfmon.lock);
++	perfmon = idr_find(&vc4file->perfmon.idr, id);
++	vc4_perfmon_get(perfmon);
++	mutex_unlock(&vc4file->perfmon.lock);
++
++	return perfmon;
++}
++
++void vc4_perfmon_open_file(struct vc4_file *vc4file)
++{
++	mutex_init(&vc4file->perfmon.lock);
++	idr_init(&vc4file->perfmon.idr);
++}
++
++static int vc4_perfmon_idr_del(int id, void *elem, void *data)
++{
++	struct vc4_perfmon *perfmon = elem;
++
++	vc4_perfmon_put(perfmon);
++
++	return 0;
++}
++
++void vc4_perfmon_close_file(struct vc4_file *vc4file)
++{
++	mutex_lock(&vc4file->perfmon.lock);
++	idr_for_each(&vc4file->perfmon.idr, vc4_perfmon_idr_del, NULL);
++	idr_destroy(&vc4file->perfmon.idr);
++	mutex_unlock(&vc4file->perfmon.lock);
++}
++
++int vc4_perfmon_create_ioctl(struct drm_device *dev, void *data,
++			     struct drm_file *file_priv)
++{
++	struct vc4_file *vc4file = file_priv->driver_priv;
++	struct drm_vc4_perfmon_create *req = data;
++	struct vc4_perfmon *perfmon;
++	unsigned int i;
++	int ret;
++
++	/* Number of monitored counters cannot exceed HW limits. */
++	if (req->ncounters > DRM_VC4_MAX_PERF_COUNTERS ||
++	    !req->ncounters)
++		return -EINVAL;
++
++	/* Make sure all events are valid. */
++	for (i = 0; i < req->ncounters; i++) {
++		if (req->events[i] >= VC4_PERFCNT_NUM_EVENTS)
++			return -EINVAL;
++	}
++
++	perfmon = kzalloc(sizeof(*perfmon) + (req->ncounters * sizeof(u64)),
++			  GFP_KERNEL);
++	if (!perfmon)
++		return -ENOMEM;
++
++	for (i = 0; i < req->ncounters; i++)
++		perfmon->events[i] = req->events[i];
++
++	perfmon->ncounters = req->ncounters;
++
++	refcount_set(&perfmon->refcnt, 1);
++
++	mutex_lock(&vc4file->perfmon.lock);
++	ret = idr_alloc(&vc4file->perfmon.idr, perfmon, VC4_PERFMONID_MIN,
++			VC4_PERFMONID_MAX, GFP_KERNEL);
++	mutex_unlock(&vc4file->perfmon.lock);
++
++	if (ret < 0) {
++		kfree(perfmon);
++		return ret;
++	}
++
++	req->id = ret;
++	return 0;
++}
++
++int vc4_perfmon_destroy_ioctl(struct drm_device *dev, void *data,
++			      struct drm_file *file_priv)
++{
++	struct vc4_file *vc4file = file_priv->driver_priv;
++	struct drm_vc4_perfmon_destroy *req = data;
++	struct vc4_perfmon *perfmon;
++
++	mutex_lock(&vc4file->perfmon.lock);
++	perfmon = idr_remove(&vc4file->perfmon.idr, req->id);
++	mutex_unlock(&vc4file->perfmon.lock);
++
++	if (!perfmon)
++		return -EINVAL;
++
++	vc4_perfmon_put(perfmon);
++	return 0;
++}
++
++int vc4_perfmon_get_values_ioctl(struct drm_device *dev, void *data,
++				 struct drm_file *file_priv)
++{
++	struct vc4_file *vc4file = file_priv->driver_priv;
++	struct drm_vc4_perfmon_get_values *req = data;
++	struct vc4_perfmon *perfmon;
++	int ret;
++
++	mutex_lock(&vc4file->perfmon.lock);
++	perfmon = idr_find(&vc4file->perfmon.idr, req->id);
++	vc4_perfmon_get(perfmon);
++	mutex_unlock(&vc4file->perfmon.lock);
++
++	if (!perfmon)
++		return -EINVAL;
++
++	if (copy_to_user(u64_to_user_ptr(req->values_ptr), perfmon->counters,
++			 perfmon->ncounters * sizeof(u64)))
++		ret = -EFAULT;
++	else
++		ret = 0;
++
++	vc4_perfmon_put(perfmon);
++	return ret;
++}
+--- a/drivers/gpu/drm/vc4/vc4_regs.h
++++ b/drivers/gpu/drm/vc4/vc4_regs.h
+@@ -122,38 +122,9 @@
+ #define V3D_VPMBASE  0x00504
+ #define V3D_PCTRC    0x00670
+ #define V3D_PCTRE    0x00674
+-#define V3D_PCTR0    0x00680
+-#define V3D_PCTRS0   0x00684
+-#define V3D_PCTR1    0x00688
+-#define V3D_PCTRS1   0x0068c
+-#define V3D_PCTR2    0x00690
+-#define V3D_PCTRS2   0x00694
+-#define V3D_PCTR3    0x00698
+-#define V3D_PCTRS3   0x0069c
+-#define V3D_PCTR4    0x006a0
+-#define V3D_PCTRS4   0x006a4
+-#define V3D_PCTR5    0x006a8
+-#define V3D_PCTRS5   0x006ac
+-#define V3D_PCTR6    0x006b0
+-#define V3D_PCTRS6   0x006b4
+-#define V3D_PCTR7    0x006b8
+-#define V3D_PCTRS7   0x006bc
+-#define V3D_PCTR8    0x006c0
+-#define V3D_PCTRS8   0x006c4
+-#define V3D_PCTR9    0x006c8
+-#define V3D_PCTRS9   0x006cc
+-#define V3D_PCTR10   0x006d0
+-#define V3D_PCTRS10  0x006d4
+-#define V3D_PCTR11   0x006d8
+-#define V3D_PCTRS11  0x006dc
+-#define V3D_PCTR12   0x006e0
+-#define V3D_PCTRS12  0x006e4
+-#define V3D_PCTR13   0x006e8
+-#define V3D_PCTRS13  0x006ec
+-#define V3D_PCTR14   0x006f0
+-#define V3D_PCTRS14  0x006f4
+-#define V3D_PCTR15   0x006f8
+-#define V3D_PCTRS15  0x006fc
++# define V3D_PCTRE_EN	BIT(31)
++#define V3D_PCTR(x)  (0x00680 + ((x) * 8))
++#define V3D_PCTRS(x) (0x00684 + ((x) * 8))
+ #define V3D_DBGE     0x00f00
+ #define V3D_FDBGO    0x00f04
+ #define V3D_FDBGB    0x00f08
+--- a/drivers/gpu/drm/vc4/vc4_v3d.c
++++ b/drivers/gpu/drm/vc4/vc4_v3d.c
+@@ -68,38 +68,38 @@ static const struct {
+ 	REGDEF(V3D_VPMBASE),
+ 	REGDEF(V3D_PCTRC),
+ 	REGDEF(V3D_PCTRE),
+-	REGDEF(V3D_PCTR0),
+-	REGDEF(V3D_PCTRS0),
+-	REGDEF(V3D_PCTR1),
+-	REGDEF(V3D_PCTRS1),
+-	REGDEF(V3D_PCTR2),
+-	REGDEF(V3D_PCTRS2),
+-	REGDEF(V3D_PCTR3),
+-	REGDEF(V3D_PCTRS3),
+-	REGDEF(V3D_PCTR4),
+-	REGDEF(V3D_PCTRS4),
+-	REGDEF(V3D_PCTR5),
+-	REGDEF(V3D_PCTRS5),
+-	REGDEF(V3D_PCTR6),
+-	REGDEF(V3D_PCTRS6),
+-	REGDEF(V3D_PCTR7),
+-	REGDEF(V3D_PCTRS7),
+-	REGDEF(V3D_PCTR8),
+-	REGDEF(V3D_PCTRS8),
+-	REGDEF(V3D_PCTR9),
+-	REGDEF(V3D_PCTRS9),
+-	REGDEF(V3D_PCTR10),
+-	REGDEF(V3D_PCTRS10),
+-	REGDEF(V3D_PCTR11),
+-	REGDEF(V3D_PCTRS11),
+-	REGDEF(V3D_PCTR12),
+-	REGDEF(V3D_PCTRS12),
+-	REGDEF(V3D_PCTR13),
+-	REGDEF(V3D_PCTRS13),
+-	REGDEF(V3D_PCTR14),
+-	REGDEF(V3D_PCTRS14),
+-	REGDEF(V3D_PCTR15),
+-	REGDEF(V3D_PCTRS15),
++	REGDEF(V3D_PCTR(0)),
++	REGDEF(V3D_PCTRS(0)),
++	REGDEF(V3D_PCTR(1)),
++	REGDEF(V3D_PCTRS(1)),
++	REGDEF(V3D_PCTR(2)),
++	REGDEF(V3D_PCTRS(2)),
++	REGDEF(V3D_PCTR(3)),
++	REGDEF(V3D_PCTRS(3)),
++	REGDEF(V3D_PCTR(4)),
++	REGDEF(V3D_PCTRS(4)),
++	REGDEF(V3D_PCTR(5)),
++	REGDEF(V3D_PCTRS(5)),
++	REGDEF(V3D_PCTR(6)),
++	REGDEF(V3D_PCTRS(6)),
++	REGDEF(V3D_PCTR(7)),
++	REGDEF(V3D_PCTRS(7)),
++	REGDEF(V3D_PCTR(8)),
++	REGDEF(V3D_PCTRS(8)),
++	REGDEF(V3D_PCTR(9)),
++	REGDEF(V3D_PCTRS(9)),
++	REGDEF(V3D_PCTR(10)),
++	REGDEF(V3D_PCTRS(10)),
++	REGDEF(V3D_PCTR(11)),
++	REGDEF(V3D_PCTRS(11)),
++	REGDEF(V3D_PCTR(12)),
++	REGDEF(V3D_PCTRS(12)),
++	REGDEF(V3D_PCTR(13)),
++	REGDEF(V3D_PCTRS(13)),
++	REGDEF(V3D_PCTR(14)),
++	REGDEF(V3D_PCTRS(14)),
++	REGDEF(V3D_PCTR(15)),
++	REGDEF(V3D_PCTRS(15)),
+ 	REGDEF(V3D_DBGE),
+ 	REGDEF(V3D_FDBGO),
+ 	REGDEF(V3D_FDBGB),
+--- a/include/uapi/drm/vc4_drm.h
++++ b/include/uapi/drm/vc4_drm.h
+@@ -42,6 +42,9 @@ extern "C" {
+ #define DRM_VC4_GET_TILING                        0x09
+ #define DRM_VC4_LABEL_BO                          0x0a
+ #define DRM_VC4_GEM_MADVISE                       0x0b
++#define DRM_VC4_PERFMON_CREATE                    0x0c
++#define DRM_VC4_PERFMON_DESTROY                   0x0d
++#define DRM_VC4_PERFMON_GET_VALUES                0x0e
+ 
+ #define DRM_IOCTL_VC4_SUBMIT_CL           DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_SUBMIT_CL, struct drm_vc4_submit_cl)
+ #define DRM_IOCTL_VC4_WAIT_SEQNO          DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_WAIT_SEQNO, struct drm_vc4_wait_seqno)
+@@ -55,6 +58,9 @@ extern "C" {
+ #define DRM_IOCTL_VC4_GET_TILING          DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_GET_TILING, struct drm_vc4_get_tiling)
+ #define DRM_IOCTL_VC4_LABEL_BO            DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_LABEL_BO, struct drm_vc4_label_bo)
+ #define DRM_IOCTL_VC4_GEM_MADVISE         DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_GEM_MADVISE, struct drm_vc4_gem_madvise)
++#define DRM_IOCTL_VC4_PERFMON_CREATE      DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_PERFMON_CREATE, struct drm_vc4_perfmon_create)
++#define DRM_IOCTL_VC4_PERFMON_DESTROY     DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_PERFMON_DESTROY, struct drm_vc4_perfmon_destroy)
++#define DRM_IOCTL_VC4_PERFMON_GET_VALUES  DRM_IOWR(DRM_COMMAND_BASE + DRM_VC4_PERFMON_GET_VALUES, struct drm_vc4_perfmon_get_values)
+ 
+ struct drm_vc4_submit_rcl_surface {
+ 	__u32 hindex; /* Handle index, or ~0 if not present. */
+@@ -173,6 +179,15 @@ struct drm_vc4_submit_cl {
+ 	 * wait ioctl).
+ 	 */
+ 	__u64 seqno;
++
++	/* ID of the perfmon to attach to this job. 0 means no perfmon. */
++	__u32 perfmonid;
++
++	/* Unused field to align this struct on 64 bits. Must be set to 0.
++	 * If one ever needs to add an u32 field to this struct, this field
++	 * can be used.
++	 */
++	__u32 pad2;
+ };
+ 
+ /**
+@@ -308,6 +323,7 @@ struct drm_vc4_get_hang_state {
+ #define DRM_VC4_PARAM_SUPPORTS_THREADED_FS	5
+ #define DRM_VC4_PARAM_SUPPORTS_FIXED_RCL_ORDER	6
+ #define DRM_VC4_PARAM_SUPPORTS_MADVISE		7
++#define DRM_VC4_PARAM_SUPPORTS_PERFMON		8
+ 
+ struct drm_vc4_get_param {
+ 	__u32 param;
+@@ -352,6 +368,66 @@ struct drm_vc4_gem_madvise {
+ 	__u32 pad;
+ };
+ 
++enum {
++	VC4_PERFCNT_FEP_VALID_PRIMS_NO_RENDER,
++	VC4_PERFCNT_FEP_VALID_PRIMS_RENDER,
++	VC4_PERFCNT_FEP_CLIPPED_QUADS,
++	VC4_PERFCNT_FEP_VALID_QUADS,
++	VC4_PERFCNT_TLB_QUADS_NOT_PASSING_STENCIL,
++	VC4_PERFCNT_TLB_QUADS_NOT_PASSING_Z_AND_STENCIL,
++	VC4_PERFCNT_TLB_QUADS_PASSING_Z_AND_STENCIL,
++	VC4_PERFCNT_TLB_QUADS_ZERO_COVERAGE,
++	VC4_PERFCNT_TLB_QUADS_NON_ZERO_COVERAGE,
++	VC4_PERFCNT_TLB_QUADS_WRITTEN_TO_COLOR_BUF,
++	VC4_PERFCNT_PLB_PRIMS_OUTSIDE_VIEWPORT,
++	VC4_PERFCNT_PLB_PRIMS_NEED_CLIPPING,
++	VC4_PERFCNT_PSE_PRIMS_REVERSED,
++	VC4_PERFCNT_QPU_TOTAL_IDLE_CYCLES,
++	VC4_PERFCNT_QPU_TOTAL_CLK_CYCLES_VERTEX_COORD_SHADING,
++	VC4_PERFCNT_QPU_TOTAL_CLK_CYCLES_FRAGMENT_SHADING,
++	VC4_PERFCNT_QPU_TOTAL_CLK_CYCLES_EXEC_VALID_INST,
++	VC4_PERFCNT_QPU_TOTAL_CLK_CYCLES_WAITING_TMUS,
++	VC4_PERFCNT_QPU_TOTAL_CLK_CYCLES_WAITING_SCOREBOARD,
++	VC4_PERFCNT_QPU_TOTAL_CLK_CYCLES_WAITING_VARYINGS,
++	VC4_PERFCNT_QPU_TOTAL_INST_CACHE_HIT,
++	VC4_PERFCNT_QPU_TOTAL_INST_CACHE_MISS,
++	VC4_PERFCNT_QPU_TOTAL_UNIFORM_CACHE_HIT,
++	VC4_PERFCNT_QPU_TOTAL_UNIFORM_CACHE_MISS,
++	VC4_PERFCNT_TMU_TOTAL_TEXT_QUADS_PROCESSED,
++	VC4_PERFCNT_TMU_TOTAL_TEXT_CACHE_MISS,
++	VC4_PERFCNT_VPM_TOTAL_CLK_CYCLES_VDW_STALLED,
++	VC4_PERFCNT_VPM_TOTAL_CLK_CYCLES_VCD_STALLED,
++	VC4_PERFCNT_L2C_TOTAL_L2_CACHE_HIT,
++	VC4_PERFCNT_L2C_TOTAL_L2_CACHE_MISS,
++	VC4_PERFCNT_NUM_EVENTS,
++};
++
++#define DRM_VC4_MAX_PERF_COUNTERS	16
++
++struct drm_vc4_perfmon_create {
++	__u32 id;
++	__u32 ncounters;
++	__u8 events[DRM_VC4_MAX_PERF_COUNTERS];
++};
++
++struct drm_vc4_perfmon_destroy {
++	__u32 id;
++};
++
++/*
++ * Returns the values of the performance counters tracked by this
++ * perfmon (as an array of ncounters u64 values).
++ *
++ * No implicit synchronization is performed, so the user has to
++ * guarantee that any jobs using this perfmon have already been
++ * completed  (probably by blocking on the seqno returned by the
++ * last exec that used the perfmon).
++ */
++struct drm_vc4_perfmon_get_values {
++	__u32 id;
++	__u64 values_ptr;
++};
++
+ #if defined(__cplusplus)
+ }
+ #endif

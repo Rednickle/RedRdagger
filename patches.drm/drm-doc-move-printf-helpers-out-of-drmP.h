@@ -24,7 +24,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 
 --- a/include/drm/drmP.h
 +++ b/include/drm/drmP.h
-@@ -293,23 +293,6 @@ struct pci_controller;
+@@ -292,23 +292,6 @@ struct pci_controller;
  /* Format strings and argument splitters to simplify printing
   * various "complex" objects
   */

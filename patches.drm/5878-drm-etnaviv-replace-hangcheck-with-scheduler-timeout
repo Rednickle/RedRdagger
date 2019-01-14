@@ -1,0 +1,383 @@
+From: Lucas Stach <l.stach@pengutronix.de>
+Date: Wed, 6 Dec 2017 10:53:27 +0100
+Subject: drm/etnaviv: replace hangcheck with scheduler timeout
+Git-commit: 6d7a20c0776036115c6e22bc673d645d524c4b8a
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This replaces the etnaviv internal hangcheck logic with the job timeout
+handling provided by the DRM scheduler. This simplifies the driver further
+and allows to replay jobs after a GPU reset, so only minimal state is lost.
+
+This introduces a user-visible change in that we don't allow jobs to run
+indefinitely as long as they make progress anymore, as this introduces
+quality of service issues when multiple processes are using the GPU.
+Userspace is now responsible to flush jobs in a way that the finish in a
+reasonable time, where reasonable is currently defined as less than 500ms.
+
+Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/etnaviv/etnaviv_dump.c       |   21 +++++-
+ drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c |    1 
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.c        |   89 +++------------------------
+ drivers/gpu/drm/etnaviv/etnaviv_gpu.h        |   11 ---
+ drivers/gpu/drm/etnaviv/etnaviv_sched.c      |   43 ++++++-------
+ 5 files changed, 51 insertions(+), 114 deletions(-)
+
+--- a/drivers/gpu/drm/etnaviv/etnaviv_dump.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_dump.c
+@@ -20,9 +20,13 @@
+ #include "etnaviv_gem.h"
+ #include "etnaviv_gpu.h"
+ #include "etnaviv_mmu.h"
++#include "etnaviv_sched.h"
+ #include "state.xml.h"
+ #include "state_hi.xml.h"
+ 
++static bool etnaviv_dump_core = true;
++module_param_named(dump_core, etnaviv_dump_core, bool, 0600);
++
+ struct core_dump_iterator {
+ 	void *start;
+ 	struct etnaviv_dump_object_header *hdr;
+@@ -121,10 +125,16 @@ void etnaviv_core_dump(struct etnaviv_gp
+ 	struct etnaviv_vram_mapping *vram;
+ 	struct etnaviv_gem_object *obj;
+ 	struct etnaviv_gem_submit *submit;
++	struct drm_sched_job *s_job;
+ 	unsigned int n_obj, n_bomap_pages;
+ 	size_t file_size, mmu_size;
+ 	__le64 *bomap, *bomap_start;
+ 
++	/* Only catch the first event, or when manually re-armed */
++	if (!etnaviv_dump_core)
++		return;
++	etnaviv_dump_core = false;
++
+ 	mmu_size = etnaviv_iommu_dump_size(gpu->mmu);
+ 
+ 	/* We always dump registers, mmu, ring and end marker */
+@@ -135,10 +145,13 @@ void etnaviv_core_dump(struct etnaviv_gp
+ 		    mmu_size + gpu->buffer.size;
+ 
+ 	/* Add in the active command buffers */
+-	list_for_each_entry(submit, &gpu->active_submit_list, node) {
++	spin_lock(&gpu->sched.job_list_lock);
++	list_for_each_entry(s_job, &gpu->sched.ring_mirror_list, node) {
++		submit = to_etnaviv_submit(s_job);
+ 		file_size += submit->cmdbuf.size;
+ 		n_obj++;
+ 	}
++	spin_unlock(&gpu->sched.job_list_lock);
+ 
+ 	/* Add in the active buffer objects */
+ 	list_for_each_entry(vram, &gpu->mmu->mappings, mmu_node) {
+@@ -180,10 +193,14 @@ void etnaviv_core_dump(struct etnaviv_gp
+ 			      gpu->buffer.size,
+ 			      etnaviv_cmdbuf_get_va(&gpu->buffer));
+ 
+-	list_for_each_entry(submit, &gpu->active_submit_list, node)
++	spin_lock(&gpu->sched.job_list_lock);
++	list_for_each_entry(s_job, &gpu->sched.ring_mirror_list, node) {
++		submit = to_etnaviv_submit(s_job);
+ 		etnaviv_core_dump_mem(&iter, ETDUMP_BUF_CMD,
+ 				      submit->cmdbuf.vaddr, submit->cmdbuf.size,
+ 				      etnaviv_cmdbuf_get_va(&submit->cmdbuf));
++	}
++	spin_unlock(&gpu->sched.job_list_lock);
+ 
+ 	/* Reserve space for the bomap */
+ 	if (n_bomap_pages) {
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gem_submit.c
+@@ -542,7 +542,6 @@ int etnaviv_ioctl_gem_submit(struct drm_
+ 		goto err_submit_objects;
+ 
+ 	memcpy(submit->cmdbuf.vaddr, stream, args->stream_size);
+-	submit->cmdbuf.user_size = ALIGN(args->stream_size, 8);
+ 
+ 	ret = submit_lock_objects(submit, &ticket);
+ 	if (ret)
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.c
+@@ -41,9 +41,6 @@ static const struct platform_device_id g
+ 	{ },
+ };
+ 
+-static bool etnaviv_dump_core = true;
+-module_param_named(dump_core, etnaviv_dump_core, bool, 0600);
+-
+ /*
+  * Driver functions:
+  */
+@@ -919,38 +916,24 @@ int etnaviv_gpu_debugfs(struct etnaviv_g
+ }
+ #endif
+ 
+-/*
+- * Hangcheck detection for locked gpu:
+- */
+-static void recover_worker(struct work_struct *work)
++void etnaviv_gpu_recover_hang(struct etnaviv_gpu *gpu)
+ {
+-	struct etnaviv_gpu *gpu = container_of(work, struct etnaviv_gpu,
+-					       recover_work);
+ 	unsigned long flags;
+ 	unsigned int i = 0;
+ 
+-	dev_err(gpu->dev, "hangcheck recover!\n");
++	dev_err(gpu->dev, "recover hung GPU!\n");
+ 
+ 	if (pm_runtime_get_sync(gpu->dev) < 0)
+ 		return;
+ 
+ 	mutex_lock(&gpu->lock);
+ 
+-	/* Only catch the first event, or when manually re-armed */
+-	if (etnaviv_dump_core) {
+-		etnaviv_core_dump(gpu);
+-		etnaviv_dump_core = false;
+-	}
+-
+ 	etnaviv_hw_reset(gpu);
+ 
+ 	/* complete all events, the GPU won't do it after the reset */
+ 	spin_lock_irqsave(&gpu->event_spinlock, flags);
+-	for_each_set_bit_from(i, gpu->event_bitmap, ETNA_NR_EVENTS) {
+-		dma_fence_signal(gpu->event[i].fence);
+-		gpu->event[i].fence = NULL;
++	for_each_set_bit_from(i, gpu->event_bitmap, ETNA_NR_EVENTS)
+ 		complete(&gpu->event_free);
+-	}
+ 	bitmap_zero(gpu->event_bitmap, ETNA_NR_EVENTS);
+ 	spin_unlock_irqrestore(&gpu->event_spinlock, flags);
+ 	gpu->completed_fence = gpu->active_fence;
+@@ -964,53 +947,6 @@ static void recover_worker(struct work_s
+ 	pm_runtime_put_autosuspend(gpu->dev);
+ }
+ 
+-static void hangcheck_timer_reset(struct etnaviv_gpu *gpu)
+-{
+-	DBG("%s", dev_name(gpu->dev));
+-	mod_timer(&gpu->hangcheck_timer,
+-		  round_jiffies_up(jiffies + DRM_ETNAVIV_HANGCHECK_JIFFIES));
+-}
+-
+-static void hangcheck_handler(struct timer_list *t)
+-{
+-	struct etnaviv_gpu *gpu = from_timer(gpu, t, hangcheck_timer);
+-	u32 fence = gpu->completed_fence;
+-	bool progress = false;
+-
+-	if (fence != gpu->hangcheck_fence) {
+-		gpu->hangcheck_fence = fence;
+-		progress = true;
+-	}
+-
+-	if (!progress) {
+-		u32 dma_addr = gpu_read(gpu, VIVS_FE_DMA_ADDRESS);
+-		int change = dma_addr - gpu->hangcheck_dma_addr;
+-
+-		if (change < 0 || change > 16) {
+-			gpu->hangcheck_dma_addr = dma_addr;
+-			progress = true;
+-		}
+-	}
+-
+-	if (!progress && fence_after(gpu->active_fence, fence)) {
+-		dev_err(gpu->dev, "hangcheck detected gpu lockup!\n");
+-		dev_err(gpu->dev, "     completed fence: %u\n", fence);
+-		dev_err(gpu->dev, "     active fence: %u\n",
+-			gpu->active_fence);
+-		queue_work(gpu->wq, &gpu->recover_work);
+-	}
+-
+-	/* if still more pending work, reset the hangcheck timer: */
+-	if (fence_after(gpu->active_fence, gpu->hangcheck_fence))
+-		hangcheck_timer_reset(gpu);
+-}
+-
+-static void hangcheck_disable(struct etnaviv_gpu *gpu)
+-{
+-	del_timer_sync(&gpu->hangcheck_timer);
+-	cancel_work_sync(&gpu->recover_work);
+-}
+-
+ /* fence object management */
+ struct etnaviv_fence {
+ 	struct etnaviv_gpu *gpu;
+@@ -1286,10 +1222,12 @@ struct dma_fence *etnaviv_gpu_submit(str
+ 	unsigned int i, nr_events = 1, event[3];
+ 	int ret;
+ 
+-	ret = pm_runtime_get_sync(gpu->dev);
+-	if (ret < 0)
+-		return NULL;
+-	submit->runtime_resumed = true;
++	if (!submit->runtime_resumed) {
++		ret = pm_runtime_get_sync(gpu->dev);
++		if (ret < 0)
++			return NULL;
++		submit->runtime_resumed = true;
++	}
+ 
+ 	/*
+ 	 * if there are performance monitor requests we need to have
+@@ -1327,6 +1265,7 @@ struct dma_fence *etnaviv_gpu_submit(str
+ 	}
+ 
+ 	gpu->event[event[0]].fence = gpu_fence;
++	submit->cmdbuf.user_size = submit->cmdbuf.size - 8;
+ 	etnaviv_buffer_queue(gpu, submit->exec_state, event[0],
+ 			     &submit->cmdbuf);
+ 
+@@ -1337,8 +1276,6 @@ struct dma_fence *etnaviv_gpu_submit(str
+ 		etnaviv_sync_point_queue(gpu, event[2]);
+ 	}
+ 
+-	hangcheck_timer_reset(gpu);
+-
+ out_unlock:
+ 	mutex_unlock(&gpu->lock);
+ 
+@@ -1626,13 +1563,9 @@ static int etnaviv_gpu_bind(struct devic
+ 	idr_init(&gpu->fence_idr);
+ 	spin_lock_init(&gpu->fence_spinlock);
+ 
+-	INIT_LIST_HEAD(&gpu->active_submit_list);
+ 	INIT_WORK(&gpu->sync_point_work, sync_point_worker);
+-	INIT_WORK(&gpu->recover_work, recover_worker);
+ 	init_waitqueue_head(&gpu->fence_event);
+ 
+-	timer_setup(&gpu->hangcheck_timer, hangcheck_handler, TIMER_DEFERRABLE);
+-
+ 	priv->gpu[priv->num_gpus++] = gpu;
+ 
+ 	pm_runtime_mark_last_busy(gpu->dev);
+@@ -1660,8 +1593,6 @@ static void etnaviv_gpu_unbind(struct de
+ 
+ 	DBG("%s", dev_name(gpu->dev));
+ 
+-	hangcheck_disable(gpu);
+-
+ 	flush_workqueue(gpu->wq);
+ 	destroy_workqueue(gpu->wq);
+ 
+--- a/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
++++ b/drivers/gpu/drm/etnaviv/etnaviv_gpu.h
+@@ -123,9 +123,6 @@ struct etnaviv_gpu {
+ 	struct completion event_free;
+ 	spinlock_t event_spinlock;
+ 
+-	/* list of currently in-flight command buffers */
+-	struct list_head active_submit_list;
+-
+ 	u32 idle_mask;
+ 
+ 	/* Fencing support */
+@@ -153,13 +150,6 @@ struct etnaviv_gpu {
+ 	struct clk *clk_core;
+ 	struct clk *clk_shader;
+ 
+-	/* Hang Detction: */
+-#define DRM_ETNAVIV_HANGCHECK_PERIOD 500 /* in ms */
+-#define DRM_ETNAVIV_HANGCHECK_JIFFIES msecs_to_jiffies(DRM_ETNAVIV_HANGCHECK_PERIOD)
+-	struct timer_list hangcheck_timer;
+-	u32 hangcheck_fence;
+-	u32 hangcheck_dma_addr;
+-	struct work_struct recover_work;
+ 	unsigned int freq_scale;
+ 	unsigned long base_rate_core;
+ 	unsigned long base_rate_shader;
+@@ -188,6 +178,7 @@ int etnaviv_gpu_init(struct etnaviv_gpu
+ int etnaviv_gpu_debugfs(struct etnaviv_gpu *gpu, struct seq_file *m);
+ #endif
+ 
++void etnaviv_gpu_recover_hang(struct etnaviv_gpu *gpu);
+ void etnaviv_gpu_retire(struct etnaviv_gpu *gpu);
+ int etnaviv_gpu_wait_fence_interruptible(struct etnaviv_gpu *gpu,
+ 	u32 fence, struct timespec *timeout);
+--- a/drivers/gpu/drm/etnaviv/etnaviv_sched.c
++++ b/drivers/gpu/drm/etnaviv/etnaviv_sched.c
+@@ -14,24 +14,19 @@
+  * this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+-#include <drm/gpu_scheduler.h>
+ #include <linux/kthread.h>
+ 
+ #include "etnaviv_drv.h"
++#include "etnaviv_dump.h"
+ #include "etnaviv_gem.h"
+ #include "etnaviv_gpu.h"
++#include "etnaviv_sched.h"
+ 
+ static int etnaviv_job_hang_limit = 0;
+ module_param_named(job_hang_limit, etnaviv_job_hang_limit, int , 0444);
+ static int etnaviv_hw_jobs_limit = 2;
+ module_param_named(hw_job_limit, etnaviv_hw_jobs_limit, int , 0444);
+ 
+-static inline
+-struct etnaviv_gem_submit *to_etnaviv_submit(struct drm_sched_job *sched_job)
+-{
+-	return container_of(sched_job, struct etnaviv_gem_submit, sched_job);
+-}
+-
+ struct dma_fence *etnaviv_sched_dependency(struct drm_sched_job *sched_job,
+ 					   struct drm_sched_entity *entity)
+ {
+@@ -86,34 +81,38 @@ struct dma_fence *etnaviv_sched_dependen
+ struct dma_fence *etnaviv_sched_run_job(struct drm_sched_job *sched_job)
+ {
+ 	struct etnaviv_gem_submit *submit = to_etnaviv_submit(sched_job);
+-	struct dma_fence *fence;
++	struct dma_fence *fence = NULL;
+ 
+-	mutex_lock(&submit->gpu->lock);
+-	list_add_tail(&submit->node, &submit->gpu->active_submit_list);
+-	mutex_unlock(&submit->gpu->lock);
+-
+-	fence = etnaviv_gpu_submit(submit);
+-	if (!fence) {
+-		etnaviv_submit_put(submit);
+-		return NULL;
+-	}
++	if (likely(!sched_job->s_fence->finished.error))
++		fence = etnaviv_gpu_submit(submit);
++	else
++		dev_dbg(submit->gpu->dev, "skipping bad job\n");
+ 
+ 	return fence;
+ }
+ 
+ static void etnaviv_sched_timedout_job(struct drm_sched_job *sched_job)
+ {
+-	/* this replaces the hangcheck */
++	struct etnaviv_gem_submit *submit = to_etnaviv_submit(sched_job);
++	struct etnaviv_gpu *gpu = submit->gpu;
++
++	/* block scheduler */
++	kthread_park(gpu->sched.thread);
++	drm_sched_hw_job_reset(&gpu->sched, sched_job);
++
++	/* get the GPU back into the init state */
++	etnaviv_core_dump(gpu);
++	etnaviv_gpu_recover_hang(gpu);
++
++	/* restart scheduler after GPU is usable again */
++	drm_sched_job_recovery(&gpu->sched);
++	kthread_unpark(gpu->sched.thread);
+ }
+ 
+ static void etnaviv_sched_free_job(struct drm_sched_job *sched_job)
+ {
+ 	struct etnaviv_gem_submit *submit = to_etnaviv_submit(sched_job);
+ 
+-	mutex_lock(&submit->gpu->lock);
+-	list_del(&submit->node);
+-	mutex_unlock(&submit->gpu->lock);
+-
+ 	etnaviv_submit_put(submit);
+ }
+ 

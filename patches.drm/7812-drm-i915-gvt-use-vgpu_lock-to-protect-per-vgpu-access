@@ -1,0 +1,525 @@
+From: Colin Xu <colin.xu@intel.com>
+Date: Sat, 19 May 2018 12:28:54 +0800
+Subject: drm/i915/gvt: Use vgpu_lock to protect per vgpu access
+Git-commit: f25a49ab8ab9c1b5587837c8a386b276403f315c
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+The patch set splits out 2 small locks from the original big gvt lock:
+  - vgpu_lock protects per-vGPU data and logic, especially the vGPU
+    trap emulation path.
+  - sched_lock protects gvt scheudler structure, context schedule logic
+    and vGPU's schedule data.
+
+Use vgpu_lock to replace the gvt big lock. By doing this, the
+mmio read/write trap path, vgpu virtual event emulation and other
+vgpu related process, would be protected under per vgpu_lock.
+
+v9:
+  - Change commit author since the patches are improved a lot compared
+    with original version.
+    Original author: Pei Zhang <pei.zhang@intel.com>
+  - Rebase to latest gvt-staging.
+v8:
+  - Correct coding and comment style.
+  - Rebase to latest gvt-staging.
+v7:
+  - Remove gtt_lock since already proteced by gvt_lock and vgpu_lock.
+  - Fix a typo in intel_gvt_deactivate_vgpu, unlock the wrong lock.
+v6:
+  - Rebase to latest gvt-staging.
+v5:
+  - Rebase to latest gvt-staging.
+  - intel_vgpu_page_track_handler should use vgpu_lock.
+v4:
+  - Rebase to latest gvt-staging.
+  - Protect vgpu->active access with vgpu_lock.
+  - Do not wait gpu idle in vgpu_lock.
+v3: update to latest code base
+v2: add gvt->lock in function gvt_check_vblank_emulation
+
+Performance comparison on Kabylake platform.
+  - Configuration:
+    Host: Ubuntu 16.04.
+    Guest 1 & 2: Ubuntu 16.04.
+
+glmark2 score comparison:
+  - Configuration:
+    Host: glxgears.
+    Guests: glmark2.
++--------------------------------+-----------------+
+| Setup                          | glmark2 score   |
++--------------------------------+-----------------+
+| unified lock, iommu=on         | 58~62 (avg. 60) |
++--------------------------------+-----------------+
+| unified lock, iommu=igfx_off   | 57~61 (avg. 59) |
++--------------------------------+-----------------+
+| per-logic lock, iommu=on       | 60~68 (avg. 64) |
++--------------------------------+-----------------+
+| per-logic lock, iommu=igfx_off | 61~67 (avg. 64) |
++--------------------------------+-----------------+
+
+lock_stat comparison:
+  - Configuration:
+    Stop lock stat immediately after boot up.
+    Boot 2 VM Guests.
+    Run glmark2 in guests.
+    Start perf lock_stat for 20 seconds and stop again.
+  - Legend: c - contentions; w - waittime-avg
++------------+-----------------+-----------+---------------+------------+
+|            | gvt_lock        |sched_lock | vgpu_lock     | gtt_lock   |
++ lock type; +-----------------+-----------+---------------+------------+
+| iommu set  | c     | w       | c  | w    | c    | w      | c   | w    |
++------------+-------+---------+----+------+------+--------+-----+------+
+| unified;   | 20697 | 839     |N/A | N/A  | N/A  | N/A    | N/A | N/A  |
+| on         |       |         |    |      |      |        |     |      |
++------------+-------+---------+----+------+------+--------+-----+------+
+| unified;   | 21838 | 658.15  |N/A | N/A  | N/A  | N/A    | N/A | N/A  |
+| igfx_off   |       |         |    |      |      |        |     |      |
++------------+-------+---------+----+------+------+--------+-----+------+
+| per-logic; | 1553  | 1599.96 |9458|429.97| 5846 | 274.33 | 0   | 0.00 |
+| on         |       |         |    |      |      |        |     |      |
++------------+-------+---------+----+------+------+--------+-----+------+
+| per-logic; | 1911  | 1678.32 |8335|445.16| 5451 | 244.80 | 0   | 0.00 |
+| igfx_off   |       |         |    |      |      |        |     |      |
++------------+-------+---------+----+------+------+--------+-----+------+
+
+Signed-off-by: Pei Zhang <pei.zhang@intel.com>
+Signed-off-by: Colin Xu <colin.xu@intel.com>
+Signed-off-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/gvt/display.c    |   35 ++++++++++++----------
+ drivers/gpu/drm/i915/gvt/gvt.c        |    5 ---
+ drivers/gpu/drm/i915/gvt/gvt.h        |    8 +++++
+ drivers/gpu/drm/i915/gvt/handlers.c   |    4 ++
+ drivers/gpu/drm/i915/gvt/mmio.c       |   12 +++----
+ drivers/gpu/drm/i915/gvt/page_track.c |    5 +--
+ drivers/gpu/drm/i915/gvt/scheduler.c  |    6 ++-
+ drivers/gpu/drm/i915/gvt/vgpu.c       |   53 +++++++++++++++++-----------------
+ 8 files changed, 71 insertions(+), 57 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gvt/display.c
++++ b/drivers/gpu/drm/i915/gvt/display.c
+@@ -337,26 +337,28 @@ void intel_gvt_check_vblank_emulation(st
+ 	struct intel_gvt_irq *irq = &gvt->irq;
+ 	struct intel_vgpu *vgpu;
+ 	int pipe, id;
++	int found = false;
+ 
+-	if (WARN_ON(!mutex_is_locked(&gvt->lock)))
+-		return;
+-
++	mutex_lock(&gvt->lock);
+ 	for_each_active_vgpu(gvt, vgpu, id) {
+ 		for (pipe = 0; pipe < I915_MAX_PIPES; pipe++) {
+-			if (pipe_is_enabled(vgpu, pipe))
+-				goto out;
++			if (pipe_is_enabled(vgpu, pipe)) {
++				found = true;
++				break;
++			}
+ 		}
++		if (found)
++			break;
+ 	}
+ 
+ 	/* all the pipes are disabled */
+-	hrtimer_cancel(&irq->vblank_timer.timer);
+-	return;
+-
+-out:
+-	hrtimer_start(&irq->vblank_timer.timer,
+-		ktime_add_ns(ktime_get(), irq->vblank_timer.period),
+-		HRTIMER_MODE_ABS);
+-
++	if (!found)
++		hrtimer_cancel(&irq->vblank_timer.timer);
++	else
++		hrtimer_start(&irq->vblank_timer.timer,
++			ktime_add_ns(ktime_get(), irq->vblank_timer.period),
++			HRTIMER_MODE_ABS);
++	mutex_unlock(&gvt->lock);
+ }
+ 
+ static void emulate_vblank_on_pipe(struct intel_vgpu *vgpu, int pipe)
+@@ -393,8 +395,10 @@ static void emulate_vblank(struct intel_
+ {
+ 	int pipe;
+ 
++	mutex_lock(&vgpu->vgpu_lock);
+ 	for_each_pipe(vgpu->gvt->dev_priv, pipe)
+ 		emulate_vblank_on_pipe(vgpu, pipe);
++	mutex_unlock(&vgpu->vgpu_lock);
+ }
+ 
+ /**
+@@ -409,11 +413,10 @@ void intel_gvt_emulate_vblank(struct int
+ 	struct intel_vgpu *vgpu;
+ 	int id;
+ 
+-	if (WARN_ON(!mutex_is_locked(&gvt->lock)))
+-		return;
+-
++	mutex_lock(&gvt->lock);
+ 	for_each_active_vgpu(gvt, vgpu, id)
+ 		emulate_vblank(vgpu);
++	mutex_unlock(&gvt->lock);
+ }
+ 
+ /**
+--- a/drivers/gpu/drm/i915/gvt/gvt.c
++++ b/drivers/gpu/drm/i915/gvt/gvt.c
+@@ -271,11 +271,8 @@ static int gvt_service_thread(void *data
+ 			continue;
+ 
+ 		if (test_and_clear_bit(INTEL_GVT_REQUEST_EMULATE_VBLANK,
+-					(void *)&gvt->service_request)) {
+-			mutex_lock(&gvt->lock);
++					(void *)&gvt->service_request))
+ 			intel_gvt_emulate_vblank(gvt);
+-			mutex_unlock(&gvt->lock);
+-		}
+ 
+ 		if (test_bit(INTEL_GVT_REQUEST_SCHED,
+ 				(void *)&gvt->service_request) ||
+--- a/drivers/gpu/drm/i915/gvt/gvt.h
++++ b/drivers/gpu/drm/i915/gvt/gvt.h
+@@ -170,6 +170,7 @@ struct intel_vgpu_submission {
+ 
+ struct intel_vgpu {
+ 	struct intel_gvt *gvt;
++	struct mutex vgpu_lock;
+ 	int id;
+ 	unsigned long handle; /* vGPU handle used by hypervisor MPT modules */
+ 	bool active;
+@@ -296,6 +297,9 @@ struct intel_vgpu_type {
+ };
+ 
+ struct intel_gvt {
++	/* GVT scope lock, protect GVT itself, and all resource currently
++	 * not yet protected by special locks(vgpu and scheduler lock).
++	 */
+ 	struct mutex lock;
+ 	struct drm_i915_private *dev_priv;
+ 	struct idr vgpu_idr;	/* vGPU IDR pool */
+@@ -316,6 +320,10 @@ struct intel_gvt {
+ 
+ 	struct task_struct *service_thread;
+ 	wait_queue_head_t service_thread_wq;
++
++	/* service_request is always used in bit operation, we should always
++	 * use it with atomic bit ops so that no need to use gvt big lock.
++	 */
+ 	unsigned long service_request;
+ 
+ 	struct {
+--- a/drivers/gpu/drm/i915/gvt/handlers.c
++++ b/drivers/gpu/drm/i915/gvt/handlers.c
+@@ -316,6 +316,7 @@ static int gdrst_mmio_write(struct intel
+ 		}
+ 	}
+ 
++	/* vgpu_lock already hold by emulate mmio r/w */
+ 	intel_gvt_reset_vgpu_locked(vgpu, false, engine_mask);
+ 
+ 	/* sw will wait for the device to ack the reset request */
+@@ -420,7 +421,10 @@ static int pipeconf_mmio_write(struct in
+ 		vgpu_vreg(vgpu, offset) |= I965_PIPECONF_ACTIVE;
+ 	else
+ 		vgpu_vreg(vgpu, offset) &= ~I965_PIPECONF_ACTIVE;
++	/* vgpu_lock already hold by emulate mmio r/w */
++	mutex_unlock(&vgpu->vgpu_lock);
+ 	intel_gvt_check_vblank_emulation(vgpu->gvt);
++	mutex_lock(&vgpu->vgpu_lock);
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/i915/gvt/mmio.c
++++ b/drivers/gpu/drm/i915/gvt/mmio.c
+@@ -67,7 +67,7 @@ static void failsafe_emulate_mmio_rw(str
+ 		return;
+ 
+ 	gvt = vgpu->gvt;
+-	mutex_lock(&gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 	offset = intel_vgpu_gpa_to_mmio_offset(vgpu, pa);
+ 	if (reg_is_mmio(gvt, offset)) {
+ 		if (read)
+@@ -85,7 +85,7 @@ static void failsafe_emulate_mmio_rw(str
+ 			memcpy(pt, p_data, bytes);
+ 
+ 	}
+-	mutex_unlock(&gvt->lock);
++	mutex_unlock(&vgpu->vgpu_lock);
+ }
+ 
+ /**
+@@ -109,7 +109,7 @@ int intel_vgpu_emulate_mmio_read(struct
+ 		failsafe_emulate_mmio_rw(vgpu, pa, p_data, bytes, true);
+ 		return 0;
+ 	}
+-	mutex_lock(&gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 
+ 	offset = intel_vgpu_gpa_to_mmio_offset(vgpu, pa);
+ 
+@@ -156,7 +156,7 @@ err:
+ 	gvt_vgpu_err("fail to emulate MMIO read %08x len %d\n",
+ 			offset, bytes);
+ out:
+-	mutex_unlock(&gvt->lock);
++	mutex_unlock(&vgpu->vgpu_lock);
+ 	return ret;
+ }
+ 
+@@ -182,7 +182,7 @@ int intel_vgpu_emulate_mmio_write(struct
+ 		return 0;
+ 	}
+ 
+-	mutex_lock(&gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 
+ 	offset = intel_vgpu_gpa_to_mmio_offset(vgpu, pa);
+ 
+@@ -220,7 +220,7 @@ err:
+ 	gvt_vgpu_err("fail to emulate MMIO write %08x len %d\n", offset,
+ 		     bytes);
+ out:
+-	mutex_unlock(&gvt->lock);
++	mutex_unlock(&vgpu->vgpu_lock);
+ 	return ret;
+ }
+ 
+--- a/drivers/gpu/drm/i915/gvt/page_track.c
++++ b/drivers/gpu/drm/i915/gvt/page_track.c
+@@ -157,11 +157,10 @@ int intel_vgpu_disable_page_track(struct
+ int intel_vgpu_page_track_handler(struct intel_vgpu *vgpu, u64 gpa,
+ 		void *data, unsigned int bytes)
+ {
+-	struct intel_gvt *gvt = vgpu->gvt;
+ 	struct intel_vgpu_page_track *page_track;
+ 	int ret = 0;
+ 
+-	mutex_lock(&gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 
+ 	page_track = intel_vgpu_find_page_track(vgpu, gpa >> PAGE_SHIFT);
+ 	if (!page_track) {
+@@ -179,6 +178,6 @@ int intel_vgpu_page_track_handler(struct
+ 	}
+ 
+ out:
+-	mutex_unlock(&gvt->lock);
++	mutex_unlock(&vgpu->vgpu_lock);
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/i915/gvt/scheduler.c
++++ b/drivers/gpu/drm/i915/gvt/scheduler.c
+@@ -634,6 +634,7 @@ static int dispatch_workload(struct inte
+ 	gvt_dbg_sched("ring id %d prepare to dispatch workload %p\n",
+ 		ring_id, workload);
+ 
++	mutex_lock(&vgpu->vgpu_lock);
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+ 
+ 	ret = intel_gvt_scan_and_shadow_workload(workload);
+@@ -654,6 +655,7 @@ out:
+ 	}
+ 
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
++	mutex_unlock(&vgpu->vgpu_lock);
+ 	return ret;
+ }
+ 
+@@ -808,6 +810,7 @@ static void complete_current_workload(st
+ 	int event;
+ 
+ 	mutex_lock(&gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 
+ 	/* For the workload w/ request, needs to wait for the context
+ 	 * switch to make sure request is completed.
+@@ -883,6 +886,7 @@ static void complete_current_workload(st
+ 	if (gvt->scheduler.need_reschedule)
+ 		intel_gvt_request_service(gvt, INTEL_GVT_REQUEST_EVENT_SCHED);
+ 
++	mutex_unlock(&vgpu->vgpu_lock);
+ 	mutex_unlock(&gvt->lock);
+ }
+ 
+@@ -935,9 +939,7 @@ static int workload_thread(void *priv)
+ 			intel_uncore_forcewake_get(gvt->dev_priv,
+ 					FORCEWAKE_ALL);
+ 
+-		mutex_lock(&gvt->lock);
+ 		ret = dispatch_workload(workload);
+-		mutex_unlock(&gvt->lock);
+ 
+ 		if (ret) {
+ 			vgpu = workload->vgpu;
+--- a/drivers/gpu/drm/i915/gvt/vgpu.c
++++ b/drivers/gpu/drm/i915/gvt/vgpu.c
+@@ -226,22 +226,20 @@ void intel_gvt_activate_vgpu(struct inte
+  */
+ void intel_gvt_deactivate_vgpu(struct intel_vgpu *vgpu)
+ {
+-	struct intel_gvt *gvt = vgpu->gvt;
+-
+-	mutex_lock(&gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 
+ 	vgpu->active = false;
+ 
+ 	if (atomic_read(&vgpu->submission.running_workload_num)) {
+-		mutex_unlock(&gvt->lock);
++		mutex_unlock(&vgpu->vgpu_lock);
+ 		intel_gvt_wait_vgpu_idle(vgpu);
+-		mutex_lock(&gvt->lock);
++		mutex_lock(&vgpu->vgpu_lock);
+ 	}
+ 
+ 	intel_vgpu_stop_schedule(vgpu);
+ 	intel_vgpu_dmabuf_cleanup(vgpu);
+ 
+-	mutex_unlock(&gvt->lock);
++	mutex_unlock(&vgpu->vgpu_lock);
+ }
+ 
+ /**
+@@ -255,14 +253,11 @@ void intel_gvt_destroy_vgpu(struct intel
+ {
+ 	struct intel_gvt *gvt = vgpu->gvt;
+ 
+-	mutex_lock(&gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 
+ 	WARN(vgpu->active, "vGPU is still active!\n");
+ 
+ 	intel_gvt_debugfs_remove_vgpu(vgpu);
+-	idr_remove(&gvt->vgpu_idr, vgpu->id);
+-	if (idr_is_empty(&gvt->vgpu_idr))
+-		intel_gvt_clean_irq(gvt);
+ 	intel_vgpu_clean_sched_policy(vgpu);
+ 	intel_vgpu_clean_submission(vgpu);
+ 	intel_vgpu_clean_display(vgpu);
+@@ -272,10 +267,16 @@ void intel_gvt_destroy_vgpu(struct intel
+ 	intel_vgpu_free_resource(vgpu);
+ 	intel_vgpu_clean_mmio(vgpu);
+ 	intel_vgpu_dmabuf_cleanup(vgpu);
+-	vfree(vgpu);
++	mutex_unlock(&vgpu->vgpu_lock);
+ 
++	mutex_lock(&gvt->lock);
++	idr_remove(&gvt->vgpu_idr, vgpu->id);
++	if (idr_is_empty(&gvt->vgpu_idr))
++		intel_gvt_clean_irq(gvt);
+ 	intel_gvt_update_vgpu_types(gvt);
+ 	mutex_unlock(&gvt->lock);
++
++	vfree(vgpu);
+ }
+ 
+ #define IDLE_VGPU_IDR 0
+@@ -301,6 +302,7 @@ struct intel_vgpu *intel_gvt_create_idle
+ 
+ 	vgpu->id = IDLE_VGPU_IDR;
+ 	vgpu->gvt = gvt;
++	mutex_init(&vgpu->vgpu_lock);
+ 
+ 	for (i = 0; i < I915_NUM_ENGINES; i++)
+ 		INIT_LIST_HEAD(&vgpu->submission.workload_q_head[i]);
+@@ -327,7 +329,10 @@ out_free_vgpu:
+  */
+ void intel_gvt_destroy_idle_vgpu(struct intel_vgpu *vgpu)
+ {
++	mutex_lock(&vgpu->vgpu_lock);
+ 	intel_vgpu_clean_sched_policy(vgpu);
++	mutex_unlock(&vgpu->vgpu_lock);
++
+ 	vfree(vgpu);
+ }
+ 
+@@ -345,8 +350,6 @@ static struct intel_vgpu *__intel_gvt_cr
+ 	if (!vgpu)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	mutex_lock(&gvt->lock);
+-
+ 	ret = idr_alloc(&gvt->vgpu_idr, vgpu, IDLE_VGPU_IDR + 1, GVT_MAX_VGPU,
+ 		GFP_KERNEL);
+ 	if (ret < 0)
+@@ -356,6 +359,7 @@ static struct intel_vgpu *__intel_gvt_cr
+ 	vgpu->handle = param->handle;
+ 	vgpu->gvt = gvt;
+ 	vgpu->sched_ctl.weight = param->weight;
++	mutex_init(&vgpu->vgpu_lock);
+ 	INIT_LIST_HEAD(&vgpu->dmabuf_obj_list_head);
+ 	INIT_RADIX_TREE(&vgpu->page_track_tree, GFP_KERNEL);
+ 	idr_init(&vgpu->object_idr);
+@@ -403,8 +407,6 @@ static struct intel_vgpu *__intel_gvt_cr
+ 	if (ret)
+ 		goto out_clean_sched_policy;
+ 
+-	mutex_unlock(&gvt->lock);
+-
+ 	return vgpu;
+ 
+ out_clean_sched_policy:
+@@ -427,7 +429,6 @@ out_clean_idr:
+ 	idr_remove(&gvt->vgpu_idr, vgpu->id);
+ out_free_vgpu:
+ 	vfree(vgpu);
+-	mutex_unlock(&gvt->lock);
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -459,12 +460,12 @@ struct intel_vgpu *intel_gvt_create_vgpu
+ 	param.low_gm_sz = BYTES_TO_MB(param.low_gm_sz);
+ 	param.high_gm_sz = BYTES_TO_MB(param.high_gm_sz);
+ 
++	mutex_lock(&gvt->lock);
+ 	vgpu = __intel_gvt_create_vgpu(gvt, &param);
+-	if (IS_ERR(vgpu))
+-		return vgpu;
+-
+-	/* calculate left instance change for types */
+-	intel_gvt_update_vgpu_types(gvt);
++	if (!IS_ERR(vgpu))
++		/* calculate left instance change for types */
++		intel_gvt_update_vgpu_types(gvt);
++	mutex_unlock(&gvt->lock);
+ 
+ 	return vgpu;
+ }
+@@ -476,7 +477,7 @@ struct intel_vgpu *intel_gvt_create_vgpu
+  * @engine_mask: engines to reset for GT reset
+  *
+  * This function is called when user wants to reset a virtual GPU through
+- * device model reset or GT reset. The caller should hold the gvt lock.
++ * device model reset or GT reset. The caller should hold the vgpu lock.
+  *
+  * vGPU Device Model Level Reset (DMLR) simulates the PCI level reset to reset
+  * the whole vGPU to default state as when it is created. This vGPU function
+@@ -516,9 +517,9 @@ void intel_gvt_reset_vgpu_locked(struct
+ 	 * scheduler when the reset is triggered by current vgpu.
+ 	 */
+ 	if (scheduler->current_vgpu == NULL) {
+-		mutex_unlock(&gvt->lock);
++		mutex_unlock(&vgpu->vgpu_lock);
+ 		intel_gvt_wait_vgpu_idle(vgpu);
+-		mutex_lock(&gvt->lock);
++		mutex_lock(&vgpu->vgpu_lock);
+ 	}
+ 
+ 	intel_vgpu_reset_submission(vgpu, resetting_eng);
+@@ -558,7 +559,7 @@ void intel_gvt_reset_vgpu_locked(struct
+  */
+ void intel_gvt_reset_vgpu(struct intel_vgpu *vgpu)
+ {
+-	mutex_lock(&vgpu->gvt->lock);
++	mutex_lock(&vgpu->vgpu_lock);
+ 	intel_gvt_reset_vgpu_locked(vgpu, true, 0);
+-	mutex_unlock(&vgpu->gvt->lock);
++	mutex_unlock(&vgpu->vgpu_lock);
+ }

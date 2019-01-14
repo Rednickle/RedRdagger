@@ -1,0 +1,219 @@
+From: Jordan Crouse <jcrouse@codeaurora.org>
+Date: Wed, 10 Jan 2018 10:41:54 -0700
+Subject: drm/msm: Add devfreq support for the GPU
+Git-commit: f91c14ab448af4d9d57350301dd9d6b6a7b6128a
+Patch-mainline: v4.16-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Add support for devfreq to dynamically control the GPU frequency.
+By default try to use the 'simple_ondemand' governor which can
+adjust the frequency based on GPU load.
+
+v2: Fix __aeabi_uldivmod issue from the 0 day bot and use
+devfreq_recommended_opp() as suggested by Rob.
+
+Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c   |   12 ++++
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c |    1 
+ drivers/gpu/drm/msm/msm_gpu.c           |   91 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/msm_gpu.h           |    7 ++
+ 4 files changed, 110 insertions(+), 1 deletion(-)
+
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -600,6 +600,9 @@ static int a5xx_hw_init(struct msm_gpu *
+ 	/* Select CP0 to always count cycles */
+ 	gpu_write(gpu, REG_A5XX_CP_PERFCTR_CP_SEL_0, PERF_CP_ALWAYS_COUNT);
+ 
++	/* Select RBBM0 to countable 6 to get the busy status for devfreq */
++	gpu_write(gpu, REG_A5XX_RBBM_PERFCTR_RBBM_SEL_0, 6);
++
+ 	/* Increase VFD cache access so LRZ and other data gets evicted less */
+ 	gpu_write(gpu, REG_A5XX_UCHE_CACHE_WAYS, 0x02);
+ 
+@@ -1170,6 +1173,14 @@ static struct msm_ringbuffer *a5xx_activ
+ 	return a5xx_gpu->cur_ring;
+ }
+ 
++static int a5xx_gpu_busy(struct msm_gpu *gpu, uint64_t *value)
++{
++	*value = gpu_read64(gpu, REG_A5XX_RBBM_PERFCTR_RBBM_0_LO,
++		REG_A5XX_RBBM_PERFCTR_RBBM_0_HI);
++
++	return 0;
++}
++
+ static const struct adreno_gpu_funcs funcs = {
+ 	.base = {
+ 		.get_param = adreno_get_param,
+@@ -1185,6 +1196,7 @@ static const struct adreno_gpu_funcs fun
+ #ifdef CONFIG_DEBUG_FS
+ 		.show = a5xx_show,
+ #endif
++		.gpu_busy = a5xx_gpu_busy,
+ 	},
+ 	.get_timestamp = a5xx_get_timestamp,
+ };
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -22,7 +22,6 @@
+ #include "msm_gem.h"
+ #include "msm_mmu.h"
+ 
+-
+ int adreno_get_param(struct msm_gpu *gpu, uint32_t param, uint64_t *value)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -21,12 +21,91 @@
+ #include "msm_fence.h"
+ 
+ #include <linux/string_helpers.h>
++#include <linux/pm_opp.h>
++#include <linux/devfreq.h>
+ 
+ 
+ /*
+  * Power Management:
+  */
+ 
++static int msm_devfreq_target(struct device *dev, unsigned long *freq,
++		u32 flags)
++{
++	struct msm_gpu *gpu = platform_get_drvdata(to_platform_device(dev));
++	struct dev_pm_opp *opp;
++
++	opp = devfreq_recommended_opp(dev, freq, flags);
++
++	if (IS_ERR(opp))
++		return PTR_ERR(opp);
++
++	clk_set_rate(gpu->core_clk, *freq);
++	dev_pm_opp_put(opp);
++
++	return 0;
++}
++
++static int msm_devfreq_get_dev_status(struct device *dev,
++		struct devfreq_dev_status *status)
++{
++	struct msm_gpu *gpu = platform_get_drvdata(to_platform_device(dev));
++	u64 cycles;
++	u32 freq = ((u32) status->current_frequency) / 1000000;
++	ktime_t time;
++
++	status->current_frequency = (unsigned long) clk_get_rate(gpu->core_clk);
++	gpu->funcs->gpu_busy(gpu, &cycles);
++
++	status->busy_time = ((u32) (cycles - gpu->devfreq.busy_cycles)) / freq;
++
++	gpu->devfreq.busy_cycles = cycles;
++
++	time = ktime_get();
++	status->total_time = ktime_us_delta(time, gpu->devfreq.time);
++	gpu->devfreq.time = time;
++
++	return 0;
++}
++
++static int msm_devfreq_get_cur_freq(struct device *dev, unsigned long *freq)
++{
++	struct msm_gpu *gpu = platform_get_drvdata(to_platform_device(dev));
++
++	*freq = (unsigned long) clk_get_rate(gpu->core_clk);
++
++	return 0;
++}
++
++static struct devfreq_dev_profile msm_devfreq_profile = {
++	.polling_ms = 10,
++	.target = msm_devfreq_target,
++	.get_dev_status = msm_devfreq_get_dev_status,
++	.get_cur_freq = msm_devfreq_get_cur_freq,
++};
++
++static void msm_devfreq_init(struct msm_gpu *gpu)
++{
++	/* We need target support to do devfreq */
++	if (!gpu->funcs->gpu_busy)
++		return;
++
++	msm_devfreq_profile.initial_freq = gpu->fast_rate;
++
++	/*
++	 * Don't set the freq_table or max_state and let devfreq build the table
++	 * from OPP
++	 */
++
++	gpu->devfreq.devfreq = devm_devfreq_add_device(&gpu->pdev->dev,
++			&msm_devfreq_profile, "simple_ondemand", NULL);
++
++	if (IS_ERR(gpu->devfreq.devfreq)) {
++		dev_err(&gpu->pdev->dev, "Couldn't initialize GPU devfreq\n");
++		gpu->devfreq.devfreq = NULL;
++	}
++}
++
+ static int enable_pwrrail(struct msm_gpu *gpu)
+ {
+ 	struct drm_device *dev = gpu->dev;
+@@ -140,6 +219,13 @@ int msm_gpu_pm_resume(struct msm_gpu *gp
+ 	if (ret)
+ 		return ret;
+ 
++	if (gpu->devfreq.devfreq) {
++		gpu->devfreq.busy_cycles = 0;
++		gpu->devfreq.time = ktime_get();
++
++		devfreq_resume_device(gpu->devfreq.devfreq);
++	}
++
+ 	gpu->needs_hw_init = true;
+ 
+ 	return 0;
+@@ -151,6 +237,9 @@ int msm_gpu_pm_suspend(struct msm_gpu *g
+ 
+ 	DBG("%s", gpu->name);
+ 
++	if (gpu->devfreq.devfreq)
++		devfreq_suspend_device(gpu->devfreq.devfreq);
++
+ 	ret = disable_axi(gpu);
+ 	if (ret)
+ 		return ret;
+@@ -721,6 +810,8 @@ int msm_gpu_init(struct drm_device *drm,
+ 	gpu->pdev = pdev;
+ 	platform_set_drvdata(pdev, gpu);
+ 
++	msm_devfreq_init(gpu);
++
+ 	gpu->aspace = msm_gpu_create_address_space(gpu, pdev,
+ 		config->va_start, config->va_end);
+ 
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -66,6 +66,7 @@ struct msm_gpu_funcs {
+ 	/* show GPU status in debugfs: */
+ 	void (*show)(struct msm_gpu *gpu, struct seq_file *m);
+ #endif
++	int (*gpu_busy)(struct msm_gpu *gpu, uint64_t *value);
+ };
+ 
+ struct msm_gpu {
+@@ -120,6 +121,12 @@ struct msm_gpu {
+ 	struct work_struct recover_work;
+ 
+ 	struct drm_gem_object *memptrs_bo;
++
++	struct {
++		struct devfreq *devfreq;
++		u64 busy_cycles;
++		ktime_t time;
++	} devfreq;
+ };
+ 
+ /* It turns out that all targets use the same ringbuffer size */

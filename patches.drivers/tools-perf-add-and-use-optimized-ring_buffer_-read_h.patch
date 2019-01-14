@@ -1,0 +1,387 @@
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Fri, 19 Oct 2018 15:51:02 +0200
+Subject: tools, perf: add and use optimized ring_buffer_{read_head,
+ write_tail} helpers
+Patch-mainline: v4.20-rc1
+Git-commit: 09d62154f61316f7e97eae3f31ef8770c7e4b386
+References: bsc#1109837
+
+Currently, on x86-64, perf uses LFENCE and MFENCE (rmb() and mb(),
+respectively) when processing events from the perf ring buffer which
+is unnecessarily expensive as we can do more lightweight in particular
+given this is critical fast-path in perf.
+
+According to Peter rmb()/mb() were added back then via a94d342b9cb0
+("tools/perf: Add required memory barriers") at a time where kernel
+still supported chips that needed it, but nowadays support for these
+has been ditched completely, therefore we can fix them up as well.
+
+While for x86-64, replacing rmb() and mb() with smp_*() variants would
+result in just a compiler barrier for the former and LOCK + ADD for
+the latter (__sync_synchronize() uses slower MFENCE by the way), Peter
+suggested we can use smp_{load_acquire,store_release}() instead for
+architectures where its implementation doesn't resolve in slower smp_mb().
+Thus, e.g. in x86-64 we would be able to avoid CPU barrier entirely due
+to TSO. For architectures where the latter needs to use smp_mb() e.g.
+on arm, we stick to cheaper smp_rmb() variant for fetching the head.
+
+This work adds helpers ring_buffer_read_head() and ring_buffer_write_tail()
+for tools infrastructure that either switches to smp_load_acquire() for
+architectures where it is cheaper or uses READ_ONCE() + smp_rmb() barrier
+for those where it's not in order to fetch the data_head from the perf
+control page, and it uses smp_store_release() to write the data_tail.
+Latter is smp_mb() + WRITE_ONCE() combination or a cheaper variant if
+architecture allows for it. Those that rely on smp_rmb() and smp_mb() can
+further improve performance in a follow up step by implementing the two
+under tools/arch/*/include/asm/barrier.h such that they don't have to
+fallback to rmb() and mb() in tools/include/asm/barrier.h.
+
+Switch perf to use ring_buffer_read_head() and ring_buffer_write_tail()
+so it can make use of the optimizations. Later, we convert libbpf as
+well to use the same helpers.
+
+Side note [0]: the topic has been raised of whether one could simply use
+the C11 gcc builtins [1] for the smp_load_acquire() and smp_store_release()
+instead:
+
+  __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+  __atomic_store_n(ptr, val, __ATOMIC_RELEASE);
+
+Kernel and (presumably) tooling shipped along with the kernel has a
+minimum requirement of being able to build with gcc-4.6 and the latter
+does not have C11 builtins. While generally the C11 memory models don't
+align with the kernel's, the C11 load-acquire and store-release alone
+/could/ suffice, however. Issue is that this is implementation dependent
+on how the load-acquire and store-release is done by the compiler and
+the mapping of supported compilers must align to be compatible with the
+kernel's implementation, and thus needs to be verified/tracked on a
+case by case basis whether they match (unless an architecture uses them
+also from kernel side). The implementations for smp_load_acquire() and
+smp_store_release() in this patch have been adapted from the kernel side
+ones to have a concrete and compatible mapping in place.
+
+  [0] http://patchwork.ozlabs.org/patch/985422/
+  [1] https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ tools/arch/arm64/include/asm/barrier.h    |   70 ++++++++++++++++++++++++++++
+ tools/arch/ia64/include/asm/barrier.h     |   13 +++++
+ tools/arch/powerpc/include/asm/barrier.h  |   16 ++++++
+ tools/arch/s390/include/asm/barrier.h     |   13 +++++
+ tools/arch/sparc/include/asm/barrier_64.h |   13 +++++
+ tools/arch/x86/include/asm/barrier.h      |   14 +++++
+ tools/include/asm/barrier.h               |   36 ++++++++++++++
+ tools/include/linux/ring_buffer.h         |   73 ++++++++++++++++++++++++++++++
+ 8 files changed, 248 insertions(+)
+ create mode 100644 tools/include/linux/ring_buffer.h
+
+--- a/tools/arch/arm64/include/asm/barrier.h
++++ b/tools/arch/arm64/include/asm/barrier.h
+@@ -13,4 +13,74 @@
+ #define wmb()		asm volatile("dmb ishst" ::: "memory")
+ #define rmb()		asm volatile("dmb ishld" ::: "memory")
+ 
++#define smp_store_release(p, v)					\
++do {								\
++	union { typeof(*p) __val; char __c[1]; } __u =		\
++		{ .__val = (__force typeof(*p)) (v) }; 		\
++								\
++	switch (sizeof(*p)) {					\
++	case 1:							\
++		asm volatile ("stlrb %w1, %0"			\
++				: "=Q" (*p)			\
++				: "r" (*(__u8 *)__u.__c)	\
++				: "memory");			\
++		break;						\
++	case 2:							\
++		asm volatile ("stlrh %w1, %0"			\
++				: "=Q" (*p)			\
++				: "r" (*(__u16 *)__u.__c)	\
++				: "memory");			\
++		break;						\
++	case 4:							\
++		asm volatile ("stlr %w1, %0"			\
++				: "=Q" (*p)			\
++				: "r" (*(__u32 *)__u.__c)	\
++				: "memory");			\
++		break;						\
++	case 8:							\
++		asm volatile ("stlr %1, %0"			\
++				: "=Q" (*p)			\
++				: "r" (*(__u64 *)__u.__c)	\
++				: "memory");			\
++		break;						\
++	default:						\
++		/* Only to shut up gcc ... */			\
++		mb();						\
++		break;						\
++	}							\
++} while (0)
++
++#define smp_load_acquire(p)					\
++({								\
++	union { typeof(*p) __val; char __c[1]; } __u;		\
++								\
++	switch (sizeof(*p)) {					\
++	case 1:							\
++		asm volatile ("ldarb %w0, %1"			\
++			: "=r" (*(__u8 *)__u.__c)		\
++			: "Q" (*p) : "memory");			\
++		break;						\
++	case 2:							\
++		asm volatile ("ldarh %w0, %1"			\
++			: "=r" (*(__u16 *)__u.__c)		\
++			: "Q" (*p) : "memory");			\
++		break;						\
++	case 4:							\
++		asm volatile ("ldar %w0, %1"			\
++			: "=r" (*(__u32 *)__u.__c)		\
++			: "Q" (*p) : "memory");			\
++		break;						\
++	case 8:							\
++		asm volatile ("ldar %0, %1"			\
++			: "=r" (*(__u64 *)__u.__c)		\
++			: "Q" (*p) : "memory");			\
++		break;						\
++	default:						\
++		/* Only to shut up gcc ... */			\
++		mb();						\
++		break;						\
++	}							\
++	__u.__val;						\
++})
++
+ #endif /* _TOOLS_LINUX_ASM_AARCH64_BARRIER_H */
+--- a/tools/arch/ia64/include/asm/barrier.h
++++ b/tools/arch/ia64/include/asm/barrier.h
+@@ -45,4 +45,17 @@
+ #define rmb()		mb()
+ #define wmb()		mb()
+ 
++#define smp_store_release(p, v)			\
++do {						\
++	barrier();				\
++	WRITE_ONCE(*p, v);			\
++} while (0)
++
++#define smp_load_acquire(p)			\
++({						\
++	typeof(*p) ___p1 = READ_ONCE(*p);	\
++	barrier();				\
++	___p1;					\
++})
++
+ #endif /* _TOOLS_LINUX_ASM_IA64_BARRIER_H */
+--- a/tools/arch/powerpc/include/asm/barrier.h
++++ b/tools/arch/powerpc/include/asm/barrier.h
+@@ -26,4 +26,20 @@
+ #define rmb()  __asm__ __volatile__ ("sync" : : : "memory")
+ #define wmb()  __asm__ __volatile__ ("sync" : : : "memory")
+ 
++#if defined(__powerpc64__)
++#define smp_lwsync()	__asm__ __volatile__ ("lwsync" : : : "memory")
++
++#define smp_store_release(p, v)			\
++do {						\
++	smp_lwsync();				\
++	WRITE_ONCE(*p, v);			\
++} while (0)
++
++#define smp_load_acquire(p)			\
++({						\
++	typeof(*p) ___p1 = READ_ONCE(*p);	\
++	smp_lwsync();				\
++	___p1;					\
++})
++#endif /* defined(__powerpc64__) */
+ #endif /* _TOOLS_LINUX_ASM_POWERPC_BARRIER_H */
+--- a/tools/arch/s390/include/asm/barrier.h
++++ b/tools/arch/s390/include/asm/barrier.h
+@@ -27,4 +27,17 @@
+ #define rmb()				mb()
+ #define wmb()				mb()
+ 
++#define smp_store_release(p, v)			\
++do {						\
++	barrier();				\
++	WRITE_ONCE(*p, v);			\
++} while (0)
++
++#define smp_load_acquire(p)			\
++({						\
++	typeof(*p) ___p1 = READ_ONCE(*p);	\
++	barrier();				\
++	___p1;					\
++})
++
+ #endif /* __TOOLS_LIB_ASM_BARRIER_H */
+--- a/tools/arch/sparc/include/asm/barrier_64.h
++++ b/tools/arch/sparc/include/asm/barrier_64.h
+@@ -39,4 +39,17 @@ do {	__asm__ __volatile__("ba,pt	%%xcc,
+ #define rmb()	__asm__ __volatile__("":::"memory")
+ #define wmb()	__asm__ __volatile__("":::"memory")
+ 
++#define smp_store_release(p, v)			\
++do {						\
++	barrier();				\
++	WRITE_ONCE(*p, v);			\
++} while (0)
++
++#define smp_load_acquire(p)			\
++({						\
++	typeof(*p) ___p1 = READ_ONCE(*p);	\
++	barrier();				\
++	___p1;					\
++})
++
+ #endif /* !(__TOOLS_LINUX_SPARC64_BARRIER_H) */
+--- a/tools/arch/x86/include/asm/barrier.h
++++ b/tools/arch/x86/include/asm/barrier.h
+@@ -25,4 +25,18 @@
+ #define wmb()	asm volatile("sfence" ::: "memory")
+ #endif
+ 
++#if defined(__x86_64__)
++#define smp_store_release(p, v)			\
++do {						\
++	barrier();				\
++	WRITE_ONCE(*p, v);			\
++} while (0)
++
++#define smp_load_acquire(p)			\
++({						\
++	typeof(*p) ___p1 = READ_ONCE(*p);	\
++	barrier();				\
++	___p1;					\
++})
++#endif /* defined(__x86_64__) */
+ #endif /* _TOOLS_LINUX_ASM_X86_BARRIER_H */
+--- a/tools/include/asm/barrier.h
++++ b/tools/include/asm/barrier.h
+@@ -1,3 +1,5 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <linux/compiler.h>
+ #if defined(__i386__) || defined(__x86_64__)
+ #include "../../arch/x86/include/asm/barrier.h"
+ #elif defined(__arm__)
+@@ -25,3 +27,37 @@
+ #else
+ #include <asm-generic/barrier.h>
+ #endif
++
++/*
++ * Generic fallback smp_*() definitions for archs that haven't
++ * been updated yet.
++ */
++
++#ifndef smp_rmb
++# define smp_rmb()	rmb()
++#endif
++
++#ifndef smp_wmb
++# define smp_wmb()	wmb()
++#endif
++
++#ifndef smp_mb
++# define smp_mb()	mb()
++#endif
++
++#ifndef smp_store_release
++# define smp_store_release(p, v)		\
++do {						\
++	smp_mb();				\
++	WRITE_ONCE(*p, v);			\
++} while (0)
++#endif
++
++#ifndef smp_load_acquire
++# define smp_load_acquire(p)			\
++({						\
++	typeof(*p) ___p1 = READ_ONCE(*p);	\
++	smp_mb();				\
++	___p1;					\
++})
++#endif
+--- /dev/null
++++ b/tools/include/linux/ring_buffer.h
+@@ -0,0 +1,73 @@
++#ifndef _TOOLS_LINUX_RING_BUFFER_H_
++#define _TOOLS_LINUX_RING_BUFFER_H_
++
++#include <asm/barrier.h>
++
++/*
++ * Contract with kernel for walking the perf ring buffer from
++ * user space requires the following barrier pairing (quote
++ * from kernel/events/ring_buffer.c):
++ *
++ *   Since the mmap() consumer (userspace) can run on a
++ *   different CPU:
++ *
++ *   kernel                             user
++ *
++ *   if (LOAD ->data_tail) {            LOAD ->data_head
++ *                      (A)             smp_rmb()       (C)
++ *      STORE $data                     LOAD $data
++ *      smp_wmb()       (B)             smp_mb()        (D)
++ *      STORE ->data_head               STORE ->data_tail
++ *   }
++ *
++ *   Where A pairs with D, and B pairs with C.
++ *
++ *   In our case A is a control dependency that separates the
++ *   load of the ->data_tail and the stores of $data. In case
++ *   ->data_tail indicates there is no room in the buffer to
++ *   store $data we do not.
++ *
++ *   D needs to be a full barrier since it separates the data
++ *   READ from the tail WRITE.
++ *
++ *   For B a WMB is sufficient since it separates two WRITEs,
++ *   and for C an RMB is sufficient since it separates two READs.
++ *
++ * Note, instead of B, C, D we could also use smp_store_release()
++ * in B and D as well as smp_load_acquire() in C.
++ *
++ * However, this optimization does not make sense for all kernel
++ * supported architectures since for a fair number it would
++ * resolve into READ_ONCE() + smp_mb() pair for smp_load_acquire(),
++ * and smp_mb() + WRITE_ONCE() pair for smp_store_release().
++ *
++ * Thus for those smp_wmb() in B and smp_rmb() in C would still
++ * be less expensive. For the case of D this has either the same
++ * cost or is less expensive, for example, due to TSO x86 can
++ * avoid the CPU barrier entirely.
++ */
++
++static inline u64 ring_buffer_read_head(struct perf_event_mmap_page *base)
++{
++/*
++ * Architectures where smp_load_acquire() does not fallback to
++ * READ_ONCE() + smp_mb() pair.
++ */
++#if defined(__x86_64__) || defined(__aarch64__) || defined(__powerpc64__) || \
++    defined(__ia64__) || defined(__sparc__) && defined(__arch64__)
++	return smp_load_acquire(&base->data_head);
++#else
++	u64 head = READ_ONCE(base->data_head);
++
++	smp_rmb();
++	return head;
++#endif
++}
++
++static inline void ring_buffer_write_tail(struct perf_event_mmap_page *base,
++					  u64 tail)
++{
++	smp_store_release(&base->data_tail, tail);
++}
++
++#endif /* _TOOLS_LINUX_RING_BUFFER_H_ */

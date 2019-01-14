@@ -1,0 +1,127 @@
+From: John Fastabend <john.fastabend@gmail.com>
+Date: Fri, 14 Sep 2018 13:01:46 -0700
+Subject: tls: async support causes out-of-bounds access in crypto APIs
+Patch-mainline: v4.20-rc1
+Git-commit: 7a3dd8c8979ce48b99cb0e9b7435a97f0716138a
+References: bsc#1109837
+
+When async support was added it needed to access the sk from the async
+callback to report errors up the stack. The patch tried to use space
+after the aead request struct by directly setting the reqsize field in
+aead_request. This is an internal field that should not be used
+outside the crypto APIs. It is used by the crypto code to define extra
+space for private structures used in the crypto context. Users of the
+API then use crypto_aead_reqsize() and add the returned amount of
+bytes to the end of the request memory allocation before posting the
+request to encrypt/decrypt APIs.
+
+So this breaks (with general protection fault and KASAN error, if
+enabled) because the request sent to decrypt is shorter than required
+causing the crypto API out-of-bounds errors. Also it seems unlikely the
+sk is even valid by the time it gets to the callback because of memset
+in crypto layer.
+
+Anyways, fix this by holding the sk in the skb->sk field when the
+callback is set up and because the skb is already passed through to
+the callback handler via void* we can access it in the handler. Then
+in the handler we need to be careful to NULL the pointer again before
+kfree_skb. I added comments on both the setup (in tls_do_decryption)
+and when we clear it from the crypto callback handler
+tls_decrypt_done(). After this selftests pass again and fixes KASAN
+errors/warnings.
+
+Fixes: 94524d8fc965 ("net/tls: Add support for async decryption of tls records")
+Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+Reviewed-by: Vakul Garg <Vakul.garg@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/tls.h |    4 ----
+ net/tls/tls_sw.c  |   39 +++++++++++++++++++++++----------------
+ 2 files changed, 23 insertions(+), 20 deletions(-)
+
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -128,10 +128,6 @@ struct tls_sw_context_rx {
+ 	bool async_notify;
+ };
+ 
+-struct decrypt_req_ctx {
+-	struct sock *sk;
+-};
+-
+ struct tls_record_info {
+ 	struct list_head list;
+ 	u32 end_seq;
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -122,25 +122,32 @@ static int skb_nsg(struct sk_buff *skb,
+ static void tls_decrypt_done(struct crypto_async_request *req, int err)
+ {
+ 	struct aead_request *aead_req = (struct aead_request *)req;
+-	struct decrypt_req_ctx *req_ctx =
+-			(struct decrypt_req_ctx *)(aead_req + 1);
+-
+ 	struct scatterlist *sgout = aead_req->dst;
+-
+-	struct tls_context *tls_ctx = tls_get_ctx(req_ctx->sk);
+-	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+-	int pending = atomic_dec_return(&ctx->decrypt_pending);
++	struct tls_sw_context_rx *ctx;
++	struct tls_context *tls_ctx;
+ 	struct scatterlist *sg;
++	struct sk_buff *skb;
+ 	unsigned int pages;
++	int pending;
++
++	skb = (struct sk_buff *)req->data;
++	tls_ctx = tls_get_ctx(skb->sk);
++	ctx = tls_sw_ctx_rx(tls_ctx);
++	pending = atomic_dec_return(&ctx->decrypt_pending);
+ 
+ 	/* Propagate if there was an err */
+ 	if (err) {
+ 		ctx->async_wait.err = err;
+-		tls_err_abort(req_ctx->sk, err);
++		tls_err_abort(skb->sk, err);
+ 	}
+ 
++	/* After using skb->sk to propagate sk through crypto async callback
++	 * we need to NULL it again.
++	 */
++	skb->sk = NULL;
++
+ 	/* Release the skb, pages and memory allocated for crypto req */
+-	kfree_skb(req->data);
++	kfree_skb(skb);
+ 
+ 	/* Skip the first S/G entry as it points to AAD */
+ 	for_each_sg(sg_next(sgout), sg, UINT_MAX, pages) {
+@@ -175,11 +182,13 @@ static int tls_do_decryption(struct sock
+ 			       (u8 *)iv_recv);
+ 
+ 	if (async) {
+-		struct decrypt_req_ctx *req_ctx;
+-
+-		req_ctx = (struct decrypt_req_ctx *)(aead_req + 1);
+-		req_ctx->sk = sk;
+-
++		/* Using skb->sk to push sk through to crypto async callback
++		 * handler. This allows propagating errors up to the socket
++		 * if needed. It _must_ be cleared in the async handler
++		 * before kfree_skb is called. We _know_ skb->sk is NULL
++		 * because it is a clone from strparser.
++		 */
++		skb->sk = sk;
+ 		aead_request_set_callback(aead_req,
+ 					  CRYPTO_TFM_REQ_MAY_BACKLOG,
+ 					  tls_decrypt_done, skb);
+@@ -1464,8 +1473,6 @@ int tls_set_sw_offload(struct sock *sk,
+ 		goto free_aead;
+ 
+ 	if (sw_ctx_rx) {
+-		(*aead)->reqsize = sizeof(struct decrypt_req_ctx);
+-
+ 		/* Set up strparser */
+ 		memset(&cb, 0, sizeof(cb));
+ 		cb.rcv_msg = tls_queue;

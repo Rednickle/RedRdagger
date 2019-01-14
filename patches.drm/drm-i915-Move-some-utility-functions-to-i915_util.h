@@ -26,7 +26,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
 
 --- a/drivers/gpu/drm/i915/i915_drv.h
 +++ b/drivers/gpu/drm/i915/i915_drv.h
-@@ -242,21 +242,6 @@ static inline uint_fixed_16_16_t add_fix
+@@ -243,21 +243,6 @@ static inline uint_fixed_16_16_t add_fix
  	return clamp_u64_to_fixed16(interm_sum);
  }
  

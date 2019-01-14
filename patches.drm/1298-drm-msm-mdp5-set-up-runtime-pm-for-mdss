@@ -1,0 +1,187 @@
+From: Archit Taneja <architt@codeaurora.org>
+Date: Fri, 28 Jul 2017 16:17:07 +0530
+Subject: drm/msm/mdp5: Set up runtime PM for MDSS
+Git-commit: 774e39ee3572272b816f3a0b39dfdbcc70dd47f1
+Patch-mainline: v4.14-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+MDSS represents the top level wrapper that contains MDP5, DSI, HDMI and
+other sub-blocks. W.r.t device heirarchy, it's the parent of all these
+devices. The power domain of this device is actually tied to the GDSC
+hw. When any sub-device enables its PD, MDSS's PD is also enabled.
+
+The suspend/resume ops enable the top level clocks that end at the MDSS
+boundary. For now, we're letting them all be optional, since the child
+devices anyway hold a ref to these clocks.
+
+Until now, we'd called a runtime_get() during probe, which ensured that
+the GDSC was always on. Now that we've set up runtime PM for the children
+devices, we can get rid of this hack.
+
+Note: that the MDSS device is the platform_device in msm_drv.c. The
+msm_runtime_suspend/resume ops call the funcs that enable/disable
+the top level MDSS clocks. This is different from MDP4, where the
+platform device created in msm_drv.c represents MDP4 itself. It would
+have been nicer to hide these differences by adding new kms funcs, but
+runtime PM needs to be enabled before kms is set up (i.e, msm_kms_init
+is called).
+
+Signed-off-by: Archit Taneja <architt@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/mdp/mdp5/mdp5_mdss.c |   63 +++++++++++++++++++++++++++----
+ drivers/gpu/drm/msm/msm_drv.c            |   29 ++++++++++++++
+ drivers/gpu/drm/msm/msm_kms.h            |    2 
+ 3 files changed, 86 insertions(+), 8 deletions(-)
+
+--- a/drivers/gpu/drm/msm/mdp/mdp5/mdp5_mdss.c
++++ b/drivers/gpu/drm/msm/mdp/mdp5/mdp5_mdss.c
+@@ -31,6 +31,10 @@ struct msm_mdss {
+ 
+ 	struct regulator *vdd;
+ 
++	struct clk *ahb_clk;
++	struct clk *axi_clk;
++	struct clk *vsync_clk;
++
+ 	struct {
+ 		volatile unsigned long enabled_mask;
+ 		struct irq_domain *domain;
+@@ -140,6 +144,51 @@ static int mdss_irq_domain_init(struct m
+ 	return 0;
+ }
+ 
++int msm_mdss_enable(struct msm_mdss *mdss)
++{
++	DBG("");
++
++	clk_prepare_enable(mdss->ahb_clk);
++	if (mdss->axi_clk)
++		clk_prepare_enable(mdss->axi_clk);
++	if (mdss->vsync_clk)
++		clk_prepare_enable(mdss->vsync_clk);
++
++	return 0;
++}
++
++int msm_mdss_disable(struct msm_mdss *mdss)
++{
++	DBG("");
++
++	if (mdss->vsync_clk)
++		clk_disable_unprepare(mdss->vsync_clk);
++	if (mdss->axi_clk)
++		clk_disable_unprepare(mdss->axi_clk);
++	clk_disable_unprepare(mdss->ahb_clk);
++
++	return 0;
++}
++
++static int msm_mdss_get_clocks(struct msm_mdss *mdss)
++{
++	struct platform_device *pdev = to_platform_device(mdss->dev->dev);
++
++	mdss->ahb_clk = msm_clk_get(pdev, "iface");
++	if (IS_ERR(mdss->ahb_clk))
++		mdss->ahb_clk = NULL;
++
++	mdss->axi_clk = msm_clk_get(pdev, "bus");
++	if (IS_ERR(mdss->axi_clk))
++		mdss->axi_clk = NULL;
++
++	mdss->vsync_clk = msm_clk_get(pdev, "vsync");
++	if (IS_ERR(mdss->vsync_clk))
++		mdss->vsync_clk = NULL;
++
++	return 0;
++}
++
+ void msm_mdss_destroy(struct drm_device *dev)
+ {
+ 	struct msm_drm_private *priv = dev->dev_private;
+@@ -153,8 +202,6 @@ void msm_mdss_destroy(struct drm_device
+ 
+ 	regulator_disable(mdss->vdd);
+ 
+-	pm_runtime_put_sync(dev->dev);
+-
+ 	pm_runtime_disable(dev->dev);
+ }
+ 
+@@ -190,6 +237,12 @@ int msm_mdss_init(struct drm_device *dev
+ 		goto fail;
+ 	}
+ 
++	ret = msm_mdss_get_clocks(mdss);
++	if (ret) {
++		dev_err(dev->dev, "failed to get clocks: %d\n", ret);
++		goto fail;
++	}
++
+ 	/* Regulator to enable GDSCs in downstream kernels */
+ 	mdss->vdd = devm_regulator_get(dev->dev, "vdd");
+ 	if (IS_ERR(mdss->vdd)) {
+@@ -221,12 +274,6 @@ int msm_mdss_init(struct drm_device *dev
+ 
+ 	pm_runtime_enable(dev->dev);
+ 
+-	/*
+-	 * TODO: This is needed as the MDSS GDSC is only tied to MDSS's power
+-	 * domain. Remove this once runtime PM is adapted for all the devices.
+-	 */
+-	pm_runtime_get_sync(dev->dev);
+-
+ 	return 0;
+ fail_irq:
+ 	regulator_disable(mdss->vdd);
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -878,8 +878,37 @@ static int msm_pm_resume(struct device *
+ }
+ #endif
+ 
++#ifdef CONFIG_PM
++static int msm_runtime_suspend(struct device *dev)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct msm_drm_private *priv = ddev->dev_private;
++
++	DBG("");
++
++	if (priv->mdss)
++		return msm_mdss_disable(priv->mdss);
++
++	return 0;
++}
++
++static int msm_runtime_resume(struct device *dev)
++{
++	struct drm_device *ddev = dev_get_drvdata(dev);
++	struct msm_drm_private *priv = ddev->dev_private;
++
++	DBG("");
++
++	if (priv->mdss)
++		return msm_mdss_enable(priv->mdss);
++
++	return 0;
++}
++#endif
++
+ static const struct dev_pm_ops msm_pm_ops = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(msm_pm_suspend, msm_pm_resume)
++	SET_RUNTIME_PM_OPS(msm_runtime_suspend, msm_runtime_resume, NULL)
+ };
+ 
+ /*
+--- a/drivers/gpu/drm/msm/msm_kms.h
++++ b/drivers/gpu/drm/msm/msm_kms.h
+@@ -99,5 +99,7 @@ struct msm_kms *mdp4_kms_init(struct drm
+ struct msm_kms *mdp5_kms_init(struct drm_device *dev);
+ int msm_mdss_init(struct drm_device *dev);
+ void msm_mdss_destroy(struct drm_device *dev);
++int msm_mdss_enable(struct msm_mdss *mdss);
++int msm_mdss_disable(struct msm_mdss *mdss);
+ 
+ #endif /* __MSM_KMS_H__ */

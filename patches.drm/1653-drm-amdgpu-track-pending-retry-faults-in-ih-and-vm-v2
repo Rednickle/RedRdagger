@@ -1,0 +1,322 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Sat, 26 Aug 2017 02:43:06 -0400
+Subject: drm/amdgpu: Track pending retry faults in IH and VM (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: a2f14820e3493145c25095873d4a510a1b25efdc
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+IH tracks pending retry faults in a hash table for fast lookup in
+interrupt context. Each VM has a short FIFO of pending VM faults for
+processing in a bottom half.
+
+The IH prescreening stage adds retry faults and filters out repeated
+retry interrupts to minimize the impact of interrupt storms.
+
+It's the VM's responsibility remove pending faults once they are
+handled. For now this is only done when the VM is destroyed.
+
+v2:
+- Made the hash table smaller and the FIFO longer. I never want the
+  FIFO to fill up, because that would make prescreen take longer.
+  128 pending page faults should be enough to keep migrations busy.
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com> (v1)
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/Kconfig                |    1 
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c |   76 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h |   12 +++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c |    7 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h |    7 ++
+ drivers/gpu/drm/amd/amdgpu/vega10_ih.c |   78 ++++++++++++++++++++++++++++++++-
+ 6 files changed, 180 insertions(+), 1 deletion(-)
+
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -184,6 +184,7 @@ config DRM_AMDGPU
+ 	select BACKLIGHT_CLASS_DEVICE
+ 	select BACKLIGHT_LCD_SUPPORT
+ 	select INTERVAL_TREE
++	select CHASH
+ 	help
+ 	  Choose this option if you have a recent AMD Radeon graphics card.
+ 
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.c
+@@ -196,3 +196,79 @@ restart_ih:
+ 
+ 	return IRQ_HANDLED;
+ }
++
++/**
++ * amdgpu_ih_add_fault - Add a page fault record
++ *
++ * @adev: amdgpu device pointer
++ * @key: 64-bit encoding of PASID and address
++ *
++ * This should be called when a retry page fault interrupt is
++ * received. If this is a new page fault, it will be added to a hash
++ * table. The return value indicates whether this is a new fault, or
++ * a fault that was already known and is already being handled.
++ *
++ * If there are too many pending page faults, this will fail. Retry
++ * interrupts should be ignored in this case until there is enough
++ * free space.
++ *
++ * Returns 0 if the fault was added, 1 if the fault was already known,
++ * -ENOSPC if there are too many pending faults.
++ */
++int amdgpu_ih_add_fault(struct amdgpu_device *adev, u64 key)
++{
++	unsigned long flags;
++	int r = -ENOSPC;
++
++	if (WARN_ON_ONCE(!adev->irq.ih.faults))
++		/* Should be allocated in <IP>_ih_sw_init on GPUs that
++		 * support retry faults and require retry filtering.
++		 */
++		return r;
++
++	spin_lock_irqsave(&adev->irq.ih.faults->lock, flags);
++
++	/* Only let the hash table fill up to 50% for best performance */
++	if (adev->irq.ih.faults->count >= (1 << (AMDGPU_PAGEFAULT_HASH_BITS-1)))
++		goto unlock_out;
++
++	r = chash_table_copy_in(&adev->irq.ih.faults->hash, key, NULL);
++	if (!r)
++		adev->irq.ih.faults->count++;
++
++	/* chash_table_copy_in should never fail unless we're losing count */
++	WARN_ON_ONCE(r < 0);
++
++unlock_out:
++	spin_unlock_irqrestore(&adev->irq.ih.faults->lock, flags);
++	return r;
++}
++
++/**
++ * amdgpu_ih_clear_fault - Remove a page fault record
++ *
++ * @adev: amdgpu device pointer
++ * @key: 64-bit encoding of PASID and address
++ *
++ * This should be called when a page fault has been handled. Any
++ * future interrupt with this key will be processed as a new
++ * page fault.
++ */
++void amdgpu_ih_clear_fault(struct amdgpu_device *adev, u64 key)
++{
++	unsigned long flags;
++	int r;
++
++	if (!adev->irq.ih.faults)
++		return;
++
++	spin_lock_irqsave(&adev->irq.ih.faults->lock, flags);
++
++	r = chash_table_remove(&adev->irq.ih.faults->hash, key, NULL);
++	if (!WARN_ON_ONCE(r < 0)) {
++		adev->irq.ih.faults->count--;
++		WARN_ON_ONCE(adev->irq.ih.faults->count < 0);
++	}
++
++	spin_unlock_irqrestore(&adev->irq.ih.faults->lock, flags);
++}
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ih.h
+@@ -24,6 +24,8 @@
+ #ifndef __AMDGPU_IH_H__
+ #define __AMDGPU_IH_H__
+ 
++#include <linux/chash.h>
++
+ struct amdgpu_device;
+  /*
+   * vega10+ IH clients
+@@ -69,6 +71,13 @@ enum amdgpu_ih_clientid
+ 
+ #define AMDGPU_IH_CLIENTID_LEGACY 0
+ 
++#define AMDGPU_PAGEFAULT_HASH_BITS 8
++struct amdgpu_retryfault_hashtable {
++	DECLARE_CHASH_TABLE(hash, AMDGPU_PAGEFAULT_HASH_BITS, 8, 0);
++	spinlock_t	lock;
++	int		count;
++};
++
+ /*
+  * R6xx+ IH ring
+  */
+@@ -87,6 +96,7 @@ struct amdgpu_ih_ring {
+ 	bool			use_doorbell;
+ 	bool			use_bus_addr;
+ 	dma_addr_t		rb_dma_addr; /* only used when use_bus_addr = true */
++	struct amdgpu_retryfault_hashtable *faults;
+ };
+ 
+ #define AMDGPU_IH_SRC_DATA_MAX_SIZE_DW 4
+@@ -109,5 +119,7 @@ int amdgpu_ih_ring_init(struct amdgpu_de
+ 			bool use_bus_addr);
+ void amdgpu_ih_ring_fini(struct amdgpu_device *adev);
+ int amdgpu_ih_process(struct amdgpu_device *adev);
++int amdgpu_ih_add_fault(struct amdgpu_device *adev, u64 key);
++void amdgpu_ih_clear_fault(struct amdgpu_device *adev, u64 key);
+ 
+ #endif
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -2680,6 +2680,8 @@ int amdgpu_vm_init(struct amdgpu_device
+ 		vm->pasid = pasid;
+ 	}
+ 
++	INIT_KFIFO(vm->faults);
++
+ 	return 0;
+ 
+ error_free_root:
+@@ -2731,8 +2733,13 @@ void amdgpu_vm_fini(struct amdgpu_device
+ {
+ 	struct amdgpu_bo_va_mapping *mapping, *tmp;
+ 	bool prt_fini_needed = !!adev->gart.gart_funcs->set_prt;
++	u64 fault;
+ 	int i;
+ 
++	/* Clear pending page faults from IH when the VM is destroyed */
++	while (kfifo_get(&vm->faults, &fault))
++		amdgpu_ih_clear_fault(adev, fault);
++
+ 	if (vm->pasid) {
+ 		unsigned long flags;
+ 
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.h
+@@ -120,6 +120,10 @@ struct amdgpu_vm_pt {
+ 	unsigned			last_entry_used;
+ };
+ 
++#define AMDGPU_VM_FAULT(pasid, addr) (((u64)(pasid) << 48) | (addr))
++#define AMDGPU_VM_FAULT_PASID(fault) ((u64)(fault) >> 48)
++#define AMDGPU_VM_FAULT_ADDR(fault)  ((u64)(fault) & 0xfffffffff000ULL)
++
+ struct amdgpu_vm {
+ 	/* tree of virtual addresses mapped */
+ 	struct rb_root		va;
+@@ -160,6 +164,9 @@ struct amdgpu_vm {
+ 
+ 	/* Flag to indicate ATS support from PTE for GFX9 */
+ 	bool			pte_support_ats;
++
++	/* Up to 128 pending page faults */
++	DECLARE_KFIFO(faults, u64, 128);
+ };
+ 
+ struct amdgpu_vm_id {
+--- a/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
++++ b/drivers/gpu/drm/amd/amdgpu/vega10_ih.c
+@@ -235,8 +235,73 @@ static u32 vega10_ih_get_wptr(struct amd
+  */
+ static bool vega10_ih_prescreen_iv(struct amdgpu_device *adev)
+ {
+-	/* TODO: Filter known pending page faults */
++	u32 ring_index = adev->irq.ih.rptr >> 2;
++	u32 dw0, dw3, dw4, dw5;
++	u16 pasid;
++	u64 addr, key;
++	struct amdgpu_vm *vm;
++	int r;
++
++	dw0 = le32_to_cpu(adev->irq.ih.ring[ring_index + 0]);
++	dw3 = le32_to_cpu(adev->irq.ih.ring[ring_index + 3]);
++	dw4 = le32_to_cpu(adev->irq.ih.ring[ring_index + 4]);
++	dw5 = le32_to_cpu(adev->irq.ih.ring[ring_index + 5]);
++
++	/* Filter retry page faults, let only the first one pass. If
++	 * there are too many outstanding faults, ignore them until
++	 * some faults get cleared.
++	 */
++	switch (dw0 & 0xff) {
++	case AMDGPU_IH_CLIENTID_VMC:
++	case AMDGPU_IH_CLIENTID_UTCL2:
++		break;
++	default:
++		/* Not a VM fault */
++		return true;
++	}
++
++	/* Not a retry fault */
++	if (!(dw5 & 0x80))
++		return true;
++
++	pasid = dw3 & 0xffff;
++	/* No PASID, can't identify faulting process */
++	if (!pasid)
++		return true;
++
++	addr = ((u64)(dw5 & 0xf) << 44) | ((u64)dw4 << 12);
++	key = AMDGPU_VM_FAULT(pasid, addr);
++	r = amdgpu_ih_add_fault(adev, key);
++
++	/* Hash table is full or the fault is already being processed,
++	 * ignore further page faults
++	 */
++	if (r != 0)
++		goto ignore_iv;
++
++	/* Track retry faults in per-VM fault FIFO. */
++	spin_lock(&adev->vm_manager.pasid_lock);
++	vm = idr_find(&adev->vm_manager.pasid_idr, pasid);
++	spin_unlock(&adev->vm_manager.pasid_lock);
++	if (WARN_ON_ONCE(!vm)) {
++		/* VM not found, process it normally */
++		amdgpu_ih_clear_fault(adev, key);
++		return true;
++	}
++	/* No locking required with single writer and single reader */
++	r = kfifo_put(&vm->faults, key);
++	if (!r) {
++		/* FIFO is full. Ignore it until there is space */
++		amdgpu_ih_clear_fault(adev, key);
++		goto ignore_iv;
++	}
++
++	/* It's the first fault for this address, process it normally */
+ 	return true;
++
++ignore_iv:
++	adev->irq.ih.rptr += 32;
++	return false;
+ }
+ 
+ /**
+@@ -323,6 +388,14 @@ static int vega10_ih_sw_init(void *handl
+ 	adev->irq.ih.use_doorbell = true;
+ 	adev->irq.ih.doorbell_index = AMDGPU_DOORBELL64_IH << 1;
+ 
++	adev->irq.ih.faults = kmalloc(sizeof(*adev->irq.ih.faults), GFP_KERNEL);
++	if (!adev->irq.ih.faults)
++		return -ENOMEM;
++	INIT_CHASH_TABLE(adev->irq.ih.faults->hash,
++			 AMDGPU_PAGEFAULT_HASH_BITS, 8, 0);
++	spin_lock_init(&adev->irq.ih.faults->lock);
++	adev->irq.ih.faults->count = 0;
++
+ 	r = amdgpu_irq_init(adev);
+ 
+ 	return r;
+@@ -335,6 +408,9 @@ static int vega10_ih_sw_fini(void *handl
+ 	amdgpu_irq_fini(adev);
+ 	amdgpu_ih_ring_fini(adev);
+ 
++	kfree(adev->irq.ih.faults);
++	adev->irq.ih.faults = NULL;
++
+ 	return 0;
+ }
+ 

@@ -1,0 +1,254 @@
+From: Rob Clark <robdclark@gmail.com>
+Date: Mon, 16 Oct 2017 09:22:38 -0400
+Subject: drm/msm/adreno: load gpu at probe/bind time
+Git-commit: eec874ce5ff1fe1742317513904a2292af749c7d
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Previously, in an effort to defer initializing the gpu until firmware
+was available (ie. rootfs mounted), the gpu was not loaded at when the
+subdevice was bound.  Which resulted that clks/etc were requested in a
+place that devm couldn't really help unwind if something failed.
+
+Instead move request_firmware() to gpu->hw_init() and construct the gpu
+earlier in adreno_bind().  To avoid the rest of the driver needing to
+be aware of a gpu that hasn't managed to load firmware and hw_init()
+yet, stash the gpu ptr in the adreno device's drvdata, and don't set
+priv->gpu() until hw_init() succeeds.
+
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c      |    5 -
+ drivers/gpu/drm/msm/adreno/adreno_device.c |   78 ++++++++++++++---------------
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c    |   45 +++++++++++-----
+ drivers/gpu/drm/msm/msm_drv.c              |   10 ---
+ 4 files changed, 73 insertions(+), 65 deletions(-)
+
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -536,13 +536,12 @@ static int a5xx_hw_init(struct msm_gpu *
+ 		REG_A5XX_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0x00000000);
+ 	gpu_write(gpu, REG_A5XX_RBBM_SECVID_TSB_TRUSTED_SIZE, 0x00000000);
+ 
+-	/* Load the GPMU firmware before starting the HW init */
+-	a5xx_gpmu_ucode_init(gpu);
+-
+ 	ret = adreno_hw_init(gpu);
+ 	if (ret)
+ 		return ret;
+ 
++	a5xx_gpmu_ucode_init(gpu);
++
+ 	ret = a5xx_ucode_init(gpu);
+ 	if (ret)
+ 		return ret;
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -125,51 +125,24 @@ struct msm_gpu *adreno_load_gpu(struct d
+ {
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 	struct platform_device *pdev = priv->gpu_pdev;
+-	struct adreno_platform_config *config;
+-	struct adreno_rev rev;
+-	const struct adreno_info *info;
+-	struct msm_gpu *gpu = NULL;
++	struct msm_gpu *gpu = platform_get_drvdata(priv->gpu_pdev);
++	int ret;
+ 
+-	if (!pdev) {
++	if (!gpu) {
+ 		dev_err(dev->dev, "no adreno device\n");
+ 		return NULL;
+ 	}
+ 
+-	config = pdev->dev.platform_data;
+-	rev = config->rev;
+-	info = adreno_info(config->rev);
+-
+-	if (!info) {
+-		dev_warn(dev->dev, "Unknown GPU revision: %u.%u.%u.%u\n",
+-				rev.core, rev.major, rev.minor, rev.patchid);
++	pm_runtime_get_sync(&pdev->dev);
++	mutex_lock(&dev->struct_mutex);
++	ret = msm_gpu_hw_init(gpu);
++	mutex_unlock(&dev->struct_mutex);
++	pm_runtime_put_sync(&pdev->dev);
++	if (ret) {
++		dev_err(dev->dev, "gpu hw init failed: %d\n", ret);
+ 		return NULL;
+ 	}
+ 
+-	DBG("Found GPU: %u.%u.%u.%u",  rev.core, rev.major,
+-			rev.minor, rev.patchid);
+-
+-	gpu = info->init(dev);
+-	if (IS_ERR(gpu)) {
+-		dev_warn(dev->dev, "failed to load adreno gpu\n");
+-		gpu = NULL;
+-		/* not fatal */
+-	}
+-
+-	if (gpu) {
+-		int ret;
+-
+-		pm_runtime_get_sync(&pdev->dev);
+-		mutex_lock(&dev->struct_mutex);
+-		ret = msm_gpu_hw_init(gpu);
+-		mutex_unlock(&dev->struct_mutex);
+-		pm_runtime_put_sync(&pdev->dev);
+-		if (ret) {
+-			dev_err(dev->dev, "gpu hw init failed: %d\n", ret);
+-			gpu->funcs->destroy(gpu);
+-			gpu = NULL;
+-		}
+-	}
+-
+ 	return gpu;
+ }
+ 
+@@ -282,6 +255,9 @@ static int adreno_get_pwrlevels(struct d
+ static int adreno_bind(struct device *dev, struct device *master, void *data)
+ {
+ 	static struct adreno_platform_config config = {};
++	const struct adreno_info *info;
++	struct drm_device *drm = dev_get_drvdata(master);
++	struct msm_gpu *gpu;
+ 	u32 val;
+ 	int ret;
+ 
+@@ -302,13 +278,39 @@ static int adreno_bind(struct device *de
+ 		return ret;
+ 
+ 	dev->platform_data = &config;
+-	set_gpu_pdev(dev_get_drvdata(master), to_platform_device(dev));
++	set_gpu_pdev(drm, to_platform_device(dev));
++
++	info = adreno_info(config.rev);
++
++	if (!info) {
++		dev_warn(drm->dev, "Unknown GPU revision: %u.%u.%u.%u\n",
++			config.rev.core, config.rev.major,
++			config.rev.minor, config.rev.patchid);
++		return -ENXIO;
++	}
++
++	DBG("Found GPU: %u.%u.%u.%u", config.rev.core, config.rev.major,
++		config.rev.minor, config.rev.patchid);
++
++	gpu = info->init(drm);
++	if (IS_ERR(gpu)) {
++		dev_warn(drm->dev, "failed to load adreno gpu\n");
++		return PTR_ERR(gpu);
++	}
++
++	dev_set_drvdata(dev, gpu);
++
+ 	return 0;
+ }
+ 
+ static void adreno_unbind(struct device *dev, struct device *master,
+ 		void *data)
+ {
++	struct msm_gpu *gpu = dev_get_drvdata(dev);
++
++	gpu->funcs->pm_suspend(gpu);
++	gpu->funcs->destroy(gpu);
++
+ 	set_gpu_pdev(dev_get_drvdata(master), NULL);
+ }
+ 
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -64,6 +64,33 @@ int adreno_get_param(struct msm_gpu *gpu
+ 	}
+ }
+ 
++static int adreno_load_fw(struct adreno_gpu *adreno_gpu)
++{
++	struct drm_device *drm = adreno_gpu->base.dev;
++	int ret;
++
++	if (adreno_gpu->pm4)
++		return 0;
++
++	ret = request_firmware(&adreno_gpu->pm4, adreno_gpu->info->pm4fw, drm->dev);
++	if (ret) {
++		dev_err(drm->dev, "failed to load %s PM4 firmware: %d\n",
++				adreno_gpu->info->pm4fw, ret);
++		return ret;
++	}
++
++	ret = request_firmware(&adreno_gpu->pfp, adreno_gpu->info->pfpfw, drm->dev);
++	if (ret) {
++		dev_err(drm->dev, "failed to load %s PFP firmware: %d\n",
++				adreno_gpu->info->pfpfw, ret);
++		release_firmware(adreno_gpu->pm4);
++		adreno_gpu->pm4 = NULL;
++		return ret;
++	}
++
++	return 0;
++}
++
+ int adreno_hw_init(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+@@ -71,6 +98,10 @@ int adreno_hw_init(struct msm_gpu *gpu)
+ 
+ 	DBG("%s", gpu->name);
+ 
++	ret = adreno_load_fw(adreno_gpu);
++	if (ret)
++		return ret;
++
+ 	ret = msm_gem_get_iova(gpu->rb->bo, gpu->aspace, &gpu->rb_iova);
+ 	if (ret) {
+ 		gpu->rb_iova = 0;
+@@ -377,20 +408,6 @@ int adreno_gpu_init(struct drm_device *d
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = request_firmware(&adreno_gpu->pm4, adreno_gpu->info->pm4fw, drm->dev);
+-	if (ret) {
+-		dev_err(drm->dev, "failed to load %s PM4 firmware: %d\n",
+-				adreno_gpu->info->pm4fw, ret);
+-		return ret;
+-	}
+-
+-	ret = request_firmware(&adreno_gpu->pfp, adreno_gpu->info->pfpfw, drm->dev);
+-	if (ret) {
+-		dev_err(drm->dev, "failed to load %s PFP firmware: %d\n",
+-				adreno_gpu->info->pfpfw, ret);
+-		return ret;
+-	}
+-
+ 	adreno_gpu->memptrs = msm_gem_kernel_new(drm,
+ 		sizeof(*adreno_gpu->memptrs), MSM_BO_UNCACHED, gpu->aspace,
+ 		&adreno_gpu->memptrs_bo, &adreno_gpu->memptrs_iova);
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -211,7 +211,6 @@ static int msm_drm_uninit(struct device
+ 	struct drm_device *ddev = platform_get_drvdata(pdev);
+ 	struct msm_drm_private *priv = ddev->dev_private;
+ 	struct msm_kms *kms = priv->kms;
+-	struct msm_gpu *gpu = priv->gpu;
+ 	struct msm_vblank_ctrl *vbl_ctrl = &priv->vblank_ctrl;
+ 	struct vblank_event *vbl_ev, *tmp;
+ 
+@@ -253,15 +252,6 @@ static int msm_drm_uninit(struct device
+ 	if (kms && kms->funcs)
+ 		kms->funcs->destroy(kms);
+ 
+-	if (gpu) {
+-		mutex_lock(&ddev->struct_mutex);
+-		// XXX what do we do here?
+-		//pm_runtime_enable(&pdev->dev);
+-		gpu->funcs->pm_suspend(gpu);
+-		mutex_unlock(&ddev->struct_mutex);
+-		gpu->funcs->destroy(gpu);
+-	}
+-
+ 	if (priv->vram.paddr) {
+ 		unsigned long attrs = DMA_ATTR_NO_KERNEL_MAPPING;
+ 		drm_mm_takedown(&priv->vram.mm);

@@ -1,0 +1,234 @@
+From 2576a9ace47eba28a682d249d1d6402f891808c9 Mon Sep 17 00:00:00 2001
+From: Denis Kenzior <denkenz@gmail.com>
+Date: Mon, 26 Mar 2018 12:52:42 -0500
+Subject: [PATCH] nl80211: Implement TX of control port frames
+Git-commit: 2576a9ace47eba28a682d249d1d6402f891808c9
+Patch-mainline: v4.17-rc1
+References: FATE#326294
+
+This commit implements the TX side of NL80211_CMD_CONTROL_PORT_FRAME.
+Userspace provides the raw EAPoL frame using NL80211_ATTR_FRAME.
+Userspace should also provide the destination address and the protocol
+type to use when sending the frame.  This is used to implement TX of
+Pre-authentication frames.  If CONTROL_PORT_ETHERTYPE_NO_ENCRYPT is
+specified, then the driver will be asked not to encrypt the outgoing
+frame.
+
+A new EXT_FEATURE flag is introduced so that nl80211 code can check
+whether a given wiphy has capability to pass EAPoL frames over nl80211.
+
+Signed-off-by: Denis Kenzior <denkenz@gmail.com>
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/cfg80211.h       |  9 +++++
+ include/uapi/linux/nl80211.h |  3 ++
+ net/wireless/nl80211.c       | 71 +++++++++++++++++++++++++++++++++++-
+ net/wireless/rdev-ops.h      | 15 ++++++++
+ net/wireless/trace.h         | 26 +++++++++++++
+ 5 files changed, 123 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index df145f76adad..de2894a4ad10 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -2961,6 +2961,9 @@ struct cfg80211_external_auth_params {
+  *
+  * @external_auth: indicates result of offloaded authentication processing from
+  *     user space
++ *
++ * @tx_control_port: TX a control port frame (EAPoL).  The noencrypt parameter
++ *	tells the driver that the frame should not be encrypted.
+  */
+ struct cfg80211_ops {
+ 	int	(*suspend)(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
+@@ -3256,6 +3259,12 @@ struct cfg80211_ops {
+ 			   const u8 *aa);
+ 	int     (*external_auth)(struct wiphy *wiphy, struct net_device *dev,
+ 				 struct cfg80211_external_auth_params *params);
++
++	int	(*tx_control_port)(struct wiphy *wiphy,
++				   struct net_device *dev,
++				   const u8 *buf, size_t len,
++				   const u8 *dest, const __be16 proto,
++				   const bool noencrypt);
+ };
+ 
+ /*
+diff --git a/include/uapi/linux/nl80211.h b/include/uapi/linux/nl80211.h
+index 6a3cc7a635b5..3167d6f7fc68 100644
+--- a/include/uapi/linux/nl80211.h
++++ b/include/uapi/linux/nl80211.h
+@@ -5024,6 +5024,8 @@ enum nl80211_feature_flags {
+  *	channel change triggered by radar detection event.
+  *	No need to start CAC from user-space, no need to react to
+  *	"radar detected" event.
++ * @NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211: Driver supports sending and
++ *	receiving control port frames over nl80211 instead of the netdevice.
+  *
+  * @NUM_NL80211_EXT_FEATURES: number of extended features.
+  * @MAX_NL80211_EXT_FEATURES: highest extended feature index.
+@@ -5055,6 +5057,7 @@ enum nl80211_ext_feature_index {
+ 	NL80211_EXT_FEATURE_LOW_POWER_SCAN,
+ 	NL80211_EXT_FEATURE_HIGH_ACCURACY_SCAN,
+ 	NL80211_EXT_FEATURE_DFS_OFFLOAD,
++	NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211,
+ 
+ 	/* add new features before the definition below */
+ 	NUM_NL80211_EXT_FEATURES,
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 0870447fbd55..6eb286784924 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -12535,6 +12535,68 @@ static int nl80211_external_auth(struct sk_buff *skb, struct genl_info *info)
+ 	return rdev_external_auth(rdev, dev, &params);
+ }
+ 
++static int nl80211_tx_control_port(struct sk_buff *skb, struct genl_info *info)
++{
++	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++	struct net_device *dev = info->user_ptr[1];
++	struct wireless_dev *wdev = dev->ieee80211_ptr;
++	const u8 *buf;
++	size_t len;
++	u8 *dest;
++	u16 proto;
++	bool noencrypt;
++	int err;
++
++	if (!wiphy_ext_feature_isset(&rdev->wiphy,
++				     NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211))
++		return -EOPNOTSUPP;
++
++	if (!rdev->ops->tx_control_port)
++		return -EOPNOTSUPP;
++
++	if (!info->attrs[NL80211_ATTR_FRAME] ||
++	    !info->attrs[NL80211_ATTR_MAC] ||
++	    !info->attrs[NL80211_ATTR_CONTROL_PORT_ETHERTYPE]) {
++		GENL_SET_ERR_MSG(info, "Frame, MAC or ethertype missing");
++		return -EINVAL;
++	}
++
++	wdev_lock(wdev);
++
++	switch (wdev->iftype) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_P2P_GO:
++	case NL80211_IFTYPE_MESH_POINT:
++		break;
++	case NL80211_IFTYPE_ADHOC:
++	case NL80211_IFTYPE_STATION:
++	case NL80211_IFTYPE_P2P_CLIENT:
++		if (wdev->current_bss)
++			break;
++		err = -ENOTCONN;
++		goto out;
++	default:
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++
++	wdev_unlock(wdev);
++
++	buf = nla_data(info->attrs[NL80211_ATTR_FRAME]);
++	len = nla_len(info->attrs[NL80211_ATTR_FRAME]);
++	dest = nla_data(info->attrs[NL80211_ATTR_MAC]);
++	proto = nla_get_u16(info->attrs[NL80211_ATTR_CONTROL_PORT_ETHERTYPE]);
++	noencrypt =
++		nla_get_flag(info->attrs[NL80211_ATTR_CONTROL_PORT_NO_ENCRYPT]);
++
++	return rdev_tx_control_port(rdev, dev, buf, len,
++				    dest, cpu_to_be16(proto), noencrypt);
++
++ out:
++	wdev_unlock(wdev);
++	return err;
++}
++
+ #define NL80211_FLAG_NEED_WIPHY		0x01
+ #define NL80211_FLAG_NEED_NETDEV	0x02
+ #define NL80211_FLAG_NEED_RTNL		0x04
+@@ -13438,7 +13500,14 @@ static const struct genl_ops nl80211_ops[] = {
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
+-
++	{
++		.cmd = NL80211_CMD_CONTROL_PORT_FRAME,
++		.doit = nl80211_tx_control_port,
++		.policy = nl80211_policy,
++		.flags = GENL_UNS_ADMIN_PERM,
++		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
++				  NL80211_FLAG_NEED_RTNL,
++	},
+ };
+ 
+ static struct genl_family nl80211_fam __ro_after_init = {
+diff --git a/net/wireless/rdev-ops.h b/net/wireless/rdev-ops.h
+index 84f23ae015fc..87479a53411b 100644
+--- a/net/wireless/rdev-ops.h
++++ b/net/wireless/rdev-ops.h
+@@ -714,6 +714,21 @@ static inline int rdev_mgmt_tx(struct cfg80211_registered_device *rdev,
+ 	return ret;
+ }
+ 
++static inline int rdev_tx_control_port(struct cfg80211_registered_device *rdev,
++				       struct net_device *dev,
++				       const void *buf, size_t len,
++				       const u8 *dest, __be16 proto,
++				       const bool noencrypt)
++{
++	int ret;
++	trace_rdev_tx_control_port(&rdev->wiphy, dev, buf, len,
++				   dest, proto, noencrypt);
++	ret = rdev->ops->tx_control_port(&rdev->wiphy, dev, buf, len,
++					 dest, proto, noencrypt);
++	trace_rdev_return_int(&rdev->wiphy, ret);
++	return ret;
++}
++
+ static inline int
+ rdev_mgmt_tx_cancel_wait(struct cfg80211_registered_device *rdev,
+ 			 struct wireless_dev *wdev, u64 cookie)
+diff --git a/net/wireless/trace.h b/net/wireless/trace.h
+index 42fd338f879e..a64291ae52a6 100644
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@ -1882,6 +1882,32 @@ TRACE_EVENT(rdev_mgmt_tx,
+ 		  BOOL_TO_STR(__entry->dont_wait_for_ack))
+ );
+ 
++TRACE_EVENT(rdev_tx_control_port,
++	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
++		 const u8 *buf, size_t len, const u8 *dest, __be16 proto,
++		 bool unencrypted),
++	TP_ARGS(wiphy, netdev, buf, len, dest, proto, unencrypted),
++	TP_STRUCT__entry(
++		WIPHY_ENTRY
++		NETDEV_ENTRY
++		MAC_ENTRY(dest)
++		__field(__be16, proto)
++		__field(bool, unencrypted)
++	),
++	TP_fast_assign(
++		WIPHY_ASSIGN;
++		NETDEV_ASSIGN;
++		MAC_ASSIGN(dest, dest);
++		__entry->proto = proto;
++		__entry->unencrypted = unencrypted;
++	),
++	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", " MAC_PR_FMT ","
++		  " proto: 0x%x, unencrypted: %s",
++		  WIPHY_PR_ARG, NETDEV_PR_ARG, MAC_PR_ARG(dest),
++		  be16_to_cpu(__entry->proto),
++		  BOOL_TO_STR(__entry->unencrypted))
++);
++
+ TRACE_EVENT(rdev_set_noack_map,
+ 	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
+ 		 u16 noack_map),
+-- 
+2.19.2
+

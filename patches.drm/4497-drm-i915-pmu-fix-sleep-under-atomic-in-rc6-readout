@@ -1,0 +1,198 @@
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Tue, 13 Feb 2018 09:57:46 +0000
+Subject: drm/i915/pmu: Fix sleep under atomic in RC6 readout
+Git-commit: 4c83f0a788ccf58864f781585d8ae7c7e6a7e07d
+Patch-mainline: v4.16-rc2
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We are not allowed to call intel_runtime_pm_get from the PMU counter read
+callback since the former can sleep, and the latter is running under IRQ
+context.
+
+To workaround this, we record the last known RC6 and while runtime
+suspended estimate its increase by querying the runtime PM core
+timestamps.
+
+Downside of this approach is that we can temporarily lose a chunk of RC6
+time, from the last PMU read-out to runtime suspend entry, but that will
+eventually catch up, once device comes back online and in the presence of
+PMU queries.
+
+Also, we have to be careful not to overshoot the RC6 estimate, so once
+resumed after a period of approximation, we only update the counter once
+it catches up. With the observation that RC6 is increasing while the
+device is suspended, this should not pose a problem and can only cause
+slight inaccuracies due clock base differences.
+
+v2: Simplify by estimating on top of PM core counters. (Imre)
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=104943
+Fixes: 6060b6aec03c ("drm/i915/pmu: Add RC6 residency metrics")
+Testcase: igt/perf_pmu/rc6-runtime-pm
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Imre Deak <imre.deak@intel.com>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: David Airlie <airlied@linux.ie>
+Cc: intel-gfx@lists.freedesktop.org
+Cc: dri-devel@lists.freedesktop.org
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180206183311.17924-1-tvrtko.ursulin@linux.intel.com
+(cherry picked from commit 1fe699e30113ed6f6e853ff44710d256072ea627)
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180213095747.2424-3-tvrtko.ursulin@linux.intel.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_pmu.c |   93 +++++++++++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_pmu.h |    6 ++
+ 2 files changed, 84 insertions(+), 15 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_pmu.c
++++ b/drivers/gpu/drm/i915/i915_pmu.c
+@@ -370,7 +370,81 @@ static int i915_pmu_event_init(struct pe
+ 	return 0;
+ }
+ 
+-static u64 __i915_pmu_event_read(struct perf_event *event)
++static u64 get_rc6(struct drm_i915_private *i915, bool locked)
++{
++	unsigned long flags;
++	u64 val;
++
++	if (intel_runtime_pm_get_if_in_use(i915)) {
++		val = intel_rc6_residency_ns(i915, IS_VALLEYVIEW(i915) ?
++						   VLV_GT_RENDER_RC6 :
++						   GEN6_GT_GFX_RC6);
++
++		if (HAS_RC6p(i915))
++			val += intel_rc6_residency_ns(i915, GEN6_GT_GFX_RC6p);
++
++		if (HAS_RC6pp(i915))
++			val += intel_rc6_residency_ns(i915, GEN6_GT_GFX_RC6pp);
++
++		intel_runtime_pm_put(i915);
++
++		/*
++		 * If we are coming back from being runtime suspended we must
++		 * be careful not to report a larger value than returned
++		 * previously.
++		 */
++
++		if (!locked)
++			spin_lock_irqsave(&i915->pmu.lock, flags);
++
++		if (val >= i915->pmu.sample[__I915_SAMPLE_RC6_ESTIMATED].cur) {
++			i915->pmu.sample[__I915_SAMPLE_RC6_ESTIMATED].cur = 0;
++			i915->pmu.sample[__I915_SAMPLE_RC6].cur = val;
++		} else {
++			val = i915->pmu.sample[__I915_SAMPLE_RC6_ESTIMATED].cur;
++		}
++
++		if (!locked)
++			spin_unlock_irqrestore(&i915->pmu.lock, flags);
++	} else {
++		struct pci_dev *pdev = i915->drm.pdev;
++		struct device *kdev = &pdev->dev;
++		unsigned long flags2;
++
++		/*
++		 * We are runtime suspended.
++		 *
++		 * Report the delta from when the device was suspended to now,
++		 * on top of the last known real value, as the approximated RC6
++		 * counter value.
++		 */
++		if (!locked)
++			spin_lock_irqsave(&i915->pmu.lock, flags);
++
++		spin_lock_irqsave(&kdev->power.lock, flags2);
++
++		if (!i915->pmu.sample[__I915_SAMPLE_RC6_ESTIMATED].cur)
++			i915->pmu.suspended_jiffies_last =
++						kdev->power.suspended_jiffies;
++
++		val = kdev->power.suspended_jiffies -
++		      i915->pmu.suspended_jiffies_last;
++		val += jiffies - kdev->power.accounting_timestamp;
++
++		spin_unlock_irqrestore(&kdev->power.lock, flags2);
++
++		val = jiffies_to_nsecs(val);
++		val += i915->pmu.sample[__I915_SAMPLE_RC6].cur;
++		i915->pmu.sample[__I915_SAMPLE_RC6_ESTIMATED].cur = val;
++
++		if (!locked)
++			spin_unlock_irqrestore(&i915->pmu.lock, flags);
++	}
++
++	return val;
++}
++
++static u64 __i915_pmu_event_read(struct perf_event *event, bool locked)
+ {
+ 	struct drm_i915_private *i915 =
+ 		container_of(event->pmu, typeof(*i915), pmu.base);
+@@ -408,18 +482,7 @@ static u64 __i915_pmu_event_read(struct
+ 			val = count_interrupts(i915);
+ 			break;
+ 		case I915_PMU_RC6_RESIDENCY:
+-			intel_runtime_pm_get(i915);
+-			val = intel_rc6_residency_ns(i915,
+-						     IS_VALLEYVIEW(i915) ?
+-						     VLV_GT_RENDER_RC6 :
+-						     GEN6_GT_GFX_RC6);
+-			if (HAS_RC6p(i915))
+-				val += intel_rc6_residency_ns(i915,
+-							      GEN6_GT_GFX_RC6p);
+-			if (HAS_RC6pp(i915))
+-				val += intel_rc6_residency_ns(i915,
+-							      GEN6_GT_GFX_RC6pp);
+-			intel_runtime_pm_put(i915);
++			val = get_rc6(i915, locked);
+ 			break;
+ 		}
+ 	}
+@@ -434,7 +497,7 @@ static void i915_pmu_event_read(struct p
+ 
+ again:
+ 	prev = local64_read(&hwc->prev_count);
+-	new = __i915_pmu_event_read(event);
++	new = __i915_pmu_event_read(event, false);
+ 
+ 	if (local64_cmpxchg(&hwc->prev_count, prev, new) != prev)
+ 		goto again;
+@@ -509,7 +572,7 @@ static void i915_pmu_enable(struct perf_
+ 	 * for all listeners. Even when the event was already enabled and has
+ 	 * an existing non-zero value.
+ 	 */
+-	local64_set(&event->hw.prev_count, __i915_pmu_event_read(event));
++	local64_set(&event->hw.prev_count, __i915_pmu_event_read(event, true));
+ 
+ 	spin_unlock_irqrestore(&i915->pmu.lock, flags);
+ }
+--- a/drivers/gpu/drm/i915/i915_pmu.h
++++ b/drivers/gpu/drm/i915/i915_pmu.h
+@@ -27,6 +27,8 @@
+ enum {
+ 	__I915_SAMPLE_FREQ_ACT = 0,
+ 	__I915_SAMPLE_FREQ_REQ,
++	__I915_SAMPLE_RC6,
++	__I915_SAMPLE_RC6_ESTIMATED,
+ 	__I915_NUM_PMU_SAMPLERS
+ };
+ 
+@@ -94,6 +96,10 @@ struct i915_pmu {
+ 	 * struct intel_engine_cs.
+ 	 */
+ 	struct i915_pmu_sample sample[__I915_NUM_PMU_SAMPLERS];
++	/**
++	 * @suspended_jiffies_last: Cached suspend time from PM core.
++	 */
++	unsigned long suspended_jiffies_last;
+ };
+ 
+ #ifdef CONFIG_PERF_EVENTS

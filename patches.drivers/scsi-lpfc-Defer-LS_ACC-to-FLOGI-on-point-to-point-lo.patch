@@ -1,0 +1,186 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Thu, 29 Nov 2018 16:09:36 -0800
+Subject: [PATCH] scsi: lpfc: Defer LS_ACC to FLOGI on point to point logins
+Git-commit: 0a9e9687acaf6ac1198fd41f03d64f8b92e4515e
+Patch-mainline: v5.0-rc1
+References: bsc#1118215
+
+The current discovery state machine the driver treated FLOGI oddly.  When
+point to point, an FLOGI is to be exchanged by the two ports, with the port
+with the most significant WWN then proceeding with PLOGI.  The
+implementation in the driver was keyed to closely with "what have I sent",
+not with what has happened between the two endpoints. Thus, it blatantly
+would ACC an FLOGI, but reject PLOGI's until it had its FLOGI ACC'd. The
+problem is - the sending of FLOGI may be delayed for some reason, or the
+response to FLOGI held off by the other side. In the failing situation the
+other side sent an FLOGI, which was ACC'd, then sent PLOGIs which were then
+rjt'd until the retry count for the PLOGIs were exceeded and the port gave
+up. The FLOGI may have been very late in transmit, or the response held off
+until the PLOGIs failed. Given the other port had the higher WWN, no PLOGIs
+would occur and communication stopped.
+
+Correct the situation by changing the FLOGI handling. Defer any response to
+an FLOGI until the driver has sent its FLOGI as well. Then, upon either
+completion of the sent FLOGI, or upon sending an ACC to a received FLOGI
+(which may be received before or just after FLOGI was sent). the driver
+will act on who has the higher WWN. if the other port does, the driver will
+noop any handling of an FLOGI response (if outstanding) and wait for PLOGI.
+If the local port does, the driver will transition to sending PLOGI and
+will noop any action on responding to an FLOGI (if not yet received).
+
+Fortunately, to implement this, it only took another state flag and
+deferring any FLOGI response if the FLOGI has yet to be transmit. All
+subsequent actions were already in place.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <jsmart2021@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/scsi/lpfc/lpfc.h         |  5 ++++
+ drivers/scsi/lpfc/lpfc_els.c     | 56 +++++++++++++++++++++++++++++++++++++---
+ drivers/scsi/lpfc/lpfc_hbadisc.c |  7 +++++
+ 3 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc.h b/drivers/scsi/lpfc/lpfc.h
+index 35dcd6958fd0..ebdfe5b26937 100644
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -731,6 +731,7 @@ struct lpfc_hba {
+ 					 * capability
+ 					 */
+ #define HBA_NVME_IOQ_FLUSH      0x80000 /* NVME IO queues flushed. */
++#define HBA_FLOGI_ISSUED	0x100000 /* FLOGI was issued */
+ 
+ 	uint32_t fcp_ring_in_use; /* When polling test if intr-hndlr active*/
+ 	struct lpfc_dmabuf slim2p;
+@@ -1127,6 +1128,10 @@ struct lpfc_hba {
+ 	uint16_t vlan_id;
+ 	struct list_head fcf_conn_rec_list;
+ 
++	bool defer_flogi_acc_flag;
++	uint16_t defer_flogi_acc_rx_id;
++	uint16_t defer_flogi_acc_ox_id;
++
+ 	spinlock_t ct_ev_lock; /* synchronize access to ct_ev_waiters */
+ 	struct list_head ct_ev_waiters;
+ 	struct unsol_rcv_ct_ctx ct_ctx[LPFC_CT_CTX_MAX];
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index 48610bcd6962..103ee7049633 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -1234,9 +1234,10 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	struct serv_parm *sp;
+ 	IOCB_t *icmd;
+ 	struct lpfc_iocbq *elsiocb;
++	struct lpfc_iocbq defer_flogi_acc;
+ 	uint8_t *pcmd;
+ 	uint16_t cmdsize;
+-	uint32_t tmo;
++	uint32_t tmo, did;
+ 	int rc;
+ 
+ 	cmdsize = (sizeof(uint32_t) + sizeof(struct serv_parm));
+@@ -1308,6 +1309,35 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 		phba->sli3_options, 0, 0);
+ 
+ 	rc = lpfc_issue_fabric_iocb(phba, elsiocb);
++
++	phba->hba_flag |= HBA_FLOGI_ISSUED;
++
++	/* Check for a deferred FLOGI ACC condition */
++	if (phba->defer_flogi_acc_flag) {
++		did = vport->fc_myDID;
++		vport->fc_myDID = Fabric_DID;
++
++		memset(&defer_flogi_acc, 0, sizeof(struct lpfc_iocbq));
++
++		defer_flogi_acc.iocb.ulpContext = phba->defer_flogi_acc_rx_id;
++		defer_flogi_acc.iocb.unsli3.rcvsli3.ox_id =
++						phba->defer_flogi_acc_ox_id;
++
++		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
++				 "3354 Xmit deferred FLOGI ACC: rx_id: x%x,"
++				 " ox_id: x%x, hba_flag x%x\n",
++				 phba->defer_flogi_acc_rx_id,
++				 phba->defer_flogi_acc_ox_id, phba->hba_flag);
++
++		/* Send deferred FLOGI ACC */
++		lpfc_els_rsp_acc(vport, ELS_CMD_FLOGI, &defer_flogi_acc,
++				 ndlp, NULL);
++
++		phba->defer_flogi_acc_flag = false;
++
++		vport->fc_myDID = did;
++	}
++
+ 	if (rc == IOCB_ERROR) {
+ 		lpfc_els_free_iocb(phba, elsiocb);
+ 		return 1;
+@@ -6662,6 +6692,25 @@ lpfc_els_rcv_flogi(struct lpfc_vport *vport, struct lpfc_iocbq *cmdiocb,
+ 
+ 	memcpy(&phba->fc_fabparam, sp, sizeof(struct serv_parm));
+ 
++	/* Defer ACC response until AFTER we issue a FLOGI */
++	if (!(phba->hba_flag & HBA_FLOGI_ISSUED)) {
++		phba->defer_flogi_acc_rx_id = cmdiocb->iocb.ulpContext;
++		phba->defer_flogi_acc_ox_id =
++					cmdiocb->iocb.unsli3.rcvsli3.ox_id;
++
++		vport->fc_myDID = did;
++
++		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
++				 "3344 Deferring FLOGI ACC: rx_id: x%x,"
++				 " ox_id: x%x, hba_flag x%x\n",
++				 phba->defer_flogi_acc_rx_id,
++				 phba->defer_flogi_acc_ox_id, phba->hba_flag);
++
++		phba->defer_flogi_acc_flag = true;
++
++		return 0;
++	}
++
+ 	/* Send back ACC */
+ 	lpfc_els_rsp_acc(vport, ELS_CMD_FLOGI, cmdiocb, ndlp, NULL);
+ 
+@@ -8133,9 +8182,10 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
+ 			cmd, did, vport->port_state, vport->fc_flag,
+ 			vport->fc_myDID, vport->fc_prevDID);
+ 
+-	/* reject till our FLOGI completes */
++	/* reject till our FLOGI completes or PLOGI assigned DID via PT2PT */
+ 	if ((vport->port_state < LPFC_FABRIC_CFG_LINK) &&
+-	    (cmd != ELS_CMD_FLOGI)) {
++	    (cmd != ELS_CMD_FLOGI) &&
++	    !((cmd == ELS_CMD_PLOGI) && (vport->fc_flag & FC_PT2PT))) {
+ 		rjt_err = LSRJT_LOGICAL_BSY;
+ 		rjt_exp = LSEXP_NOTHING_MORE;
+ 		goto lsrjt;
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index 4cc63139dafa..8857f559e6c3 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -894,6 +894,8 @@ lpfc_linkdown(struct lpfc_hba *phba)
+ 	/* Block all SCSI stack I/Os */
+ 	lpfc_scsi_dev_block(phba);
+ 
++	phba->defer_flogi_acc_flag = false;
++
+ 	spin_lock_irq(&phba->hbalock);
+ 	phba->fcf.fcf_flag &= ~(FCF_AVAILABLE | FCF_SCAN_DONE);
+ 	spin_unlock_irq(&phba->hbalock);
+@@ -1040,6 +1042,11 @@ lpfc_linkup(struct lpfc_hba *phba)
+ 	spin_lock_irq(shost->host_lock);
+ 	phba->pport->rcv_flogi_cnt = 0;
+ 	spin_unlock_irq(shost->host_lock);
++
++	/* reinitialize initial FLOGI flag */
++	phba->hba_flag &= ~(HBA_FLOGI_ISSUED);
++	phba->defer_flogi_acc_flag = false;
++
+ 	return 0;
+ }
+ 
+-- 
+2.16.4
+

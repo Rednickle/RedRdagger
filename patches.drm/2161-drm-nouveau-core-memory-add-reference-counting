@@ -1,0 +1,339 @@
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Nov 2017 03:56:19 +1000
+Subject: drm/nouveau/core/memory: add reference counting
+Git-commit: 997a89003c2d950466bc289147ffb823c0c51fb0
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We need to be able to prevent memory from being freed while it's still
+mapped in a GPU's address-space.
+
+Will be used by upcoming MMU changes.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/nouveau/include/nvkm/core/memory.h |    4 ++-
+ drivers/gpu/drm/nouveau/nvkm/core/gpuobj.c         |    2 -
+ drivers/gpu/drm/nouveau/nvkm/core/memory.c         |   28 +++++++++++++++++----
+ drivers/gpu/drm/nouveau/nvkm/engine/falcon.c       |    2 -
+ drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c   |    6 ++--
+ drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c   |    6 ++--
+ drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c    |    4 +--
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c  |    2 -
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c     |    4 +--
+ drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c      |    4 +--
+ drivers/gpu/drm/nouveau/nvkm/engine/xtensa.c       |    2 -
+ drivers/gpu/drm/nouveau/nvkm/subdev/bar/gf100.c    |    6 ++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/bar/nv50.c     |    2 -
+ drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c      |    4 +--
+ drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c |    2 -
+ drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv04.c |    6 ++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv40.c |    6 ++--
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/base.c     |    2 -
+ drivers/gpu/drm/nouveau/nvkm/subdev/mmu/nv04.c     |    2 -
+ 19 files changed, 57 insertions(+), 37 deletions(-)
+
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/memory.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/memory.h
+@@ -20,6 +20,7 @@ enum nvkm_memory_target {
+ struct nvkm_memory {
+ 	const struct nvkm_memory_func *func;
+ 	const struct nvkm_memory_ptrs *ptrs;
++	struct kref kref;
+ 	struct nvkm_tags *tags;
+ };
+ 
+@@ -44,7 +45,8 @@ struct nvkm_memory_ptrs {
+ void nvkm_memory_ctor(const struct nvkm_memory_func *, struct nvkm_memory *);
+ int nvkm_memory_new(struct nvkm_device *, enum nvkm_memory_target,
+ 		    u64 size, u32 align, bool zero, struct nvkm_memory **);
+-void nvkm_memory_del(struct nvkm_memory **);
++struct nvkm_memory *nvkm_memory_ref(struct nvkm_memory *);
++void nvkm_memory_unref(struct nvkm_memory **);
+ int nvkm_memory_tags_get(struct nvkm_memory *, struct nvkm_device *, u32 tags,
+ 			 void (*clear)(struct nvkm_device *, u32, u32),
+ 			 struct nvkm_tags **);
+--- a/drivers/gpu/drm/nouveau/nvkm/core/gpuobj.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/gpuobj.c
+@@ -219,7 +219,7 @@ nvkm_gpuobj_del(struct nvkm_gpuobj **pgp
+ 		if (gpuobj->parent)
+ 			nvkm_mm_free(&gpuobj->parent->heap, &gpuobj->node);
+ 		nvkm_mm_fini(&gpuobj->heap);
+-		nvkm_memory_del(&gpuobj->memory);
++		nvkm_memory_unref(&gpuobj->memory);
+ 		kfree(*pgpuobj);
+ 		*pgpuobj = NULL;
+ 	}
+--- a/drivers/gpu/drm/nouveau/nvkm/core/memory.c
++++ b/drivers/gpu/drm/nouveau/nvkm/core/memory.c
+@@ -100,20 +100,38 @@ nvkm_memory_ctor(const struct nvkm_memor
+ 		 struct nvkm_memory *memory)
+ {
+ 	memory->func = func;
++	kref_init(&memory->kref);
++}
++
++static void
++nvkm_memory_del(struct kref *kref)
++{
++	struct nvkm_memory *memory = container_of(kref, typeof(*memory), kref);
++	if (!WARN_ON(!memory->func)) {
++		if (memory->func->dtor)
++			memory = memory->func->dtor(memory);
++		kfree(memory);
++	}
+ }
+ 
+ void
+-nvkm_memory_del(struct nvkm_memory **pmemory)
++nvkm_memory_unref(struct nvkm_memory **pmemory)
+ {
+ 	struct nvkm_memory *memory = *pmemory;
+-	if (memory && !WARN_ON(!memory->func)) {
+-		if (memory->func->dtor)
+-			*pmemory = memory->func->dtor(memory);
+-		kfree(*pmemory);
++	if (memory) {
++		kref_put(&memory->kref, nvkm_memory_del);
+ 		*pmemory = NULL;
+ 	}
+ }
+ 
++struct nvkm_memory *
++nvkm_memory_ref(struct nvkm_memory *memory)
++{
++	if (memory)
++		kref_get(&memory->kref);
++	return memory;
++}
++
+ int
+ nvkm_memory_new(struct nvkm_device *device, enum nvkm_memory_target target,
+ 		u64 size, u32 align, bool zero,
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/falcon.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/falcon.c
+@@ -99,7 +99,7 @@ nvkm_falcon_fini(struct nvkm_engine *eng
+ 	const u32 base = falcon->addr;
+ 
+ 	if (!suspend) {
+-		nvkm_memory_del(&falcon->core);
++		nvkm_memory_unref(&falcon->core);
+ 		if (falcon->external) {
+ 			vfree(falcon->data.data);
+ 			vfree(falcon->code.data);
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gf100.c
+@@ -642,9 +642,9 @@ gf100_fifo_dtor(struct nvkm_fifo *base)
+ {
+ 	struct gf100_fifo *fifo = gf100_fifo(base);
+ 	nvkm_vm_put(&fifo->user.bar);
+-	nvkm_memory_del(&fifo->user.mem);
+-	nvkm_memory_del(&fifo->runlist.mem[0]);
+-	nvkm_memory_del(&fifo->runlist.mem[1]);
++	nvkm_memory_unref(&fifo->user.mem);
++	nvkm_memory_unref(&fifo->runlist.mem[0]);
++	nvkm_memory_unref(&fifo->runlist.mem[1]);
+ 	return fifo;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/gk104.c
+@@ -880,11 +880,11 @@ gk104_fifo_dtor(struct nvkm_fifo *base)
+ 	int i;
+ 
+ 	nvkm_vm_put(&fifo->user.bar);
+-	nvkm_memory_del(&fifo->user.mem);
++	nvkm_memory_unref(&fifo->user.mem);
+ 
+ 	for (i = 0; i < fifo->runlist_nr; i++) {
+-		nvkm_memory_del(&fifo->runlist[i].mem[1]);
+-		nvkm_memory_del(&fifo->runlist[i].mem[0]);
++		nvkm_memory_unref(&fifo->runlist[i].mem[1]);
++		nvkm_memory_unref(&fifo->runlist[i].mem[0]);
+ 	}
+ 
+ 	return fifo;
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/fifo/nv50.c
+@@ -100,8 +100,8 @@ void *
+ nv50_fifo_dtor(struct nvkm_fifo *base)
+ {
+ 	struct nv50_fifo *fifo = nv50_fifo(base);
+-	nvkm_memory_del(&fifo->runlist[1]);
+-	nvkm_memory_del(&fifo->runlist[0]);
++	nvkm_memory_unref(&fifo->runlist[1]);
++	nvkm_memory_unref(&fifo->runlist[0]);
+ 	return fifo;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/ctxgf100.c
+@@ -1380,7 +1380,7 @@ gf100_grctx_generate(struct gf100_gr *gr
+ 	}
+ 
+ done:
+-	nvkm_memory_del(&chan);
++	nvkm_memory_unref(&chan);
+ 	return ret;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/gf100.c
+@@ -354,14 +354,14 @@ gf100_gr_chan_dtor(struct nvkm_object *o
+ 			nvkm_vm_unmap(&chan->data[i].vma);
+ 			nvkm_vm_put(&chan->data[i].vma);
+ 		}
+-		nvkm_memory_del(&chan->data[i].mem);
++		nvkm_memory_unref(&chan->data[i].mem);
+ 	}
+ 
+ 	if (chan->mmio_vma.node) {
+ 		nvkm_vm_unmap(&chan->mmio_vma);
+ 		nvkm_vm_put(&chan->mmio_vma);
+ 	}
+-	nvkm_memory_del(&chan->mmio);
++	nvkm_memory_unref(&chan->mmio);
+ 	return chan;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/gr/nv20.c
+@@ -59,7 +59,7 @@ void *
+ nv20_gr_chan_dtor(struct nvkm_object *object)
+ {
+ 	struct nv20_gr_chan *chan = nv20_gr_chan(object);
+-	nvkm_memory_del(&chan->inst);
++	nvkm_memory_unref(&chan->inst);
+ 	return chan;
+ }
+ 
+@@ -323,7 +323,7 @@ void *
+ nv20_gr_dtor(struct nvkm_gr *base)
+ {
+ 	struct nv20_gr *gr = nv20_gr(base);
+-	nvkm_memory_del(&gr->ctxtab);
++	nvkm_memory_unref(&gr->ctxtab);
+ 	return gr;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/xtensa.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/xtensa.c
+@@ -86,7 +86,7 @@ nvkm_xtensa_fini(struct nvkm_engine *eng
+ 	nvkm_wr32(device, base + 0xd94, 0); /* FIFO_CTRL */
+ 
+ 	if (!suspend)
+-		nvkm_memory_del(&xtensa->gpu_fw);
++		nvkm_memory_unref(&xtensa->gpu_fw);
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/bar/gf100.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/bar/gf100.c
+@@ -166,14 +166,14 @@ gf100_bar_dtor(struct nvkm_bar *base)
+ 
+ 	nvkm_vm_ref(NULL, &bar->bar[1].vm, bar->bar[1].pgd);
+ 	nvkm_gpuobj_del(&bar->bar[1].pgd);
+-	nvkm_memory_del(&bar->bar[1].mem);
++	nvkm_memory_unref(&bar->bar[1].mem);
+ 
+ 	if (bar->bar[0].vm) {
+-		nvkm_memory_del(&bar->bar[0].vm->pgt[0].mem[0]);
++		nvkm_memory_unref(&bar->bar[0].vm->pgt[0].mem[0]);
+ 		nvkm_vm_ref(NULL, &bar->bar[0].vm, bar->bar[0].pgd);
+ 	}
+ 	nvkm_gpuobj_del(&bar->bar[0].pgd);
+-	nvkm_memory_del(&bar->bar[0].mem);
++	nvkm_memory_unref(&bar->bar[0].mem);
+ 	return bar;
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/bar/nv50.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/bar/nv50.c
+@@ -201,7 +201,7 @@ nv50_bar_dtor(struct nvkm_bar *base)
+ 	nvkm_vm_ref(NULL, &bar->bar1_vm, bar->pgd);
+ 	nvkm_gpuobj_del(&bar->bar2);
+ 	if (bar->bar2_vm) {
+-		nvkm_memory_del(&bar->bar2_vm->pgt[0].mem[0]);
++		nvkm_memory_unref(&bar->bar2_vm->pgt[0].mem[0]);
+ 		nvkm_vm_ref(NULL, &bar->bar2_vm, bar->pgd);
+ 	}
+ 	nvkm_gpuobj_del(&bar->pgd);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/fb/base.c
+@@ -163,8 +163,8 @@ nvkm_fb_dtor(struct nvkm_subdev *subdev)
+ 	struct nvkm_fb *fb = nvkm_fb(subdev);
+ 	int i;
+ 
+-	nvkm_memory_del(&fb->mmu_wr);
+-	nvkm_memory_del(&fb->mmu_rd);
++	nvkm_memory_unref(&fb->mmu_wr);
++	nvkm_memory_unref(&fb->mmu_rd);
+ 
+ 	for (i = 0; i < fb->tile.regions; i++)
+ 		fb->func->tile.fini(fb, i, &fb->tile.region[i]);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/base.c
+@@ -120,7 +120,7 @@ nvkm_instobj_new(struct nvkm_instmem *im
+ 
+ done:
+ 	if (ret)
+-		nvkm_memory_del(&memory);
++		nvkm_memory_unref(&memory);
+ 	*pmemory = memory;
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv04.c
+@@ -199,10 +199,10 @@ static void *
+ nv04_instmem_dtor(struct nvkm_instmem *base)
+ {
+ 	struct nv04_instmem *imem = nv04_instmem(base);
+-	nvkm_memory_del(&imem->base.ramfc);
+-	nvkm_memory_del(&imem->base.ramro);
++	nvkm_memory_unref(&imem->base.ramfc);
++	nvkm_memory_unref(&imem->base.ramro);
+ 	nvkm_ramht_del(&imem->base.ramht);
+-	nvkm_memory_del(&imem->base.vbios);
++	nvkm_memory_unref(&imem->base.vbios);
+ 	nvkm_mm_fini(&imem->heap);
+ 	return imem;
+ }
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv40.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/instmem/nv40.c
+@@ -215,10 +215,10 @@ static void *
+ nv40_instmem_dtor(struct nvkm_instmem *base)
+ {
+ 	struct nv40_instmem *imem = nv40_instmem(base);
+-	nvkm_memory_del(&imem->base.ramfc);
+-	nvkm_memory_del(&imem->base.ramro);
++	nvkm_memory_unref(&imem->base.ramfc);
++	nvkm_memory_unref(&imem->base.ramro);
+ 	nvkm_ramht_del(&imem->base.ramht);
+-	nvkm_memory_del(&imem->base.vbios);
++	nvkm_memory_unref(&imem->base.vbios);
+ 	nvkm_mm_fini(&imem->heap);
+ 	if (imem->iomem)
+ 		iounmap(imem->iomem);
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/base.c
+@@ -243,7 +243,7 @@ nvkm_vm_unmap_pgt(struct nvkm_vm *vm, in
+ 
+ 		mmu->func->flush(vm);
+ 
+-		nvkm_memory_del(&pgt);
++		nvkm_memory_unref(&pgt);
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/nv04.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/nv04.c
+@@ -106,7 +106,7 @@ nv04_mmu_dtor(struct nvkm_mmu *base)
+ 	struct nv04_mmu *mmu = nv04_mmu(base);
+ 	struct nvkm_device *device = mmu->base.subdev.device;
+ 	if (mmu->base.vmm) {
+-		nvkm_memory_del(&mmu->base.vmm->pgt[0].mem[0]);
++		nvkm_memory_unref(&mmu->base.vmm->pgt[0].mem[0]);
+ 		nvkm_vm_ref(NULL, &mmu->base.vmm, NULL);
+ 	}
+ 	if (mmu->nullp) {

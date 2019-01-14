@@ -1,0 +1,366 @@
+From: Intiyaz Basha <intiyaz.basha@cavium.com>
+Date: Sun, 9 Sep 2018 23:34:21 -0700
+Subject: liquidio: Per queue oom work queue
+Patch-mainline: v4.20-rc1
+Git-commit: 4b6e326b2d346b7935ec9a1e6385e27be8a36837
+References: bsc#1119406 FATE#326562
+
+Removed oom task unconditional rescheduling every 250ms and created per
+queue oom work queue for refilling buffers.
+
+The oom task refills only if the available descriptors is fallen to 64.
+There will be no packets coming in after hitting this level. So NAPI will
+not run until oom task refills the buffers.
+
+Signed-off-by: Intiyaz Basha <intiyaz.basha@cavium.com>
+Acked-by: Derek Chickles <derek.chickles@cavium.com>
+Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/cavium/liquidio/lio_core.c       |   75 +++++++++-----
+ drivers/net/ethernet/cavium/liquidio/lio_ethtool.c    |    7 +
+ drivers/net/ethernet/cavium/liquidio/octeon_droq.c    |   91 +++++++++---------
+ drivers/net/ethernet/cavium/liquidio/octeon_droq.h    |    2 
+ drivers/net/ethernet/cavium/liquidio/octeon_main.h    |    4 
+ drivers/net/ethernet/cavium/liquidio/octeon_network.h |    2 
+ 6 files changed, 109 insertions(+), 72 deletions(-)
+
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@ -425,56 +425,73 @@ void octeon_pf_changed_vf_macaddr(struct
+ 	 */
+ }
+ 
++void octeon_schedule_rxq_oom_work(struct octeon_device *oct,
++				  struct octeon_droq *droq)
++{
++	struct net_device *netdev = oct->props[0].netdev;
++	struct lio *lio = GET_LIO(netdev);
++	struct cavium_wq *wq = &lio->rxq_status_wq[droq->q_no];
++
++	queue_delayed_work(wq->wq, &wq->wk.work,
++			   msecs_to_jiffies(LIO_OOM_POLL_INTERVAL_MS));
++}
++
+ static void octnet_poll_check_rxq_oom_status(struct work_struct *work)
+ {
+ 	struct cavium_wk *wk = (struct cavium_wk *)work;
+ 	struct lio *lio = (struct lio *)wk->ctxptr;
+ 	struct octeon_device *oct = lio->oct_dev;
+-	struct octeon_droq *droq;
+-	int q, q_no = 0;
++	int q_no = wk->ctxul;
++	struct octeon_droq *droq = oct->droq[q_no];
+ 
+-	if (ifstate_check(lio, LIO_IFSTATE_RUNNING)) {
+-		for (q = 0; q < lio->linfo.num_rxpciq; q++) {
+-			q_no = lio->linfo.rxpciq[q].s.q_no;
+-			droq = oct->droq[q_no];
+-			if (!droq)
+-				continue;
+-			octeon_droq_check_oom(droq);
+-		}
+-	}
+-	queue_delayed_work(lio->rxq_status_wq.wq,
+-			   &lio->rxq_status_wq.wk.work,
+-			   msecs_to_jiffies(LIO_OOM_POLL_INTERVAL_MS));
++	if (!ifstate_check(lio, LIO_IFSTATE_RUNNING) || !droq)
++		return;
++
++	if (octeon_retry_droq_refill(droq))
++		octeon_schedule_rxq_oom_work(oct, droq);
+ }
+ 
+ int setup_rx_oom_poll_fn(struct net_device *netdev)
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+ 	struct octeon_device *oct = lio->oct_dev;
++	struct cavium_wq *wq;
++	int q, q_no;
++
++	for (q = 0; q < oct->num_oqs; q++) {
++		q_no = lio->linfo.rxpciq[q].s.q_no;
++		wq = &lio->rxq_status_wq[q_no];
++		wq->wq = alloc_workqueue("rxq-oom-status",
++					 WQ_MEM_RECLAIM, 0);
++		if (!wq->wq) {
++			dev_err(&oct->pci_dev->dev, "unable to create cavium rxq oom status wq\n");
++			return -ENOMEM;
++		}
+ 
+-	lio->rxq_status_wq.wq = alloc_workqueue("rxq-oom-status",
+-						WQ_MEM_RECLAIM, 0);
+-	if (!lio->rxq_status_wq.wq) {
+-		dev_err(&oct->pci_dev->dev, "unable to create cavium rxq oom status wq\n");
+-		return -ENOMEM;
++		INIT_DELAYED_WORK(&wq->wk.work,
++				  octnet_poll_check_rxq_oom_status);
++		wq->wk.ctxptr = lio;
++		wq->wk.ctxul = q_no;
+ 	}
+-	INIT_DELAYED_WORK(&lio->rxq_status_wq.wk.work,
+-			  octnet_poll_check_rxq_oom_status);
+-	lio->rxq_status_wq.wk.ctxptr = lio;
+-	queue_delayed_work(lio->rxq_status_wq.wq,
+-			   &lio->rxq_status_wq.wk.work,
+-			   msecs_to_jiffies(LIO_OOM_POLL_INTERVAL_MS));
++
+ 	return 0;
+ }
+ 
+ void cleanup_rx_oom_poll_fn(struct net_device *netdev)
+ {
+ 	struct lio *lio = GET_LIO(netdev);
++	struct octeon_device *oct = lio->oct_dev;
++	struct cavium_wq *wq;
++	int q_no;
+ 
+-	if (lio->rxq_status_wq.wq) {
+-		cancel_delayed_work_sync(&lio->rxq_status_wq.wk.work);
+-		flush_workqueue(lio->rxq_status_wq.wq);
+-		destroy_workqueue(lio->rxq_status_wq.wq);
++	for (q_no = 0; q_no < oct->num_oqs; q_no++) {
++		wq = &lio->rxq_status_wq[q_no];
++		if (wq->wq) {
++			cancel_delayed_work_sync(&wq->wk.work);
++			flush_workqueue(wq->wq);
++			destroy_workqueue(wq->wq);
++			wq->wq = NULL;
++		}
+ 	}
+ }
+ 
+--- a/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_ethtool.c
+@@ -1115,6 +1115,8 @@ static int lio_reset_queues(struct net_d
+ 	 * steps like updating sriov_info for the octeon device need to be done.
+ 	 */
+ 	if (queue_count_update) {
++		cleanup_rx_oom_poll_fn(netdev);
++
+ 		lio_delete_glists(lio);
+ 
+ 		/* Delete mbox for PF which is SRIOV disabled because sriov_info
+@@ -1214,6 +1216,11 @@ static int lio_reset_queues(struct net_d
+ 			return -1;
+ 		}
+ 
++		if (setup_rx_oom_poll_fn(netdev)) {
++			dev_err(&oct->pci_dev->dev, "lio_setup_rx_oom_poll_fn failed\n");
++			return 1;
++		}
++
+ 		/* Send firmware the information about new number of queues
+ 		 * if the interface is a VF or a PF that is SRIOV enabled.
+ 		 */
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_droq.c
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_droq.c
+@@ -334,8 +334,6 @@ init_droq_fail:
+  * Returns:
+  *  Success: Pointer to recv_info_t
+  *  Failure: NULL.
+- * Locks:
+- *  The droq->lock is held when this routine is called.
+  */
+ static inline struct octeon_recv_info *octeon_create_recv_info(
+ 		struct octeon_device *octeon_dev,
+@@ -434,8 +432,6 @@ octeon_droq_refill_pullup_descs(struct o
+  *  up buffers (that were not dispatched) to form a contiguous ring.
+  * Returns:
+  *  No of descriptors refilled.
+- * Locks:
+- *  This routine is called with droq->lock held.
+  */
+ static u32
+ octeon_droq_refill(struct octeon_device *octeon_dev, struct octeon_droq *droq)
+@@ -450,8 +446,7 @@ octeon_droq_refill(struct octeon_device
+ 
+ 	while (droq->refill_count && (desc_refilled < droq->max_count)) {
+ 		/* If a valid buffer exists (happens if there is no dispatch),
+-		 * reuse
+-		 * the buffer, else allocate.
++		 * reuse the buffer, else allocate.
+ 		 */
+ 		if (!droq->recv_buf_list[droq->refill_idx].buffer) {
+ 			pg_info =
+@@ -504,28 +499,33 @@ octeon_droq_refill(struct octeon_device
+ 
+ /** check if we can allocate packets to get out of oom.
+  *  @param  droq - Droq being checked.
+- *  @return does not return anything
++ *  @return 1 if fails to refill minimum
+  */
+-void octeon_droq_check_oom(struct octeon_droq *droq)
++int octeon_retry_droq_refill(struct octeon_droq *droq)
+ {
+-	int desc_refilled;
+ 	struct octeon_device *oct = droq->oct_dev;
++	int desc_refilled, reschedule = 1;
++	u32 pkts_credit;
+ 
+-	if (readl(droq->pkts_credit_reg) <= CN23XX_SLI_DEF_BP) {
+-		spin_lock_bh(&droq->lock);
+-		desc_refilled = octeon_droq_refill(oct, droq);
+-		if (desc_refilled) {
+-			/* Flush the droq descriptor data to memory to be sure
+-			 * that when we update the credits the data in memory
+-			 * is accurate.
+-			 */
+-			wmb();
+-			writel(desc_refilled, droq->pkts_credit_reg);
+-			/* make sure mmio write completes */
+-			mmiowb();
+-		}
+-		spin_unlock_bh(&droq->lock);
++	spin_lock_bh(&droq->lock);
++	pkts_credit = readl(droq->pkts_credit_reg);
++	desc_refilled = octeon_droq_refill(oct, droq);
++	if (desc_refilled) {
++		/* Flush the droq descriptor data to memory to be sure
++		 * that when we update the credits the data in memory
++		 * is accurate.
++		 */
++		wmb();
++		writel(desc_refilled, droq->pkts_credit_reg);
++		/* make sure mmio write completes */
++		mmiowb();
++
++		if (pkts_credit + desc_refilled >= CN23XX_SLI_DEF_BP)
++			reschedule = 0;
+ 	}
++	spin_unlock_bh(&droq->lock);
++
++	return reschedule;
+ }
+ 
+ static inline u32
+@@ -604,9 +604,9 @@ octeon_droq_fast_process_packets(struct
+ 				 struct octeon_droq *droq,
+ 				 u32 pkts_to_process)
+ {
++	u32 pkt, total_len = 0, pkt_count, retval;
+ 	struct octeon_droq_info *info;
+ 	union octeon_rh *rh;
+-	u32 pkt, total_len = 0, pkt_count;
+ 
+ 	pkt_count = pkts_to_process;
+ 
+@@ -710,30 +710,43 @@ octeon_droq_fast_process_packets(struct
+ 		if (droq->refill_count >= droq->refill_threshold) {
+ 			int desc_refilled = octeon_droq_refill(oct, droq);
+ 
+-			/* Flush the droq descriptor data to memory to be sure
+-			 * that when we update the credits the data in memory
+-			 * is accurate.
+-			 */
+-			wmb();
+-			writel((desc_refilled), droq->pkts_credit_reg);
+-			/* make sure mmio write completes */
+-			mmiowb();
++			if (desc_refilled) {
++				/* Flush the droq descriptor data to memory to
++				 * be sure that when we update the credits the
++				 * data in memory is accurate.
++				 */
++				wmb();
++				writel(desc_refilled, droq->pkts_credit_reg);
++				/* make sure mmio write completes */
++				mmiowb();
++			}
+ 		}
+-
+ 	}                       /* for (each packet)... */
+ 
+ 	/* Increment refill_count by the number of buffers processed. */
+ 	droq->stats.pkts_received += pkt;
+ 	droq->stats.bytes_received += total_len;
+ 
++	retval = pkt;
+ 	if ((droq->ops.drop_on_max) && (pkts_to_process - pkt)) {
+ 		octeon_droq_drop_packets(oct, droq, (pkts_to_process - pkt));
+ 
+ 		droq->stats.dropped_toomany += (pkts_to_process - pkt);
+-		return pkts_to_process;
++		retval = pkts_to_process;
++	}
++
++	atomic_sub(retval, &droq->pkts_pending);
++
++	if (droq->refill_count >= droq->refill_threshold &&
++	    readl(droq->pkts_credit_reg) < CN23XX_SLI_DEF_BP) {
++		octeon_droq_check_hw_for_pkts(droq);
++
++		/* Make sure there are no pkts_pending */
++		if (!atomic_read(&droq->pkts_pending))
++			octeon_schedule_rxq_oom_work(oct, droq);
+ 	}
+ 
+-	return pkt;
++	return retval;
+ }
+ 
+ int
+@@ -741,7 +754,7 @@ octeon_droq_process_packets(struct octeo
+ 			    struct octeon_droq *droq,
+ 			    u32 budget)
+ {
+-	u32 pkt_count = 0, pkts_processed = 0;
++	u32 pkt_count = 0;
+ 	struct list_head *tmp, *tmp2;
+ 
+ 	/* Grab the droq lock */
+@@ -758,9 +771,7 @@ octeon_droq_process_packets(struct octeo
+ 	if (pkt_count > budget)
+ 		pkt_count = budget;
+ 
+-	pkts_processed = octeon_droq_fast_process_packets(oct, droq, pkt_count);
+-
+-	atomic_sub(pkts_processed, &droq->pkts_pending);
++	octeon_droq_fast_process_packets(oct, droq, pkt_count);
+ 
+ 	/* Release the spin lock */
+ 	spin_unlock(&droq->lock);
+@@ -814,8 +825,6 @@ octeon_droq_process_poll_pkts(struct oct
+ 			octeon_droq_fast_process_packets(oct, droq,
+ 							 pkts_available);
+ 
+-		atomic_sub(pkts_processed, &droq->pkts_pending);
+-
+ 		total_pkts_processed += pkts_processed;
+ 	}
+ 
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_droq.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_droq.h
+@@ -414,6 +414,6 @@ int octeon_droq_process_poll_pkts(struct
+ 
+ int octeon_enable_irq(struct octeon_device *oct, u32 q_no);
+ 
+-void octeon_droq_check_oom(struct octeon_droq *droq);
++int octeon_retry_droq_refill(struct octeon_droq *droq);
+ 
+ #endif	/*__OCTEON_DROQ_H__ */
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_main.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_main.h
+@@ -70,6 +70,10 @@ void octeon_update_tx_completion_counter
+ void octeon_report_tx_completion_to_bql(void *txq, unsigned int pkts_compl,
+ 					unsigned int bytes_compl);
+ void octeon_pf_changed_vf_macaddr(struct octeon_device *oct, u8 *mac);
++
++void octeon_schedule_rxq_oom_work(struct octeon_device *oct,
++				  struct octeon_droq *droq);
++
+ /** Swap 8B blocks */
+ static inline void octeon_swap_8B_data(u64 *data, u32 blocks)
+ {
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@ -173,7 +173,7 @@ struct lio {
+ 	struct cavium_wq	txq_status_wq;
+ 
+ 	/* work queue for  rxq oom status */
+-	struct cavium_wq	rxq_status_wq;
++	struct cavium_wq rxq_status_wq[MAX_POSSIBLE_OCTEON_OUTPUT_QUEUES];
+ 
+ 	/* work queue for  link status */
+ 	struct cavium_wq	link_status_wq;

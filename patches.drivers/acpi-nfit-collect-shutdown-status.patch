@@ -1,0 +1,275 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Wed, 26 Sep 2018 10:47:15 -0700
+Subject: acpi, nfit: Collect shutdown status
+Git-commit: 0ead11181fe0c9538b185e46a494df21dc7de23a
+Patch-mainline: v4.20-rc1
+References: FATE#326060
+
+Some NVDIMMs, in addition to providing an indication of whether the
+previous shutdown was clean, also provide a running count of lifetime
+dirty-shutdown events for the device. In anticipation of this
+functionality appearing on more devices arrange for the nfit driver to
+retrieve / cache this data at DIMM discovery time, and export it via
+sysfs.
+
+Reviewed-by: Keith Busch <keith.busch@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/acpi/nfit/core.c              | 77 ++++++++++++++++++++++++++++++++++-
+ drivers/acpi/nfit/intel.h             | 38 +++++++++++++++++
+ drivers/acpi/nfit/nfit.h              |  3 ++
+ tools/testing/nvdimm/test/nfit.c      |  1 +
+ tools/testing/nvdimm/test/nfit_test.h | 24 -----------
+ 5 files changed, 118 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/acpi/nfit/core.c b/drivers/acpi/nfit/core.c
+index 308a77b6c837..bf7021bb276c 100644
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@ -25,6 +25,7 @@
+ #include <asm/cacheflush.h>
+ #include <acpi/nfit.h>
+ #include "nfit.h"
++#include "intel.h"
+ 
+ /*
+  * For readq() and writeq() on 32-bit builds, the hi-lo, lo-hi order is
+@@ -1551,7 +1552,12 @@ static DEVICE_ATTR_RO(dsm_mask);
+ static ssize_t flags_show(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+ {
+-	u16 flags = to_nfit_memdev(dev)->flags;
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++	struct nfit_mem *nfit_mem = nvdimm_provider_data(nvdimm);
++	u16 flags = __to_nfit_memdev(nfit_mem)->flags;
++
++	if (test_bit(NFIT_MEM_DIRTY, &nfit_mem->flags))
++		flags |= ACPI_NFIT_MEM_FLUSH_FAILED;
+ 
+ 	return sprintf(buf, "%s%s%s%s%s%s%s\n",
+ 		flags & ACPI_NFIT_MEM_SAVE_FAILED ? "save_fail " : "",
+@@ -1582,6 +1588,16 @@ static ssize_t id_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(id);
+ 
++static ssize_t dirty_shutdown_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++	struct nfit_mem *nfit_mem = nvdimm_provider_data(nvdimm);
++
++	return sprintf(buf, "%d\n", nfit_mem->dirty_shutdown);
++}
++static DEVICE_ATTR_RO(dirty_shutdown);
++
+ static struct attribute *acpi_nfit_dimm_attributes[] = {
+ 	&dev_attr_handle.attr,
+ 	&dev_attr_phys_id.attr,
+@@ -1599,6 +1615,7 @@ static struct attribute *acpi_nfit_dimm_attributes[] = {
+ 	&dev_attr_id.attr,
+ 	&dev_attr_family.attr,
+ 	&dev_attr_dsm_mask.attr,
++	&dev_attr_dirty_shutdown.attr,
+ 	NULL,
+ };
+ 
+@@ -1607,6 +1624,7 @@ static umode_t acpi_nfit_dimm_attr_visible(struct kobject *kobj,
+ {
+ 	struct device *dev = container_of(kobj, struct device, kobj);
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
++	struct nfit_mem *nfit_mem = nvdimm_provider_data(nvdimm);
+ 
+ 	if (!to_nfit_dcr(dev)) {
+ 		/* Without a dcr only the memdev attributes can be surfaced */
+@@ -1620,6 +1638,11 @@ static umode_t acpi_nfit_dimm_attr_visible(struct kobject *kobj,
+ 
+ 	if (a == &dev_attr_format1.attr && num_nvdimm_formats(nvdimm) <= 1)
+ 		return 0;
++
++	if (!test_bit(NFIT_MEM_DIRTY_COUNT, &nfit_mem->flags)
++			&& a == &dev_attr_dirty_shutdown.attr)
++		return 0;
++
+ 	return a->mode;
+ }
+ 
+@@ -1698,6 +1721,56 @@ static bool acpi_nvdimm_has_method(struct acpi_device *adev, char *method)
+ 	return false;
+ }
+ 
++static void nfit_intel_shutdown_status(struct nfit_mem *nfit_mem)
++{
++	struct nd_intel_smart smart = { 0 };
++	union acpi_object in_buf = {
++		.type = ACPI_TYPE_BUFFER,
++		.buffer.pointer = (char *) &smart,
++		.buffer.length = sizeof(smart),
++	};
++	union acpi_object in_obj = {
++		.type = ACPI_TYPE_PACKAGE,
++		.package.count = 1,
++		.package.elements = &in_buf,
++	};
++	const u8 func = ND_INTEL_SMART;
++	const guid_t *guid = to_nfit_uuid(nfit_mem->family);
++	u8 revid = nfit_dsm_revid(nfit_mem->family, func);
++	struct acpi_device *adev = nfit_mem->adev;
++	acpi_handle handle = adev->handle;
++	union acpi_object *out_obj;
++
++	if ((nfit_mem->dsm_mask & (1 << func)) == 0)
++		return;
++
++	out_obj = acpi_evaluate_dsm(handle, guid, revid, func, &in_obj);
++	if (!out_obj)
++		return;
++
++	if (smart.flags & ND_INTEL_SMART_SHUTDOWN_VALID) {
++		if (smart.shutdown_state)
++			set_bit(NFIT_MEM_DIRTY, &nfit_mem->flags);
++	}
++
++	if (smart.flags & ND_INTEL_SMART_SHUTDOWN_COUNT_VALID) {
++		set_bit(NFIT_MEM_DIRTY_COUNT, &nfit_mem->flags);
++		nfit_mem->dirty_shutdown = smart.shutdown_count;
++	}
++	ACPI_FREE(out_obj);
++}
++
++static void populate_shutdown_status(struct nfit_mem *nfit_mem)
++{
++	/*
++	 * For DIMMs that provide a dynamic facility to retrieve a
++	 * dirty-shutdown status and/or a dirty-shutdown count, cache
++	 * these values in nfit_mem.
++	 */
++	if (nfit_mem->family == NVDIMM_FAMILY_INTEL)
++		nfit_intel_shutdown_status(nfit_mem);
++}
++
+ static int acpi_nfit_add_dimm(struct acpi_nfit_desc *acpi_desc,
+ 		struct nfit_mem *nfit_mem, u32 device_handle)
+ {
+@@ -1797,6 +1870,8 @@ static int acpi_nfit_add_dimm(struct acpi_nfit_desc *acpi_desc,
+ 		set_bit(NFIT_MEM_LSW, &nfit_mem->flags);
+ 	}
+ 
++	populate_shutdown_status(nfit_mem);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/acpi/nfit/intel.h b/drivers/acpi/nfit/intel.h
+new file mode 100644
+index 000000000000..86746312381f
+--- /dev/null
++++ b/drivers/acpi/nfit/intel.h
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright(c) 2018 Intel Corporation. All rights reserved.
++ * Intel specific definitions for NVDIMM Firmware Interface Table - NFIT
++ */
++#ifndef _NFIT_INTEL_H_
++#define _NFIT_INTEL_H_
++
++#define ND_INTEL_SMART 1
++
++#define ND_INTEL_SMART_SHUTDOWN_COUNT_VALID     (1 << 5)
++#define ND_INTEL_SMART_SHUTDOWN_VALID           (1 << 10)
++
++struct nd_intel_smart {
++	u32 status;
++	union {
++		struct {
++			u32 flags;
++			u8 reserved0[4];
++			u8 health;
++			u8 spares;
++			u8 life_used;
++			u8 alarm_flags;
++			u16 media_temperature;
++			u16 ctrl_temperature;
++			u32 shutdown_count;
++			u8 ait_status;
++			u16 pmic_temperature;
++			u8 reserved1[8];
++			u8 shutdown_state;
++			u32 vendor_size;
++			u8 vendor_data[92];
++		} __packed;
++		u8 data[128];
++	};
++} __packed;
++
++#endif
+diff --git a/drivers/acpi/nfit/nfit.h b/drivers/acpi/nfit/nfit.h
+index 111c3c437c80..af73aec547f2 100644
+--- a/drivers/acpi/nfit/nfit.h
++++ b/drivers/acpi/nfit/nfit.h
+@@ -162,6 +162,8 @@ struct nfit_memdev {
+ enum nfit_mem_flags {
+ 	NFIT_MEM_LSR,
+ 	NFIT_MEM_LSW,
++	NFIT_MEM_DIRTY,
++	NFIT_MEM_DIRTY_COUNT,
+ };
+ 
+ /* assembled tables for a given dimm/memory-device */
+@@ -184,6 +186,7 @@ struct nfit_mem {
+ 	struct resource *flush_wpq;
+ 	unsigned long dsm_mask;
+ 	unsigned long flags;
++	u32 dirty_shutdown;
+ 	int family;
+ };
+ 
+diff --git a/tools/testing/nvdimm/test/nfit.c b/tools/testing/nvdimm/test/nfit.c
+index cffc2c5a778d..f1a2a1a7bb1b 100644
+--- a/tools/testing/nvdimm/test/nfit.c
++++ b/tools/testing/nvdimm/test/nfit.c
+@@ -24,6 +24,7 @@
+ #include <linux/list.h>
+ #include <linux/slab.h>
+ #include <nd-core.h>
++#include <intel.h>
+ #include <nfit.h>
+ #include <nd.h>
+ #include "nfit_test.h"
+diff --git a/tools/testing/nvdimm/test/nfit_test.h b/tools/testing/nvdimm/test/nfit_test.h
+index 33752e06ff8d..ade14fe3837e 100644
+--- a/tools/testing/nvdimm/test/nfit_test.h
++++ b/tools/testing/nvdimm/test/nfit_test.h
+@@ -117,30 +117,6 @@ struct nd_cmd_ars_err_inj_stat {
+ #define ND_INTEL_SMART_INJECT_FATAL		(1 << 2)
+ #define ND_INTEL_SMART_INJECT_SHUTDOWN		(1 << 3)
+ 
+-struct nd_intel_smart {
+-	__u32 status;
+-	union {
+-		struct {
+-			__u32 flags;
+-			__u8 reserved0[4];
+-			__u8 health;
+-			__u8 spares;
+-			__u8 life_used;
+-			__u8 alarm_flags;
+-			__u16 media_temperature;
+-			__u16 ctrl_temperature;
+-			__u32 shutdown_count;
+-			__u8 ait_status;
+-			__u16 pmic_temperature;
+-			__u8 reserved1[8];
+-			__u8 shutdown_state;
+-			__u32 vendor_size;
+-			__u8 vendor_data[92];
+-		} __packed;
+-		__u8 data[128];
+-	};
+-} __packed;
+-
+ struct nd_intel_smart_threshold {
+ 	__u32 status;
+ 	union {
+

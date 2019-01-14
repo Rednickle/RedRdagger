@@ -1,0 +1,208 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 22 Jun 2017 11:56:25 +0100
+Subject: drm/i915: Break modeset deadlocks on reset
+Git-commit: 36703e79a982c8ce5a8e43833291f2719e92d0d1
+Patch-mainline: v4.14-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Trying to do a modeset from within a reset is fraught with danger. We
+can fall into a cyclic deadlock where the modeset is waiting on a
+previous modeset that is waiting on a request, and since the GPU hung
+that request completion is waiting on the reset. As modesetting doesn't
+allow its locks to be broken and restarted, or for its *own* reset
+mechanism to take over the display, we have to do something very
+evil instead. If we detect that we are stuck waiting to prepare the
+display reset (by using a very simple timeout), resort to cancelling all
+in-flight requests and throwing the user data into /dev/null, which is
+marginally better than the driver locking up and keeping that data to
+itself.
+
+This is not a fix; this is just a workaround that unbreaks machines
+until we can resolve the deadlock in a way that doesn't lose data!
+
+v2: Move the retirement from set-wegded to the i915_reset() error path,
+after which we no longer any delayed worker cleanup for
+i915_handle_error()
+v3: C abuse for syntactic sugar
+v4: Cover all waits with the timeout to catch more driver breakage
+
+References: https://bugs.freedesktop.org/show_bug.cgi?id=99093
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170622105625.16952-1-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c |    1 
+ drivers/gpu/drm/i915/i915_gem.c |   18 +-------
+ drivers/gpu/drm/i915/i915_irq.c |   82 +++++++++++++++++++++++++++++-----------
+ 3 files changed, 66 insertions(+), 35 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1917,6 +1917,7 @@ wakeup:
+ 
+ error:
+ 	i915_gem_set_wedged(dev_priv);
++	i915_gem_retire_requests(dev_priv);
+ 	goto finish;
+ }
+ 
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3063,7 +3063,8 @@ static void engine_set_wedged(struct int
+ 	/* Mark all executing requests as skipped */
+ 	spin_lock_irqsave(&engine->timeline->lock, flags);
+ 	list_for_each_entry(request, &engine->timeline->requests, link)
+-		dma_fence_set_error(&request->fence, -EIO);
++		if (!i915_gem_request_completed(request))
++			dma_fence_set_error(&request->fence, -EIO);
+ 	spin_unlock_irqrestore(&engine->timeline->lock, flags);
+ 
+ 	/* Mark all pending requests as complete so that any concurrent
+@@ -3109,6 +3110,7 @@ static int __i915_gem_set_wedged_BKL(voi
+ 	struct intel_engine_cs *engine;
+ 	enum intel_engine_id id;
+ 
++	set_bit(I915_WEDGED, &i915->gpu_error.flags);
+ 	for_each_engine(engine, i915, id)
+ 		engine_set_wedged(engine);
+ 
+@@ -3117,20 +3119,7 @@ static int __i915_gem_set_wedged_BKL(voi
+ 
+ void i915_gem_set_wedged(struct drm_i915_private *dev_priv)
+ {
+-	lockdep_assert_held(&dev_priv->drm.struct_mutex);
+-	set_bit(I915_WEDGED, &dev_priv->gpu_error.flags);
+-
+-	/* Retire completed requests first so the list of inflight/incomplete
+-	 * requests is accurate and we don't try and mark successful requests
+-	 * as in error during __i915_gem_set_wedged_BKL().
+-	 */
+-	i915_gem_retire_requests(dev_priv);
+-
+ 	stop_machine(__i915_gem_set_wedged_BKL, dev_priv, NULL);
+-
+-	i915_gem_contexts_lost(dev_priv);
+-
+-	mod_delayed_work(dev_priv->wq, &dev_priv->gt.idle_work, 0);
+ }
+ 
+ bool i915_gem_unset_wedged(struct drm_i915_private *i915)
+@@ -3185,6 +3174,7 @@ bool i915_gem_unset_wedged(struct drm_i9
+ 	 * context and do not require stop_machine().
+ 	 */
+ 	intel_engines_reset_default_submission(i915);
++	i915_gem_contexts_lost(i915);
+ 
+ 	smp_mb__before_atomic(); /* complete takeover before enabling execbuf */
+ 	clear_bit(I915_WEDGED, &i915->gpu_error.flags);
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2599,6 +2599,46 @@ static irqreturn_t gen8_irq_handler(int
+ 	return ret;
+ }
+ 
++struct wedge_me {
++	struct delayed_work work;
++	struct drm_i915_private *i915;
++	const char *name;
++};
++
++static void wedge_me(struct work_struct *work)
++{
++	struct wedge_me *w = container_of(work, typeof(*w), work.work);
++
++	dev_err(w->i915->drm.dev,
++		"%s timed out, cancelling all in-flight rendering.\n",
++		w->name);
++	i915_gem_set_wedged(w->i915);
++}
++
++static void __init_wedge(struct wedge_me *w,
++			 struct drm_i915_private *i915,
++			 long timeout,
++			 const char *name)
++{
++	w->i915 = i915;
++	w->name = name;
++
++	INIT_DELAYED_WORK_ONSTACK(&w->work, wedge_me);
++	schedule_delayed_work(&w->work, timeout);
++}
++
++static void __fini_wedge(struct wedge_me *w)
++{
++	cancel_delayed_work_sync(&w->work);
++	destroy_delayed_work_on_stack(&w->work);
++	w->i915 = NULL;
++}
++
++#define i915_wedge_on_timeout(W, DEV, TIMEOUT)				\
++	for (__init_wedge((W), (DEV), (TIMEOUT), __func__);		\
++	     (W)->i915;							\
++	     __fini_wedge((W)))
++
+ /**
+  * i915_reset_device - do process context error handling work
+  * @dev_priv: i915 device private
+@@ -2612,36 +2652,36 @@ static void i915_reset_device(struct drm
+ 	char *error_event[] = { I915_ERROR_UEVENT "=1", NULL };
+ 	char *reset_event[] = { I915_RESET_UEVENT "=1", NULL };
+ 	char *reset_done_event[] = { I915_ERROR_UEVENT "=0", NULL };
++	struct wedge_me w;
+ 
+ 	kobject_uevent_env(kobj, KOBJ_CHANGE, error_event);
+ 
+ 	DRM_DEBUG_DRIVER("resetting chip\n");
+ 	kobject_uevent_env(kobj, KOBJ_CHANGE, reset_event);
+ 
+-	intel_prepare_reset(dev_priv);
+-
+-	set_bit(I915_RESET_HANDOFF, &dev_priv->gpu_error.flags);
+-	wake_up_all(&dev_priv->gpu_error.wait_queue);
++	/* Use a watchdog to ensure that our reset completes */
++	i915_wedge_on_timeout(&w, dev_priv, 5*HZ) {
++		intel_prepare_reset(dev_priv);
++
++		/* Signal that locked waiters should reset the GPU */
++		set_bit(I915_RESET_HANDOFF, &dev_priv->gpu_error.flags);
++		wake_up_all(&dev_priv->gpu_error.wait_queue);
+ 
+-	do {
+-		/*
+-		 * All state reset _must_ be completed before we update the
+-		 * reset counter, for otherwise waiters might miss the reset
+-		 * pending state and not properly drop locks, resulting in
+-		 * deadlocks with the reset work.
++		/* Wait for anyone holding the lock to wakeup, without
++		 * blocking indefinitely on struct_mutex.
+ 		 */
+-		if (mutex_trylock(&dev_priv->drm.struct_mutex)) {
+-			i915_reset(dev_priv);
+-			mutex_unlock(&dev_priv->drm.struct_mutex);
+-		}
+-
+-		/* We need to wait for anyone holding the lock to wakeup */
+-	} while (wait_on_bit_timeout(&dev_priv->gpu_error.flags,
+-				     I915_RESET_HANDOFF,
+-				     TASK_UNINTERRUPTIBLE,
+-				     HZ));
++		do {
++			if (mutex_trylock(&dev_priv->drm.struct_mutex)) {
++				i915_reset(dev_priv);
++				mutex_unlock(&dev_priv->drm.struct_mutex);
++			}
++		} while (wait_on_bit_timeout(&dev_priv->gpu_error.flags,
++					     I915_RESET_HANDOFF,
++					     TASK_UNINTERRUPTIBLE,
++					     1));
+ 
+-	intel_finish_reset(dev_priv);
++		intel_finish_reset(dev_priv);
++	}
+ 
+ 	if (!test_bit(I915_WEDGED, &dev_priv->gpu_error.flags))
+ 		kobject_uevent_env(kobj,

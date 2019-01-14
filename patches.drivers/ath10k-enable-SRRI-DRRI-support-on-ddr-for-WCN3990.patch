@@ -1,0 +1,442 @@
+From 4945af5b264fbdbdb5a9021b8a6a179d0c7a33b2 Mon Sep 17 00:00:00 2001
+From: Govind Singh <govinds@codeaurora.org>
+Date: Tue, 17 Apr 2018 17:37:00 +0530
+Subject: [PATCH] ath10k: enable SRRI/DRRI support on ddr for WCN3990
+Git-commit: 4945af5b264fbdbdb5a9021b8a6a179d0c7a33b2
+Patch-mainline: v4.18-rc1
+References: FATE#326906
+
+SRRI/DRRI are not mapped in the HW Shadow block and can lead
+to un-clocked access if common subsystem in the target is
+powered down due to idle mode.
+
+To mitigate this problem SRRI/DRRI can be read from
+DDR instead of doing an actual hardware read.
+Host allocates non cached memory on ddr and configures
+the physical address of this memory to the CE hardware.
+The hardware updates the RRI on this particular location.
+Read SRRI/DRRI from DDR location instead of
+direct target read.
+
+Enable retention restore on ddr using hw params to enable
+in specific targets.
+
+Signed-off-by: Govind Singh <govinds@codeaurora.org>
+Signed-off-by: Rakesh Pillai <pillair@codeaurora.org>
+Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/net/wireless/ath/ath10k/ce.c   | 102 +++++++++++++++++++++++--
+ drivers/net/wireless/ath/ath10k/ce.h   |  10 +++
+ drivers/net/wireless/ath/ath10k/core.c |  14 ++++
+ drivers/net/wireless/ath/ath10k/hw.c   |   9 ++-
+ drivers/net/wireless/ath/ath10k/hw.h   |  13 +++-
+ drivers/net/wireless/ath/ath10k/snoc.c |   3 +
+ 6 files changed, 142 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath10k/ce.c b/drivers/net/wireless/ath/ath10k/ce.c
+index 020405b6d408..3b96a43fbda4 100644
+--- a/drivers/net/wireless/ath/ath10k/ce.c
++++ b/drivers/net/wireless/ath/ath10k/ce.c
+@@ -185,11 +185,30 @@ static inline u32 ath10k_ce_src_ring_write_index_get(struct ath10k *ar,
+ 				ar->hw_ce_regs->sr_wr_index_addr);
+ }
+ 
++static inline u32 ath10k_ce_src_ring_read_index_from_ddr(struct ath10k *ar,
++							 u32 ce_id)
++{
++	struct ath10k_ce *ce = ath10k_ce_priv(ar);
++
++	return ce->vaddr_rri[ce_id] & CE_DDR_RRI_MASK;
++}
++
+ static inline u32 ath10k_ce_src_ring_read_index_get(struct ath10k *ar,
+ 						    u32 ce_ctrl_addr)
+ {
+-	return ath10k_ce_read32(ar, ce_ctrl_addr +
+-				ar->hw_ce_regs->current_srri_addr);
++	struct ath10k_ce *ce = ath10k_ce_priv(ar);
++	u32 ce_id = COPY_ENGINE_ID(ce_ctrl_addr);
++	struct ath10k_ce_pipe *ce_state = &ce->ce_states[ce_id];
++	u32 index;
++
++	if (ar->hw_params.rri_on_ddr &&
++	    (ce_state->attr_flags & CE_ATTR_DIS_INTR))
++		index = ath10k_ce_src_ring_read_index_from_ddr(ar, ce_id);
++	else
++		index = ath10k_ce_read32(ar, ce_ctrl_addr +
++					 ar->hw_ce_regs->current_srri_addr);
++
++	return index;
+ }
+ 
+ static inline void
+@@ -266,11 +285,31 @@ static inline void ath10k_ce_dest_ring_byte_swap_set(struct ath10k *ar,
+ 			  ath10k_set_ring_byte(n, ctrl_regs->dst_ring));
+ }
+ 
++static inline
++	u32 ath10k_ce_dest_ring_read_index_from_ddr(struct ath10k *ar, u32 ce_id)
++{
++	struct ath10k_ce *ce = ath10k_ce_priv(ar);
++
++	return (ce->vaddr_rri[ce_id] >> CE_DDR_DRRI_SHIFT) &
++		CE_DDR_RRI_MASK;
++}
++
+ static inline u32 ath10k_ce_dest_ring_read_index_get(struct ath10k *ar,
+ 						     u32 ce_ctrl_addr)
+ {
+-	return ath10k_ce_read32(ar, ce_ctrl_addr +
+-				ar->hw_ce_regs->current_drri_addr);
++	struct ath10k_ce *ce = ath10k_ce_priv(ar);
++	u32 ce_id = COPY_ENGINE_ID(ce_ctrl_addr);
++	struct ath10k_ce_pipe *ce_state = &ce->ce_states[ce_id];
++	u32 index;
++
++	if (ar->hw_params.rri_on_ddr &&
++	    (ce_state->attr_flags & CE_ATTR_DIS_INTR))
++		index = ath10k_ce_dest_ring_read_index_from_ddr(ar, ce_id);
++	else
++		index = ath10k_ce_read32(ar, ce_ctrl_addr +
++					 ar->hw_ce_regs->current_drri_addr);
++
++	return index;
+ }
+ 
+ static inline void ath10k_ce_dest_ring_base_addr_set(struct ath10k *ar,
+@@ -486,7 +525,7 @@ static int _ath10k_ce_send_nolock_64(struct ath10k_ce_pipe *ce_state,
+ 	struct ath10k_ce_ring *src_ring = ce_state->src_ring;
+ 	struct ce_desc_64 *desc, sdesc;
+ 	unsigned int nentries_mask = src_ring->nentries_mask;
+-	unsigned int sw_index = src_ring->sw_index;
++	unsigned int sw_index;
+ 	unsigned int write_index = src_ring->write_index;
+ 	u32 ctrl_addr = ce_state->ctrl_addr;
+ 	__le32 *addr;
+@@ -500,6 +539,11 @@ static int _ath10k_ce_send_nolock_64(struct ath10k_ce_pipe *ce_state,
+ 		ath10k_warn(ar, "%s: send more we can (nbytes: %d, max: %d)\n",
+ 			    __func__, nbytes, ce_state->src_sz_max);
+ 
++	if (ar->hw_params.rri_on_ddr)
++		sw_index = ath10k_ce_src_ring_read_index_from_ddr(ar, ce_state->id);
++	else
++		sw_index = src_ring->sw_index;
++
+ 	if (unlikely(CE_RING_DELTA(nentries_mask,
+ 				   write_index, sw_index - 1) <= 0)) {
+ 		ret = -ENOSR;
+@@ -1016,7 +1060,10 @@ int ath10k_ce_completed_send_next_nolock(struct ath10k_ce_pipe *ce_state,
+ 		src_ring->hw_index = read_index;
+ 	}
+ 
+-	read_index = src_ring->hw_index;
++	if (ar->hw_params.rri_on_ddr)
++		read_index = ath10k_ce_src_ring_read_index_get(ar, ctrl_addr);
++	else
++		read_index = src_ring->hw_index;
+ 
+ 	if (read_index == sw_index)
+ 		return -EIO;
+@@ -1841,3 +1888,46 @@ int ath10k_ce_alloc_pipe(struct ath10k *ar, int ce_id,
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ath10k_ce_alloc_pipe);
++
++void ath10k_ce_alloc_rri(struct ath10k *ar)
++{
++	int i;
++	u32 value;
++	u32 ctrl1_regs;
++	u32 ce_base_addr;
++	struct ath10k_ce *ce = ath10k_ce_priv(ar);
++
++	ce->vaddr_rri = dma_alloc_coherent(ar->dev,
++					   (CE_COUNT * sizeof(u32)),
++					   &ce->paddr_rri, GFP_KERNEL);
++
++	if (!ce->vaddr_rri)
++		return;
++
++	ath10k_ce_write32(ar, ar->hw_ce_regs->ce_rri_low,
++			  lower_32_bits(ce->paddr_rri));
++	ath10k_ce_write32(ar, ar->hw_ce_regs->ce_rri_high,
++			  (upper_32_bits(ce->paddr_rri) &
++			  CE_DESC_FLAGS_GET_MASK));
++
++	for (i = 0; i < CE_COUNT; i++) {
++		ctrl1_regs = ar->hw_ce_regs->ctrl1_regs->addr;
++		ce_base_addr = ath10k_ce_base_address(ar, i);
++		value = ath10k_ce_read32(ar, ce_base_addr + ctrl1_regs);
++		value |= ar->hw_ce_regs->upd->mask;
++		ath10k_ce_write32(ar, ce_base_addr + ctrl1_regs, value);
++	}
++
++	memset(ce->vaddr_rri, 0, CE_COUNT * sizeof(u32));
++}
++EXPORT_SYMBOL(ath10k_ce_alloc_rri);
++
++void ath10k_ce_free_rri(struct ath10k *ar)
++{
++	struct ath10k_ce *ce = ath10k_ce_priv(ar);
++
++	dma_free_coherent(ar->dev, (CE_COUNT * sizeof(u32)),
++			  ce->vaddr_rri,
++			  ce->paddr_rri);
++}
++EXPORT_SYMBOL(ath10k_ce_free_rri);
+diff --git a/drivers/net/wireless/ath/ath10k/ce.h b/drivers/net/wireless/ath/ath10k/ce.h
+index 9aea89133209..dbeffaef6024 100644
+--- a/drivers/net/wireless/ath/ath10k/ce.h
++++ b/drivers/net/wireless/ath/ath10k/ce.h
+@@ -49,6 +49,9 @@ struct ath10k_ce_pipe;
+ #define CE_DESC_FLAGS_META_DATA_MASK ar->hw_values->ce_desc_meta_data_mask
+ #define CE_DESC_FLAGS_META_DATA_LSB  ar->hw_values->ce_desc_meta_data_lsb
+ 
++#define CE_DDR_RRI_MASK			GENMASK(15, 0)
++#define CE_DDR_DRRI_SHIFT		16
++
+ struct ce_desc {
+ 	__le32 addr;
+ 	__le16 nbytes;
+@@ -157,6 +160,8 @@ struct ath10k_ce {
+ 	spinlock_t ce_lock;
+ 	const struct ath10k_bus_ops *bus_ops;
+ 	struct ath10k_ce_pipe ce_states[CE_COUNT_MAX];
++	u32 *vaddr_rri;
++	dma_addr_t paddr_rri;
+ };
+ 
+ /*==================Send====================*/
+@@ -265,6 +270,8 @@ int ath10k_ce_disable_interrupts(struct ath10k *ar);
+ void ath10k_ce_enable_interrupts(struct ath10k *ar);
+ void ath10k_ce_dump_registers(struct ath10k *ar,
+ 			      struct ath10k_fw_crash_data *crash_data);
++void ath10k_ce_alloc_rri(struct ath10k *ar);
++void ath10k_ce_free_rri(struct ath10k *ar);
+ 
+ /* ce_attr.flags values */
+ /* Use NonSnooping PCIe accesses? */
+@@ -331,6 +338,9 @@ static inline u32 ath10k_ce_base_address(struct ath10k *ar, unsigned int ce_id)
+ 	return CE0_BASE_ADDRESS + (CE1_BASE_ADDRESS - CE0_BASE_ADDRESS) * ce_id;
+ }
+ 
++#define COPY_ENGINE_ID(COPY_ENGINE_BASE_ADDRESS) (((COPY_ENGINE_BASE_ADDRESS) \
++		- CE0_BASE_ADDRESS) / (CE1_BASE_ADDRESS - CE0_BASE_ADDRESS))
++
+ #define CE_SRC_RING_TO_DESC(baddr, idx) \
+ 	(&(((struct ce_desc *)baddr)[idx]))
+ 
+diff --git a/drivers/net/wireless/ath/ath10k/core.c b/drivers/net/wireless/ath/ath10k/core.c
+index a8bb21173d2c..4cf54a7ef09a 100644
+--- a/drivers/net/wireless/ath/ath10k/core.c
++++ b/drivers/net/wireless/ath/ath10k/core.c
+@@ -91,6 +91,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.target_64bit = false,
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA988X_HW_2_0_VERSION,
+@@ -122,6 +123,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA9887_HW_1_0_VERSION,
+@@ -153,6 +155,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA6174_HW_2_1_VERSION,
+@@ -183,6 +186,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA6174_HW_2_1_VERSION,
+@@ -213,6 +217,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA6174_HW_3_0_VERSION,
+@@ -243,6 +248,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA6174_HW_3_2_VERSION,
+@@ -276,6 +282,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA99X0_HW_2_0_DEV_VERSION,
+@@ -312,6 +319,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA9984_HW_1_0_DEV_VERSION,
+@@ -353,6 +361,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA9888_HW_2_0_DEV_VERSION,
+@@ -393,6 +402,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA9377_HW_1_0_DEV_VERSION,
+@@ -423,6 +433,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA9377_HW_1_1_DEV_VERSION,
+@@ -455,6 +466,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = QCA4019_HW_1_0_DEV_VERSION,
+@@ -492,6 +504,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL,
+ 		.per_ce_irq = false,
+ 		.shadow_reg_support = false,
++		.rri_on_ddr = false,
+ 	},
+ 	{
+ 		.id = WCN3990_HW_1_0_DEV_VERSION,
+@@ -514,6 +527,7 @@ static const struct ath10k_hw_params ath10k_hw_params_list[] = {
+ 		.rx_ring_fill_level = HTT_RX_RING_FILL_LEVEL_DUAL_MAC,
+ 		.per_ce_irq = true,
+ 		.shadow_reg_support = true,
++		.rri_on_ddr = true,
+ 	},
+ };
+ 
+diff --git a/drivers/net/wireless/ath/ath10k/hw.c b/drivers/net/wireless/ath/ath10k/hw.c
+index 497ac33e0fbf..677535b3d207 100644
+--- a/drivers/net/wireless/ath/ath10k/hw.c
++++ b/drivers/net/wireless/ath/ath10k/hw.c
+@@ -310,6 +310,12 @@ static struct ath10k_hw_ce_dst_src_wm_regs wcn3990_wm_dst_ring = {
+ 	.wm_high	= &wcn3990_dst_wm_high,
+ };
+ 
++static struct ath10k_hw_ce_ctrl1_upd wcn3990_ctrl1_upd = {
++	.shift = 19,
++	.mask = 0x00080000,
++	.enable = 0x00000000,
++};
++
+ const struct ath10k_hw_ce_regs wcn3990_ce_regs = {
+ 	.sr_base_addr		= 0x00000000,
+ 	.sr_size_addr		= 0x00000008,
+@@ -320,8 +326,6 @@ const struct ath10k_hw_ce_regs wcn3990_ce_regs = {
+ 	.dst_wr_index_addr	= 0x00000040,
+ 	.current_srri_addr	= 0x00000044,
+ 	.current_drri_addr	= 0x00000048,
+-	.ddr_addr_for_rri_low	= 0x00000004,
+-	.ddr_addr_for_rri_high	= 0x00000008,
+ 	.ce_rri_low		= 0x0024C004,
+ 	.ce_rri_high		= 0x0024C008,
+ 	.host_ie_addr		= 0x0000002c,
+@@ -331,6 +335,7 @@ const struct ath10k_hw_ce_regs wcn3990_ce_regs = {
+ 	.misc_regs		= &wcn3990_misc_reg,
+ 	.wm_srcr		= &wcn3990_wm_src_ring,
+ 	.wm_dstr		= &wcn3990_wm_dst_ring,
++	.upd			= &wcn3990_ctrl1_upd,
+ };
+ 
+ const struct ath10k_hw_values wcn3990_values = {
+diff --git a/drivers/net/wireless/ath/ath10k/hw.h b/drivers/net/wireless/ath/ath10k/hw.h
+index dcefde76956c..b8bdabe73073 100644
+--- a/drivers/net/wireless/ath/ath10k/hw.h
++++ b/drivers/net/wireless/ath/ath10k/hw.h
+@@ -336,6 +336,12 @@ struct ath10k_hw_ce_dst_src_wm_regs {
+ 	struct ath10k_hw_ce_regs_addr_map *wm_low;
+ 	struct ath10k_hw_ce_regs_addr_map *wm_high; };
+ 
++struct ath10k_hw_ce_ctrl1_upd {
++	u32 shift;
++	u32 mask;
++	u32 enable;
++};
++
+ struct ath10k_hw_ce_regs {
+ 	u32 sr_base_addr;
+ 	u32 sr_size_addr;
+@@ -358,7 +364,9 @@ struct ath10k_hw_ce_regs {
+ 	struct ath10k_hw_ce_cmd_halt *cmd_halt;
+ 	struct ath10k_hw_ce_host_ie *host_ie;
+ 	struct ath10k_hw_ce_dst_src_wm_regs *wm_srcr;
+-	struct ath10k_hw_ce_dst_src_wm_regs *wm_dstr; };
++	struct ath10k_hw_ce_dst_src_wm_regs *wm_dstr;
++	struct ath10k_hw_ce_ctrl1_upd *upd;
++};
+ 
+ struct ath10k_hw_values {
+ 	u32 rtc_state_val_on;
+@@ -575,6 +583,9 @@ struct ath10k_hw_params {
+ 
+ 	/* target supporting shadow register for ce write */
+ 	bool shadow_reg_support;
++
++	/* target supporting retention restore on ddr */
++	bool rri_on_ddr;
+ };
+ 
+ struct htt_rx_desc;
+diff --git a/drivers/net/wireless/ath/ath10k/snoc.c b/drivers/net/wireless/ath/ath10k/snoc.c
+index 2e490ff124f1..47a4d2a5bd4c 100644
+--- a/drivers/net/wireless/ath/ath10k/snoc.c
++++ b/drivers/net/wireless/ath/ath10k/snoc.c
+@@ -767,6 +767,7 @@ static void ath10k_snoc_hif_power_down(struct ath10k *ar)
+ 	ath10k_dbg(ar, ATH10K_DBG_BOOT, "boot hif power down\n");
+ 
+ 	ath10k_snoc_wlan_disable(ar);
++	ath10k_ce_free_rri(ar);
+ }
+ 
+ static int ath10k_snoc_hif_power_up(struct ath10k *ar)
+@@ -782,6 +783,8 @@ static int ath10k_snoc_hif_power_up(struct ath10k *ar)
+ 		return ret;
+ 	}
+ 
++	ath10k_ce_alloc_rri(ar);
++
+ 	ret = ath10k_snoc_init_pipes(ar);
+ 	if (ret) {
+ 		ath10k_err(ar, "failed to initialize CE: %d\n", ret);
+-- 
+2.19.2
+

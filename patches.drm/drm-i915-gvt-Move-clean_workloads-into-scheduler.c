@@ -100,7 +100,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  }
 --- a/drivers/gpu/drm/i915/gvt/scheduler.c
 +++ b/drivers/gpu/drm/i915/gvt/scheduler.c
-@@ -679,6 +679,25 @@ static void update_guest_context(struct
+@@ -685,6 +685,25 @@ static void update_guest_context(struct
  	kunmap(page);
  }
  
@@ -126,7 +126,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  static void complete_current_workload(struct intel_gvt *gvt, int ring_id)
  {
  	struct intel_gvt_workload_scheduler *scheduler = &gvt->scheduler;
-@@ -742,6 +761,23 @@ static void complete_current_workload(st
+@@ -748,6 +767,23 @@ static void complete_current_workload(st
  		release_shadow_wa_ctx(&workload->wa_ctx);
  	}
  
@@ -150,7 +150,7 @@ Acked-by: Takashi Iwai <tiwai@suse.de>
  	workload->complete(workload);
  
  	atomic_dec(&s->running_workload_num);
-@@ -941,6 +977,7 @@ void intel_vgpu_reset_submission(struct
+@@ -947,6 +983,7 @@ void intel_vgpu_reset_submission(struct
  	if (!s->active)
  		return;
  

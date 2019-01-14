@@ -1,0 +1,230 @@
+From: Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>
+Date: Wed, 11 Jul 2018 23:02:26 -0300
+Subject: drm/vkms: Add vblank events simulated by hrtimers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 3a0709928b172a4123a76078f70e0a706265690c
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This commit adds regular vblank events simulated through hrtimers, which
+is a feature required by VKMS to mimic real hardware. Additionally, all
+the vblank event send after pageflip is kept in the atomic_flush
+function.
+
+Changes since V1:
+ - Compute the vblank timer interval per interruption
+ Ville Syrjälä and Daniel Vetter:
+ - Removes hardcoded vblank interval to get it from user space
+
+Changes since V2:
+ Chris Wilson
+ - Removes unnecessary algorithm to compute the next period
+ Daniel Vetter:
+ - Uses drm_calc_timestamping_constants to get the vblank interval
+   instead of calculating it manually
+ - Adds disable_vblank helper that turns of crtc
+ - Simplifies implementation by using drm_crtc_arm_vblank_event
+ - Replaces the code in atomic_begin to atomic_flush
+ - Removes unnecessary field in vkms_output
+
+Changes since V3:
+ Daniel Vetter:
+ - Squash "drm/vkms: Add atomic helpers functions" into the commit that
+   handling vblank events simulated by hrtimers
+
+Signed-off-by: Rodrigo Siqueira <rodrigosiqueiramelo@gmail.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/7709bba40782ec06332d57fff337797b272581fc.1531359228.git.rodrigosiqueiramelo@gmail.com
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/vkms/vkms_crtc.c |   95 +++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/vkms/vkms_drv.c  |    9 +++
+ drivers/gpu/drm/vkms/vkms_drv.h  |   15 ++++++
+ 3 files changed, 119 insertions(+)
+
+--- a/drivers/gpu/drm/vkms/vkms_crtc.c
++++ b/drivers/gpu/drm/vkms/vkms_crtc.c
+@@ -10,6 +10,60 @@
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_crtc_helper.h>
+ 
++static enum hrtimer_restart vkms_vblank_simulate(struct hrtimer *timer)
++{
++	struct vkms_output *output = container_of(timer, struct vkms_output,
++						  vblank_hrtimer);
++	struct drm_crtc *crtc = &output->crtc;
++	int ret_overrun;
++	bool ret;
++
++	ret = drm_crtc_handle_vblank(crtc);
++	if (!ret)
++		DRM_ERROR("vkms failure on handling vblank");
++
++	ret_overrun = hrtimer_forward_now(&output->vblank_hrtimer,
++					  output->period_ns);
++
++	return HRTIMER_RESTART;
++}
++
++static int vkms_enable_vblank(struct drm_crtc *crtc)
++{
++	struct drm_device *dev = crtc->dev;
++	unsigned int pipe = drm_crtc_index(crtc);
++	struct drm_vblank_crtc *vblank = &dev->vblank[pipe];
++	struct vkms_output *out = drm_crtc_to_vkms_output(crtc);
++
++	drm_calc_timestamping_constants(crtc, &crtc->mode);
++
++	hrtimer_init(&out->vblank_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	out->vblank_hrtimer.function = &vkms_vblank_simulate;
++	out->period_ns = ktime_set(0, vblank->framedur_ns);
++	hrtimer_start(&out->vblank_hrtimer, out->period_ns, HRTIMER_MODE_REL);
++
++	return 0;
++}
++
++static void vkms_disable_vblank(struct drm_crtc *crtc)
++{
++	struct vkms_output *out = drm_crtc_to_vkms_output(crtc);
++
++	hrtimer_cancel(&out->vblank_hrtimer);
++}
++
++bool vkms_get_vblank_timestamp(struct drm_device *dev, unsigned int pipe,
++			       int *max_error, ktime_t *vblank_time,
++			       bool in_vblank_irq)
++{
++	struct vkms_device *vkmsdev = drm_device_to_vkms_device(dev);
++	struct vkms_output *output = &vkmsdev->output;
++
++	*vblank_time = output->vblank_hrtimer.node.expires;
++
++	return true;
++}
++
+ static const struct drm_crtc_funcs vkms_crtc_funcs = {
+ 	.set_config             = drm_atomic_helper_set_config,
+ 	.destroy                = drm_crtc_cleanup,
+@@ -17,6 +71,45 @@ static const struct drm_crtc_funcs vkms_
+ 	.reset                  = drm_atomic_helper_crtc_reset,
+ 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+ 	.atomic_destroy_state   = drm_atomic_helper_crtc_destroy_state,
++	.enable_vblank		= vkms_enable_vblank,
++	.disable_vblank		= vkms_disable_vblank,
++};
++
++static void vkms_crtc_atomic_enable(struct drm_crtc *crtc,
++				    struct drm_crtc_state *old_state)
++{
++	drm_crtc_vblank_on(crtc);
++}
++
++static void vkms_crtc_atomic_disable(struct drm_crtc *crtc,
++				     struct drm_crtc_state *old_state)
++{
++	drm_crtc_vblank_off(crtc);
++}
++
++static void vkms_crtc_atomic_flush(struct drm_crtc *crtc,
++				   struct drm_crtc_state *old_crtc_state)
++{
++	unsigned long flags;
++
++	if (crtc->state->event) {
++		spin_lock_irqsave(&crtc->dev->event_lock, flags);
++
++		if (drm_crtc_vblank_get(crtc) != 0)
++			drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		else
++			drm_crtc_arm_vblank_event(crtc, crtc->state->event);
++
++		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++
++		crtc->state->event = NULL;
++	}
++}
++
++static const struct drm_crtc_helper_funcs vkms_crtc_helper_funcs = {
++	.atomic_flush	= vkms_crtc_atomic_flush,
++	.atomic_enable	= vkms_crtc_atomic_enable,
++	.atomic_disable	= vkms_crtc_atomic_disable,
+ };
+ 
+ int vkms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
+@@ -31,5 +124,7 @@ int vkms_crtc_init(struct drm_device *de
+ 		return ret;
+ 	}
+ 
++	drm_crtc_helper_add(crtc, &vkms_crtc_helper_funcs);
++
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/vkms/vkms_drv.c
++++ b/drivers/gpu/drm/vkms/vkms_drv.c
+@@ -54,6 +54,7 @@ static struct drm_driver vkms_driver = {
+ 	.dumb_map_offset	= vkms_dumb_map,
+ 	.gem_vm_ops		= &vkms_gem_vm_ops,
+ 	.gem_free_object_unlocked = vkms_gem_free_object,
++	.get_vblank_timestamp	= vkms_get_vblank_timestamp,
+ 
+ 	.name			= DRIVER_NAME,
+ 	.desc			= DRIVER_DESC,
+@@ -100,6 +101,14 @@ static int __init vkms_init(void)
+ 		goto out_fini;
+ 	}
+ 
++	vkms_device->drm.irq_enabled = true;
++
++	ret = drm_vblank_init(&vkms_device->drm, 1);
++	if (ret) {
++		DRM_ERROR("Failed to vblank\n");
++		goto out_fini;
++	}
++
+ 	ret = vkms_modeset_init(vkms_device);
+ 	if (ret)
+ 		goto out_unregister;
+--- a/drivers/gpu/drm/vkms/vkms_drv.h
++++ b/drivers/gpu/drm/vkms/vkms_drv.h
+@@ -5,6 +5,7 @@
+ #include <drm/drm.h>
+ #include <drm/drm_gem.h>
+ #include <drm/drm_encoder.h>
++#include <linux/hrtimer.h>
+ 
+ #define XRES_MIN    32
+ #define YRES_MIN    32
+@@ -23,6 +24,9 @@ struct vkms_output {
+ 	struct drm_crtc crtc;
+ 	struct drm_encoder encoder;
+ 	struct drm_connector connector;
++	struct hrtimer vblank_hrtimer;
++	ktime_t period_ns;
++	struct drm_pending_vblank_event *event;
+ };
+ 
+ struct vkms_device {
+@@ -37,9 +41,20 @@ struct vkms_gem_object {
+ 	struct page **pages;
+ };
+ 
++#define drm_crtc_to_vkms_output(target) \
++	container_of(target, struct vkms_output, crtc)
++
++#define drm_device_to_vkms_device(target) \
++	container_of(target, struct vkms_device, drm)
++
++/* CRTC */
+ int vkms_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
+ 		   struct drm_plane *primary, struct drm_plane *cursor);
+ 
++bool vkms_get_vblank_timestamp(struct drm_device *dev, unsigned int pipe,
++			       int *max_error, ktime_t *vblank_time,
++			       bool in_vblank_irq);
++
+ int vkms_output_init(struct vkms_device *vkmsdev);
+ 
+ struct drm_plane *vkms_plane_init(struct vkms_device *vkmsdev);

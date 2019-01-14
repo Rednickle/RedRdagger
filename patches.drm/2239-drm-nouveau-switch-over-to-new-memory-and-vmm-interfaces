@@ -1,0 +1,669 @@
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 1 Nov 2017 03:56:20 +1000
+Subject: drm/nouveau: switch over to new memory and vmm interfaces
+Git-commit: d7722134b8254bcee6086230723814cddf9ab54b
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/nouveau/include/nvif/device.h |    2 
+ drivers/gpu/drm/nouveau/nouveau_bo.c          |   92 ++++++++----
+ drivers/gpu/drm/nouveau/nouveau_chan.c        |   11 +
+ drivers/gpu/drm/nouveau/nouveau_gem.c         |    1 
+ drivers/gpu/drm/nouveau/nouveau_mem.c         |  192 +++++++++++++++-----------
+ drivers/gpu/drm/nouveau/nouveau_mem.h         |   21 --
+ drivers/gpu/drm/nouveau/nouveau_sgdma.c       |    2 
+ drivers/gpu/drm/nouveau/nouveau_ttm.c         |   18 --
+ drivers/gpu/drm/nouveau/nouveau_vmm.c         |   24 +--
+ drivers/gpu/drm/nouveau/nouveau_vmm.h         |    2 
+ 10 files changed, 209 insertions(+), 156 deletions(-)
+
+--- a/drivers/gpu/drm/nouveau/include/nvif/device.h
++++ b/drivers/gpu/drm/nouveau/include/nvif/device.h
+@@ -38,7 +38,6 @@ u64  nvif_device_time(struct nvif_device
+ /*XXX*/
+ #include <subdev/bios.h>
+ #include <subdev/fb.h>
+-#include <subdev/mmu.h>
+ #include <subdev/bar.h>
+ #include <subdev/gpio.h>
+ #include <subdev/clk.h>
+@@ -57,7 +56,6 @@ u64  nvif_device_time(struct nvif_device
+ })
+ #define nvxx_bios(a) nvxx_device(a)->bios
+ #define nvxx_fb(a) nvxx_device(a)->fb
+-#define nvxx_mmu(a) nvxx_device(a)->mmu
+ #define nvxx_gpio(a) nvxx_device(a)->gpio
+ #define nvxx_clk(a) nvxx_device(a)->clk
+ #define nvxx_i2c(a) nvxx_device(a)->i2c
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -40,6 +40,10 @@
+ #include "nouveau_mem.h"
+ #include "nouveau_vmm.h"
+ 
++#include <nvif/class.h>
++#include <nvif/if500b.h>
++#include <nvif/if900b.h>
++
+ /*
+  * NV10-NV40 tiling helpers
+  */
+@@ -1034,21 +1038,18 @@ nouveau_bo_move_prep(struct nouveau_drm
+ {
+ 	struct nouveau_mem *old_mem = nouveau_mem(&bo->mem);
+ 	struct nouveau_mem *new_mem = nouveau_mem(reg);
+-	struct nvkm_vm *vmm = drm->client.vm;
+-	u64 size = (u64)reg->num_pages << PAGE_SHIFT;
++	struct nvif_vmm *vmm = &drm->client.vmm.vmm;
+ 	int ret;
+ 
+-	ret = nvkm_vm_get(vmm, size, old_mem->mem.page, NV_MEM_ACCESS_RW,
+-			  &old_mem->vma[0]);
++	ret = nvif_vmm_get(vmm, LAZY, false, old_mem->mem.page, 0,
++			   old_mem->mem.size, &old_mem->vma[0]);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = nvkm_vm_get(vmm, size, new_mem->mem.page, NV_MEM_ACCESS_RW,
+-			  &old_mem->vma[1]);
+-	if (ret) {
+-		nvkm_vm_put(&old_mem->vma[0]);
+-		return ret;
+-	}
++	ret = nvif_vmm_get(vmm, LAZY, false, new_mem->mem.page, 0,
++			   new_mem->mem.size, &old_mem->vma[1]);
++	if (ret)
++		goto done;
+ 
+ 	ret = nouveau_mem_map(old_mem, vmm, &old_mem->vma[0]);
+ 	if (ret)
+@@ -1057,8 +1058,8 @@ nouveau_bo_move_prep(struct nouveau_drm
+ 	ret = nouveau_mem_map(new_mem, vmm, &old_mem->vma[1]);
+ done:
+ 	if (ret) {
+-		nvkm_vm_put(&old_mem->vma[1]);
+-		nvkm_vm_put(&old_mem->vma[0]);
++		nvif_vmm_put(vmm, &old_mem->vma[1]);
++		nvif_vmm_put(vmm, &old_mem->vma[0]);
+ 	}
+ 	return 0;
+ }
+@@ -1374,7 +1375,6 @@ nouveau_ttm_io_mem_reserve(struct ttm_bo
+ 	struct nouveau_drm *drm = nouveau_bdev(bdev);
+ 	struct nvkm_device *device = nvxx_device(&drm->client.device);
+ 	struct nouveau_mem *mem = nouveau_mem(reg);
+-	int ret;
+ 
+ 	reg->bus.addr = NULL;
+ 	reg->bus.offset = 0;
+@@ -1395,7 +1395,7 @@ nouveau_ttm_io_mem_reserve(struct ttm_bo
+ 			reg->bus.is_iomem = !drm->agp.cma;
+ 		}
+ #endif
+-		if (drm->client.device.info.family < NV_DEVICE_INFO_V0_TESLA || !mem->kind)
++		if (drm->client.mem->oclass < NVIF_CLASS_MEM_NV50 || !mem->kind)
+ 			/* untiled */
+ 			break;
+ 		/* fallthrough, tiled memory */
+@@ -1403,20 +1403,40 @@ nouveau_ttm_io_mem_reserve(struct ttm_bo
+ 		reg->bus.offset = reg->start << PAGE_SHIFT;
+ 		reg->bus.base = device->func->resource_addr(device, 1);
+ 		reg->bus.is_iomem = true;
+-		if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_TESLA) {
+-			struct nvkm_vmm *bar = nvkm_bar_bar1_vmm(device);
+-			int page_shift = 12;
+-			if (drm->client.device.info.family >= NV_DEVICE_INFO_V0_FERMI)
+-				page_shift = mem->mem.page;
+-
+-			ret = nvkm_vm_get(bar, mem->_mem->size << 12,
+-					  page_shift, NV_MEM_ACCESS_RW,
+-					  &mem->bar_vma);
+-			if (ret)
+-				return ret;
++		if (drm->client.mem->oclass >= NVIF_CLASS_MEM_NV50) {
++			union {
++				struct nv50_mem_map_v0 nv50;
++				struct gf100_mem_map_v0 gf100;
++			} args;
++			u64 handle, length;
++			u32 argc = 0;
++			int ret;
++
++			switch (mem->mem.object.oclass) {
++			case NVIF_CLASS_MEM_NV50:
++				args.nv50.version = 0;
++				args.nv50.ro = 0;
++				args.nv50.kind = mem->kind;
++				args.nv50.comp = mem->comp;
++				break;
++			case NVIF_CLASS_MEM_GF100:
++				args.gf100.version = 0;
++				args.gf100.ro = 0;
++				args.gf100.kind = mem->kind;
++				break;
++			default:
++				WARN_ON(1);
++				break;
++			}
+ 
+-			nvkm_vm_map(&mem->bar_vma, mem->_mem);
+-			reg->bus.offset = mem->bar_vma.offset;
++			ret = nvif_object_map_handle(&mem->mem.object,
++						     &argc, argc,
++						     &handle, &length);
++			if (ret != 1)
++				return ret ? ret : -EINVAL;
++
++			reg->bus.base = 0;
++			reg->bus.offset = handle;
+ 		}
+ 		break;
+ 	default:
+@@ -1428,12 +1448,22 @@ nouveau_ttm_io_mem_reserve(struct ttm_bo
+ static void
+ nouveau_ttm_io_mem_free(struct ttm_bo_device *bdev, struct ttm_mem_reg *reg)
+ {
++	struct nouveau_drm *drm = nouveau_bdev(bdev);
+ 	struct nouveau_mem *mem = nouveau_mem(reg);
+ 
+-	if (!mem->bar_vma.node)
+-		return;
+-
+-	nvkm_vm_put(&mem->bar_vma);
++	if (drm->client.mem->oclass >= NVIF_CLASS_MEM_NV50) {
++		switch (reg->mem_type) {
++		case TTM_PL_TT:
++			if (mem->kind)
++				nvif_object_unmap_handle(&mem->mem.object);
++			break;
++		case TTM_PL_VRAM:
++			nvif_object_unmap_handle(&mem->mem.object);
++			break;
++		default:
++			break;
++		}
++	}
+ }
+ 
+ static int
+--- a/drivers/gpu/drm/nouveau/nouveau_chan.c
++++ b/drivers/gpu/drm/nouveau/nouveau_chan.c
+@@ -84,6 +84,14 @@ nouveau_channel_del(struct nouveau_chann
+ {
+ 	struct nouveau_channel *chan = *pchan;
+ 	if (chan) {
++		struct nouveau_cli *cli = (void *)chan->user.client;
++		bool super;
++
++		if (cli) {
++			super = cli->base.super;
++			cli->base.super = true;
++		}
++
+ 		if (chan->fence)
+ 			nouveau_fence(chan->drm)->context_del(chan);
+ 		nvif_object_fini(&chan->nvsw);
+@@ -98,6 +106,9 @@ nouveau_channel_del(struct nouveau_chann
+ 			nouveau_bo_unpin(chan->push.buffer);
+ 		nouveau_bo_ref(NULL, &chan->push.buffer);
+ 		kfree(chan);
++
++		if (cli)
++			cli->base.super = super;
+ 	}
+ 	*pchan = NULL;
+ }
+--- a/drivers/gpu/drm/nouveau/nouveau_gem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_gem.c
+@@ -31,6 +31,7 @@
+ 
+ #include "nouveau_ttm.h"
+ #include "nouveau_gem.h"
++#include "nouveau_mem.h"
+ #include "nouveau_vmm.h"
+ 
+ #include <nvif/class.h>
+--- a/drivers/gpu/drm/nouveau/nouveau_mem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_mem.c
+@@ -25,19 +25,70 @@
+ 
+ #include <drm/ttm/ttm_bo_driver.h>
+ 
++#include <nvif/class.h>
++#include <nvif/if000a.h>
++#include <nvif/if500b.h>
++#include <nvif/if500d.h>
++#include <nvif/if900b.h>
++#include <nvif/if900d.h>
++
+ int
+ nouveau_mem_map(struct nouveau_mem *mem,
+-		struct nvkm_vmm *vmm, struct nvkm_vma *vma)
++		struct nvif_vmm *vmm, struct nvif_vma *vma)
+ {
+-	nvkm_vm_map(vma, mem->_mem);
+-	return 0;
++	union {
++		struct nv50_vmm_map_v0 nv50;
++		struct gf100_vmm_map_v0 gf100;
++	} args;
++	u32 argc = 0;
++	bool super;
++	int ret;
++
++	switch (vmm->object.oclass) {
++	case NVIF_CLASS_VMM_NV04:
++		break;
++	case NVIF_CLASS_VMM_NV50:
++		args.nv50.version = 0;
++		args.nv50.ro = 0;
++		args.nv50.priv = 0;
++		args.nv50.kind = mem->kind;
++		args.nv50.comp = mem->comp;
++		argc = sizeof(args.nv50);
++		break;
++	case NVIF_CLASS_VMM_GF100:
++	case NVIF_CLASS_VMM_GM200:
++	case NVIF_CLASS_VMM_GP100:
++		args.gf100.version = 0;
++		if (mem->mem.type & NVIF_MEM_VRAM)
++			args.gf100.vol = 0;
++		else
++			args.gf100.vol = 1;
++		args.gf100.ro = 0;
++		args.gf100.priv = 0;
++		args.gf100.kind = mem->kind;
++		argc = sizeof(args.gf100);
++		break;
++	default:
++		WARN_ON(1);
++		return -ENOSYS;
++	}
++
++	super = vmm->object.client->super;
++	vmm->object.client->super = true;
++	ret = nvif_vmm_map(vmm, vma->addr, mem->mem.size, &args, argc,
++			   &mem->mem, 0);
++	vmm->object.client->super = super;
++	return ret;
+ }
+ 
+ void
+ nouveau_mem_fini(struct nouveau_mem *mem)
+ {
+-	nvkm_vm_put(&mem->vma[1]);
+-	nvkm_vm_put(&mem->vma[0]);
++	nvif_vmm_put(&mem->cli->drm->client.vmm.vmm, &mem->vma[1]);
++	nvif_vmm_put(&mem->cli->drm->client.vmm.vmm, &mem->vma[0]);
++	mutex_lock(&mem->cli->drm->master.lock);
++	nvif_mem_fini(&mem->mem);
++	mutex_unlock(&mem->cli->drm->master.lock);
+ }
+ 
+ int
+@@ -45,67 +96,79 @@ nouveau_mem_host(struct ttm_mem_reg *reg
+ {
+ 	struct nouveau_mem *mem = nouveau_mem(reg);
+ 	struct nouveau_cli *cli = mem->cli;
++	struct nouveau_drm *drm = cli->drm;
++	struct nvif_mmu *mmu = &cli->mmu;
++	struct nvif_mem_ram_v0 args = {};
++	bool super = cli->base.super;
++	u8 type;
++	int ret;
++
++	if (mmu->type[drm->ttm.type_host].type & NVIF_MEM_UNCACHED)
++		type = drm->ttm.type_ncoh;
++	else
++		type = drm->ttm.type_host;
+ 
+-	if (mem->kind && cli->device.info.chipset == 0x50)
++	if (mem->kind && !(mmu->type[type].type & NVIF_MEM_KIND))
+ 		mem->comp = mem->kind = 0;
+-	if (mem->comp) {
+-		if (cli->device.info.chipset >= 0xc0)
+-			mem->kind = gf100_pte_storage_type_map[mem->kind];
++	if (mem->comp && !(mmu->type[type].type & NVIF_MEM_COMP)) {
++		if (mmu->object.oclass >= NVIF_CLASS_MMU_GF100)
++			mem->kind = mmu->kind[mem->kind];
+ 		mem->comp = 0;
+ 	}
+ 
+-	mem->__mem.size = (reg->num_pages << PAGE_SHIFT) >> 12;
+-	mem->__mem.memtype = (mem->comp << 7) | mem->kind;
+-	if (tt->ttm.sg) mem->__mem.sg    = tt->ttm.sg;
+-	else            mem->__mem.pages = tt->dma_address;
+-	mem->_mem = &mem->__mem;
+-	mem->mem.page = 12;
+-	mem->_mem->memory = &mem->memory;
+-	return 0;
+-}
+-
+-#include <subdev/fb/nv50.h>
++	if (tt->ttm.sg) args.sgl = tt->ttm.sg->sgl;
++	else            args.dma = tt->dma_address;
+ 
+-struct nvkm_vram {
+-	struct nvkm_memory memory;
+-	struct nvkm_ram *ram;
+-	u8 page;
+-	struct nvkm_mm_node *mn;
+-};
++	mutex_lock(&drm->master.lock);
++	cli->base.super = true;
++	ret = nvif_mem_init_type(mmu, cli->mem->oclass, type, PAGE_SHIFT,
++				 reg->num_pages << PAGE_SHIFT,
++				 &args, sizeof(args), &mem->mem);
++	cli->base.super = super;
++	mutex_unlock(&drm->master.lock);
++	return ret;
++}
+ 
+ int
+ nouveau_mem_vram(struct ttm_mem_reg *reg, bool contig, u8 page)
+ {
+ 	struct nouveau_mem *mem = nouveau_mem(reg);
+ 	struct nouveau_cli *cli = mem->cli;
+-	struct nvkm_device *device = nvxx_device(&cli->device);
++	struct nouveau_drm *drm = cli->drm;
++	struct nvif_mmu *mmu = &cli->mmu;
++	bool super = cli->base.super;
+ 	u64 size = ALIGN(reg->num_pages << PAGE_SHIFT, 1 << page);
+-	u8  type;
+ 	int ret;
+ 
+-	mem->mem.page = page;
+-	mem->_mem = &mem->__mem;
+-
+-	if (cli->device.info.chipset < 0xc0) {
+-		type = nv50_fb_memtype[mem->kind];
+-	} else {
+-		if (!mem->comp)
+-			mem->kind = gf100_pte_storage_type_map[mem->kind];
+-		mem->comp = 0;
+-		type = 0x01;
++	mutex_lock(&drm->master.lock);
++	cli->base.super = true;
++	switch (cli->mem->oclass) {
++	case NVIF_CLASS_MEM_GF100:
++		ret = nvif_mem_init_type(mmu, cli->mem->oclass,
++					 drm->ttm.type_vram, page, size,
++					 &(struct gf100_mem_v0) {
++						.contig = contig,
++					 }, sizeof(struct gf100_mem_v0),
++					 &mem->mem);
++		break;
++	case NVIF_CLASS_MEM_NV50:
++		ret = nvif_mem_init_type(mmu, cli->mem->oclass,
++					 drm->ttm.type_vram, page, size,
++					 &(struct nv50_mem_v0) {
++						.bankswz = mmu->kind[mem->kind] == 2,
++						.contig = contig,
++					 }, sizeof(struct nv50_mem_v0),
++					 &mem->mem);
++		break;
++	default:
++		ret = -ENOSYS;
++		WARN_ON(1);
++		break;
+ 	}
++	cli->base.super = super;
++	mutex_unlock(&drm->master.lock);
+ 
+-	ret = nvkm_ram_get(device, NVKM_RAM_MM_NORMAL, type, page, size,
+-			   contig, false, &mem->_mem->memory);
+-	if (ret)
+-		return ret;
+-
+-	mem->_mem->size = size >> NVKM_RAM_MM_SHIFT;
+-	mem->_mem->offset = nvkm_memory_addr(mem->_mem->memory);
+-	mem->_mem->mem = ((struct nvkm_vram *)mem->_mem->memory)->mn;
+-	mem->_mem->memtype = (mem->comp << 7) | mem->kind;
+-
+-	reg->start = mem->_mem->offset >> PAGE_SHIFT;
++	reg->start = mem->mem.addr >> PAGE_SHIFT;
+ 	return ret;
+ }
+ 
+@@ -118,36 +181,6 @@ nouveau_mem_del(struct ttm_mem_reg *reg)
+ 	reg->mm_node = NULL;
+ }
+ 
+-static enum nvkm_memory_target
+-nouveau_mem_memory_target(struct nvkm_memory *memory)
+-{
+-	struct nouveau_mem *mem = container_of(memory, typeof(*mem), memory);
+-	if (mem->_mem->mem)
+-		return NVKM_MEM_TARGET_VRAM;
+-	return NVKM_MEM_TARGET_HOST;
+-};
+-
+-static u8
+-nouveau_mem_memory_page(struct nvkm_memory *memory)
+-{
+-	struct nouveau_mem *mem = container_of(memory, typeof(*mem), memory);
+-	return mem->mem.page;
+-};
+-
+-static u64
+-nouveau_mem_memory_size(struct nvkm_memory *memory)
+-{
+-	struct nouveau_mem *mem = container_of(memory, typeof(*mem), memory);
+-	return mem->_mem->size << 12;
+-}
+-
+-static const struct nvkm_memory_func
+-nouveau_mem_memory = {
+-	.target = nouveau_mem_memory_target,
+-	.page = nouveau_mem_memory_page,
+-	.size = nouveau_mem_memory_size,
+-};
+-
+ int
+ nouveau_mem_new(struct nouveau_cli *cli, u8 kind, u8 comp,
+ 		struct ttm_mem_reg *reg)
+@@ -159,7 +192,6 @@ nouveau_mem_new(struct nouveau_cli *cli,
+ 	mem->cli = cli;
+ 	mem->kind = kind;
+ 	mem->comp = comp;
+-	nvkm_memory_ctor(&nouveau_mem_memory, &mem->memory);
+ 
+ 	reg->mm_node = mem;
+ 	return 0;
+--- a/drivers/gpu/drm/nouveau/nouveau_mem.h
++++ b/drivers/gpu/drm/nouveau/nouveau_mem.h
+@@ -1,12 +1,11 @@
+ #ifndef __NOUVEAU_MEM_H__
+ #define __NOUVEAU_MEM_H__
+-#include <core/memory.h>
+-#include <subdev/fb.h>
+-#include <subdev/mmu.h>
+-
+ #include <drm/ttm/ttm_bo_api.h>
+ struct ttm_dma_tt;
+ 
++#include <nvif/mem.h>
++#include <nvif/vmm.h>
++
+ static inline struct nouveau_mem *
+ nouveau_mem(struct ttm_mem_reg *reg)
+ {
+@@ -17,16 +16,8 @@ struct nouveau_mem {
+ 	struct nouveau_cli *cli;
+ 	u8 kind;
+ 	u8 comp;
+-	struct {
+-		u8 page;
+-	} mem;
+-	struct nvkm_vma vma[2];
+-
+-	struct nvkm_mem __mem;
+-	struct nvkm_mem *_mem;
+-	struct nvkm_vma bar_vma;
+-
+-	struct nvkm_memory memory;
++	struct nvif_mem mem;
++	struct nvif_vma vma[2];
+ };
+ 
+ int nouveau_mem_new(struct nouveau_cli *, u8 kind, u8 comp,
+@@ -35,5 +26,5 @@ void nouveau_mem_del(struct ttm_mem_reg
+ int nouveau_mem_vram(struct ttm_mem_reg *, bool contig, u8 page);
+ int nouveau_mem_host(struct ttm_mem_reg *, struct ttm_dma_tt *);
+ void nouveau_mem_fini(struct nouveau_mem *);
+-int nouveau_mem_map(struct nouveau_mem *, struct nvkm_vmm *, struct nvkm_vma *);
++int nouveau_mem_map(struct nouveau_mem *, struct nvif_vmm *, struct nvif_vma *);
+ #endif
+--- a/drivers/gpu/drm/nouveau/nouveau_sgdma.c
++++ b/drivers/gpu/drm/nouveau/nouveau_sgdma.c
+@@ -35,7 +35,7 @@ nv04_sgdma_bind(struct ttm_tt *ttm, stru
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = nouveau_mem_map(mem, mem->cli->vm, &mem->vma[0]);
++	ret = nouveau_mem_map(mem, &mem->cli->vmm.vmm, &mem->vma[0]);
+ 	if (ret) {
+ 		nouveau_mem_fini(mem);
+ 		return ret;
+--- a/drivers/gpu/drm/nouveau/nouveau_ttm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_ttm.c
+@@ -56,15 +56,6 @@ nouveau_manager_debug(struct ttm_mem_typ
+ {
+ }
+ 
+-static void
+-nouveau_vram_manager_del(struct ttm_mem_type_manager *man,
+-			 struct ttm_mem_reg *reg)
+-{
+-	struct nvkm_memory *memory = nouveau_mem(reg)->_mem->memory;
+-	nouveau_mem_del(reg);
+-	nvkm_memory_unref(&memory);
+-}
+-
+ static int
+ nouveau_vram_manager_new(struct ttm_mem_type_manager *man,
+ 			 struct ttm_buffer_object *bo,
+@@ -101,7 +92,7 @@ const struct ttm_mem_type_manager_func n
+ 	.init = nouveau_manager_init,
+ 	.takedown = nouveau_manager_fini,
+ 	.get_node = nouveau_vram_manager_new,
+-	.put_node = nouveau_vram_manager_del,
++	.put_node = nouveau_manager_del,
+ 	.debug = nouveau_manager_debug,
+ };
+ 
+@@ -121,7 +112,6 @@ nouveau_gart_manager_new(struct ttm_mem_
+ 	if (ret)
+ 		return ret;
+ 
+-	mem->_mem = &mem->__mem;
+ 	reg->start = 0;
+ 	return 0;
+ }
+@@ -143,7 +133,6 @@ nv04_gart_manager_new(struct ttm_mem_typ
+ 	struct nouveau_bo *nvbo = nouveau_bo(bo);
+ 	struct nouveau_drm *drm = nvbo->cli->drm;
+ 	struct nouveau_mem *mem;
+-	struct nvkm_mmu *mmu = nvxx_mmu(&drm->client.device);
+ 	int ret;
+ 
+ 	ret = nouveau_mem_new(&drm->master, nvbo->kind, nvbo->comp, reg);
+@@ -151,8 +140,8 @@ nv04_gart_manager_new(struct ttm_mem_typ
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = nvkm_vm_get(mmu->vmm, reg->num_pages << 12, 12,
+-			  NV_MEM_ACCESS_RW, &mem->vma[0]);
++	ret = nvif_vmm_get(&mem->cli->vmm.vmm, PTES, false, 12, 0,
++			   reg->num_pages << PAGE_SHIFT, &mem->vma[0]);
+ 	if (ret) {
+ 		nouveau_mem_del(reg);
+ 		if (ret == -ENOSPC) {
+@@ -162,7 +151,6 @@ nv04_gart_manager_new(struct ttm_mem_typ
+ 		return ret;
+ 	}
+ 
+-	mem->_mem = &mem->__mem;
+ 	reg->start = mem->vma[0].addr >> PAGE_SHIFT;
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/nouveau/nouveau_vmm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_vmm.c
+@@ -28,7 +28,7 @@ void
+ nouveau_vma_unmap(struct nouveau_vma *vma)
+ {
+ 	if (vma->mem) {
+-		nvkm_vm_unmap(&vma->_vma);
++		nvif_vmm_unmap(&vma->vmm->vmm, vma->addr);
+ 		vma->mem = NULL;
+ 	}
+ }
+@@ -36,7 +36,8 @@ nouveau_vma_unmap(struct nouveau_vma *vm
+ int
+ nouveau_vma_map(struct nouveau_vma *vma, struct nouveau_mem *mem)
+ {
+-	int ret = nouveau_mem_map(mem, vma->vmm->vm, &vma->_vma);
++	struct nvif_vma tmp = { .addr = vma->addr };
++	int ret = nouveau_mem_map(mem, &vma->vmm->vmm, &tmp);
+ 	if (ret)
+ 		return ret;
+ 	vma->mem = mem;
+@@ -61,8 +62,10 @@ nouveau_vma_del(struct nouveau_vma **pvm
+ {
+ 	struct nouveau_vma *vma = *pvma;
+ 	if (vma && --vma->refs <= 0) {
+-		if (likely(vma->addr != ~0ULL))
+-			nvkm_vm_put(&vma->_vma);
++		if (likely(vma->addr != ~0ULL)) {
++			struct nvif_vma tmp = { .addr = vma->addr, .size = 1 };
++			nvif_vmm_put(&vma->vmm->vmm, &tmp);
++		}
+ 		list_del(&vma->head);
+ 		*pvma = NULL;
+ 		kfree(*pvma);
+@@ -75,6 +78,7 @@ nouveau_vma_new(struct nouveau_bo *nvbo,
+ {
+ 	struct nouveau_mem *mem = nouveau_mem(&nvbo->bo.mem);
+ 	struct nouveau_vma *vma;
++	struct nvif_vma tmp;
+ 	int ret;
+ 
+ 	if ((vma = *pvma = nouveau_vma_find(nvbo, vmm))) {
+@@ -92,17 +96,17 @@ nouveau_vma_new(struct nouveau_bo *nvbo,
+ 
+ 	if (nvbo->bo.mem.mem_type != TTM_PL_SYSTEM &&
+ 	    mem->mem.page == nvbo->page) {
+-		ret = nvkm_vm_get(vmm->vm, mem->_mem->size << 12, mem->mem.page,
+-				  NV_MEM_ACCESS_RW, &vma->_vma);
++		ret = nvif_vmm_get(&vmm->vmm, LAZY, false, mem->mem.page, 0,
++				   mem->mem.size, &tmp);
+ 		if (ret)
+ 			goto done;
+ 
+-		vma->addr = vma->_vma.offset;
++		vma->addr = tmp.addr;
+ 		ret = nouveau_vma_map(vma, mem);
+ 	} else {
+-		ret = nvkm_vm_get(vmm->vm, mem->_mem->size << 12, mem->mem.page,
+-				  NV_MEM_ACCESS_RW, &vma->_vma);
+-		vma->addr = vma->_vma.offset;
++		ret = nvif_vmm_get(&vmm->vmm, PTES, false, mem->mem.page, 0,
++				   mem->mem.size, &tmp);
++		vma->addr = tmp.addr;
+ 	}
+ 
+ done:
+--- a/drivers/gpu/drm/nouveau/nouveau_vmm.h
++++ b/drivers/gpu/drm/nouveau/nouveau_vmm.h
+@@ -12,8 +12,6 @@ struct nouveau_vma {
+ 	u64 addr;
+ 
+ 	struct nouveau_mem *mem;
+-
+-	struct nvkm_vma _vma;
+ };
+ 
+ struct nouveau_vma *nouveau_vma_find(struct nouveau_bo *, struct nouveau_vmm *);

@@ -1,0 +1,376 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Sat, 14 Jul 2018 19:05:59 -0400
+Subject: drm/amdkfd: Add CU-masking ioctl to KFD
+Git-commit: 39e7f331864d2b9e30d5f3fd2121e182b2c9c8a9
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+CU-masking allows a KFD client to control the set of CUs used by a
+user mode queue for executing compute dispatches. This can be used
+for optimizing the partitioning of the GPU and minimize conflicts
+between concurrent tasks.
+
+Signed-off-by: Flora Cui <flora.cui@amd.com>
+Signed-off-by: Kent Russell <kent.russell@amd.com>
+Signed-off-by: Eric Huang <JinHuiEric.Huang@amd.com>
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Oded Gabbay <oded.gabbay@gmail.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c               |   58 +++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c          |    1 
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c           |   41 +++++++++++-
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h           |    4 +
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c       |   27 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c        |   27 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c        |   27 +++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h                  |    5 +
+ drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c |   30 ++++++++
+ 9 files changed, 219 insertions(+), 1 deletion(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -392,6 +392,61 @@ static int kfd_ioctl_update_queue(struct
+ 	return retval;
+ }
+ 
++static int kfd_ioctl_set_cu_mask(struct file *filp, struct kfd_process *p,
++					void *data)
++{
++	int retval;
++	const int max_num_cus = 1024;
++	struct kfd_ioctl_set_cu_mask_args *args = data;
++	struct queue_properties properties;
++	uint32_t __user *cu_mask_ptr = (uint32_t __user *)args->cu_mask_ptr;
++	size_t cu_mask_size = sizeof(uint32_t) * (args->num_cu_mask / 32);
++
++	if ((args->num_cu_mask % 32) != 0) {
++		pr_debug("num_cu_mask 0x%x must be a multiple of 32",
++				args->num_cu_mask);
++		return -EINVAL;
++	}
++
++	properties.cu_mask_count = args->num_cu_mask;
++	if (properties.cu_mask_count == 0) {
++		pr_debug("CU mask cannot be 0");
++		return -EINVAL;
++	}
++
++	/* To prevent an unreasonably large CU mask size, set an arbitrary
++	 * limit of max_num_cus bits.  We can then just drop any CU mask bits
++	 * past max_num_cus bits and just use the first max_num_cus bits.
++	 */
++	if (properties.cu_mask_count > max_num_cus) {
++		pr_debug("CU mask cannot be greater than 1024 bits");
++		properties.cu_mask_count = max_num_cus;
++		cu_mask_size = sizeof(uint32_t) * (max_num_cus/32);
++	}
++
++	properties.cu_mask = kzalloc(cu_mask_size, GFP_KERNEL);
++	if (!properties.cu_mask)
++		return -ENOMEM;
++
++	retval = copy_from_user(properties.cu_mask, cu_mask_ptr, cu_mask_size);
++	if (retval) {
++		pr_debug("Could not copy CU mask from userspace");
++		kfree(properties.cu_mask);
++		return -EFAULT;
++	}
++
++	mutex_lock(&p->mutex);
++
++	retval = pqm_set_cu_mask(&p->pqm, args->queue_id, &properties);
++
++	mutex_unlock(&p->mutex);
++
++	if (retval)
++		kfree(properties.cu_mask);
++
++	return retval;
++}
++
+ static int kfd_ioctl_set_memory_policy(struct file *filep,
+ 					struct kfd_process *p, void *data)
+ {
+@@ -1557,6 +1612,9 @@ static const struct amdkfd_ioctl_desc am
+ 	AMDKFD_IOCTL_DEF(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU,
+ 			kfd_ioctl_unmap_memory_from_gpu, 0),
+ 
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_SET_CU_MASK,
++			kfd_ioctl_set_cu_mask, 0),
++
+ };
+ 
+ #define AMDKFD_CORE_IOCTL_COUNT	ARRAY_SIZE(amdkfd_ioctls)
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_kernel_queue.c
+@@ -123,6 +123,7 @@ static bool initialize(struct kernel_que
+ 	prop.write_ptr = (uint32_t *) kq->wptr_gpu_addr;
+ 	prop.eop_ring_buffer_address = kq->eop_gpu_addr;
+ 	prop.eop_ring_buffer_size = PAGE_SIZE;
++	prop.cu_mask = NULL;
+ 
+ 	if (init_queue(&kq->queue, &prop) != 0)
+ 		goto err_init_queue;
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c
+@@ -21,7 +21,7 @@
+  *
+  */
+ 
+-#include "kfd_priv.h"
++#include "kfd_mqd_manager.h"
+ 
+ struct mqd_manager *mqd_manager_init(enum KFD_MQD_TYPE type,
+ 					struct kfd_dev *dev)
+@@ -48,3 +48,42 @@ struct mqd_manager *mqd_manager_init(enu
+ 
+ 	return NULL;
+ }
++
++void mqd_symmetrically_map_cu_mask(struct mqd_manager *mm,
++		const uint32_t *cu_mask, uint32_t cu_mask_count,
++		uint32_t *se_mask)
++{
++	struct kfd_cu_info cu_info;
++	uint32_t cu_per_sh[4] = {0};
++	int i, se, cu = 0;
++
++	mm->dev->kfd2kgd->get_cu_info(mm->dev->kgd, &cu_info);
++
++	if (cu_mask_count > cu_info.cu_active_number)
++		cu_mask_count = cu_info.cu_active_number;
++
++	for (se = 0; se < cu_info.num_shader_engines; se++)
++		for (i = 0; i < 4; i++)
++			cu_per_sh[se] += hweight32(cu_info.cu_bitmap[se][i]);
++
++	/* Symmetrically map cu_mask to all SEs:
++	 * cu_mask[0] bit0 -> se_mask[0] bit0;
++	 * cu_mask[0] bit1 -> se_mask[1] bit0;
++	 * ... (if # SE is 4)
++	 * cu_mask[0] bit4 -> se_mask[0] bit1;
++	 * ...
++	 */
++	se = 0;
++	for (i = 0; i < cu_mask_count; i++) {
++		if (cu_mask[i / 32] & (1 << (i % 32)))
++			se_mask[se] |= 1 << cu;
++
++		do {
++			se++;
++			if (se == cu_info.num_shader_engines) {
++				se = 0;
++				cu++;
++			}
++		} while (cu >= cu_per_sh[se] && cu < 32);
++	}
++}
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.h
+@@ -93,4 +93,8 @@ struct mqd_manager {
+ 	struct kfd_dev	*dev;
+ };
+ 
++void mqd_symmetrically_map_cu_mask(struct mqd_manager *mm,
++		const uint32_t *cu_mask, uint32_t cu_mask_count,
++		uint32_t *se_mask);
++
+ #endif /* KFD_MQD_MANAGER_H_ */
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_cik.c
+@@ -41,6 +41,31 @@ static inline struct cik_sdma_rlc_regist
+ 	return (struct cik_sdma_rlc_registers *)mqd;
+ }
+ 
++static void update_cu_mask(struct mqd_manager *mm, void *mqd,
++			struct queue_properties *q)
++{
++	struct cik_mqd *m;
++	uint32_t se_mask[4] = {0}; /* 4 is the max # of SEs */
++
++	if (q->cu_mask_count == 0)
++		return;
++
++	mqd_symmetrically_map_cu_mask(mm,
++		q->cu_mask, q->cu_mask_count, se_mask);
++
++	m = get_mqd(mqd);
++	m->compute_static_thread_mgmt_se0 = se_mask[0];
++	m->compute_static_thread_mgmt_se1 = se_mask[1];
++	m->compute_static_thread_mgmt_se2 = se_mask[2];
++	m->compute_static_thread_mgmt_se3 = se_mask[3];
++
++	pr_debug("Update cu mask to %#x %#x %#x %#x\n",
++		m->compute_static_thread_mgmt_se0,
++		m->compute_static_thread_mgmt_se1,
++		m->compute_static_thread_mgmt_se2,
++		m->compute_static_thread_mgmt_se3);
++}
++
+ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 		struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+ 		struct queue_properties *q)
+@@ -196,6 +221,8 @@ static int __update_mqd(struct mqd_manag
+ 	if (q->format == KFD_QUEUE_FORMAT_AQL)
+ 		m->cp_hqd_pq_control |= NO_UPDATE_RPTR;
+ 
++	update_cu_mask(mm, mqd, q);
++
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+ 			q->queue_percent > 0 &&
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v9.c
+@@ -41,6 +41,31 @@ static inline struct v9_sdma_mqd *get_sd
+ 	return (struct v9_sdma_mqd *)mqd;
+ }
+ 
++static void update_cu_mask(struct mqd_manager *mm, void *mqd,
++			struct queue_properties *q)
++{
++	struct v9_mqd *m;
++	uint32_t se_mask[4] = {0}; /* 4 is the max # of SEs */
++
++	if (q->cu_mask_count == 0)
++		return;
++
++	mqd_symmetrically_map_cu_mask(mm,
++		q->cu_mask, q->cu_mask_count, se_mask);
++
++	m = get_mqd(mqd);
++	m->compute_static_thread_mgmt_se0 = se_mask[0];
++	m->compute_static_thread_mgmt_se1 = se_mask[1];
++	m->compute_static_thread_mgmt_se2 = se_mask[2];
++	m->compute_static_thread_mgmt_se3 = se_mask[3];
++
++	pr_debug("update cu mask to %#x %#x %#x %#x\n",
++		m->compute_static_thread_mgmt_se0,
++		m->compute_static_thread_mgmt_se1,
++		m->compute_static_thread_mgmt_se2,
++		m->compute_static_thread_mgmt_se3);
++}
++
+ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 			struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+ 			struct queue_properties *q)
+@@ -198,6 +223,8 @@ static int update_mqd(struct mqd_manager
+ 	if (mm->dev->cwsr_enabled && q->ctx_save_restore_area_address)
+ 		m->cp_hqd_ctx_save_control = 0;
+ 
++	update_cu_mask(mm, mqd, q);
++
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+ 			q->queue_percent > 0 &&
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_vi.c
+@@ -43,6 +43,31 @@ static inline struct vi_sdma_mqd *get_sd
+ 	return (struct vi_sdma_mqd *)mqd;
+ }
+ 
++static void update_cu_mask(struct mqd_manager *mm, void *mqd,
++			struct queue_properties *q)
++{
++	struct vi_mqd *m;
++	uint32_t se_mask[4] = {0}; /* 4 is the max # of SEs */
++
++	if (q->cu_mask_count == 0)
++		return;
++
++	mqd_symmetrically_map_cu_mask(mm,
++		q->cu_mask, q->cu_mask_count, se_mask);
++
++	m = get_mqd(mqd);
++	m->compute_static_thread_mgmt_se0 = se_mask[0];
++	m->compute_static_thread_mgmt_se1 = se_mask[1];
++	m->compute_static_thread_mgmt_se2 = se_mask[2];
++	m->compute_static_thread_mgmt_se3 = se_mask[3];
++
++	pr_debug("Update cu mask to %#x %#x %#x %#x\n",
++		m->compute_static_thread_mgmt_se0,
++		m->compute_static_thread_mgmt_se1,
++		m->compute_static_thread_mgmt_se2,
++		m->compute_static_thread_mgmt_se3);
++}
++
+ static int init_mqd(struct mqd_manager *mm, void **mqd,
+ 			struct kfd_mem_obj **mqd_mem_obj, uint64_t *gart_addr,
+ 			struct queue_properties *q)
+@@ -196,6 +221,8 @@ static int __update_mqd(struct mqd_manag
+ 			atc_bit << CP_HQD_CTX_SAVE_CONTROL__ATC__SHIFT |
+ 			mtype << CP_HQD_CTX_SAVE_CONTROL__MTYPE__SHIFT;
+ 
++	update_cu_mask(mm, mqd, q);
++
+ 	q->is_active = (q->queue_size > 0 &&
+ 			q->queue_address != 0 &&
+ 			q->queue_percent > 0 &&
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -422,6 +422,9 @@ struct queue_properties {
+ 	uint32_t ctl_stack_size;
+ 	uint64_t tba_addr;
+ 	uint64_t tma_addr;
++	/* Relevant for CU */
++	uint32_t cu_mask_count; /* Must be a multiple of 32 */
++	uint32_t *cu_mask;
+ };
+ 
+ /**
+@@ -872,6 +875,8 @@ int pqm_create_queue(struct process_queu
+ int pqm_destroy_queue(struct process_queue_manager *pqm, unsigned int qid);
+ int pqm_update_queue(struct process_queue_manager *pqm, unsigned int qid,
+ 			struct queue_properties *p);
++int pqm_set_cu_mask(struct process_queue_manager *pqm, unsigned int qid,
++			struct queue_properties *p);
+ struct kernel_queue *pqm_get_kernel_queue(struct process_queue_manager *pqm,
+ 						unsigned int qid);
+ 
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
+@@ -325,6 +325,8 @@ int pqm_destroy_queue(struct process_que
+ 			if (retval != -ETIME)
+ 				goto err_destroy_queue;
+ 		}
++		kfree(pqn->q->properties.cu_mask);
++		pqn->q->properties.cu_mask = NULL;
+ 		uninit_queue(pqn->q);
+ 	}
+ 
+@@ -359,6 +361,34 @@ int pqm_update_queue(struct process_queu
+ 
+ 	retval = pqn->q->device->dqm->ops.update_queue(pqn->q->device->dqm,
+ 							pqn->q);
++	if (retval != 0)
++		return retval;
++
++	return 0;
++}
++
++int pqm_set_cu_mask(struct process_queue_manager *pqm, unsigned int qid,
++			struct queue_properties *p)
++{
++	int retval;
++	struct process_queue_node *pqn;
++
++	pqn = get_queue_by_qid(pqm, qid);
++	if (!pqn) {
++		pr_debug("No queue %d exists for update operation\n", qid);
++		return -EFAULT;
++	}
++
++	/* Free the old CU mask memory if it is already allocated, then
++	 * allocate memory for the new CU mask.
++	 */
++	kfree(pqn->q->properties.cu_mask);
++
++	pqn->q->properties.cu_mask_count = p->cu_mask_count;
++	pqn->q->properties.cu_mask = p->cu_mask;
++
++	retval = pqn->q->device->dqm->ops.update_queue(pqn->q->device->dqm,
++							pqn->q);
+ 	if (retval != 0)
+ 		return retval;
+ 

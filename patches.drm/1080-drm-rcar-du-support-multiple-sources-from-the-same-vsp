@@ -1,0 +1,297 @@
+From: Laurent Pinchart <laurent.pinchart+renesas@ideasonboard.com>
+Date: Mon, 26 Jun 2017 13:12:01 +0300
+Subject: drm: rcar-du: Support multiple sources from the same VSP
+Git-commit: 3e81374e2014c42abff62cb74b654c6d4fb269ee
+Patch-mainline: v4.14-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+On R-Car H3 ES2.0, DU channels 0 and 3 are served by two separate
+pipelines from the same VSP. Support this in the DU driver.
+
+Signed-off-by: Laurent Pinchart <laurent.pinchart+renesas@ideasonboard.com>
+Reviewed-by: Kieran Bingham <kieran.bingham+renesas@ideasonboard.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/rcar-du/rcar_du_crtc.c |    2 
+ drivers/gpu/drm/rcar-du/rcar_du_crtc.h |    3 +
+ drivers/gpu/drm/rcar-du/rcar_du_kms.c  |   89 ++++++++++++++++++++++++++++-----
+ drivers/gpu/drm/rcar-du/rcar_du_vsp.c  |   37 ++++++-------
+ drivers/gpu/drm/rcar-du/rcar_du_vsp.h  |   10 ++-
+ 5 files changed, 108 insertions(+), 33 deletions(-)
+
+--- a/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
+@@ -731,7 +731,7 @@ int rcar_du_crtc_create(struct rcar_du_g
+ 	rcrtc->index = index;
+ 
+ 	if (rcar_du_has(rcdu, RCAR_DU_FEATURE_VSP1_SOURCE))
+-		primary = &rcrtc->vsp->planes[0].plane;
++		primary = &rcrtc->vsp->planes[rcrtc->vsp_pipe].plane;
+ 	else
+ 		primary = &rgrp->planes[index % 2].plane;
+ 
+--- a/drivers/gpu/drm/rcar-du/rcar_du_crtc.h
++++ b/drivers/gpu/drm/rcar-du/rcar_du_crtc.h
+@@ -35,6 +35,8 @@ struct rcar_du_vsp;
+  * @flip_wait: wait queue used to signal page flip completion
+  * @outputs: bitmask of the outputs (enum rcar_du_output) driven by this CRTC
+  * @group: CRTC group this CRTC belongs to
++ * @vsp: VSP feeding video to this CRTC
++ * @vsp_pipe: index of the VSP pipeline feeding video to this CRTC
+  */
+ struct rcar_du_crtc {
+ 	struct drm_crtc crtc;
+@@ -52,6 +54,7 @@ struct rcar_du_crtc {
+ 
+ 	struct rcar_du_group *group;
+ 	struct rcar_du_vsp *vsp;
++	unsigned int vsp_pipe;
+ };
+ 
+ #define to_rcar_crtc(c)	container_of(c, struct rcar_du_crtc, crtc)
+--- a/drivers/gpu/drm/rcar-du/rcar_du_kms.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_kms.c
+@@ -435,6 +435,81 @@ static int rcar_du_properties_init(struc
+ 	return 0;
+ }
+ 
++static int rcar_du_vsps_init(struct rcar_du_device *rcdu)
++{
++	const struct device_node *np = rcdu->dev->of_node;
++	struct of_phandle_args args;
++	struct {
++		struct device_node *np;
++		unsigned int crtcs_mask;
++	} vsps[RCAR_DU_MAX_VSPS] = { { 0, }, };
++	unsigned int vsps_count = 0;
++	unsigned int cells;
++	unsigned int i;
++	int ret;
++
++	/*
++	 * First parse the DT vsps property to populate the list of VSPs. Each
++	 * entry contains a pointer to the VSP DT node and a bitmask of the
++	 * connected DU CRTCs.
++	 */
++	cells = of_property_count_u32_elems(np, "vsps") / rcdu->num_crtcs - 1;
++	if (cells > 1)
++		return -EINVAL;
++
++	for (i = 0; i < rcdu->num_crtcs; ++i) {
++		unsigned int j;
++
++		ret = of_parse_phandle_with_fixed_args(np, "vsps", cells, i,
++						       &args);
++		if (ret < 0)
++			goto error;
++
++		/*
++		 * Add the VSP to the list or update the corresponding existing
++		 * entry if the VSP has already been added.
++		 */
++		for (j = 0; j < vsps_count; ++j) {
++			if (vsps[j].np == args.np)
++				break;
++		}
++
++		if (j < vsps_count)
++			of_node_put(args.np);
++		else
++			vsps[vsps_count++].np = args.np;
++
++		vsps[j].crtcs_mask |= BIT(i);
++
++		/* Store the VSP pointer and pipe index in the CRTC. */
++		rcdu->crtcs[i].vsp = &rcdu->vsps[j];
++		rcdu->crtcs[i].vsp_pipe = cells >= 1 ? args.args[0] : 0;
++	}
++
++	/*
++	 * Then initialize all the VSPs from the node pointers and CRTCs bitmask
++	 * computed previously.
++	 */
++	for (i = 0; i < vsps_count; ++i) {
++		struct rcar_du_vsp *vsp = &rcdu->vsps[i];
++
++		vsp->index = i;
++		vsp->dev = rcdu;
++
++		ret = rcar_du_vsp_init(vsp, vsps[i].np, vsps[i].crtcs_mask);
++		if (ret < 0)
++			goto error;
++	}
++
++	return 0;
++
++error:
++	for (i = 0; i < ARRAY_SIZE(vsps); ++i)
++		of_node_put(vsps[i].np);
++
++	return ret;
++}
++
+ int rcar_du_modeset_init(struct rcar_du_device *rcdu)
+ {
+ 	static const unsigned int mmio_offsets[] = {
+@@ -504,17 +579,9 @@ int rcar_du_modeset_init(struct rcar_du_
+ 
+ 	/* Initialize the compositors. */
+ 	if (rcar_du_has(rcdu, RCAR_DU_FEATURE_VSP1_SOURCE)) {
+-		for (i = 0; i < rcdu->num_crtcs; ++i) {
+-			struct rcar_du_vsp *vsp = &rcdu->vsps[i];
+-
+-			vsp->index = i;
+-			vsp->dev = rcdu;
+-			rcdu->crtcs[i].vsp = vsp;
+-
+-			ret = rcar_du_vsp_init(vsp);
+-			if (ret < 0)
+-				return ret;
+-		}
++		ret = rcar_du_vsps_init(rcdu);
++		if (ret < 0)
++			return ret;
+ 	}
+ 
+ 	/* Create the CRTCs. */
+--- a/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
+@@ -19,6 +19,7 @@
+ #include <drm/drm_gem_cma_helper.h>
+ #include <drm/drm_plane_helper.h>
+ 
++#include <linux/bitops.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/of_platform.h>
+ #include <linux/scatterlist.h>
+@@ -82,22 +83,22 @@ void rcar_du_vsp_enable(struct rcar_du_c
+ 	 */
+ 	crtc->group->need_restart = true;
+ 
+-	vsp1_du_setup_lif(crtc->vsp->vsp, 0, &cfg);
++	vsp1_du_setup_lif(crtc->vsp->vsp, crtc->vsp_pipe, &cfg);
+ }
+ 
+ void rcar_du_vsp_disable(struct rcar_du_crtc *crtc)
+ {
+-	vsp1_du_setup_lif(crtc->vsp->vsp, 0, NULL);
++	vsp1_du_setup_lif(crtc->vsp->vsp, crtc->vsp_pipe, NULL);
+ }
+ 
+ void rcar_du_vsp_atomic_begin(struct rcar_du_crtc *crtc)
+ {
+-	vsp1_du_atomic_begin(crtc->vsp->vsp, 0);
++	vsp1_du_atomic_begin(crtc->vsp->vsp, crtc->vsp_pipe);
+ }
+ 
+ void rcar_du_vsp_atomic_flush(struct rcar_du_crtc *crtc)
+ {
+-	vsp1_du_atomic_flush(crtc->vsp->vsp, 0);
++	vsp1_du_atomic_flush(crtc->vsp->vsp, crtc->vsp_pipe);
+ }
+ 
+ /* Keep the two tables in sync. */
+@@ -163,6 +164,7 @@ static void rcar_du_vsp_plane_setup(stru
+ {
+ 	struct rcar_du_vsp_plane_state *state =
+ 		to_rcar_vsp_plane_state(plane->plane.state);
++	struct rcar_du_crtc *crtc = to_rcar_crtc(state->state.crtc);
+ 	struct drm_framebuffer *fb = plane->plane.state->fb;
+ 	struct vsp1_du_atomic_config cfg = {
+ 		.pixelformat = 0,
+@@ -193,7 +195,8 @@ static void rcar_du_vsp_plane_setup(stru
+ 		}
+ 	}
+ 
+-	vsp1_du_atomic_update(plane->vsp->vsp, 0, plane->index, &cfg);
++	vsp1_du_atomic_update(plane->vsp->vsp, crtc->vsp_pipe,
++			      plane->index, &cfg);
+ }
+ 
+ static int rcar_du_vsp_plane_prepare_fb(struct drm_plane *plane,
+@@ -289,11 +292,13 @@ static void rcar_du_vsp_plane_atomic_upd
+ 					struct drm_plane_state *old_state)
+ {
+ 	struct rcar_du_vsp_plane *rplane = to_rcar_vsp_plane(plane);
++	struct rcar_du_crtc *crtc = to_rcar_crtc(old_state->crtc);
+ 
+ 	if (plane->state->crtc)
+ 		rcar_du_vsp_plane_setup(rplane);
+ 	else
+-		vsp1_du_atomic_update(rplane->vsp->vsp, 0, rplane->index, NULL);
++		vsp1_du_atomic_update(rplane->vsp->vsp, crtc->vsp_pipe,
++				      rplane->index, NULL);
+ }
+ 
+ static const struct drm_plane_helper_funcs rcar_du_vsp_plane_helper_funcs = {
+@@ -391,23 +396,17 @@ static const struct drm_plane_funcs rcar
+ 	.atomic_get_property = rcar_du_vsp_plane_atomic_get_property,
+ };
+ 
+-int rcar_du_vsp_init(struct rcar_du_vsp *vsp)
++int rcar_du_vsp_init(struct rcar_du_vsp *vsp, struct device_node *np,
++		     unsigned int crtcs)
+ {
+ 	struct rcar_du_device *rcdu = vsp->dev;
+ 	struct platform_device *pdev;
+-	struct device_node *np;
++	unsigned int num_crtcs = hweight32(crtcs);
+ 	unsigned int i;
+ 	int ret;
+ 
+ 	/* Find the VSP device and initialize it. */
+-	np = of_parse_phandle(rcdu->dev->of_node, "vsps", vsp->index);
+-	if (!np) {
+-		dev_err(rcdu->dev, "vsps node not found\n");
+-		return -ENXIO;
+-	}
+-
+ 	pdev = of_find_device_by_node(np);
+-	of_node_put(np);
+ 	if (!pdev)
+ 		return -ENXIO;
+ 
+@@ -429,15 +428,15 @@ int rcar_du_vsp_init(struct rcar_du_vsp
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < vsp->num_planes; ++i) {
+-		enum drm_plane_type type = i ? DRM_PLANE_TYPE_OVERLAY
+-					 : DRM_PLANE_TYPE_PRIMARY;
++		enum drm_plane_type type = i < num_crtcs
++					 ? DRM_PLANE_TYPE_PRIMARY
++					 : DRM_PLANE_TYPE_OVERLAY;
+ 		struct rcar_du_vsp_plane *plane = &vsp->planes[i];
+ 
+ 		plane->vsp = vsp;
+ 		plane->index = i;
+ 
+-		ret = drm_universal_plane_init(rcdu->ddev, &plane->plane,
+-					       1 << vsp->index,
++		ret = drm_universal_plane_init(rcdu->ddev, &plane->plane, crtcs,
+ 					       &rcar_du_vsp_plane_funcs,
+ 					       formats_kms,
+ 					       ARRAY_SIZE(formats_kms),
+--- a/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
++++ b/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
+@@ -64,13 +64,19 @@ to_rcar_vsp_plane_state(struct drm_plane
+ }
+ 
+ #ifdef CONFIG_DRM_RCAR_VSP
+-int rcar_du_vsp_init(struct rcar_du_vsp *vsp);
++int rcar_du_vsp_init(struct rcar_du_vsp *vsp, struct device_node *np,
++		     unsigned int crtcs);
+ void rcar_du_vsp_enable(struct rcar_du_crtc *crtc);
+ void rcar_du_vsp_disable(struct rcar_du_crtc *crtc);
+ void rcar_du_vsp_atomic_begin(struct rcar_du_crtc *crtc);
+ void rcar_du_vsp_atomic_flush(struct rcar_du_crtc *crtc);
+ #else
+-static inline int rcar_du_vsp_init(struct rcar_du_vsp *vsp) { return -ENXIO; };
++static inline int rcar_du_vsp_init(struct rcar_du_vsp *vsp,
++				   struct device_node *np,
++				   unsigned int crtcs)
++{
++	return -ENXIO;
++}
+ static inline void rcar_du_vsp_enable(struct rcar_du_crtc *crtc) { };
+ static inline void rcar_du_vsp_disable(struct rcar_du_crtc *crtc) { };
+ static inline void rcar_du_vsp_atomic_begin(struct rcar_du_crtc *crtc) { };

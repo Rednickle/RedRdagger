@@ -1,0 +1,145 @@
+From 2a9e25796b289f71c0802eca46005c750c57af95 Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Fri, 6 Oct 2017 11:53:33 +0200
+Subject: [PATCH] mac80211: only remove AP VLAN frames from TXQ
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 2a9e25796b289f71c0802eca46005c750c57af95
+Patch-mainline: v4.15-rc1
+References: FATE#326294
+
+When removing an AP VLAN interface, mac80211 currently purges
+the entire TXQ for the AP interface. Fix this by using the FQ
+API introduced in the previous patch to filter frames.
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Acked-by: Toke Høiland-Jørgensen <toke@toke.dk>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ net/mac80211/ieee80211_i.h |  2 ++
+ net/mac80211/iface.c       | 25 +++----------------------
+ net/mac80211/tx.c          | 34 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 39 insertions(+), 22 deletions(-)
+
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 9675814f64db..68f874e73561 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2009,6 +2009,8 @@ void ieee80211_txq_init(struct ieee80211_sub_if_data *sdata,
+ 			struct txq_info *txq, int tid);
+ void ieee80211_txq_purge(struct ieee80211_local *local,
+ 			 struct txq_info *txqi);
++void ieee80211_txq_remove_vlan(struct ieee80211_local *local,
++			       struct ieee80211_sub_if_data *sdata);
+ void ieee80211_send_auth(struct ieee80211_sub_if_data *sdata,
+ 			 u16 transaction, u16 auth_alg, u16 status,
+ 			 const u8 *extra, size_t extra_len, const u8 *bssid,
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 2619daa29961..13b16f90e1cf 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -793,9 +793,7 @@ static int ieee80211_open(struct net_device *dev)
+ static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata,
+ 			      bool going_down)
+ {
+-	struct ieee80211_sub_if_data *txq_sdata = sdata;
+ 	struct ieee80211_local *local = sdata->local;
+-	struct fq *fq = &local->fq;
+ 	unsigned long flags;
+ 	struct sk_buff *skb, *tmp;
+ 	u32 hw_reconf_flags = 0;
+@@ -939,9 +937,6 @@ static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata,
+ 
+ 	switch (sdata->vif.type) {
+ 	case NL80211_IFTYPE_AP_VLAN:
+-		txq_sdata = container_of(sdata->bss,
+-					 struct ieee80211_sub_if_data, u.ap);
+-
+ 		mutex_lock(&local->mtx);
+ 		list_del(&sdata->u.vlan.list);
+ 		mutex_unlock(&local->mtx);
+@@ -998,8 +993,6 @@ static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata,
+ 		skb_queue_purge(&sdata->skb_queue);
+ 	}
+ 
+-	sdata->bss = NULL;
+-
+ 	spin_lock_irqsave(&local->queue_stop_reason_lock, flags);
+ 	for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
+ 		skb_queue_walk_safe(&local->pending[i], skb, tmp) {
+@@ -1012,22 +1005,10 @@ static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata,
+ 	}
+ 	spin_unlock_irqrestore(&local->queue_stop_reason_lock, flags);
+ 
+-	if (txq_sdata->vif.txq) {
+-		struct txq_info *txqi = to_txq_info(txq_sdata->vif.txq);
++	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN)
++		ieee80211_txq_remove_vlan(local, sdata);
+ 
+-		/*
+-		 * FIXME FIXME
+-		 *
+-		 * We really shouldn't purge the *entire* txqi since that
+-		 * contains frames for the other AP_VLANs (and possibly
+-		 * the AP itself) as well, but there's no API in FQ now
+-		 * to be able to filter.
+-		 */
+-
+-		spin_lock_bh(&fq->lock);
+-		ieee80211_txq_purge(local, txqi);
+-		spin_unlock_bh(&fq->lock);
+-	}
++	sdata->bss = NULL;
+ 
+ 	if (local->open_count == 0)
+ 		ieee80211_clear_tx_pending(local);
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index 94826680cf2b..7b8154474b9e 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1396,6 +1396,40 @@ static void ieee80211_txq_enqueue(struct ieee80211_local *local,
+ 		       fq_flow_get_default_func);
+ }
+ 
++static bool fq_vlan_filter_func(struct fq *fq, struct fq_tin *tin,
++				struct fq_flow *flow, struct sk_buff *skb,
++				void *data)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++
++	return info->control.vif == data;
++}
++
++void ieee80211_txq_remove_vlan(struct ieee80211_local *local,
++			       struct ieee80211_sub_if_data *sdata)
++{
++	struct fq *fq = &local->fq;
++	struct txq_info *txqi;
++	struct fq_tin *tin;
++	struct ieee80211_sub_if_data *ap;
++
++	if (WARN_ON(sdata->vif.type != NL80211_IFTYPE_AP_VLAN))
++		return;
++
++	ap = container_of(sdata->bss, struct ieee80211_sub_if_data, u.ap);
++
++	if (!ap->vif.txq)
++		return;
++
++	txqi = to_txq_info(ap->vif.txq);
++	tin = &txqi->tin;
++
++	spin_lock_bh(&fq->lock);
++	fq_tin_filter(fq, tin, fq_vlan_filter_func, &sdata->vif,
++		      fq_skb_free_func);
++	spin_unlock_bh(&fq->lock);
++}
++
+ void ieee80211_txq_init(struct ieee80211_sub_if_data *sdata,
+ 			struct sta_info *sta,
+ 			struct txq_info *txqi, int tid)
+-- 
+2.19.2
+

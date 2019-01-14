@@ -1,0 +1,217 @@
+From 484a54c2e597dbc4ace79c1687022282905afba0 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Toke=20H=C3=B8iland-J=C3=B8rgensen?= <toke@toke.dk>
+Date: Thu, 6 Apr 2017 11:38:26 +0200
+Subject: [PATCH] mac80211: Dynamically set CoDel parameters per station
+Mime-version: 1.0
+Content-type: text/plain; charset=UTF-8
+Content-transfer-encoding: 8bit
+Git-commit: 484a54c2e597dbc4ace79c1687022282905afba0
+Patch-mainline: v4.13-rc1
+References: FATE#326294
+
+CoDel can be too aggressive if a station sends at a very low rate,
+leading reduced throughput. This gets worse the more stations are
+present, as each station gets more bursty the longer the round-robin
+scheduling between stations takes.
+
+This adds dynamic adjustment of CoDel parameters per station. It uses
+the rate selection information to estimate throughput and sets more
+lenient CoDel parameters if the estimated throughput is below a
+threshold (modified by the number of active stations).
+
+A new callback is added that drivers can use to notify mac80211 about
+changes in expected throughput, so the same adjustment can be made for
+cards that implement rate control in firmware. Drivers that don't use
+this will just get the default parameters.
+
+Signed-off-by: Toke Høiland-Jørgensen <toke@toke.dk>
+[remove currently unnecessary EXPORT_SYMBOL, fix kernel-doc, remove
+inline annotation]
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ include/net/mac80211.h     | 16 ++++++++++++++++
+ net/mac80211/debugfs_sta.c |  6 ++++++
+ net/mac80211/rate.c        |  3 ++-
+ net/mac80211/sta_info.c    | 30 ++++++++++++++++++++++++++++++
+ net/mac80211/sta_info.h    | 11 +++++++++++
+ net/mac80211/tx.c          |  9 ++++++++-
+ 6 files changed, 73 insertions(+), 2 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 76ed24a201eb..e01daff1e255 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4204,6 +4204,22 @@ void ieee80211_get_tx_rates(struct ieee80211_vif *vif,
+ 			    struct ieee80211_tx_rate *dest,
+ 			    int max_rates);
+ 
++/**
++ * ieee80211_sta_set_expected_throughput - set the expected tpt for a station
++ *
++ * Call this function to notify mac80211 about a change in expected throughput
++ * to a station. A driver for a device that does rate control in firmware can
++ * call this function when the expected throughput estimate towards a station
++ * changes. The information is used to tune the CoDel AQM applied to traffic
++ * going towards that station (which can otherwise be too aggressive and cause
++ * slow stations to starve).
++ *
++ * @pubsta: the station to set throughput for.
++ * @thr: the current expected throughput in kbps.
++ */
++void ieee80211_sta_set_expected_throughput(struct ieee80211_sta *pubsta,
++					   u32 thr);
++
+ /**
+  * ieee80211_tx_status - transmit status callback
+  *
+diff --git a/net/mac80211/debugfs_sta.c b/net/mac80211/debugfs_sta.c
+index 42601820db20..b15412c21ac9 100644
+--- a/net/mac80211/debugfs_sta.c
++++ b/net/mac80211/debugfs_sta.c
+@@ -152,6 +152,12 @@ static ssize_t sta_aqm_read(struct file *file, char __user *userbuf,
+ 	spin_lock_bh(&local->fq.lock);
+ 	rcu_read_lock();
+ 
++	p += scnprintf(p,
++		       bufsz+buf-p,
++		       "target %uus interval %uus ecn %s\n",
++		       codel_time_to_us(sta->cparams.target),
++		       codel_time_to_us(sta->cparams.interval),
++		       sta->cparams.ecn ? "yes" : "no");
+ 	p += scnprintf(p,
+ 		       bufsz+buf-p,
+ 		       "tid ac backlog-bytes backlog-packets new-flows drops marks overlimit collisions tx-bytes tx-packets\n");
+diff --git a/net/mac80211/rate.c b/net/mac80211/rate.c
+index ea1f4315c521..76f303fda3ed 100644
+--- a/net/mac80211/rate.c
++++ b/net/mac80211/rate.c
+@@ -943,6 +943,8 @@ int rate_control_set_rates(struct ieee80211_hw *hw,
+ 
+ 	drv_sta_rate_tbl_update(hw_to_local(hw), sta->sdata, pubsta);
+ 
++	ieee80211_sta_set_expected_throughput(pubsta, sta_get_expected_throughput(sta));
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(rate_control_set_rates);
+@@ -991,4 +993,3 @@ void rate_control_deinitialize(struct ieee80211_local *local)
+ 	local->rate_ctrl = NULL;
+ 	rate_control_free(local, ref);
+ }
+-
+diff --git a/net/mac80211/sta_info.c b/net/mac80211/sta_info.c
+index 7cdf7a835bb0..f59434ac385d 100644
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -20,6 +20,7 @@
+ #include <linux/timer.h>
+ #include <linux/rtnetlink.h>
+ 
++#include <net/codel.h>
+ #include <net/mac80211.h>
+ #include "ieee80211_i.h"
+ #include "driver-ops.h"
+@@ -425,6 +426,11 @@ struct sta_info *sta_info_alloc(struct ieee80211_sub_if_data *sdata,
+ 
+ 	sta->sta.max_rc_amsdu_len = IEEE80211_MAX_MPDU_LEN_HT_BA;
+ 
++	sta->cparams.ce_threshold = CODEL_DISABLED_THRESHOLD;
++	sta->cparams.target = MS2TIME(20);
++	sta->cparams.interval = MS2TIME(100);
++	sta->cparams.ecn = true;
++
+ 	sta_dbg(sdata, "Allocated STA %pM\n", sta->sta.addr);
+ 
+ 	return sta;
+@@ -2310,3 +2316,27 @@ unsigned long ieee80211_sta_last_active(struct sta_info *sta)
+ 		return stats->last_rx;
+ 	return sta->status_stats.last_ack;
+ }
++
++static void sta_update_codel_params(struct sta_info *sta, u32 thr)
++{
++	if (!sta->sdata->local->ops->wake_tx_queue)
++		return;
++
++	if (thr && thr < STA_SLOW_THRESHOLD * sta->local->num_sta) {
++		sta->cparams.target = MS2TIME(50);
++		sta->cparams.interval = MS2TIME(300);
++		sta->cparams.ecn = false;
++	} else {
++		sta->cparams.target = MS2TIME(20);
++		sta->cparams.interval = MS2TIME(100);
++		sta->cparams.ecn = true;
++	}
++}
++
++void ieee80211_sta_set_expected_throughput(struct ieee80211_sta *pubsta,
++					   u32 thr)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++
++	sta_update_codel_params(sta, thr);
++}
+diff --git a/net/mac80211/sta_info.h b/net/mac80211/sta_info.h
+index 5609cacb20d5..b58c3b19ab78 100644
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -393,6 +393,14 @@ struct ieee80211_sta_rx_stats {
+ 	u64 msdu[IEEE80211_NUM_TIDS + 1];
+ };
+ 
++/**
++ * The bandwidth threshold below which the per-station CoDel parameters will be
++ * scaled to be more lenient (to prevent starvation of slow stations). This
++ * value will be scaled by the number of active stations when it is being
++ * applied.
++ */
++#define STA_SLOW_THRESHOLD 6000 /* 6 Mbps */
++
+ /**
+  * struct sta_info - STA information
+  *
+@@ -446,6 +454,7 @@ struct ieee80211_sta_rx_stats {
+  * @known_smps_mode: the smps_mode the client thinks we are in. Relevant for
+  *	AP only.
+  * @cipher_scheme: optional cipher scheme for this station
++ * @cparams: CoDel parameters for this station.
+  * @reserved_tid: reserved TID (if any, otherwise IEEE80211_TID_UNRESERVED)
+  * @fast_tx: TX fastpath information
+  * @fast_rx: RX fastpath information
+@@ -549,6 +558,8 @@ struct sta_info {
+ 	enum ieee80211_smps_mode known_smps_mode;
+ 	const struct ieee80211_cipher_scheme *cipher_scheme;
+ 
++	struct codel_params cparams;
++
+ 	u8 reserved_tid;
+ 
+ 	struct cfg80211_chan_def tdls_chandef;
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index 04b22f8982fe..b8dc41191835 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -1340,9 +1340,16 @@ static struct sk_buff *fq_tin_dequeue_func(struct fq *fq,
+ 
+ 	local = container_of(fq, struct ieee80211_local, fq);
+ 	txqi = container_of(tin, struct txq_info, tin);
+-	cparams = &local->cparams;
+ 	cstats = &txqi->cstats;
+ 
++	if (txqi->txq.sta) {
++		struct sta_info *sta = container_of(txqi->txq.sta,
++						    struct sta_info, sta);
++		cparams = &sta->cparams;
++	} else {
++		cparams = &local->cparams;
++	}
++
+ 	if (flow == &txqi->def_flow)
+ 		cvars = &txqi->def_cvars;
+ 	else
+-- 
+2.19.2
+

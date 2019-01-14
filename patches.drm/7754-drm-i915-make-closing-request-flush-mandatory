@@ -1,0 +1,301 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 12 Jun 2018 11:51:35 +0100
+Subject: drm/i915: Make closing request flush mandatory
+Git-commit: 697b9a8714cb4631fd0526b3c78955d5422c24ba
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+For symmetry, simplicity and ensuring the request is always truly idle
+upon its completion, always emit the closing flush prior to emitting the
+request breadcrumb. Previously, we would only emit the flush if we had
+started a user batch, but this just leaves all the other paths open to
+speculation (do they affect the GPU caches or not?) With mm switching, a
+key requirement is that the GPU is flushed and invalidated before hand,
+so for absolute safety, we want that closing flush be mandatory.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180612105135.4459-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_gem.c                     |    4 ++--
+ drivers/gpu/drm/i915/i915_gem_context.c             |    9 +--------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c          |    4 ++--
+ drivers/gpu/drm/i915/i915_request.c                 |   18 ++----------------
+ drivers/gpu/drm/i915/i915_request.h                 |    4 +---
+ drivers/gpu/drm/i915/selftests/huge_pages.c         |    2 +-
+ drivers/gpu/drm/i915/selftests/i915_gem_coherency.c |    4 ++--
+ drivers/gpu/drm/i915/selftests/i915_gem_context.c   |    4 ++--
+ drivers/gpu/drm/i915/selftests/i915_request.c       |    2 +-
+ drivers/gpu/drm/i915/selftests/intel_hangcheck.c    |   16 ++++++++--------
+ drivers/gpu/drm/i915/selftests/intel_lrc.c          |    2 +-
+ drivers/gpu/drm/i915/selftests/intel_workarounds.c  |    2 +-
+ 12 files changed, 24 insertions(+), 47 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3248,7 +3248,7 @@ void i915_gem_reset(struct drm_i915_priv
+ 			rq = i915_request_alloc(engine,
+ 						dev_priv->kernel_context);
+ 			if (!IS_ERR(rq))
+-				__i915_request_add(rq, false);
++				i915_request_add(rq);
+ 		}
+ 	}
+ 
+@@ -5367,7 +5367,7 @@ static int __intel_engines_record_defaul
+ 		if (engine->init_context)
+ 			err = engine->init_context(rq);
+ 
+-		__i915_request_add(rq, true);
++		i915_request_add(rq);
+ 		if (err)
+ 			goto err_active;
+ 	}
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -700,14 +700,7 @@ int i915_gem_switch_to_kernel_context(st
+ 			i915_timeline_sync_set(rq->timeline, &prev->fence);
+ 		}
+ 
+-		/*
+-		 * Force a flush after the switch to ensure that all rendering
+-		 * and operations prior to switching to the kernel context hits
+-		 * memory. This should be guaranteed by the previous request,
+-		 * but an extra layer of paranoia before we declare the system
+-		 * idle (on suspend etc) is advisable!
+-		 */
+-		__i915_request_add(rq, true);
++		i915_request_add(rq);
+ 	}
+ 
+ 	return 0;
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -921,7 +921,7 @@ static void reloc_gpu_flush(struct reloc
+ 	i915_gem_object_unpin_map(cache->rq->batch->obj);
+ 	i915_gem_chipset_flush(cache->rq->i915);
+ 
+-	__i915_request_add(cache->rq, true);
++	i915_request_add(cache->rq);
+ 	cache->rq = NULL;
+ }
+ 
+@@ -2438,7 +2438,7 @@ i915_gem_do_execbuffer(struct drm_device
+ 	trace_i915_request_queue(eb.request, eb.batch_flags);
+ 	err = eb_submit(&eb);
+ err_request:
+-	__i915_request_add(eb.request, err == 0);
++	i915_request_add(eb.request);
+ 	add_to_client(eb.request, file);
+ 
+ 	if (fences)
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -1018,14 +1018,13 @@ i915_request_await_object(struct i915_re
+  * request is not being tracked for completion but the work itself is
+  * going to happen on the hardware. This would be a Bad Thing(tm).
+  */
+-void __i915_request_add(struct i915_request *request, bool flush_caches)
++void i915_request_add(struct i915_request *request)
+ {
+ 	struct intel_engine_cs *engine = request->engine;
+ 	struct i915_timeline *timeline = request->timeline;
+ 	struct intel_ring *ring = request->ring;
+ 	struct i915_request *prev;
+ 	u32 *cs;
+-	int err;
+ 
+ 	GEM_TRACE("%s fence %llx:%d\n",
+ 		  engine->name, request->fence.context, request->fence.seqno);
+@@ -1046,20 +1045,7 @@ void __i915_request_add(struct i915_requ
+ 	 * know that it is time to use that space up.
+ 	 */
+ 	request->reserved_space = 0;
+-
+-	/*
+-	 * Emit any outstanding flushes - execbuf can fail to emit the flush
+-	 * after having emitted the batchbuffer command. Hence we need to fix
+-	 * things up similar to emitting the lazy request. The difference here
+-	 * is that the flush _must_ happen before the next request, no matter
+-	 * what.
+-	 */
+-	if (flush_caches) {
+-		err = engine->emit_flush(request, EMIT_FLUSH);
+-
+-		/* Not allowed to fail! */
+-		WARN(err, "engine->emit_flush() failed: %d!\n", err);
+-	}
++	engine->emit_flush(request, EMIT_FLUSH);
+ 
+ 	/*
+ 	 * Record the position of the start of the breadcrumb so that
+--- a/drivers/gpu/drm/i915/i915_request.h
++++ b/drivers/gpu/drm/i915/i915_request.h
+@@ -253,9 +253,7 @@ int i915_request_await_object(struct i91
+ int i915_request_await_dma_fence(struct i915_request *rq,
+ 				 struct dma_fence *fence);
+ 
+-void __i915_request_add(struct i915_request *rq, bool flush_caches);
+-#define i915_request_add(rq) \
+-	__i915_request_add(rq, false)
++void i915_request_add(struct i915_request *rq);
+ 
+ void __i915_request_submit(struct i915_request *request);
+ void i915_request_submit(struct i915_request *request);
+--- a/drivers/gpu/drm/i915/selftests/huge_pages.c
++++ b/drivers/gpu/drm/i915/selftests/huge_pages.c
+@@ -1003,7 +1003,7 @@ static int gpu_write(struct i915_vma *vm
+ 	reservation_object_unlock(vma->resv);
+ 
+ err_request:
+-	__i915_request_add(rq, err == 0);
++	i915_request_add(rq);
+ 
+ 	return err;
+ }
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_coherency.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_coherency.c
+@@ -199,7 +199,7 @@ static int gpu_set(struct drm_i915_gem_o
+ 
+ 	cs = intel_ring_begin(rq, 4);
+ 	if (IS_ERR(cs)) {
+-		__i915_request_add(rq, false);
++		i915_request_add(rq);
+ 		i915_vma_unpin(vma);
+ 		return PTR_ERR(cs);
+ 	}
+@@ -229,7 +229,7 @@ static int gpu_set(struct drm_i915_gem_o
+ 	reservation_object_add_excl_fence(obj->resv, &rq->fence);
+ 	reservation_object_unlock(obj->resv);
+ 
+-	__i915_request_add(rq, true);
++	i915_request_add(rq);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_context.c
+@@ -182,12 +182,12 @@ static int gpu_fill(struct drm_i915_gem_
+ 	reservation_object_add_excl_fence(obj->resv, &rq->fence);
+ 	reservation_object_unlock(obj->resv);
+ 
+-	__i915_request_add(rq, true);
++	i915_request_add(rq);
+ 
+ 	return 0;
+ 
+ err_request:
+-	__i915_request_add(rq, false);
++	i915_request_add(rq);
+ err_batch:
+ 	i915_vma_unpin(batch);
+ err_vma:
+--- a/drivers/gpu/drm/i915/selftests/i915_request.c
++++ b/drivers/gpu/drm/i915/selftests/i915_request.c
+@@ -466,7 +466,7 @@ empty_request(struct intel_engine_cs *en
+ 		goto out_request;
+ 
+ out_request:
+-	__i915_request_add(request, err == 0);
++	i915_request_add(request);
+ 	return err ? ERR_PTR(err) : request;
+ }
+ 
+--- a/drivers/gpu/drm/i915/selftests/intel_hangcheck.c
++++ b/drivers/gpu/drm/i915/selftests/intel_hangcheck.c
+@@ -245,7 +245,7 @@ hang_create_request(struct hang *h, stru
+ 
+ 	err = emit_recurse_batch(h, rq);
+ 	if (err) {
+-		__i915_request_add(rq, false);
++		i915_request_add(rq);
+ 		return ERR_PTR(err);
+ 	}
+ 
+@@ -318,7 +318,7 @@ static int igt_hang_sanitycheck(void *ar
+ 		*h.batch = MI_BATCH_BUFFER_END;
+ 		i915_gem_chipset_flush(i915);
+ 
+-		__i915_request_add(rq, true);
++		i915_request_add(rq);
+ 
+ 		timeout = i915_request_wait(rq,
+ 					    I915_WAIT_LOCKED,
+@@ -464,7 +464,7 @@ static int __igt_reset_engine(struct drm
+ 				}
+ 
+ 				i915_request_get(rq);
+-				__i915_request_add(rq, true);
++				i915_request_add(rq);
+ 				mutex_unlock(&i915->drm.struct_mutex);
+ 
+ 				if (!wait_until_running(&h, rq)) {
+@@ -742,7 +742,7 @@ static int __igt_reset_engines(struct dr
+ 				}
+ 
+ 				i915_request_get(rq);
+-				__i915_request_add(rq, true);
++				i915_request_add(rq);
+ 				mutex_unlock(&i915->drm.struct_mutex);
+ 
+ 				if (!wait_until_running(&h, rq)) {
+@@ -942,7 +942,7 @@ static int igt_wait_reset(void *arg)
+ 	}
+ 
+ 	i915_request_get(rq);
+-	__i915_request_add(rq, true);
++	i915_request_add(rq);
+ 
+ 	if (!wait_until_running(&h, rq)) {
+ 		struct drm_printer p = drm_info_printer(i915->drm.dev);
+@@ -1037,7 +1037,7 @@ static int igt_reset_queue(void *arg)
+ 		}
+ 
+ 		i915_request_get(prev);
+-		__i915_request_add(prev, true);
++		i915_request_add(prev);
+ 
+ 		count = 0;
+ 		do {
+@@ -1051,7 +1051,7 @@ static int igt_reset_queue(void *arg)
+ 			}
+ 
+ 			i915_request_get(rq);
+-			__i915_request_add(rq, true);
++			i915_request_add(rq);
+ 
+ 			/*
+ 			 * XXX We don't handle resetting the kernel context
+@@ -1184,7 +1184,7 @@ static int igt_handle_error(void *arg)
+ 	}
+ 
+ 	i915_request_get(rq);
+-	__i915_request_add(rq, true);
++	i915_request_add(rq);
+ 
+ 	if (!wait_until_running(&h, rq)) {
+ 		struct drm_printer p = drm_info_printer(i915->drm.dev);
+--- a/drivers/gpu/drm/i915/selftests/intel_lrc.c
++++ b/drivers/gpu/drm/i915/selftests/intel_lrc.c
+@@ -155,7 +155,7 @@ spinner_create_request(struct spinner *s
+ 
+ 	err = emit_recurse_batch(spin, rq, arbitration_command);
+ 	if (err) {
+-		__i915_request_add(rq, false);
++		i915_request_add(rq);
+ 		return ERR_PTR(err);
+ 	}
+ 
+--- a/drivers/gpu/drm/i915/selftests/intel_workarounds.c
++++ b/drivers/gpu/drm/i915/selftests/intel_workarounds.c
+@@ -75,7 +75,7 @@ read_nonprivs(struct i915_gem_context *c
+ 	i915_gem_object_get(result);
+ 	i915_gem_object_set_active_reference(result);
+ 
+-	__i915_request_add(rq, true);
++	i915_request_add(rq);
+ 	i915_vma_unpin(vma);
+ 
+ 	return result;

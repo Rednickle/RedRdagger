@@ -1,0 +1,266 @@
+From: Monk Liu <Monk.Liu@amd.com>
+Date: Mon, 25 Dec 2017 11:59:27 +0800
+Subject: drm/amdgpu: cleanups for vram lost handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: c41d1cf62d3615294c1dee291b05ee3220a4de6c
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+1)create a routine "handle_vram_lost" to do the vram
+recovery, and put it into amdgpu_device_reset/reset_sriov,
+this way no need of the extra paramter to hold the
+VRAM LOST information and the related macros can be removed.
+
+3)show vram_recover failure if time out, and set TMO equal to
+lockup_timeout if vram_recover is under SRIOV runtime mode.
+
+4)report error if any ip reset failed for SR-IOV
+
+Signed-off-by: Monk Liu <Monk.Liu@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Acked-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |    4 
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c |  137 +++++++++++++++--------------
+ 2 files changed, 72 insertions(+), 69 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -181,10 +181,6 @@ extern int amdgpu_cik_support;
+ #define CIK_CURSOR_WIDTH 128
+ #define CIK_CURSOR_HEIGHT 128
+ 
+-/* GPU RESET flags */
+-#define AMDGPU_RESET_INFO_VRAM_LOST  (1 << 0)
+-#define AMDGPU_RESET_INFO_FULLRESET  (1 << 1)
+-
+ struct amdgpu_device;
+ struct amdgpu_ib;
+ struct amdgpu_cs_parser;
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1591,6 +1591,8 @@ static int amdgpu_device_ip_reinit_early
+ 
+ 			r = block->version->funcs->hw_init(adev);
+ 			DRM_INFO("RE-INIT: %s %s\n", block->version->funcs->name, r?"failed":"successed");
++			if (r)
++				return r;
+ 		}
+ 	}
+ 
+@@ -1624,6 +1626,8 @@ static int amdgpu_device_ip_reinit_late_
+ 
+ 			r = block->version->funcs->hw_init(adev);
+ 			DRM_INFO("RE-INIT: %s %s\n", block->version->funcs->name, r?"failed":"successed");
++			if (r)
++				return r;
+ 		}
+ 	}
+ 
+@@ -2473,17 +2477,71 @@ err:
+ 	return r;
+ }
+ 
++static int amdgpu_device_handle_vram_lost(struct amdgpu_device *adev)
++{
++	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
++	struct amdgpu_bo *bo, *tmp;
++	struct dma_fence *fence = NULL, *next = NULL;
++	long r = 1;
++	int i = 0;
++	long tmo;
++
++	if (amdgpu_sriov_runtime(adev))
++		tmo = msecs_to_jiffies(amdgpu_lockup_timeout);
++	else
++		tmo = msecs_to_jiffies(100);
++
++	DRM_INFO("recover vram bo from shadow start\n");
++	mutex_lock(&adev->shadow_list_lock);
++	list_for_each_entry_safe(bo, tmp, &adev->shadow_list, shadow_list) {
++		next = NULL;
++		amdgpu_device_recover_vram_from_shadow(adev, ring, bo, &next);
++		if (fence) {
++			r = dma_fence_wait_timeout(fence, false, tmo);
++			if (r == 0)
++				pr_err("wait fence %p[%d] timeout\n", fence, i);
++			else if (r < 0)
++				pr_err("wait fence %p[%d] interrupted\n", fence, i);
++			if (r < 1) {
++				dma_fence_put(fence);
++				fence = next;
++				break;
++			}
++			i++;
++		}
++
++		dma_fence_put(fence);
++		fence = next;
++	}
++	mutex_unlock(&adev->shadow_list_lock);
++
++	if (fence) {
++		r = dma_fence_wait_timeout(fence, false, tmo);
++		if (r == 0)
++			pr_err("wait fence %p[%d] timeout\n", fence, i);
++		else if (r < 0)
++			pr_err("wait fence %p[%d] interrupted\n", fence, i);
++
++	}
++	dma_fence_put(fence);
++
++	if (r > 0)
++		DRM_INFO("recover vram bo from shadow done\n");
++	else
++		DRM_ERROR("recover vram bo from shadow failed\n");
++
++	return (r > 0?0:1);
++}
++
+ /*
+  * amdgpu_device_reset - reset ASIC/GPU for bare-metal or passthrough
+  *
+  * @adev: amdgpu device pointer
+- * @reset_flags: output param tells caller the reset result
+  *
+  * attempt to do soft-reset or full-reset and reinitialize Asic
+  * return 0 means successed otherwise failed
+ */
+-static int amdgpu_device_reset(struct amdgpu_device *adev,
+-			       uint64_t* reset_flags)
++static int amdgpu_device_reset(struct amdgpu_device *adev)
+ {
+ 	bool need_full_reset, vram_lost = 0;
+ 	int r;
+@@ -2498,7 +2556,6 @@ static int amdgpu_device_reset(struct am
+ 			DRM_INFO("soft reset failed, will fallback to full reset!\n");
+ 			need_full_reset = true;
+ 		}
+-
+ 	}
+ 
+ 	if (need_full_reset) {
+@@ -2547,13 +2604,8 @@ out:
+ 		}
+ 	}
+ 
+-	if (reset_flags) {
+-		if (vram_lost)
+-			(*reset_flags) |= AMDGPU_RESET_INFO_VRAM_LOST;
+-
+-		if (need_full_reset)
+-			(*reset_flags) |= AMDGPU_RESET_INFO_FULLRESET;
+-	}
++	if (!r && ((need_full_reset && !(adev->flags & AMD_IS_APU)) || vram_lost))
++		r = amdgpu_device_handle_vram_lost(adev);
+ 
+ 	return r;
+ }
+@@ -2562,14 +2614,11 @@ out:
+  * amdgpu_device_reset_sriov - reset ASIC for SR-IOV vf
+  *
+  * @adev: amdgpu device pointer
+- * @reset_flags: output param tells caller the reset result
+  *
+  * do VF FLR and reinitialize Asic
+  * return 0 means successed otherwise failed
+ */
+-static int amdgpu_device_reset_sriov(struct amdgpu_device *adev,
+-				     uint64_t *reset_flags,
+-				     bool from_hypervisor)
++static int amdgpu_device_reset_sriov(struct amdgpu_device *adev, bool from_hypervisor)
+ {
+ 	int r;
+ 
+@@ -2590,28 +2639,20 @@ static int amdgpu_device_reset_sriov(str
+ 
+ 	/* now we are okay to resume SMC/CP/SDMA */
+ 	r = amdgpu_device_ip_reinit_late_sriov(adev);
++	amdgpu_virt_release_full_gpu(adev, true);
+ 	if (r)
+ 		goto error;
+ 
+ 	amdgpu_irq_gpu_reset_resume_helper(adev);
+ 	r = amdgpu_ib_ring_tests(adev);
+-	if (r)
+-		dev_err(adev->dev, "[GPU_RESET] ib ring test failed (%d).\n", r);
+ 
+-error:
+-	/* release full control of GPU after ib test */
+-	amdgpu_virt_release_full_gpu(adev, true);
+-
+-	if (reset_flags) {
+-		if (adev->virt.gim_feature & AMDGIM_FEATURE_GIM_FLR_VRAMLOST) {
+-			(*reset_flags) |= AMDGPU_RESET_INFO_VRAM_LOST;
+-			atomic_inc(&adev->vram_lost_counter);
+-		}
+-
+-		/* VF FLR or hotlink reset is always full-reset */
+-		(*reset_flags) |= AMDGPU_RESET_INFO_FULLRESET;
++	if (!r && adev->virt.gim_feature & AMDGIM_FEATURE_GIM_FLR_VRAMLOST) {
++		atomic_inc(&adev->vram_lost_counter);
++		r = amdgpu_device_handle_vram_lost(adev);
+ 	}
+ 
++error:
++
+ 	return r;
+ }
+ 
+@@ -2629,7 +2670,6 @@ int amdgpu_device_gpu_recover(struct amd
+ 			      struct amdgpu_job *job, bool force)
+ {
+ 	struct drm_atomic_state *state = NULL;
+-	uint64_t reset_flags = 0;
+ 	int i, r, resched;
+ 
+ 	if (!force && !amdgpu_device_ip_check_soft_reset(adev)) {
+@@ -2675,42 +2715,9 @@ int amdgpu_device_gpu_recover(struct amd
+ 	}
+ 
+ 	if (amdgpu_sriov_vf(adev))
+-		r = amdgpu_device_reset_sriov(adev, &reset_flags, job ? false : true);
++		r = amdgpu_device_reset_sriov(adev, job ? false : true);
+ 	else
+-		r = amdgpu_device_reset(adev, &reset_flags);
+-
+-	if (!r) {
+-		if (((reset_flags & AMDGPU_RESET_INFO_FULLRESET) && !(adev->flags & AMD_IS_APU)) ||
+-			(reset_flags & AMDGPU_RESET_INFO_VRAM_LOST)) {
+-			struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
+-			struct amdgpu_bo *bo, *tmp;
+-			struct dma_fence *fence = NULL, *next = NULL;
+-
+-			DRM_INFO("recover vram bo from shadow\n");
+-			mutex_lock(&adev->shadow_list_lock);
+-			list_for_each_entry_safe(bo, tmp, &adev->shadow_list, shadow_list) {
+-				next = NULL;
+-				amdgpu_device_recover_vram_from_shadow(adev, ring, bo, &next);
+-				if (fence) {
+-					r = dma_fence_wait(fence, false);
+-					if (r) {
+-						WARN(r, "recovery from shadow isn't completed\n");
+-						break;
+-					}
+-				}
+-
+-				dma_fence_put(fence);
+-				fence = next;
+-			}
+-			mutex_unlock(&adev->shadow_list_lock);
+-			if (fence) {
+-				r = dma_fence_wait(fence, false);
+-				if (r)
+-					WARN(r, "recovery from shadow isn't completed\n");
+-			}
+-			dma_fence_put(fence);
+-		}
+-	}
++		r = amdgpu_device_reset(adev);
+ 
+ 	for (i = 0; i < AMDGPU_MAX_RINGS; ++i) {
+ 		struct amdgpu_ring *ring = adev->rings[i];

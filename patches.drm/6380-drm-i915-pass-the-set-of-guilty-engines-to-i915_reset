@@ -1,0 +1,296 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 6 Apr 2018 23:03:54 +0100
+Subject: drm/i915: Pass the set of guilty engines to i915_reset()
+Git-commit: d0667e9ce52eb2d5d32db4f16976226e78f88784
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Currently, we rely on inspecting the hangcheck state from within the
+i915_reset() routines to determine which engines were guilty of the
+hang. This is problematic for cases where we want to run
+i915_handle_error() and call i915_reset() independently of hangcheck.
+Instead of relying on the indirect parameter passing, turn it into an
+explicit parameter providing the set of stalled engines which then are
+treated as guilty until proven innocent.
+
+While we are removing the implicit stalled parameter, also make the
+reason into an explicit parameter to i915_reset(). We still need a
+back-channel for i915_handle_error() to hand over the task to the locked
+waiter, but let's keep that its own channel rather than incriminate
+another.
+
+This leaves stalled/seqno as being private to hangcheck, with no more
+nefarious snooping by reset, be it whole-device or per-engine. \o/
+
+The only real issue now is that this makes it crystal clear that we
+don't actually do any testing of hangcheck per se in
+drv_selftest/live_hangcheck, merely of resets!
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Michel Thierry <michel.thierry@intel.com>
+Cc: Jeff McGee <jeff.mcgee@intel.com>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180406220354.18911-2-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c                  |   13 ++++++---
+ drivers/gpu/drm/i915/i915_drv.h                  |   10 +++++--
+ drivers/gpu/drm/i915/i915_gem.c                  |    5 ++-
+ drivers/gpu/drm/i915/i915_gpu_error.h            |    3 ++
+ drivers/gpu/drm/i915/i915_irq.c                  |   12 ++++++---
+ drivers/gpu/drm/i915/i915_request.c              |    6 +++-
+ drivers/gpu/drm/i915/selftests/intel_hangcheck.c |   30 ++++++++++-------------
+ 7 files changed, 47 insertions(+), 32 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -1872,6 +1872,8 @@ static int i915_resume_switcheroo(struct
+ /**
+  * i915_reset - reset chip after a hang
+  * @i915: #drm_i915_private to reset
++ * @stalled_mask: mask of the stalled engines with the guilty requests
++ * @reason: user error message for why we are resetting
+  *
+  * Reset the chip.  Useful if a hang is detected. Marks the device as wedged
+  * on failure.
+@@ -1886,7 +1888,9 @@ static int i915_resume_switcheroo(struct
+  *   - re-init interrupt state
+  *   - re-init display
+  */
+-void i915_reset(struct drm_i915_private *i915)
++void i915_reset(struct drm_i915_private *i915,
++		unsigned int stalled_mask,
++		const char *reason)
+ {
+ 	struct i915_gpu_error *error = &i915->gpu_error;
+ 	int ret;
+@@ -1905,9 +1909,8 @@ void i915_reset(struct drm_i915_private
+ 	if (!i915_gem_unset_wedged(i915))
+ 		goto wakeup;
+ 
+-	if (error->reason)
+-		dev_notice(i915->drm.dev,
+-			   "Resetting chip for %s\n", error->reason);
++	if (reason)
++		dev_notice(i915->drm.dev, "Resetting chip for %s\n", reason);
+ 	error->reset_count++;
+ 
+ 	disable_irq(i915->drm.irq);
+@@ -1950,7 +1953,7 @@ void i915_reset(struct drm_i915_private
+ 		goto error;
+ 	}
+ 
+-	i915_gem_reset(i915);
++	i915_gem_reset(i915, stalled_mask);
+ 	intel_overlay_reset(i915);
+ 
+ 	/*
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -2701,8 +2701,11 @@ extern void i915_driver_unload(struct dr
+ extern int intel_gpu_reset(struct drm_i915_private *dev_priv, u32 engine_mask);
+ extern bool intel_has_gpu_reset(struct drm_i915_private *dev_priv);
+ 
+-extern void i915_reset(struct drm_i915_private *i915);
+-extern int i915_reset_engine(struct intel_engine_cs *engine, const char *msg);
++extern void i915_reset(struct drm_i915_private *i915,
++		       unsigned int stalled_mask,
++		       const char *reason);
++extern int i915_reset_engine(struct intel_engine_cs *engine,
++			     const char *reason);
+ 
+ extern bool intel_has_reset_engine(struct drm_i915_private *dev_priv);
+ extern int intel_reset_guc(struct drm_i915_private *dev_priv);
+@@ -3126,7 +3129,8 @@ static inline u32 i915_reset_engine_coun
+ struct i915_request *
+ i915_gem_reset_prepare_engine(struct intel_engine_cs *engine);
+ int i915_gem_reset_prepare(struct drm_i915_private *dev_priv);
+-void i915_gem_reset(struct drm_i915_private *dev_priv);
++void i915_gem_reset(struct drm_i915_private *dev_priv,
++		    unsigned int stalled_mask);
+ void i915_gem_reset_finish_engine(struct intel_engine_cs *engine);
+ void i915_gem_reset_finish(struct drm_i915_private *dev_priv);
+ void i915_gem_set_wedged(struct drm_i915_private *dev_priv);
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3213,7 +3213,8 @@ void i915_gem_reset_engine(struct intel_
+ 	engine->reset_hw(engine, request);
+ }
+ 
+-void i915_gem_reset(struct drm_i915_private *dev_priv)
++void i915_gem_reset(struct drm_i915_private *dev_priv,
++		    unsigned int stalled_mask)
+ {
+ 	struct intel_engine_cs *engine;
+ 	enum intel_engine_id id;
+@@ -3227,7 +3228,7 @@ void i915_gem_reset(struct drm_i915_priv
+ 
+ 		i915_gem_reset_engine(engine,
+ 				      engine->hangcheck.active_request,
+-				      engine->hangcheck.stalled);
++				      stalled_mask & ENGINE_MASK(id));
+ 		ctx = fetch_and_zero(&engine->last_retired_context);
+ 		if (ctx)
+ 			engine->context_unpin(engine, ctx);
+--- a/drivers/gpu/drm/i915/i915_gpu_error.h
++++ b/drivers/gpu/drm/i915/i915_gpu_error.h
+@@ -269,6 +269,9 @@ struct i915_gpu_error {
+ 	/** Number of times an engine has been reset */
+ 	u32 reset_engine_count[I915_NUM_ENGINES];
+ 
++	/** Set of stalled engines with guilty requests, in the current reset */
++	u32 stalled_mask;
++
+ 	/** Reason for the current *global* reset */
+ 	const char *reason;
+ 
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2961,7 +2961,8 @@ static irqreturn_t gen11_irq_handler(int
+ }
+ 
+ static void i915_reset_device(struct drm_i915_private *dev_priv,
+-			      const char *msg)
++			      u32 engine_mask,
++			      const char *reason)
+ {
+ 	struct i915_gpu_error *error = &dev_priv->gpu_error;
+ 	struct kobject *kobj = &dev_priv->drm.primary->kdev->kobj;
+@@ -2979,9 +2980,11 @@ static void i915_reset_device(struct drm
+ 	i915_wedge_on_timeout(&w, dev_priv, 5*HZ) {
+ 		intel_prepare_reset(dev_priv);
+ 
+-		error->reason = msg;
++		error->reason = reason;
++		error->stalled_mask = engine_mask;
+ 
+ 		/* Signal that locked waiters should reset the GPU */
++		smp_mb__before_atomic();
+ 		set_bit(I915_RESET_HANDOFF, &error->flags);
+ 		wake_up_all(&error->wait_queue);
+ 
+@@ -2990,7 +2993,7 @@ static void i915_reset_device(struct drm
+ 		 */
+ 		do {
+ 			if (mutex_trylock(&dev_priv->drm.struct_mutex)) {
+-				i915_reset(dev_priv);
++				i915_reset(dev_priv, engine_mask, reason);
+ 				mutex_unlock(&dev_priv->drm.struct_mutex);
+ 			}
+ 		} while (wait_on_bit_timeout(&error->flags,
+@@ -2998,6 +3001,7 @@ static void i915_reset_device(struct drm
+ 					     TASK_UNINTERRUPTIBLE,
+ 					     1));
+ 
++		error->stalled_mask = 0;
+ 		error->reason = NULL;
+ 
+ 		intel_finish_reset(dev_priv);
+@@ -3122,7 +3126,7 @@ void i915_handle_error(struct drm_i915_p
+ 				    TASK_UNINTERRUPTIBLE);
+ 	}
+ 
+-	i915_reset_device(dev_priv, msg);
++	i915_reset_device(dev_priv, engine_mask, msg);
+ 
+ 	for_each_engine(engine, dev_priv, tmp) {
+ 		clear_bit(I915_RESET_ENGINE + engine->id,
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -1185,11 +1185,13 @@ static bool __i915_spin_request(const st
+ 
+ static bool __i915_wait_request_check_and_reset(struct i915_request *request)
+ {
+-	if (likely(!i915_reset_handoff(&request->i915->gpu_error)))
++	struct i915_gpu_error *error = &request->i915->gpu_error;
++
++	if (likely(!i915_reset_handoff(error)))
+ 		return false;
+ 
+ 	__set_current_state(TASK_RUNNING);
+-	i915_reset(request->i915);
++	i915_reset(request->i915, error->stalled_mask, error->reason);
+ 	return true;
+ }
+ 
+--- a/drivers/gpu/drm/i915/selftests/intel_hangcheck.c
++++ b/drivers/gpu/drm/i915/selftests/intel_hangcheck.c
+@@ -437,7 +437,7 @@ static int igt_global_reset(void *arg)
+ 	mutex_lock(&i915->drm.struct_mutex);
+ 	reset_count = i915_reset_count(&i915->gpu_error);
+ 
+-	i915_reset(i915);
++	i915_reset(i915, ALL_ENGINES, NULL);
+ 
+ 	if (i915_reset_count(&i915->gpu_error) == reset_count) {
+ 		pr_err("No GPU reset recorded!\n");
+@@ -881,17 +881,18 @@ static int igt_reset_engines(void *arg)
+ 	return 0;
+ }
+ 
+-static u32 fake_hangcheck(struct i915_request *rq)
++static u32 fake_hangcheck(struct i915_request *rq, u32 mask)
+ {
+-	u32 reset_count;
++	struct i915_gpu_error *error = &rq->i915->gpu_error;
++	u32 reset_count = i915_reset_count(error);
+ 
+-	rq->engine->hangcheck.stalled = true;
+-	rq->engine->hangcheck.seqno = intel_engine_get_seqno(rq->engine);
++	error->stalled_mask = mask;
+ 
+-	reset_count = i915_reset_count(&rq->i915->gpu_error);
++	/* set_bit() must be after we have setup the backchannel (mask) */
++	smp_mb__before_atomic();
++	set_bit(I915_RESET_HANDOFF, &error->flags);
+ 
+-	set_bit(I915_RESET_HANDOFF, &rq->i915->gpu_error.flags);
+-	wake_up_all(&rq->i915->gpu_error.wait_queue);
++	wake_up_all(&error->wait_queue);
+ 
+ 	return reset_count;
+ }
+@@ -939,7 +940,7 @@ static int igt_wait_reset(void *arg)
+ 		goto out_rq;
+ 	}
+ 
+-	reset_count = fake_hangcheck(rq);
++	reset_count = fake_hangcheck(rq, ALL_ENGINES);
+ 
+ 	timeout = i915_request_wait(rq, I915_WAIT_LOCKED, 10);
+ 	if (timeout < 0) {
+@@ -1075,9 +1076,9 @@ static int igt_reset_queue(void *arg)
+ 				goto fini;
+ 			}
+ 
+-			reset_count = fake_hangcheck(prev);
++			reset_count = fake_hangcheck(prev, ENGINE_MASK(id));
+ 
+-			i915_reset(i915);
++			i915_reset(i915, ENGINE_MASK(id), NULL);
+ 
+ 			GEM_BUG_ON(test_bit(I915_RESET_HANDOFF,
+ 					    &i915->gpu_error.flags));
+@@ -1150,7 +1151,7 @@ static int igt_handle_error(void *arg)
+ 	if (!intel_has_reset_engine(i915))
+ 		return 0;
+ 
+-	if (!intel_engine_can_store_dword(i915->engine[RCS]))
++	if (!engine || !intel_engine_can_store_dword(engine))
+ 		return 0;
+ 
+ 	mutex_lock(&i915->drm.struct_mutex);
+@@ -1186,10 +1187,7 @@ static int igt_handle_error(void *arg)
+ 	/* Temporarily disable error capture */
+ 	error = xchg(&i915->gpu_error.first_error, (void *)-1);
+ 
+-	engine->hangcheck.stalled = true;
+-	engine->hangcheck.seqno = intel_engine_get_seqno(engine);
+-
+-	i915_handle_error(i915, intel_engine_flag(engine), 0, NULL);
++	i915_handle_error(i915, ENGINE_MASK(engine->id), 0, NULL);
+ 
+ 	xchg(&i915->gpu_error.first_error, error);
+ 

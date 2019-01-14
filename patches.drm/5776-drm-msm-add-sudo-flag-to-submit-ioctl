@@ -1,0 +1,178 @@
+From: Rob Clark <robdclark@gmail.com>
+Date: Wed, 13 Dec 2017 15:12:57 -0500
+Subject: drm/msm: add sudo flag to submit ioctl
+Git-commit: 6a8bd08d0465b2b8d214007c58598e2c15312296
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+This flags cause cmdstream to be executed from the ringbuffer (RB)
+instead of IB1.  Normally not something you'd ever want to do, but
+it is super useful for firmware debugging.
+
+Hidden behind CAP_SYS_RAWIO and a default=n kconfig option which
+depends on EXPERT (and has a suitably scary warning), to prevent
+it from being used on accident.
+
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/msm/Kconfig           |   13 ++++++
+ drivers/gpu/drm/msm/adreno/a5xx_gpu.c |   65 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/msm/msm_gem.h         |    1 
+ drivers/gpu/drm/msm/msm_gem_submit.c  |    9 ++++
+ include/uapi/drm/msm_drm.h            |    2 +
+ 5 files changed, 90 insertions(+)
+
+--- a/drivers/gpu/drm/msm/Kconfig
++++ b/drivers/gpu/drm/msm/Kconfig
+@@ -28,6 +28,19 @@ config DRM_MSM_REGISTER_LOGGING
+ 	  that can be parsed by envytools demsm tool.  If enabled, register
+ 	  logging can be switched on via msm.reglog=y module param.
+ 
++config DRM_MSM_GPU_SUDO
++	bool "Enable SUDO flag on submits"
++	depends on DRM_MSM && EXPERT
++	default n
++	help
++	  Enable userspace that has CAP_SYS_RAWIO to submit GPU commands
++	  that are run from RB instead of IB1.  This essentially gives
++	  userspace kernel level access, but is useful for firmware
++	  debugging.
++
++	  Only use this if you are a driver developer.  This should *not*
++	  be enabled for production kernels.  If unsure, say N.
++
+ config DRM_MSM_HDMI_HDCP
+ 	bool "Enable HDMI HDCP support in MSM DRM driver"
+ 	depends on DRM_MSM && QCOM_SCM
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -140,6 +140,65 @@ static void a5xx_flush(struct msm_gpu *g
+ 		gpu_write(gpu, REG_A5XX_CP_RB_WPTR, wptr);
+ }
+ 
++static void a5xx_submit_in_rb(struct msm_gpu *gpu, struct msm_gem_submit *submit,
++	struct msm_file_private *ctx)
++{
++	struct msm_drm_private *priv = gpu->dev->dev_private;
++	struct msm_ringbuffer *ring = submit->ring;
++	struct msm_gem_object *obj;
++	uint32_t *ptr, dwords;
++	unsigned int i;
++
++	for (i = 0; i < submit->nr_cmds; i++) {
++		switch (submit->cmd[i].type) {
++		case MSM_SUBMIT_CMD_IB_TARGET_BUF:
++			break;
++		case MSM_SUBMIT_CMD_CTX_RESTORE_BUF:
++			if (priv->lastctx == ctx)
++				break;
++		case MSM_SUBMIT_CMD_BUF:
++			/* copy commands into RB: */
++			obj = submit->bos[submit->cmd[i].idx].obj;
++			dwords = submit->cmd[i].size;
++
++			ptr = msm_gem_get_vaddr(&obj->base);
++
++			/* _get_vaddr() shouldn't fail at this point,
++			 * since we've already mapped it once in
++			 * submit_reloc()
++			 */
++			if (WARN_ON(!ptr))
++				return;
++
++			for (i = 0; i < dwords; i++) {
++				/* normally the OUT_PKTn() would wait
++				 * for space for the packet.  But since
++				 * we just OUT_RING() the whole thing,
++				 * need to call adreno_wait_ring()
++				 * ourself:
++				 */
++				adreno_wait_ring(ring, 1);
++				OUT_RING(ring, ptr[i]);
++			}
++
++			msm_gem_put_vaddr(&obj->base);
++
++			break;
++		}
++	}
++
++	a5xx_flush(gpu, ring);
++	a5xx_preempt_trigger(gpu);
++
++	/* we might not necessarily have a cmd from userspace to
++	 * trigger an event to know that submit has completed, so
++	 * do this manually:
++	 */
++	a5xx_idle(gpu, ring);
++	ring->memptrs->fence = submit->seqno;
++	msm_gpu_retire(gpu);
++}
++
+ static void a5xx_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit,
+ 	struct msm_file_private *ctx)
+ {
+@@ -149,6 +208,12 @@ static void a5xx_submit(struct msm_gpu *
+ 	struct msm_ringbuffer *ring = submit->ring;
+ 	unsigned int i, ibs = 0;
+ 
++	if (IS_ENABLED(CONFIG_DRM_MSM_GPU_SUDO) && submit->in_rb) {
++		priv->lastctx = NULL;
++		a5xx_submit_in_rb(gpu, submit, ctx);
++		return;
++	}
++
+ 	OUT_PKT7(ring, CP_PREEMPT_ENABLE_GLOBAL, 1);
+ 	OUT_RING(ring, 0x02);
+ 
+--- a/drivers/gpu/drm/msm/msm_gem.h
++++ b/drivers/gpu/drm/msm/msm_gem.h
+@@ -146,6 +146,7 @@ struct msm_gem_submit {
+ 	struct msm_gpu_submitqueue *queue;
+ 	struct pid *pid;    /* submitting process */
+ 	bool valid;         /* true if no cmdstream patching needed */
++	bool in_rb;         /* "sudo" mode, copy cmds into RB */
+ 	struct msm_ringbuffer *ring;
+ 	unsigned int nr_cmds;
+ 	unsigned int nr_bos;
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -430,6 +430,12 @@ int msm_ioctl_gem_submit(struct drm_devi
+ 	if (MSM_PIPE_FLAGS(args->flags) & ~MSM_SUBMIT_FLAGS)
+ 		return -EINVAL;
+ 
++	if (args->flags & MSM_SUBMIT_SUDO) {
++		if (!IS_ENABLED(CONFIG_DRM_MSM_GPU_SUDO) ||
++		    !capable(CAP_SYS_RAWIO))
++			return -EINVAL;
++	}
++
+ 	queue = msm_submitqueue_get(ctx, args->queueid);
+ 	if (!queue)
+ 		return -ENOENT;
+@@ -471,6 +477,9 @@ int msm_ioctl_gem_submit(struct drm_devi
+ 		goto out_unlock;
+ 	}
+ 
++	if (args->flags & MSM_SUBMIT_SUDO)
++		submit->in_rb = true;
++
+ 	ret = submit_lookup_objects(submit, args, file);
+ 	if (ret)
+ 		goto out;
+--- a/include/uapi/drm/msm_drm.h
++++ b/include/uapi/drm/msm_drm.h
+@@ -201,10 +201,12 @@ struct drm_msm_gem_submit_bo {
+ #define MSM_SUBMIT_NO_IMPLICIT   0x80000000 /* disable implicit sync */
+ #define MSM_SUBMIT_FENCE_FD_IN   0x40000000 /* enable input fence_fd */
+ #define MSM_SUBMIT_FENCE_FD_OUT  0x20000000 /* enable output fence_fd */
++#define MSM_SUBMIT_SUDO          0x10000000 /* run submitted cmds from RB */
+ #define MSM_SUBMIT_FLAGS                ( \
+ 		MSM_SUBMIT_NO_IMPLICIT   | \
+ 		MSM_SUBMIT_FENCE_FD_IN   | \
+ 		MSM_SUBMIT_FENCE_FD_OUT  | \
++		MSM_SUBMIT_SUDO          | \
+ 		0)
+ 
+ /* Each cmdstream submit consists of a table of buffers involved, and

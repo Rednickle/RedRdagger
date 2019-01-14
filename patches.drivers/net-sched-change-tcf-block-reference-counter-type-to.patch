@@ -1,0 +1,143 @@
+From: Vlad Buslov <vladbu@mellanox.com>
+Date: Mon, 24 Sep 2018 19:22:54 +0300
+Subject: net: sched: change tcf block reference counter type to refcount_t
+Patch-mainline: v4.20-rc1
+Git-commit: cfebd7e242d7193a9901222b3e667788810d98c1
+References: bsc#1109837
+
+As a preparation for removing rtnl lock dependency from rules update path,
+change tcf block reference counter type to refcount_t to allow modification
+by concurrent users.
+
+In block put function perform decrement and check reference counter once to
+accommodate concurrent modification by unlocked users. After this change
+tcf_chain_put at the end of block put function is called with
+block->refcnt==0 and will deallocate block after the last chain is
+released, so there is no need to manually deallocate block in this case.
+However, if block reference counter reached 0 and there are no chains to
+release, block must still be deallocated manually.
+
+Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+Acked-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ include/net/sch_generic.h |    2 -
+ net/sched/cls_api.c       |   59 +++++++++++++++++++++++++++-------------------
+ 2 files changed, 36 insertions(+), 25 deletions(-)
+
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -344,7 +344,7 @@ struct tcf_chain {
+ struct tcf_block {
+ 	struct list_head chain_list;
+ 	u32 index; /* block index for shared blocks */
+-	unsigned int refcnt;
++	refcount_t refcnt;
+ 	struct net *net;
+ 	struct Qdisc *q;
+ 	struct list_head cb_list;
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -243,7 +243,7 @@ static void tcf_chain_destroy(struct tcf
+ 	if (!chain->index)
+ 		block->chain0.chain = NULL;
+ 	kfree(chain);
+-	if (list_empty(&block->chain_list) && block->refcnt == 0)
++	if (list_empty(&block->chain_list) && !refcount_read(&block->refcnt))
+ 		kfree(block);
+ }
+ 
+@@ -513,7 +513,7 @@ static struct tcf_block *tcf_block_creat
+ 	INIT_LIST_HEAD(&block->owner_list);
+ 	INIT_LIST_HEAD(&block->chain0.filter_chain_list);
+ 
+-	block->refcnt = 1;
++	refcount_set(&block->refcnt, 1);
+ 	block->net = net;
+ 	block->index = block_index;
+ 
+@@ -713,7 +713,7 @@ int tcf_block_get_ext(struct tcf_block *
+ 		/* block_index not 0 means the shared block is requested */
+ 		block = tcf_block_lookup(net, ei->block_index);
+ 		if (block)
+-			block->refcnt++;
++			refcount_inc(&block->refcnt);
+ 	}
+ 
+ 	if (!block) {
+@@ -756,7 +756,7 @@ err_block_owner_add:
+ err_block_insert:
+ 		kfree(block);
+ 	} else {
+-		block->refcnt--;
++		refcount_dec(&block->refcnt);
+ 	}
+ 	return err;
+ }
+@@ -796,34 +796,45 @@ void tcf_block_put_ext(struct tcf_block
+ 	tcf_chain0_head_change_cb_del(block, ei);
+ 	tcf_block_owner_del(block, q, ei->binder_type);
+ 
+-	if (block->refcnt == 1) {
+-		if (tcf_block_shared(block))
+-			tcf_block_remove(block, block->net);
+-
+-		/* Hold a refcnt for all chains, so that they don't disappear
+-		 * while we are iterating.
++	if (refcount_dec_and_test(&block->refcnt)) {
++		/* Flushing/putting all chains will cause the block to be
++		 * deallocated when last chain is freed. However, if chain_list
++		 * is empty, block has to be manually deallocated. After block
++		 * reference counter reached 0, it is no longer possible to
++		 * increment it or add new chains to block.
+ 		 */
+-		list_for_each_entry(chain, &block->chain_list, list)
+-			tcf_chain_hold(chain);
++		bool free_block = list_empty(&block->chain_list);
+ 
+-		list_for_each_entry(chain, &block->chain_list, list)
+-			tcf_chain_flush(chain);
+-	}
++		if (tcf_block_shared(block))
++			tcf_block_remove(block, block->net);
+ 
+-	tcf_block_offload_unbind(block, q, ei);
++		if (!free_block) {
++			/* Hold a refcnt for all chains, so that they don't
++			 * disappear while we are iterating.
++			 */
++			list_for_each_entry(chain, &block->chain_list, list)
++				tcf_chain_hold(chain);
+ 
+-	if (block->refcnt == 1) {
+-		/* At this point, all the chains should have refcnt >= 1. */
+-		list_for_each_entry_safe(chain, tmp, &block->chain_list, list) {
+-			tcf_chain_put_explicitly_created(chain);
+-			tcf_chain_put(chain);
++			list_for_each_entry(chain, &block->chain_list, list)
++				tcf_chain_flush(chain);
+ 		}
+ 
+-		block->refcnt--;
+-		if (list_empty(&block->chain_list))
++		tcf_block_offload_unbind(block, q, ei);
++
++		if (free_block) {
+ 			kfree(block);
++		} else {
++			/* At this point, all the chains should have
++			 * refcnt >= 1.
++			 */
++			list_for_each_entry_safe(chain, tmp, &block->chain_list,
++						 list) {
++				tcf_chain_put_explicitly_created(chain);
++				tcf_chain_put(chain);
++			}
++		}
+ 	} else {
+-		block->refcnt--;
++		tcf_block_offload_unbind(block, q, ei);
+ 	}
+ }
+ EXPORT_SYMBOL(tcf_block_put_ext);

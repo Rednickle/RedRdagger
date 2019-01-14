@@ -1,0 +1,233 @@
+From: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+Date: Sat, 2 Jun 2018 12:29:46 +0100
+Subject: drm/i915/perf: fix ctx_id read with GuC & ICL
+Git-commit: 61d5676b5561d61e3fdd9e88fc2b549b9b4df08f
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+One thing we didn't really understand about the OA report is that the
+ContextID field (dword 2) is copy of the context descriptor (dword 1).
+
+On Gen8->10 and without using GuC we didn't notice the issue because
+we only checked the 21bits of the ContextID field in the OA reports
+which matches exactly the hw_id stored into the context descriptor.
+
+When using GuC submission we have an issue of a non matching hw_id
+because GuC uses bit 20 of the hw_id to signal proxy submission. This
+change introduces a mask to compare only the relevant bits.
+
+On ICL the context descriptor format has changed and we failed to
+address this. On top of using a mask we also need to shift the bits
+properly.
+
+v2: Reuse lrc_desc rather than recomputing part of it (Chris/Michel)
+
+v3: Always pin the context we're filtering with (Chris)
+
+Signed-off-by: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+Fixes: 1de401c08fa805 ("drm/i915/perf: enable perf support on ICL")
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=104252
+BSpec: 1237
+Testcase: igt/perf/gen8-unprivileged-single-ctx-counters
+Acked-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Michel Thierry <michel.thierry@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180602112946.30803-3-lionel.g.landwerlin@intel.com
+Cc: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+Cc: Matthew Auld <matthew.auld@intel.com>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: intel-gfx@lists.freedesktop.org
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h  |    1 
+ drivers/gpu/drm/i915/i915_perf.c |  123 ++++++++++++++++++++++++++++-----------
+ drivers/gpu/drm/i915/intel_lrc.c |    5 +
+ 3 files changed, 97 insertions(+), 32 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1959,6 +1959,7 @@ struct drm_i915_private {
+ 
+ 			struct intel_context *pinned_ctx;
+ 			u32 specific_ctx_id;
++			u32 specific_ctx_id_mask;
+ 
+ 			struct hrtimer poll_check_timer;
+ 			wait_queue_head_t poll_wq;
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -737,12 +737,7 @@ static int gen8_append_oa_reports(struct
+ 			continue;
+ 		}
+ 
+-		/*
+-		 * XXX: Just keep the lower 21 bits for now since I'm not
+-		 * entirely sure if the HW touches any of the higher bits in
+-		 * this field
+-		 */
+-		ctx_id = report32[2] & 0x1fffff;
++		ctx_id = report32[2] & dev_priv->perf.oa.specific_ctx_id_mask;
+ 
+ 		/*
+ 		 * Squash whatever is in the CTX_ID field if it's marked as
+@@ -1203,6 +1198,33 @@ static int i915_oa_read(struct i915_perf
+ 	return dev_priv->perf.oa.ops.read(stream, buf, count, offset);
+ }
+ 
++static struct intel_context *oa_pin_context(struct drm_i915_private *i915,
++					    struct i915_gem_context *ctx)
++{
++	struct intel_engine_cs *engine = i915->engine[RCS];
++	struct intel_context *ce;
++	int ret;
++
++	ret = i915_mutex_lock_interruptible(&i915->drm);
++	if (ret)
++		return ERR_PTR(ret);
++
++	/*
++	 * As the ID is the gtt offset of the context's vma we
++	 * pin the vma to ensure the ID remains fixed.
++	 *
++	 * NB: implied RCS engine...
++	 */
++	ce = intel_context_pin(ctx, engine);
++	mutex_unlock(&i915->drm.struct_mutex);
++	if (IS_ERR(ce))
++		return ce;
++
++	i915->perf.oa.pinned_ctx = ce;
++
++	return ce;
++}
++
+ /**
+  * oa_get_render_ctx_id - determine and hold ctx hw id
+  * @stream: An i915-perf stream opened for OA metrics
+@@ -1215,40 +1237,76 @@ static int i915_oa_read(struct i915_perf
+  */
+ static int oa_get_render_ctx_id(struct i915_perf_stream *stream)
+ {
+-	struct drm_i915_private *dev_priv = stream->dev_priv;
++	struct drm_i915_private *i915 = stream->dev_priv;
++	struct intel_context *ce;
+ 
+-	if (HAS_LOGICAL_RING_CONTEXTS(dev_priv)) {
+-		dev_priv->perf.oa.specific_ctx_id = stream->ctx->hw_id;
+-	} else {
+-		struct intel_engine_cs *engine = dev_priv->engine[RCS];
+-		struct intel_context *ce;
+-		int ret;
+-
+-		ret = i915_mutex_lock_interruptible(&dev_priv->drm);
+-		if (ret)
+-			return ret;
++	ce = oa_pin_context(i915, stream->ctx);
++	if (IS_ERR(ce))
++		return PTR_ERR(ce);
+ 
++	switch (INTEL_GEN(i915)) {
++	case 7: {
+ 		/*
+-		 * As the ID is the gtt offset of the context's vma we
+-		 * pin the vma to ensure the ID remains fixed.
+-		 *
+-		 * NB: implied RCS engine...
++		 * On Haswell we don't do any post processing of the reports
++		 * and don't need to use the mask.
+ 		 */
+-		ce = intel_context_pin(stream->ctx, engine);
+-		mutex_unlock(&dev_priv->drm.struct_mutex);
+-		if (IS_ERR(ce))
+-			return PTR_ERR(ce);
++		i915->perf.oa.specific_ctx_id = i915_ggtt_offset(ce->state);
++		i915->perf.oa.specific_ctx_id_mask = 0;
++		break;
++	}
+ 
+-		dev_priv->perf.oa.pinned_ctx = ce;
++	case 8:
++	case 9:
++	case 10:
++		if (USES_GUC_SUBMISSION(i915)) {
++			/*
++			 * When using GuC, the context descriptor we write in
++			 * i915 is read by GuC and rewritten before it's
++			 * actually written into the hardware. The LRCA is
++			 * what is put into the context id field of the
++			 * context descriptor by GuC. Because it's aligned to
++			 * a page, the lower 12bits are always at 0 and
++			 * dropped by GuC. They won't be part of the context
++			 * ID in the OA reports, so squash those lower bits.
++			 */
++			i915->perf.oa.specific_ctx_id =
++				lower_32_bits(ce->lrc_desc) >> 12;
+ 
+-		/*
+-		 * Explicitly track the ID (instead of calling
+-		 * i915_ggtt_offset() on the fly) considering the difference
+-		 * with gen8+ and execlists
+-		 */
+-		dev_priv->perf.oa.specific_ctx_id = i915_ggtt_offset(ce->state);
++			/*
++			 * GuC uses the top bit to signal proxy submission, so
++			 * ignore that bit.
++			 */
++			i915->perf.oa.specific_ctx_id_mask =
++				(1U << (GEN8_CTX_ID_WIDTH - 1)) - 1;
++		} else {
++			i915->perf.oa.specific_ctx_id = stream->ctx->hw_id;
++			i915->perf.oa.specific_ctx_id_mask =
++				(1U << GEN8_CTX_ID_WIDTH) - 1;
++		}
++		break;
++
++	case 11: {
++		struct intel_engine_cs *engine = i915->engine[RCS];
++
++		i915->perf.oa.specific_ctx_id =
++			stream->ctx->hw_id << (GEN11_SW_CTX_ID_SHIFT - 32) |
++			engine->instance << (GEN11_ENGINE_INSTANCE_SHIFT - 32) |
++			engine->class << (GEN11_ENGINE_INSTANCE_SHIFT - 32);
++		i915->perf.oa.specific_ctx_id_mask =
++			((1U << GEN11_SW_CTX_ID_WIDTH) - 1) << (GEN11_SW_CTX_ID_SHIFT - 32) |
++			((1U << GEN11_ENGINE_INSTANCE_WIDTH) - 1) << (GEN11_ENGINE_INSTANCE_SHIFT - 32) |
++			((1 << GEN11_ENGINE_CLASS_WIDTH) - 1) << (GEN11_ENGINE_CLASS_SHIFT - 32);
++		break;
++	}
++
++	default:
++		MISSING_CASE(INTEL_GEN(i915));
+ 	}
+ 
++	DRM_DEBUG_DRIVER("filtering on ctx_id=0x%x ctx_id_mask=0x%x\n",
++			 i915->perf.oa.specific_ctx_id,
++			 i915->perf.oa.specific_ctx_id_mask);
++
+ 	return 0;
+ }
+ 
+@@ -1265,6 +1323,7 @@ static void oa_put_render_ctx_id(struct
+ 	struct intel_context *ce;
+ 
+ 	dev_priv->perf.oa.specific_ctx_id = INVALID_CTX_ID;
++	dev_priv->perf.oa.specific_ctx_id_mask = 0;
+ 
+ 	ce = fetch_and_zero(&dev_priv->perf.oa.pinned_ctx);
+ 	if (ce) {
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -233,6 +233,11 @@ intel_lr_context_descriptor_update(struc
+ 								/* bits 12-31 */
+ 	GEM_BUG_ON(desc & GENMASK_ULL(63, 32));
+ 
++	/*
++	 * The following 32bits are copied into the OA reports (dword 2).
++	 * Consider updating oa_get_render_ctx_id in i915_perf.c when changing
++	 * anything below.
++	 */
+ 	if (INTEL_GEN(ctx->i915) >= 11) {
+ 		GEM_BUG_ON(ctx->hw_id >= BIT(GEN11_SW_CTX_ID_WIDTH));
+ 		desc |= (u64)ctx->hw_id << GEN11_SW_CTX_ID_SHIFT;

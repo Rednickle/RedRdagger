@@ -1,0 +1,223 @@
+From: Jordan Crouse <jcrouse@codeaurora.org>
+Date: Tue, 24 Jul 2018 10:33:31 -0600
+Subject: drm/msm/gpu: Add the buffer objects from the submit to the crash dump
+Git-commit: cdb95931dea32981545e34a3b1dfc9e172425d95
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+For hangs, dump copy out the contents of the buffer objects attached to the
+guilty submission and print them in the crash dump report.
+
+Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ Documentation/gpu/msm-crash-dump.rst    |   14 +++++++
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c |   58 ++++++++++++++++++++++++++------
+ drivers/gpu/drm/msm/msm_gpu.c           |   48 ++++++++++++++++++++++++--
+ drivers/gpu/drm/msm/msm_gpu.h           |    9 ++++
+ 4 files changed, 116 insertions(+), 13 deletions(-)
+
+--- a/Documentation/gpu/msm-crash-dump.rst
++++ b/Documentation/gpu/msm-crash-dump.rst
+@@ -66,6 +66,20 @@ ringbuffer
+ 		The contents of the ring encoded as ascii85.  Only the used
+ 		portions of the ring will be printed.
+ 
++bo
++	List of buffers from the hanging submission if available.
++	Each buffer object will have a uinque iova.
++
++	iova
++		GPU address of the buffer object.
++
++	size
++		Allocated size of the buffer object.
++
++	data
++		The contents of the buffer object encoded with ascii85.  Only
++		Trailing zeros at the end of the buffer will be skipped.
++
+ registers
+ 	Set of registers values. Each entry is on its own line enclosed
+ 	by brackets { }.
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -437,6 +437,10 @@ void adreno_gpu_state_destroy(struct msm
+ 	for (i = 0; i < ARRAY_SIZE(state->ring); i++)
+ 		kfree(state->ring[i].data);
+ 
++	for (i = 0; state->bos && i < state->nr_bos; i++)
++		kvfree(state->bos[i].data);
++
++	kfree(state->bos);
+ 	kfree(state->comm);
+ 	kfree(state->cmd);
+ 	kfree(state->registers);
+@@ -460,6 +464,39 @@ int adreno_gpu_state_put(struct msm_gpu_
+ }
+ 
+ #if defined(CONFIG_DEBUG_FS) || defined(CONFIG_DEV_COREDUMP)
++
++static void adreno_show_object(struct drm_printer *p, u32 *ptr, int len)
++{
++	char out[ASCII85_BUFSZ];
++	long l, datalen, i;
++
++	if (!ptr || !len)
++		return;
++
++	/*
++	 * Only dump the non-zero part of the buffer - rarely will any data
++	 * completely fill the entire allocated size of the buffer
++	 */
++	for (datalen = 0, i = 0; i < len >> 2; i++) {
++		if (ptr[i])
++			datalen = (i << 2) + 1;
++	}
++
++	/* Skip printing the object if it is empty */
++	if (datalen == 0)
++		return;
++
++	l = ascii85_encode_len(datalen);
++
++	drm_puts(p, "    data: !!ascii85 |\n");
++	drm_puts(p, "     ");
++
++	for (i = 0; i < l; i++)
++		drm_puts(p, ascii85_encode(ptr[i], out));
++
++	drm_puts(p, "\n");
++}
++
+ void adreno_show(struct msm_gpu *gpu, struct msm_gpu_state *state,
+ 		struct drm_printer *p)
+ {
+@@ -487,19 +524,20 @@ void adreno_show(struct msm_gpu *gpu, st
+ 		drm_printf(p, "    wptr: %d\n", state->ring[i].wptr);
+ 		drm_printf(p, "    size: %d\n", MSM_GPU_RINGBUFFER_SZ);
+ 
+-		if (state->ring[i].data && state->ring[i].data_size) {
+-			u32 *ptr = (u32 *) state->ring[i].data;
+-			char out[ASCII85_BUFSZ];
+-			long len = ascii85_encode_len(state->ring[i].data_size);
+-			int j;
++		adreno_show_object(p, state->ring[i].data,
++			state->ring[i].data_size);
++	}
+ 
+-			drm_printf(p, "    data: !!ascii85 |\n");
+-			drm_printf(p, "     ");
++	if (state->bos) {
++		drm_puts(p, "bos:\n");
+ 
+-			for (j = 0; j < len; j++)
+-				drm_printf(p, ascii85_encode(ptr[j], out));
++		for (i = 0; i < state->nr_bos; i++) {
++			drm_printf(p, "  - iova: 0x%016llx\n",
++				state->bos[i].iova);
++			drm_printf(p, "    size: %zd\n", state->bos[i].size);
+ 
+-			drm_printf(p, "\n");
++			adreno_show_object(p, state->bos[i].data,
++				state->bos[i].size);
+ 		}
+ 	}
+ 
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -318,8 +318,39 @@ static void msm_gpu_devcoredump_free(voi
+ 	msm_gpu_crashstate_put(gpu);
+ }
+ 
+-static void msm_gpu_crashstate_capture(struct msm_gpu *gpu, char *comm,
+-		char *cmd)
++static void msm_gpu_crashstate_get_bo(struct msm_gpu_state *state,
++		struct msm_gem_object *obj, u64 iova, u32 flags)
++{
++	struct msm_gpu_state_bo *state_bo = &state->bos[state->nr_bos];
++
++	/* Don't record write only objects */
++
++	state_bo->size = obj->base.size;
++	state_bo->iova = iova;
++
++	/* Only store the data for buffer objects marked for read */
++	if ((flags & MSM_SUBMIT_BO_READ)) {
++		void *ptr;
++
++		state_bo->data = kvmalloc(obj->base.size, GFP_KERNEL);
++		if (!state_bo->data)
++			return;
++
++		ptr = msm_gem_get_vaddr_active(&obj->base);
++		if (IS_ERR(ptr)) {
++			kvfree(state_bo->data);
++			return;
++		}
++
++		memcpy(state_bo->data, ptr, obj->base.size);
++		msm_gem_put_vaddr(&obj->base);
++	}
++
++	state->nr_bos++;
++}
++
++static void msm_gpu_crashstate_capture(struct msm_gpu *gpu,
++		struct msm_gem_submit *submit, char *comm, char *cmd)
+ {
+ 	struct msm_gpu_state *state;
+ 
+@@ -335,6 +366,17 @@ static void msm_gpu_crashstate_capture(s
+ 	state->comm = kstrdup(comm, GFP_KERNEL);
+ 	state->cmd = kstrdup(cmd, GFP_KERNEL);
+ 
++	if (submit) {
++		int i;
++
++		state->bos = kcalloc(submit->nr_bos,
++			sizeof(struct msm_gpu_state_bo), GFP_KERNEL);
++
++		for (i = 0; state->bos && i < submit->nr_bos; i++)
++			msm_gpu_crashstate_get_bo(state, submit->bos[i].obj,
++				submit->bos[i].iova, submit->bos[i].flags);
++	}
++
+ 	/* Set the active crash state to be dumped on failure */
+ 	gpu->crashstate = state;
+ 
+@@ -434,7 +476,7 @@ static void recover_worker(struct work_s
+ 
+ 	/* Record the crash state */
+ 	pm_runtime_get_sync(&gpu->pdev->dev);
+-	msm_gpu_crashstate_capture(gpu, comm, cmd);
++	msm_gpu_crashstate_capture(gpu, submit, comm, cmd);
+ 	pm_runtime_put_sync(&gpu->pdev->dev);
+ 
+ 	kfree(cmd);
+--- a/drivers/gpu/drm/msm/msm_gpu.h
++++ b/drivers/gpu/drm/msm/msm_gpu.h
+@@ -181,6 +181,12 @@ struct msm_gpu_submitqueue {
+ 	struct kref ref;
+ };
+ 
++struct msm_gpu_state_bo {
++	u64 iova;
++	size_t size;
++	void *data;
++};
++
+ struct msm_gpu_state {
+ 	struct kref ref;
+ 	struct timeval time;
+@@ -202,6 +208,9 @@ struct msm_gpu_state {
+ 
+ 	char *comm;
+ 	char *cmd;
++
++	int nr_bos;
++	struct msm_gpu_state_bo *bos;
+ };
+ 
+ static inline void gpu_write(struct msm_gpu *gpu, u32 reg, u32 data)

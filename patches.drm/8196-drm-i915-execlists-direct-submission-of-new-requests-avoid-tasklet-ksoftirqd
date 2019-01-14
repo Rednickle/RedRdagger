@@ -1,0 +1,377 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 28 Jun 2018 21:12:11 +0100
+Subject: drm/i915/execlists: Direct submission of new requests (avoid
+ tasklet/ksoftirqd)
+Git-commit: 9512f985c32d45ab439a210981e0d73071da395a
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Back in commit 27af5eea54d1 ("drm/i915: Move execlists irq handler to a
+bottom half"), we came to the conclusion that running our CSB processing
+and ELSP submission from inside the irq handler was a bad idea. A really
+bad idea as we could impose nearly 1s latency on other users of the
+system, on average! Deferring our work to a tasklet allowed us to do the
+processing with irqs enabled, reducing the impact to an average of about
+50us.
+
+We have since eradicated the use of forcewaked mmio from inside the CSB
+processing and ELSP submission, bringing the impact down to around 5us
+(on Kabylake); an order of magnitude better than our measurements 2
+years ago on Broadwell and only about 2x worse on average than the
+gem_syslatency on an unladen system.
+
+In this iteration of the tasklet-vs-direct submission debate, we seek a
+compromise where by we submit new requests immediately to the HW but
+defer processing the CS interrupt onto a tasklet. We gain the advantage
+of low-latency and ksoftirqd avoidance when waking up the HW, while
+avoiding the system-wide starvation of our CS irq-storms.
+
+Comparing the impact on the maximum latency observed (that is the time
+stolen from an RT process) over a 120s interval, repeated several times
+(using gem_syslatency, similar to RT's cyclictest) while the system is
+fully laden with i915 nops, we see that direct submission an actually
+improve the worse case.
+
+Maximum latency in microseconds of a third party RT thread
+(gem_syslatency -t 120 -f 2)
+  x Always using tasklets (a couple of >1000us outliers removed)
+  + Only using tasklets from CS irq, direct submission of requests
++------------------------------------------------------------------------+
+|          +                                                             |
+|          +                                                             |
+|          +                                                             |
+|          +       +                                                     |
+|          + +     +                                                     |
+|       +  + +     +  x     x     x                                      |
+|      +++ + +     +  x  x  x  x  x  x                                   |
+|      +++ + ++  + +  *x x  x  x  x  x                                   |
+|      +++ + ++  + *  *x x  *  x  x  x                                   |
+|    + +++ + ++  * * +*xxx  *  x  x  xx                                  |
+|    * +++ + ++++* *x+**xx+ *  x  x xxxx x                               |
+|   **x++++*++**+*x*x****x+ * +x xx xxxx x          x                    |
+|x* ******+***************++*+***xxxxxx* xx*x     xxx +                x+|
+|             |__________MA___________|                                  |
+|      |______M__A________|                                              |
++------------------------------------------------------------------------+
+    N           Min           Max        Median           Avg        Stddev
+x 118            91           186           124     125.28814     16.279137
++ 120            92           187           109     112.00833     13.458617
+Difference at 95.0% confidence
+	-13.2798 +/- 3.79219
+	-10.5994% +/- 3.02677%
+	(Student's t, pooled s = 14.9237)
+
+However the mean latency is adversely affected:
+
+Mean latency in microseconds of a third party RT thread
+(gem_syslatency -t 120 -f 1)
+  x Always using tasklets
+  + Only using tasklets from CS irq, direct submission of requests
++------------------------------------------------------------------------+
+|           xxxxxx                                        +   ++         |
+|           xxxxxx                                        +   ++         |
+|           xxxxxx                                      + +++ ++         |
+|           xxxxxxx                                     +++++ ++         |
+|           xxxxxxx                                     +++++ ++         |
+|           xxxxxxx                                     +++++ +++        |
+|           xxxxxxx                                   + ++++++++++       |
+|           xxxxxxxx                                 ++ ++++++++++       |
+|           xxxxxxxx                                 ++ ++++++++++       |
+|          xxxxxxxxxx                                +++++++++++++++     |
+|         xxxxxxxxxxx    x                           +++++++++++++++     |
+|x       xxxxxxxxxxxxx   x           +            + ++++++++++++++++++  +|
+|           |__A__|                                                      |
+|                                                      |____A___|        |
++------------------------------------------------------------------------+
+    N           Min           Max        Median           Avg        Stddev
+x 120         3.506         3.727         3.631     3.6321417    0.02773109
++ 120         3.834         4.149         4.039     4.0375167   0.041221676
+Difference at 95.0% confidence
+	0.405375 +/- 0.00888913
+	11.1608% +/- 0.244735%
+	(Student's t, pooled s = 0.03513)
+
+However, since the mean latency corresponds to the amount of irqsoff
+processing we have to do for a CS interrupt, we only need to speed that
+up to benefit not just system latency but our own throughput.
+
+v2: Remember to defer submissions when under reset.
+v4: Only use direct submission for new requests
+v5: Be aware that with mixing direct tasklet evaluation and deferred
+tasklets, we may end up idling before running the deferred tasklet.
+v6: Remove the redudant likely() from tasklet_is_enabled(), restrict the
+annotation to reset_in_progress().
+v7: Take the full timeline.lock when enabling perf_pmu stats as the
+tasklet is no longer a valid guard. A consequence is that the stats are
+now only valid for engines also using the timeline.lock to process
+state.
+
+Testcase: igt/gem_exec_latency/*rthog*
+References: 27af5eea54d1 ("drm/i915: Move execlists irq handler to a bottom half")
+Suggested-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180628201211.13837-9-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_gem.h        |    5 +
+ drivers/gpu/drm/i915/intel_engine_cs.c |    8 +-
+ drivers/gpu/drm/i915/intel_lrc.c       |  102 +++++++++++++++++++++------------
+ 3 files changed, 75 insertions(+), 40 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem.h
++++ b/drivers/gpu/drm/i915/i915_gem.h
+@@ -88,4 +88,9 @@ static inline void __tasklet_enable_sync
+ 		tasklet_kill(t);
+ }
+ 
++static inline bool __tasklet_is_enabled(const struct tasklet_struct *t)
++{
++	return !atomic_read(&t->count);
++}
++
+ #endif /* __I915_GEM_H__ */
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -1619,8 +1619,8 @@ int intel_enable_engine_stats(struct int
+ 	if (!intel_engine_supports_stats(engine))
+ 		return -ENODEV;
+ 
+-	tasklet_disable(&execlists->tasklet);
+-	write_seqlock_irqsave(&engine->stats.lock, flags);
++	spin_lock_irqsave(&engine->timeline.lock, flags);
++	write_seqlock(&engine->stats.lock);
+ 
+ 	if (unlikely(engine->stats.enabled == ~0)) {
+ 		err = -EBUSY;
+@@ -1644,8 +1644,8 @@ int intel_enable_engine_stats(struct int
+ 	}
+ 
+ unlock:
+-	write_sequnlock_irqrestore(&engine->stats.lock, flags);
+-	tasklet_enable(&execlists->tasklet);
++	write_sequnlock(&engine->stats.lock);
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ 
+ 	return err;
+ }
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -563,12 +563,14 @@ static void complete_preempt_context(str
+ 	GEM_BUG_ON(!execlists_is_active(execlists, EXECLISTS_ACTIVE_PREEMPT));
+ 
+ 	execlists_cancel_port_requests(execlists);
+-	execlists_unwind_incomplete_requests(execlists);
++	__unwind_incomplete_requests(container_of(execlists,
++						  struct intel_engine_cs,
++						  execlists));
+ 
+ 	execlists_clear_active(execlists, EXECLISTS_ACTIVE_PREEMPT);
+ }
+ 
+-static void __execlists_dequeue(struct intel_engine_cs *engine)
++static void execlists_dequeue(struct intel_engine_cs *engine)
+ {
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+ 	struct execlist_port *port = execlists->port;
+@@ -578,9 +580,8 @@ static void __execlists_dequeue(struct i
+ 	struct rb_node *rb;
+ 	bool submit = false;
+ 
+-	lockdep_assert_held(&engine->timeline.lock);
+-
+-	/* Hardware submission is through 2 ports. Conceptually each port
++	/*
++	 * Hardware submission is through 2 ports. Conceptually each port
+ 	 * has a (RING_START, RING_HEAD, RING_TAIL) tuple. RING_START is
+ 	 * static for a context, and unique to each, so we only execute
+ 	 * requests belonging to a single context from each ring. RING_HEAD
+@@ -770,15 +771,6 @@ done:
+ 		   !port_isset(engine->execlists.port));
+ }
+ 
+-static void execlists_dequeue(struct intel_engine_cs *engine)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&engine->timeline.lock, flags);
+-	__execlists_dequeue(engine);
+-	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+-}
+-
+ void
+ execlists_cancel_port_requests(struct intel_engine_execlists * const execlists)
+ {
+@@ -957,6 +949,12 @@ static void execlists_cancel_requests(st
+ 	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ }
+ 
++static inline bool
++reset_in_progress(const struct intel_engine_execlists *execlists)
++{
++	return unlikely(!__tasklet_is_enabled(&execlists->tasklet));
++}
++
+ static void process_csb(struct intel_engine_cs *engine)
+ {
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+@@ -1108,18 +1106,9 @@ static void process_csb(struct intel_eng
+ 	execlists->csb_head = head;
+ }
+ 
+-/*
+- * Check the unread Context Status Buffers and manage the submission of new
+- * contexts to the ELSP accordingly.
+- */
+-static void execlists_submission_tasklet(unsigned long data)
++static void __execlists_submission_tasklet(struct intel_engine_cs *const engine)
+ {
+-	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
+-
+-	GEM_TRACE("%s awake?=%d, active=%x\n",
+-		  engine->name,
+-		  engine->i915->gt.awake,
+-		  engine->execlists.active);
++	lockdep_assert_held(&engine->timeline.lock);
+ 
+ 	/*
+ 	 * We can skip acquiring intel_runtime_pm_get() here as it was taken
+@@ -1136,6 +1125,28 @@ static void execlists_submission_tasklet
+ 		execlists_dequeue(engine);
+ }
+ 
++/*
++ * Check the unread Context Status Buffers and manage the submission of new
++ * contexts to the ELSP accordingly.
++ */
++static void execlists_submission_tasklet(unsigned long data)
++{
++	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
++	unsigned long flags;
++
++	GEM_TRACE("%s awake?=%d, active=%x\n",
++		  engine->name,
++		  engine->i915->gt.awake,
++		  engine->execlists.active);
++
++	spin_lock_irqsave(&engine->timeline.lock, flags);
++
++	if (engine->i915->gt.awake) /* we may be delayed until after we idle! */
++		__execlists_submission_tasklet(engine);
++
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
++}
++
+ static void queue_request(struct intel_engine_cs *engine,
+ 			  struct i915_sched_node *node,
+ 			  int prio)
+@@ -1144,16 +1155,30 @@ static void queue_request(struct intel_e
+ 		      &lookup_priolist(engine, prio)->requests);
+ }
+ 
+-static void __submit_queue(struct intel_engine_cs *engine, int prio)
++static void __update_queue(struct intel_engine_cs *engine, int prio)
+ {
+ 	engine->execlists.queue_priority = prio;
+-	tasklet_hi_schedule(&engine->execlists.tasklet);
++}
++
++static void __submit_queue_imm(struct intel_engine_cs *engine)
++{
++	struct intel_engine_execlists * const execlists = &engine->execlists;
++
++	if (reset_in_progress(execlists))
++		return; /* defer until we restart the engine following reset */
++
++	if (execlists->tasklet.func == execlists_submission_tasklet)
++		__execlists_submission_tasklet(engine);
++	else
++		tasklet_hi_schedule(&execlists->tasklet);
+ }
+ 
+ static void submit_queue(struct intel_engine_cs *engine, int prio)
+ {
+-	if (prio > engine->execlists.queue_priority)
+-		__submit_queue(engine, prio);
++	if (prio > engine->execlists.queue_priority) {
++		__update_queue(engine, prio);
++		__submit_queue_imm(engine);
++	}
+ }
+ 
+ static void execlists_submit_request(struct i915_request *request)
+@@ -1165,11 +1190,12 @@ static void execlists_submit_request(str
+ 	spin_lock_irqsave(&engine->timeline.lock, flags);
+ 
+ 	queue_request(engine, &request->sched, rq_prio(request));
+-	submit_queue(engine, rq_prio(request));
+ 
+ 	GEM_BUG_ON(!engine->execlists.first);
+ 	GEM_BUG_ON(list_empty(&request->sched.link));
+ 
++	submit_queue(engine, rq_prio(request));
++
+ 	spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ }
+ 
+@@ -1296,8 +1322,11 @@ static void execlists_schedule(struct i9
+ 		}
+ 
+ 		if (prio > engine->execlists.queue_priority &&
+-		    i915_sw_fence_done(&sched_to_request(node)->submit))
+-			__submit_queue(engine, prio);
++		    i915_sw_fence_done(&sched_to_request(node)->submit)) {
++			/* defer submission until after all of our updates */
++			__update_queue(engine, prio);
++			tasklet_hi_schedule(&engine->execlists.tasklet);
++		}
+ 	}
+ 
+ 	spin_unlock_irq(&engine->timeline.lock);
+@@ -1878,6 +1907,7 @@ execlists_reset_prepare(struct intel_eng
+ {
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+ 	struct i915_request *request, *active;
++	unsigned long flags;
+ 
+ 	GEM_TRACE("%s\n", engine->name);
+ 
+@@ -1892,6 +1922,8 @@ execlists_reset_prepare(struct intel_eng
+ 	 */
+ 	__tasklet_disable_sync_once(&execlists->tasklet);
+ 
++	spin_lock_irqsave(&engine->timeline.lock, flags);
++
+ 	/*
+ 	 * We want to flush the pending context switches, having disabled
+ 	 * the tasklet above, we can assume exclusive access to the execlists.
+@@ -1909,15 +1941,12 @@ execlists_reset_prepare(struct intel_eng
+ 	active = NULL;
+ 	request = port_request(execlists->port);
+ 	if (request) {
+-		unsigned long flags;
+-
+ 		/*
+ 		 * Prevent the breadcrumb from advancing before we decide
+ 		 * which request is currently active.
+ 		 */
+ 		intel_engine_stop_cs(engine);
+ 
+-		spin_lock_irqsave(&engine->timeline.lock, flags);
+ 		list_for_each_entry_from_reverse(request,
+ 						 &engine->timeline.requests,
+ 						 link) {
+@@ -1927,9 +1956,10 @@ execlists_reset_prepare(struct intel_eng
+ 
+ 			active = request;
+ 		}
+-		spin_unlock_irqrestore(&engine->timeline.lock, flags);
+ 	}
+ 
++	spin_unlock_irqrestore(&engine->timeline.lock, flags);
++
+ 	return active;
+ }
+ 

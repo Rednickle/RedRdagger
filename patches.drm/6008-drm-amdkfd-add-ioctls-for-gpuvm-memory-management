@@ -1,0 +1,580 @@
+From: Felix Kuehling <Felix.Kuehling@amd.com>
+Date: Thu, 15 Mar 2018 17:27:51 -0400
+Subject: drm/amdkfd: Add ioctls for GPUVM memory management
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 5ec7e02854b3b9b55936c3b44b8acfb85e333f49
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+v2:
+* Fix error handling after kfd_bind_process_to_device in
+  kfd_ioctl_map_memory_to_gpu
+v3:
+* Add ioctl to acquire VM from a DRM FD
+v4:
+* Return number of successful map/unmap operations in failure cases
+* Facilitate partial retry after failed map/unmap
+* Added comments with parameter descriptions to new APIs
+* Defined AMDKFD_IOC_FREE_MEMORY_OF_GPU write-only
+
+Signed-off-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Oded Gabbay <oded.gabbay@gmail.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/amd/amdkfd/kfd_chardev.c        |  377 ++++++++++++++++++++++++
+ drivers/gpu/drm/amd/amdkfd/kfd_priv.h           |    8 
+ drivers/gpu/drm/amd/include/kgd_kfd_interface.h |    2 
+ include/uapi/linux/kfd_ioctl.h                  |   97 ++++++
+ 4 files changed, 483 insertions(+), 1 deletion(-)
+
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -24,6 +24,7 @@
+ #include <linux/export.h>
+ #include <linux/err.h>
+ #include <linux/fs.h>
++#include <linux/file.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+@@ -1046,6 +1047,366 @@ static int kfd_ioctl_get_tile_config(str
+ 	return 0;
+ }
+ 
++static int kfd_ioctl_acquire_vm(struct file *filep, struct kfd_process *p,
++				void *data)
++{
++	struct kfd_ioctl_acquire_vm_args *args = data;
++	struct kfd_process_device *pdd;
++	struct kfd_dev *dev;
++	struct file *drm_file;
++	int ret;
++
++	dev = kfd_device_by_id(args->gpu_id);
++	if (!dev)
++		return -EINVAL;
++
++	drm_file = fget(args->drm_fd);
++	if (!drm_file)
++		return -EINVAL;
++
++	mutex_lock(&p->mutex);
++
++	pdd = kfd_get_process_device_data(dev, p);
++	if (!pdd) {
++		ret = -EINVAL;
++		goto err_unlock;
++	}
++
++	if (pdd->drm_file) {
++		ret = pdd->drm_file == drm_file ? 0 : -EBUSY;
++		goto err_unlock;
++	}
++
++	ret = kfd_process_device_init_vm(pdd, drm_file);
++	if (ret)
++		goto err_unlock;
++	/* On success, the PDD keeps the drm_file reference */
++	mutex_unlock(&p->mutex);
++
++	return 0;
++
++err_unlock:
++	mutex_unlock(&p->mutex);
++	fput(drm_file);
++	return ret;
++}
++
++bool kfd_dev_is_large_bar(struct kfd_dev *dev)
++{
++	struct kfd_local_mem_info mem_info;
++
++	if (dev->device_info->needs_iommu_device)
++		return false;
++
++	dev->kfd2kgd->get_local_mem_info(dev->kgd, &mem_info);
++	if (mem_info.local_mem_size_private == 0 &&
++			mem_info.local_mem_size_public > 0)
++		return true;
++	return false;
++}
++
++static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
++					struct kfd_process *p, void *data)
++{
++	struct kfd_ioctl_alloc_memory_of_gpu_args *args = data;
++	struct kfd_process_device *pdd;
++	void *mem;
++	struct kfd_dev *dev;
++	int idr_handle;
++	long err;
++	uint64_t offset = args->mmap_offset;
++	uint32_t flags = args->flags;
++
++	if (args->size == 0)
++		return -EINVAL;
++
++	dev = kfd_device_by_id(args->gpu_id);
++	if (!dev)
++		return -EINVAL;
++
++	if ((flags & KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC) &&
++		(flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) &&
++		!kfd_dev_is_large_bar(dev)) {
++		pr_err("Alloc host visible vram on small bar is not allowed\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&p->mutex);
++
++	pdd = kfd_bind_process_to_device(dev, p);
++	if (IS_ERR(pdd)) {
++		err = PTR_ERR(pdd);
++		goto err_unlock;
++	}
++
++	err = dev->kfd2kgd->alloc_memory_of_gpu(
++		dev->kgd, args->va_addr, args->size,
++		pdd->vm, (struct kgd_mem **) &mem, &offset,
++		flags);
++
++	if (err)
++		goto err_unlock;
++
++	idr_handle = kfd_process_device_create_obj_handle(pdd, mem);
++	if (idr_handle < 0) {
++		err = -EFAULT;
++		goto err_free;
++	}
++
++	mutex_unlock(&p->mutex);
++
++	args->handle = MAKE_HANDLE(args->gpu_id, idr_handle);
++	args->mmap_offset = offset;
++
++	return 0;
++
++err_free:
++	dev->kfd2kgd->free_memory_of_gpu(dev->kgd, (struct kgd_mem *)mem);
++err_unlock:
++	mutex_unlock(&p->mutex);
++	return err;
++}
++
++static int kfd_ioctl_free_memory_of_gpu(struct file *filep,
++					struct kfd_process *p, void *data)
++{
++	struct kfd_ioctl_free_memory_of_gpu_args *args = data;
++	struct kfd_process_device *pdd;
++	void *mem;
++	struct kfd_dev *dev;
++	int ret;
++
++	dev = kfd_device_by_id(GET_GPU_ID(args->handle));
++	if (!dev)
++		return -EINVAL;
++
++	mutex_lock(&p->mutex);
++
++	pdd = kfd_get_process_device_data(dev, p);
++	if (!pdd) {
++		pr_err("Process device data doesn't exist\n");
++		ret = -EINVAL;
++		goto err_unlock;
++	}
++
++	mem = kfd_process_device_translate_handle(
++		pdd, GET_IDR_HANDLE(args->handle));
++	if (!mem) {
++		ret = -EINVAL;
++		goto err_unlock;
++	}
++
++	ret = dev->kfd2kgd->free_memory_of_gpu(dev->kgd, (struct kgd_mem *)mem);
++
++	/* If freeing the buffer failed, leave the handle in place for
++	 * clean-up during process tear-down.
++	 */
++	if (!ret)
++		kfd_process_device_remove_obj_handle(
++			pdd, GET_IDR_HANDLE(args->handle));
++
++err_unlock:
++	mutex_unlock(&p->mutex);
++	return ret;
++}
++
++static int kfd_ioctl_map_memory_to_gpu(struct file *filep,
++					struct kfd_process *p, void *data)
++{
++	struct kfd_ioctl_map_memory_to_gpu_args *args = data;
++	struct kfd_process_device *pdd, *peer_pdd;
++	void *mem;
++	struct kfd_dev *dev, *peer;
++	long err = 0;
++	int i;
++	uint32_t *devices_arr = NULL;
++
++	dev = kfd_device_by_id(GET_GPU_ID(args->handle));
++	if (!dev)
++		return -EINVAL;
++
++	if (!args->n_devices) {
++		pr_debug("Device IDs array empty\n");
++		return -EINVAL;
++	}
++	if (args->n_success > args->n_devices) {
++		pr_debug("n_success exceeds n_devices\n");
++		return -EINVAL;
++	}
++
++	devices_arr = kmalloc(args->n_devices * sizeof(*devices_arr),
++			      GFP_KERNEL);
++	if (!devices_arr)
++		return -ENOMEM;
++
++	err = copy_from_user(devices_arr,
++			     (void __user *)args->device_ids_array_ptr,
++			     args->n_devices * sizeof(*devices_arr));
++	if (err != 0) {
++		err = -EFAULT;
++		goto copy_from_user_failed;
++	}
++
++	mutex_lock(&p->mutex);
++
++	pdd = kfd_bind_process_to_device(dev, p);
++	if (IS_ERR(pdd)) {
++		err = PTR_ERR(pdd);
++		goto bind_process_to_device_failed;
++	}
++
++	mem = kfd_process_device_translate_handle(pdd,
++						GET_IDR_HANDLE(args->handle));
++	if (!mem) {
++		err = -ENOMEM;
++		goto get_mem_obj_from_handle_failed;
++	}
++
++	for (i = args->n_success; i < args->n_devices; i++) {
++		peer = kfd_device_by_id(devices_arr[i]);
++		if (!peer) {
++			pr_debug("Getting device by id failed for 0x%x\n",
++				 devices_arr[i]);
++			err = -EINVAL;
++			goto get_mem_obj_from_handle_failed;
++		}
++
++		peer_pdd = kfd_bind_process_to_device(peer, p);
++		if (IS_ERR(peer_pdd)) {
++			err = PTR_ERR(peer_pdd);
++			goto get_mem_obj_from_handle_failed;
++		}
++		err = peer->kfd2kgd->map_memory_to_gpu(
++			peer->kgd, (struct kgd_mem *)mem, peer_pdd->vm);
++		if (err) {
++			pr_err("Failed to map to gpu %d/%d\n",
++			       i, args->n_devices);
++			goto map_memory_to_gpu_failed;
++		}
++		args->n_success = i+1;
++	}
++
++	mutex_unlock(&p->mutex);
++
++	err = dev->kfd2kgd->sync_memory(dev->kgd, (struct kgd_mem *) mem, true);
++	if (err) {
++		pr_debug("Sync memory failed, wait interrupted by user signal\n");
++		goto sync_memory_failed;
++	}
++
++	/* Flush TLBs after waiting for the page table updates to complete */
++	for (i = 0; i < args->n_devices; i++) {
++		peer = kfd_device_by_id(devices_arr[i]);
++		if (WARN_ON_ONCE(!peer))
++			continue;
++		peer_pdd = kfd_get_process_device_data(peer, p);
++		if (WARN_ON_ONCE(!peer_pdd))
++			continue;
++		kfd_flush_tlb(peer_pdd);
++	}
++
++	kfree(devices_arr);
++
++	return err;
++
++bind_process_to_device_failed:
++get_mem_obj_from_handle_failed:
++map_memory_to_gpu_failed:
++	mutex_unlock(&p->mutex);
++copy_from_user_failed:
++sync_memory_failed:
++	kfree(devices_arr);
++
++	return err;
++}
++
++static int kfd_ioctl_unmap_memory_from_gpu(struct file *filep,
++					struct kfd_process *p, void *data)
++{
++	struct kfd_ioctl_unmap_memory_from_gpu_args *args = data;
++	struct kfd_process_device *pdd, *peer_pdd;
++	void *mem;
++	struct kfd_dev *dev, *peer;
++	long err = 0;
++	uint32_t *devices_arr = NULL, i;
++
++	dev = kfd_device_by_id(GET_GPU_ID(args->handle));
++	if (!dev)
++		return -EINVAL;
++
++	if (!args->n_devices) {
++		pr_debug("Device IDs array empty\n");
++		return -EINVAL;
++	}
++	if (args->n_success > args->n_devices) {
++		pr_debug("n_success exceeds n_devices\n");
++		return -EINVAL;
++	}
++
++	devices_arr = kmalloc(args->n_devices * sizeof(*devices_arr),
++			      GFP_KERNEL);
++	if (!devices_arr)
++		return -ENOMEM;
++
++	err = copy_from_user(devices_arr,
++			     (void __user *)args->device_ids_array_ptr,
++			     args->n_devices * sizeof(*devices_arr));
++	if (err != 0) {
++		err = -EFAULT;
++		goto copy_from_user_failed;
++	}
++
++	mutex_lock(&p->mutex);
++
++	pdd = kfd_get_process_device_data(dev, p);
++	if (!pdd) {
++		err = PTR_ERR(pdd);
++		goto bind_process_to_device_failed;
++	}
++
++	mem = kfd_process_device_translate_handle(pdd,
++						GET_IDR_HANDLE(args->handle));
++	if (!mem) {
++		err = -ENOMEM;
++		goto get_mem_obj_from_handle_failed;
++	}
++
++	for (i = args->n_success; i < args->n_devices; i++) {
++		peer = kfd_device_by_id(devices_arr[i]);
++		if (!peer) {
++			err = -EINVAL;
++			goto get_mem_obj_from_handle_failed;
++		}
++
++		peer_pdd = kfd_get_process_device_data(peer, p);
++		if (!peer_pdd) {
++			err = -ENODEV;
++			goto get_mem_obj_from_handle_failed;
++		}
++		err = dev->kfd2kgd->unmap_memory_to_gpu(
++			peer->kgd, (struct kgd_mem *)mem, peer_pdd->vm);
++		if (err) {
++			pr_err("Failed to unmap from gpu %d/%d\n",
++			       i, args->n_devices);
++			goto unmap_memory_from_gpu_failed;
++		}
++		args->n_success = i+1;
++	}
++	kfree(devices_arr);
++
++	mutex_unlock(&p->mutex);
++
++	return 0;
++
++bind_process_to_device_failed:
++get_mem_obj_from_handle_failed:
++unmap_memory_from_gpu_failed:
++	mutex_unlock(&p->mutex);
++copy_from_user_failed:
++	kfree(devices_arr);
++	return err;
++}
++
+ #define AMDKFD_IOCTL_DEF(ioctl, _func, _flags) \
+ 	[_IOC_NR(ioctl)] = {.cmd = ioctl, .func = _func, .flags = _flags, \
+ 			    .cmd_drv = 0, .name = #ioctl}
+@@ -1111,6 +1472,22 @@ static const struct amdkfd_ioctl_desc am
+ 
+ 	AMDKFD_IOCTL_DEF(AMDKFD_IOC_GET_PROCESS_APERTURES_NEW,
+ 			kfd_ioctl_get_process_apertures_new, 0),
++
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_ACQUIRE_VM,
++			kfd_ioctl_acquire_vm, 0),
++
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_ALLOC_MEMORY_OF_GPU,
++			kfd_ioctl_alloc_memory_of_gpu, 0),
++
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_FREE_MEMORY_OF_GPU,
++			kfd_ioctl_free_memory_of_gpu, 0),
++
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_MAP_MEMORY_TO_GPU,
++			kfd_ioctl_map_memory_to_gpu, 0),
++
++	AMDKFD_IOCTL_DEF(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU,
++			kfd_ioctl_unmap_memory_from_gpu, 0),
++
+ };
+ 
+ #define AMDKFD_CORE_IOCTL_COUNT	ARRAY_SIZE(amdkfd_ioctls)
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -509,6 +509,14 @@ struct qcm_process_device {
+ int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
+ 					       struct dma_fence *fence);
+ 
++/* 8 byte handle containing GPU ID in the most significant 4 bytes and
++ * idr_handle in the least significant 4 bytes
++ */
++#define MAKE_HANDLE(gpu_id, idr_handle) \
++	(((uint64_t)(gpu_id) << 32) + idr_handle)
++#define GET_GPU_ID(handle) (handle >> 32)
++#define GET_IDR_HANDLE(handle) (handle & 0xFFFFFFFF)
++
+ enum kfd_pdd_bound {
+ 	PDD_UNBOUND = 0,
+ 	PDD_BOUND,
+--- a/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
++++ b/drivers/gpu/drm/amd/include/kgd_kfd_interface.h
+@@ -130,6 +130,7 @@ struct tile_config {
+ 
+ /*
+  * Allocation flag domains
++ * NOTE: This must match the corresponding definitions in kfd_ioctl.h.
+  */
+ #define ALLOC_MEM_FLAGS_VRAM		(1 << 0)
+ #define ALLOC_MEM_FLAGS_GTT		(1 << 1)
+@@ -138,6 +139,7 @@ struct tile_config {
+ 
+ /*
+  * Allocation flags attributes/access options.
++ * NOTE: This must match the corresponding definitions in kfd_ioctl.h.
+  */
+ #define ALLOC_MEM_FLAGS_WRITABLE	(1 << 31)
+ #define ALLOC_MEM_FLAGS_EXECUTABLE	(1 << 30)
+--- a/include/uapi/linux/kfd_ioctl.h
++++ b/include/uapi/linux/kfd_ioctl.h
+@@ -286,6 +286,86 @@ struct kfd_ioctl_set_trap_handler_args {
+ 	__u32 pad;
+ };
+ 
++struct kfd_ioctl_acquire_vm_args {
++	__u32 drm_fd;	/* to KFD */
++	__u32 gpu_id;	/* to KFD */
++};
++
++/* Allocation flags: memory types */
++#define KFD_IOC_ALLOC_MEM_FLAGS_VRAM		(1 << 0)
++#define KFD_IOC_ALLOC_MEM_FLAGS_GTT		(1 << 1)
++#define KFD_IOC_ALLOC_MEM_FLAGS_USERPTR		(1 << 2)
++#define KFD_IOC_ALLOC_MEM_FLAGS_DOORBELL	(1 << 3)
++/* Allocation flags: attributes/access options */
++#define KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE	(1 << 31)
++#define KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE	(1 << 30)
++#define KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC		(1 << 29)
++#define KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE	(1 << 28)
++#define KFD_IOC_ALLOC_MEM_FLAGS_AQL_QUEUE_MEM	(1 << 27)
++#define KFD_IOC_ALLOC_MEM_FLAGS_COHERENT	(1 << 26)
++
++/* Allocate memory for later SVM (shared virtual memory) mapping.
++ *
++ * @va_addr:     virtual address of the memory to be allocated
++ *               all later mappings on all GPUs will use this address
++ * @size:        size in bytes
++ * @handle:      buffer handle returned to user mode, used to refer to
++ *               this allocation for mapping, unmapping and freeing
++ * @mmap_offset: for CPU-mapping the allocation by mmapping a render node
++ *               for userptrs this is overloaded to specify the CPU address
++ * @gpu_id:      device identifier
++ * @flags:       memory type and attributes. See KFD_IOC_ALLOC_MEM_FLAGS above
++ */
++struct kfd_ioctl_alloc_memory_of_gpu_args {
++	__u64 va_addr;		/* to KFD */
++	__u64 size;		/* to KFD */
++	__u64 handle;		/* from KFD */
++	__u64 mmap_offset;	/* to KFD (userptr), from KFD (mmap offset) */
++	__u32 gpu_id;		/* to KFD */
++	__u32 flags;
++};
++
++/* Free memory allocated with kfd_ioctl_alloc_memory_of_gpu
++ *
++ * @handle: memory handle returned by alloc
++ */
++struct kfd_ioctl_free_memory_of_gpu_args {
++	__u64 handle;		/* to KFD */
++};
++
++/* Map memory to one or more GPUs
++ *
++ * @handle:                memory handle returned by alloc
++ * @device_ids_array_ptr:  array of gpu_ids (__u32 per device)
++ * @n_devices:             number of devices in the array
++ * @n_success:             number of devices mapped successfully
++ *
++ * @n_success returns information to the caller how many devices from
++ * the start of the array have mapped the buffer successfully. It can
++ * be passed into a subsequent retry call to skip those devices. For
++ * the first call the caller should initialize it to 0.
++ *
++ * If the ioctl completes with return code 0 (success), n_success ==
++ * n_devices.
++ */
++struct kfd_ioctl_map_memory_to_gpu_args {
++	__u64 handle;			/* to KFD */
++	__u64 device_ids_array_ptr;	/* to KFD */
++	__u32 n_devices;		/* to KFD */
++	__u32 n_success;		/* to/from KFD */
++};
++
++/* Unmap memory from one or more GPUs
++ *
++ * same arguments as for mapping
++ */
++struct kfd_ioctl_unmap_memory_from_gpu_args {
++	__u64 handle;			/* to KFD */
++	__u64 device_ids_array_ptr;	/* to KFD */
++	__u32 n_devices;		/* to KFD */
++	__u32 n_success;		/* to/from KFD */
++};
++
+ #define AMDKFD_IOCTL_BASE 'K'
+ #define AMDKFD_IO(nr)			_IO(AMDKFD_IOCTL_BASE, nr)
+ #define AMDKFD_IOR(nr, type)		_IOR(AMDKFD_IOCTL_BASE, nr, type)
+@@ -353,7 +433,22 @@ struct kfd_ioctl_set_trap_handler_args {
+ 		AMDKFD_IOWR(0x14,		\
+ 			struct kfd_ioctl_get_process_apertures_new_args)
+ 
++#define AMDKFD_IOC_ACQUIRE_VM			\
++		AMDKFD_IOW(0x15, struct kfd_ioctl_acquire_vm_args)
++
++#define AMDKFD_IOC_ALLOC_MEMORY_OF_GPU		\
++		AMDKFD_IOWR(0x16, struct kfd_ioctl_alloc_memory_of_gpu_args)
++
++#define AMDKFD_IOC_FREE_MEMORY_OF_GPU		\
++		AMDKFD_IOW(0x17, struct kfd_ioctl_free_memory_of_gpu_args)
++
++#define AMDKFD_IOC_MAP_MEMORY_TO_GPU		\
++		AMDKFD_IOWR(0x18, struct kfd_ioctl_map_memory_to_gpu_args)
++
++#define AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU	\
++		AMDKFD_IOWR(0x19, struct kfd_ioctl_unmap_memory_from_gpu_args)
++
+ #define AMDKFD_COMMAND_START		0x01
+-#define AMDKFD_COMMAND_END		0x15
++#define AMDKFD_COMMAND_END		0x1A
+ 
+ #endif

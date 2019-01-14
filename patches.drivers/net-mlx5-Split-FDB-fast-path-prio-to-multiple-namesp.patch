@@ -1,0 +1,275 @@
+From: Paul Blakey <paulb@mellanox.com>
+Date: Tue, 3 Jul 2018 11:13:00 +0300
+Subject: net/mlx5: Split FDB fast path prio to multiple namespaces
+Patch-mainline: v4.20-rc1
+Git-commit: 328edb499f99126946845ece477c9c1afe8631af
+References: bsc#1103990 FATE#326006
+
+Towards supporting multi-chains and priorities, split the FDB fast path
+to multiple namespaces (sub namespaces), each with multiple priorities.
+
+This patch adds a new flow steering type, FS_TYPE_PRIO_CHAINS, which is
+like current FS_TYPE_PRIO, but may contain only namespaces, and those
+will be in parallel to one another in terms of managing of the flow
+tables connections inside them. Meaning, while searching for the next
+or previous flow table to connect for a new table inside such namespace
+we skip the parallel namespaces in the same level under the
+FS_TYPE_PRIO_CHAINS prio we originated from.
+
+We use this new type for splitting the fast path prio into multiple
+parallel namespaces, each containing normal prios.
+The prios inside them (and their tables) will be connected to one
+another, but not from one parallel namespace to another, instead the
+last prio in each namespace will be connected to the next prio in
+the containing FDB namespace, which is the slow path prio.
+
+Signed-off-by: Paul Blakey <paulb@mellanox.com>
+Acked-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.c |    2 
+ drivers/net/ethernet/mellanox/mlx5/core/eswitch.h |    7 +
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.c |   88 +++++++++++++++++++---
+ drivers/net/ethernet/mellanox/mlx5/core/fs_core.h |   13 +++
+ include/linux/mlx5/fs.h                           |    2 
+ 5 files changed, 101 insertions(+), 11 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -263,7 +263,7 @@ static int esw_create_legacy_fdb_table(s
+ 	esw_debug(dev, "Create FDB log_max_size(%d)\n",
+ 		  MLX5_CAP_ESW_FLOWTABLE_FDB(dev, log_max_ft_size));
+ 
+-	root_ns = mlx5_get_flow_namespace(dev, MLX5_FLOW_NAMESPACE_FDB);
++	root_ns = mlx5_get_fdb_sub_ns(dev, 0);
+ 	if (!root_ns) {
+ 		esw_warn(dev, "Failed to get FDB flow namespace\n");
+ 		return -EOPNOTSUPP;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -59,6 +59,9 @@
+ #define mlx5_esw_has_fwd_fdb(dev) \
+ 	MLX5_CAP_ESW_FLOWTABLE(dev, fdb_multi_path_to_table)
+ 
++#define FDB_MAX_CHAIN 3
++#define FDB_MAX_PRIO 16
++
+ struct vport_ingress {
+ 	struct mlx5_flow_table *acl;
+ 	struct mlx5_flow_group *allow_untagged_spoofchk_grp;
+@@ -319,6 +322,10 @@ static inline void mlx5_eswitch_cleanup(
+ static inline void mlx5_eswitch_vport_event(struct mlx5_eswitch *esw, struct mlx5_eqe *eqe) {}
+ static inline int  mlx5_eswitch_enable_sriov(struct mlx5_eswitch *esw, int nvfs, int mode) { return 0; }
+ static inline void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw) {}
++
++#define FDB_MAX_CHAIN 1
++#define FDB_MAX_PRIO 1
++
+ #endif /* CONFIG_MLX5_ESWITCH */
+ 
+ #endif /* __MLX5_ESWITCH_H__ */
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -40,6 +40,7 @@
+ #include "diag/fs_tracepoint.h"
+ #include "accel/ipsec.h"
+ #include "fpga/ipsec.h"
++#include "eswitch.h"
+ 
+ #define INIT_TREE_NODE_ARRAY_SIZE(...)	(sizeof((struct init_tree_node[]){__VA_ARGS__}) /\
+ 					 sizeof(struct init_tree_node))
+@@ -713,7 +714,7 @@ static struct mlx5_flow_table *find_clos
+ 	struct fs_node *iter = list_entry(start, struct fs_node, list);
+ 	struct mlx5_flow_table *ft = NULL;
+ 
+-	if (!root)
++	if (!root || root->type == FS_TYPE_PRIO_CHAINS)
+ 		return NULL;
+ 
+ 	list_for_each_advance_continue(iter, &root->children, reverse) {
+@@ -1974,6 +1975,18 @@ void mlx5_destroy_flow_group(struct mlx5
+ 			       fg->id);
+ }
+ 
++struct mlx5_flow_namespace *mlx5_get_fdb_sub_ns(struct mlx5_core_dev *dev,
++						int n)
++{
++	struct mlx5_flow_steering *steering = dev->priv.steering;
++
++	if (!steering || !steering->fdb_sub_ns)
++		return NULL;
++
++	return steering->fdb_sub_ns[n];
++}
++EXPORT_SYMBOL(mlx5_get_fdb_sub_ns);
++
+ struct mlx5_flow_namespace *mlx5_get_flow_namespace(struct mlx5_core_dev *dev,
+ 						    enum mlx5_flow_namespace_type type)
+ {
+@@ -2052,8 +2065,10 @@ struct mlx5_flow_namespace *mlx5_get_flo
+ 	}
+ }
+ 
+-static struct fs_prio *fs_create_prio(struct mlx5_flow_namespace *ns,
+-				      unsigned int prio, int num_levels)
++static struct fs_prio *_fs_create_prio(struct mlx5_flow_namespace *ns,
++				       unsigned int prio,
++				       int num_levels,
++				       enum fs_node_type type)
+ {
+ 	struct fs_prio *fs_prio;
+ 
+@@ -2061,7 +2076,7 @@ static struct fs_prio *fs_create_prio(st
+ 	if (!fs_prio)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	fs_prio->node.type = FS_TYPE_PRIO;
++	fs_prio->node.type = type;
+ 	tree_init_node(&fs_prio->node, NULL, del_sw_prio);
+ 	tree_add_node(&fs_prio->node, &ns->node);
+ 	fs_prio->num_levels = num_levels;
+@@ -2071,6 +2086,19 @@ static struct fs_prio *fs_create_prio(st
+ 	return fs_prio;
+ }
+ 
++static struct fs_prio *fs_create_prio_chained(struct mlx5_flow_namespace *ns,
++					      unsigned int prio,
++					      int num_levels)
++{
++	return _fs_create_prio(ns, prio, num_levels, FS_TYPE_PRIO_CHAINS);
++}
++
++static struct fs_prio *fs_create_prio(struct mlx5_flow_namespace *ns,
++				      unsigned int prio, int num_levels)
++{
++	return _fs_create_prio(ns, prio, num_levels, FS_TYPE_PRIO);
++}
++
+ static struct mlx5_flow_namespace *fs_init_namespace(struct mlx5_flow_namespace
+ 						     *ns)
+ {
+@@ -2375,6 +2403,9 @@ void mlx5_cleanup_fs(struct mlx5_core_de
+ 	cleanup_egress_acls_root_ns(dev);
+ 	cleanup_ingress_acls_root_ns(dev);
+ 	cleanup_root_ns(steering->fdb_root_ns);
++	steering->fdb_root_ns = NULL;
++	kfree(steering->fdb_sub_ns);
++	steering->fdb_sub_ns = NULL;
+ 	cleanup_root_ns(steering->sniffer_rx_root_ns);
+ 	cleanup_root_ns(steering->sniffer_tx_root_ns);
+ 	cleanup_root_ns(steering->egress_root_ns);
+@@ -2420,27 +2451,64 @@ static int init_sniffer_rx_root_ns(struc
+ 
+ static int init_fdb_root_ns(struct mlx5_flow_steering *steering)
+ {
+-	struct fs_prio *prio;
++	struct mlx5_flow_namespace *ns;
++	struct fs_prio *maj_prio;
++	struct fs_prio *min_prio;
++	int levels;
++	int chain;
++	int prio;
++	int err;
+ 
+ 	steering->fdb_root_ns = create_root_ns(steering, FS_FT_FDB);
+ 	if (!steering->fdb_root_ns)
+ 		return -ENOMEM;
+ 
+-	prio = fs_create_prio(&steering->fdb_root_ns->ns, 0, 2);
+-	if (IS_ERR(prio))
++	steering->fdb_sub_ns = kzalloc(sizeof(steering->fdb_sub_ns) *
++				       FDB_MAX_CHAIN + 1, GFP_KERNEL);
++	if (!steering->fdb_sub_ns)
++		return -ENOMEM;
++
++	levels = 2 * FDB_MAX_PRIO * (FDB_MAX_CHAIN + 1);
++	maj_prio = fs_create_prio_chained(&steering->fdb_root_ns->ns, 0,
++					  levels);
++	if (IS_ERR(maj_prio)) {
++		err = PTR_ERR(maj_prio);
+ 		goto out_err;
++	}
+ 
+-	prio = fs_create_prio(&steering->fdb_root_ns->ns, 1, 1);
+-	if (IS_ERR(prio))
++	for (chain = 0; chain <= FDB_MAX_CHAIN; chain++) {
++		ns = fs_create_namespace(maj_prio);
++		if (IS_ERR(ns)) {
++			err = PTR_ERR(ns);
++			goto out_err;
++		}
++
++		for (prio = 0; prio < FDB_MAX_PRIO * (chain + 1); prio++) {
++			min_prio = fs_create_prio(ns, prio, 2);
++			if (IS_ERR(min_prio)) {
++				err = PTR_ERR(min_prio);
++				goto out_err;
++			}
++		}
++
++		steering->fdb_sub_ns[chain] = ns;
++	}
++
++	maj_prio = fs_create_prio(&steering->fdb_root_ns->ns, 1, 1);
++	if (IS_ERR(maj_prio)) {
++		err = PTR_ERR(maj_prio);
+ 		goto out_err;
++	}
+ 
+ 	set_prio_attrs(steering->fdb_root_ns);
+ 	return 0;
+ 
+ out_err:
+ 	cleanup_root_ns(steering->fdb_root_ns);
++	kfree(steering->fdb_sub_ns);
++	steering->fdb_sub_ns = NULL;
+ 	steering->fdb_root_ns = NULL;
+-	return PTR_ERR(prio);
++	return err;
+ }
+ 
+ static int init_egress_acl_root_ns(struct mlx5_flow_steering *steering, int vport)
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.h
+@@ -38,9 +38,21 @@
+ #include <linux/rhashtable.h>
+ #include <linux/llist.h>
+ 
++/* FS_TYPE_PRIO_CHAINS is a PRIO that will have namespaces only,
++ * and those are in parallel to one another when going over them to connect
++ * a new flow table. Meaning the last flow table in a TYPE_PRIO prio in one
++ * parallel namespace will not automatically connect to the first flow table
++ * found in any prio in any next namespace, but skip the entire containing
++ * TYPE_PRIO_CHAINS prio.
++ *
++ * This is used to implement tc chains, each chain of prios is a different
++ * namespace inside a containing TYPE_PRIO_CHAINS prio.
++ */
++
+ enum fs_node_type {
+ 	FS_TYPE_NAMESPACE,
+ 	FS_TYPE_PRIO,
++	FS_TYPE_PRIO_CHAINS,
+ 	FS_TYPE_FLOW_TABLE,
+ 	FS_TYPE_FLOW_GROUP,
+ 	FS_TYPE_FLOW_ENTRY,
+@@ -73,6 +85,7 @@ struct mlx5_flow_steering {
+ 	struct kmem_cache               *ftes_cache;
+ 	struct mlx5_flow_root_namespace *root_ns;
+ 	struct mlx5_flow_root_namespace *fdb_root_ns;
++	struct mlx5_flow_namespace	**fdb_sub_ns;
+ 	struct mlx5_flow_root_namespace **esw_egress_root_ns;
+ 	struct mlx5_flow_root_namespace **esw_ingress_root_ns;
+ 	struct mlx5_flow_root_namespace	*sniffer_tx_root_ns;
+--- a/include/linux/mlx5/fs.h
++++ b/include/linux/mlx5/fs.h
+@@ -102,6 +102,8 @@ struct mlx5_flow_destination {
+ };
+ 
+ struct mlx5_flow_namespace *
++mlx5_get_fdb_sub_ns(struct mlx5_core_dev *dev, int n);
++struct mlx5_flow_namespace *
+ mlx5_get_flow_namespace(struct mlx5_core_dev *dev,
+ 			enum mlx5_flow_namespace_type type);
+ struct mlx5_flow_namespace *

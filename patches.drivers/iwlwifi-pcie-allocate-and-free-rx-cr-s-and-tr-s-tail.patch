@@ -1,0 +1,345 @@
+From 1b493e30a19540438a9944683aa9310b8077bc80 Mon Sep 17 00:00:00 2001
+From: Golan Ben Ami <golan.ben.ami@intel.com>
+Date: Sun, 11 Feb 2018 10:48:32 +0200
+Subject: [PATCH] iwlwifi: pcie: allocate and free rx cr's and tr's tails
+Git-commit: 1b493e30a19540438a9944683aa9310b8077bc80
+Patch-mainline: v4.19-rc1
+References: FATE#326294
+
+The hw now refers to two new blocks:
+* rx tr tail - The Tail index on the free buffers queue TR,
+which is update by the device after reading the free buffer
+from the tr.
+* rx cr tail - Updated by the driver when completing
+processing a new completion descriptor in the cr.
+
+Add these two new struct to the rxq, allocate and free them
+when needed.
+
+In addition, the register for rx write pointer had been changed
+to HBUS_TARG_WRPTR. The way to differentiate tx from rx is the
+queue number. TX range is 0-511, and RX's is 512-527.
+
+Signed-off-by: Golan Ben Ami <golan.ben.ami@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ .../wireless/intel/iwlwifi/pcie/internal.h    |  13 +-
+ drivers/net/wireless/intel/iwlwifi/pcie/rx.c  | 201 +++++++++++-------
+ 2 files changed, 131 insertions(+), 83 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+index 45ea32796cda..d944c6ec0b87 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+@@ -3,6 +3,7 @@
+  * Copyright(c) 2003 - 2015 Intel Corporation. All rights reserved.
+  * Copyright(c) 2013 - 2015 Intel Mobile Communications GmbH
+  * Copyright(c) 2016 - 2017 Intel Deutschland GmbH
++ * Copyright(c) 2018 Intel Corporation
+  *
+  * Portions of this file are derived from the ipw3945 project, as well
+  * as portions of the ieee80211 subsystem header files.
+@@ -17,8 +18,7 @@
+  * more details.
+  *
+  * You should have received a copy of the GNU General Public License along with
+- * this program; if not, write to the Free Software Foundation, Inc.,
+- * 51 Franklin Street, Fifth Floor, Boston, MA 02110, USA
++ * this program.
+  *
+  * The full GNU General Public License is included in this distribution in the
+  * file called LICENSE.
+@@ -59,6 +59,7 @@
+ #define RX_POST_REQ_ALLOC 2
+ #define RX_CLAIM_REQ_ALLOC 8
+ #define RX_PENDING_WATERMARK 16
++#define FIRST_RX_QUEUE 512
+ 
+ struct iwl_host_cmd;
+ 
+@@ -106,6 +107,10 @@ struct isr_statistics {
+  * @bd_dma: bus address of buffer of receive buffer descriptors (rbd)
+  * @ubd: driver's pointer to buffer of used receive buffer descriptors (rbd)
+  * @ubd_dma: physical address of buffer of used receive buffer descriptors (rbd)
++ * @tr_tail: driver's pointer to the transmission ring tail buffer
++ * @tr_tail_dma: physical address of the buffer for the transmission ring tail
++ * @cr_tail: driver's pointer to the completion ring tail buffer
++ * @cr_tail_dma: physical address of the buffer for the completion ring tail
+  * @read: Shared index to newest available Rx buffer
+  * @write: Shared index to oldest written Rx packet
+  * @free_count: Number of pre-allocated buffers in rx_free
+@@ -127,6 +132,10 @@ struct iwl_rxq {
+ 	dma_addr_t bd_dma;
+ 	__le32 *used_bd;
+ 	dma_addr_t used_bd_dma;
++	__le16 *tr_tail;
++	dma_addr_t tr_tail_dma;
++	__le16 *cr_tail;
++	dma_addr_t cr_tail_dma;
+ 	u32 read;
+ 	u32 write;
+ 	u32 free_count;
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/rx.c b/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+index d15f5ba2dc77..24ce2d6beb0f 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+@@ -209,7 +209,11 @@ static void iwl_pcie_rxq_inc_wr_ptr(struct iwl_trans *trans,
+ 	}
+ 
+ 	rxq->write_actual = round_down(rxq->write, 8);
+-	if (trans->cfg->mq_rx_supported)
++	if (trans->cfg->device_family >= IWL_DEVICE_FAMILY_22560)
++		iwl_write32(trans, HBUS_TARG_WRPTR,
++			    (rxq->write_actual |
++			     ((FIRST_RX_QUEUE + rxq->id) << 16)));
++	else if (trans->cfg->mq_rx_supported)
+ 		iwl_write32(trans, RFH_Q_FRBDCB_WIDX_TRG(rxq->id),
+ 			    rxq->write_actual);
+ 	else
+@@ -608,89 +612,146 @@ void iwl_pcie_rx_allocator_work(struct work_struct *data)
+ 	iwl_pcie_rx_allocator(trans_pcie->trans);
+ }
+ 
+-static int iwl_pcie_rx_alloc(struct iwl_trans *trans)
++static void iwl_pcie_free_rxq_dma(struct iwl_trans *trans,
++				  struct iwl_rxq *rxq)
++{
++	struct device *dev = trans->dev;
++	int free_size = trans->cfg->mq_rx_supported ? sizeof(__le64) :
++						      sizeof(__le32);
++
++	if (rxq->bd)
++		dma_free_coherent(dev, free_size * rxq->queue_size,
++				  rxq->bd, rxq->bd_dma);
++	rxq->bd_dma = 0;
++	rxq->bd = NULL;
++
++	if (rxq->rb_stts)
++		dma_free_coherent(trans->dev,
++				  sizeof(struct iwl_rb_status),
++				  rxq->rb_stts, rxq->rb_stts_dma);
++	rxq->rb_stts_dma = 0;
++	rxq->rb_stts = NULL;
++
++	if (rxq->used_bd)
++		dma_free_coherent(dev, sizeof(__le32) * rxq->queue_size,
++				  rxq->used_bd, rxq->used_bd_dma);
++	rxq->used_bd_dma = 0;
++	rxq->used_bd = NULL;
++
++	if (trans->cfg->device_family < IWL_DEVICE_FAMILY_22560)
++		return;
++
++	if (rxq->tr_tail)
++		dma_free_coherent(dev, sizeof(__le16),
++				  rxq->tr_tail, rxq->tr_tail_dma);
++	rxq->tr_tail_dma = 0;
++	rxq->tr_tail = NULL;
++
++	if (rxq->cr_tail)
++		dma_free_coherent(dev, sizeof(__le16),
++				  rxq->cr_tail, rxq->cr_tail_dma);
++	rxq->cr_tail_dma = 0;
++	rxq->cr_tail = NULL;
++}
++
++static int iwl_pcie_alloc_rxq_dma(struct iwl_trans *trans,
++				  struct iwl_rxq *rxq)
+ {
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+-	struct iwl_rb_allocator *rba = &trans_pcie->rba;
+ 	struct device *dev = trans->dev;
+ 	int i;
+ 	int free_size = trans->cfg->mq_rx_supported ? sizeof(__le64) :
+ 						      sizeof(__le32);
+ 
+-	if (WARN_ON(trans_pcie->rxq))
+-		return -EINVAL;
++	spin_lock_init(&rxq->lock);
++	if (trans->cfg->mq_rx_supported)
++		rxq->queue_size = MQ_RX_TABLE_SIZE;
++	else
++		rxq->queue_size = RX_QUEUE_SIZE;
+ 
+-	trans_pcie->rxq = kcalloc(trans->num_rx_queues, sizeof(struct iwl_rxq),
+-				  GFP_KERNEL);
+-	if (!trans_pcie->rxq)
+-		return -EINVAL;
++	/*
++	 * Allocate the circular buffer of Read Buffer Descriptors
++	 * (RBDs)
++	 */
++	rxq->bd = dma_zalloc_coherent(dev,
++				      free_size * rxq->queue_size,
++				      &rxq->bd_dma, GFP_KERNEL);
++	if (!rxq->bd)
++		goto err;
+ 
+-	spin_lock_init(&rba->lock);
++	if (trans->cfg->mq_rx_supported) {
++		rxq->used_bd = dma_zalloc_coherent(dev,
++						   sizeof(__le32) *
++						   rxq->queue_size,
++						   &rxq->used_bd_dma,
++						   GFP_KERNEL);
++		if (!rxq->used_bd)
++			goto err;
++	}
+ 
+-	for (i = 0; i < trans->num_rx_queues; i++) {
+-		struct iwl_rxq *rxq = &trans_pcie->rxq[i];
++	/* Allocate the driver's pointer to receive buffer status */
++	rxq->rb_stts = dma_zalloc_coherent(dev, sizeof(*rxq->rb_stts),
++					   &rxq->rb_stts_dma,
++					   GFP_KERNEL);
++	if (!rxq->rb_stts)
++		goto err;
+ 
+-		spin_lock_init(&rxq->lock);
+-		if (trans->cfg->mq_rx_supported)
+-			rxq->queue_size = MQ_RX_TABLE_SIZE;
+-		else
+-			rxq->queue_size = RX_QUEUE_SIZE;
++	if (trans->cfg->device_family < IWL_DEVICE_FAMILY_22560)
++		return 0;
+ 
+-		/*
+-		 * Allocate the circular buffer of Read Buffer Descriptors
+-		 * (RBDs)
+-		 */
+-		rxq->bd = dma_zalloc_coherent(dev,
+-					     free_size * rxq->queue_size,
+-					     &rxq->bd_dma, GFP_KERNEL);
+-		if (!rxq->bd)
+-			goto err;
++	/* Allocate the driver's pointer to TR tail */
++	rxq->tr_tail = dma_zalloc_coherent(dev, sizeof(__le16),
++					   &rxq->tr_tail_dma,
++					   GFP_KERNEL);
++	if (!rxq->tr_tail)
++		goto err;
+ 
+-		if (trans->cfg->mq_rx_supported) {
+-			rxq->used_bd = dma_zalloc_coherent(dev,
+-							   sizeof(__le32) *
+-							   rxq->queue_size,
+-							   &rxq->used_bd_dma,
+-							   GFP_KERNEL);
+-			if (!rxq->used_bd)
+-				goto err;
+-		}
++	/* Allocate the driver's pointer to CR tail */
++	rxq->cr_tail = dma_zalloc_coherent(dev, sizeof(__le16),
++					   &rxq->cr_tail_dma,
++					   GFP_KERNEL);
++	if (!rxq->cr_tail)
++		goto err;
+ 
+-		/*Allocate the driver's pointer to receive buffer status */
+-		rxq->rb_stts = dma_zalloc_coherent(dev, sizeof(*rxq->rb_stts),
+-						   &rxq->rb_stts_dma,
+-						   GFP_KERNEL);
+-		if (!rxq->rb_stts)
+-			goto err;
+-	}
+ 	return 0;
+ 
+ err:
+ 	for (i = 0; i < trans->num_rx_queues; i++) {
+ 		struct iwl_rxq *rxq = &trans_pcie->rxq[i];
+ 
+-		if (rxq->bd)
+-			dma_free_coherent(dev, free_size * rxq->queue_size,
+-					  rxq->bd, rxq->bd_dma);
+-		rxq->bd_dma = 0;
+-		rxq->bd = NULL;
+-
+-		if (rxq->rb_stts)
+-			dma_free_coherent(trans->dev,
+-					  sizeof(struct iwl_rb_status),
+-					  rxq->rb_stts, rxq->rb_stts_dma);
+-
+-		if (rxq->used_bd)
+-			dma_free_coherent(dev, sizeof(__le32) * rxq->queue_size,
+-					  rxq->used_bd, rxq->used_bd_dma);
+-		rxq->used_bd_dma = 0;
+-		rxq->used_bd = NULL;
++		iwl_pcie_free_rxq_dma(trans, rxq);
+ 	}
+ 	kfree(trans_pcie->rxq);
+ 
+ 	return -ENOMEM;
+ }
+ 
++static int iwl_pcie_rx_alloc(struct iwl_trans *trans)
++{
++	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
++	struct iwl_rb_allocator *rba = &trans_pcie->rba;
++	int i, ret;
++
++	if (WARN_ON(trans_pcie->rxq))
++		return -EINVAL;
++
++	trans_pcie->rxq = kcalloc(trans->num_rx_queues, sizeof(struct iwl_rxq),
++				  GFP_KERNEL);
++	if (!trans_pcie->rxq)
++		return -EINVAL;
++
++	spin_lock_init(&rba->lock);
++
++	for (i = 0; i < trans->num_rx_queues; i++) {
++		struct iwl_rxq *rxq = &trans_pcie->rxq[i];
++
++		ret = iwl_pcie_alloc_rxq_dma(trans, rxq);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
+ static void iwl_pcie_rx_hw_init(struct iwl_trans *trans, struct iwl_rxq *rxq)
+ {
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+@@ -1002,8 +1063,6 @@ void iwl_pcie_rx_free(struct iwl_trans *trans)
+ {
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+ 	struct iwl_rb_allocator *rba = &trans_pcie->rba;
+-	int free_size = trans->cfg->mq_rx_supported ? sizeof(__le64) :
+-					      sizeof(__le32);
+ 	int i;
+ 
+ 	/*
+@@ -1022,27 +1081,7 @@ void iwl_pcie_rx_free(struct iwl_trans *trans)
+ 	for (i = 0; i < trans->num_rx_queues; i++) {
+ 		struct iwl_rxq *rxq = &trans_pcie->rxq[i];
+ 
+-		if (rxq->bd)
+-			dma_free_coherent(trans->dev,
+-					  free_size * rxq->queue_size,
+-					  rxq->bd, rxq->bd_dma);
+-		rxq->bd_dma = 0;
+-		rxq->bd = NULL;
+-
+-		if (rxq->rb_stts)
+-			dma_free_coherent(trans->dev,
+-					  sizeof(struct iwl_rb_status),
+-					  rxq->rb_stts, rxq->rb_stts_dma);
+-		else
+-			IWL_DEBUG_INFO(trans,
+-				       "Free rxq->rb_stts which is NULL\n");
+-
+-		if (rxq->used_bd)
+-			dma_free_coherent(trans->dev,
+-					  sizeof(__le32) * rxq->queue_size,
+-					  rxq->used_bd, rxq->used_bd_dma);
+-		rxq->used_bd_dma = 0;
+-		rxq->used_bd = NULL;
++		iwl_pcie_free_rxq_dma(trans, rxq);
+ 
+ 		if (rxq->napi.poll)
+ 			netif_napi_del(&rxq->napi);
+-- 
+2.19.2
+

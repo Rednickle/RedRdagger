@@ -1,0 +1,256 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 12 Oct 2017 13:57:26 +0100
+Subject: drm/i915/selftests: Exercise adding requests to a full GGTT
+Git-commit: 9c1477e83e629632758518cde4a039d62a1000e7
+Patch-mainline: v4.15-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+A bug recently encountered involved the issue where are we were
+submitting requests to different ppGTT, each would pin a segment of the
+GGTT for its logical context and ring. However, this is invisible to
+eviction as we do not tie the context/ring VMA to a request and so do
+not automatically wait upon it them (instead they are marked as pinned,
+preventing eviction entirely). Instead the eviction code must flush those
+contexts by switching to the kernel context. This selftest tries to
+fill the GGTT with contexts to exercise a path where the
+switch-to-kernel-context failed to make forward progress and we fail
+with ENOSPC.
+
+v2: Make the hole in the filled GGTT explicit.
+v3: Swap out the arbitrary timeout for a private notification from
+i915_gem_evict_something()
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171012125726.14736-3-chris@chris-wilson.co.uk
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_gem_evict.c                |    7 
+ drivers/gpu/drm/i915/selftests/i915_gem_evict.c      |  154 +++++++++++++++++++
+ drivers/gpu/drm/i915/selftests/i915_live_selftests.h |    1 
+ drivers/gpu/drm/i915/selftests/mock_context.c        |    6 
+ 4 files changed, 163 insertions(+), 5 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -33,6 +33,10 @@
+ #include "intel_drv.h"
+ #include "i915_trace.h"
+ 
++I915_SELFTEST_DECLARE(static struct igt_evict_ctl {
++	bool fail_if_busy:1;
++} igt_evict_ctl;)
++
+ static bool ggtt_is_idle(struct drm_i915_private *i915)
+ {
+        struct intel_engine_cs *engine;
+@@ -205,6 +209,9 @@ search_again:
+ 	 * the kernel's there is no more we can evict.
+ 	 */
+ 	if (!ggtt_is_idle(dev_priv)) {
++		if (I915_SELFTEST_ONLY(igt_evict_ctl.fail_if_busy))
++			return -EBUSY;
++
+ 		ret = ggtt_flush(dev_priv);
+ 		if (ret)
+ 			return ret;
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_evict.c
+@@ -24,6 +24,9 @@
+ 
+ #include "../i915_selftest.h"
+ 
++#include "lib_sw_fence.h"
++#include "mock_context.h"
++#include "mock_drm.h"
+ #include "mock_gem_device.h"
+ 
+ static int populate_ggtt(struct drm_i915_private *i915)
+@@ -325,6 +328,148 @@ cleanup:
+ 	return err;
+ }
+ 
++static int igt_evict_contexts(void *arg)
++{
++	const u64 PRETEND_GGTT_SIZE = 16ull << 20;
++	struct drm_i915_private *i915 = arg;
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	struct reserved {
++		struct drm_mm_node node;
++		struct reserved *next;
++	} *reserved = NULL;
++	struct drm_mm_node hole;
++	unsigned long count;
++	int err;
++
++	/*
++	 * The purpose of this test is to verify that we will trigger an
++	 * eviction in the GGTT when constructing a request that requires
++	 * additional space in the GGTT for pinning the context. This space
++	 * is not directly tied to the request so reclaiming it requires
++	 * extra work.
++	 *
++	 * As such this test is only meaningful for full-ppgtt environments
++	 * where the GTT space of the request is separate from the GGTT
++	 * allocation required to build the request.
++	 */
++	if (!USES_FULL_PPGTT(i915))
++		return 0;
++
++	mutex_lock(&i915->drm.struct_mutex);
++
++	/* Reserve a block so that we know we have enough to fit a few rq */
++	memset(&hole, 0, sizeof(hole));
++	err = i915_gem_gtt_insert(&i915->ggtt.base, &hole,
++				  PRETEND_GGTT_SIZE, 0, I915_COLOR_UNEVICTABLE,
++				  0, i915->ggtt.base.total,
++				  PIN_NOEVICT);
++	if (err)
++		goto out_locked;
++
++	/* Make the GGTT appear small by filling it with unevictable nodes */
++	count = 0;
++	do {
++		struct reserved *r;
++
++		r = kcalloc(1, sizeof(*r), GFP_KERNEL);
++		if (!r) {
++			err = -ENOMEM;
++			goto out_locked;
++		}
++
++		if (i915_gem_gtt_insert(&i915->ggtt.base, &r->node,
++					1ul << 20, 0, I915_COLOR_UNEVICTABLE,
++					0, i915->ggtt.base.total,
++					PIN_NOEVICT)) {
++			kfree(r);
++			break;
++		}
++
++		r->next = reserved;
++		reserved = r;
++
++		count++;
++	} while (1);
++	drm_mm_remove_node(&hole);
++	mutex_unlock(&i915->drm.struct_mutex);
++	pr_info("Filled GGTT with %lu 1MiB nodes\n", count);
++
++	/* Overfill the GGTT with context objects and so try to evict one. */
++	for_each_engine(engine, i915, id) {
++		struct i915_sw_fence fence;
++		struct drm_file *file;
++
++		file = mock_file(i915);
++		if (IS_ERR(file))
++			return PTR_ERR(file);
++
++		count = 0;
++		mutex_lock(&i915->drm.struct_mutex);
++		onstack_fence_init(&fence);
++		do {
++			struct drm_i915_gem_request *rq;
++			struct i915_gem_context *ctx;
++
++			ctx = live_context(i915, file);
++			if (!ctx)
++				break;
++
++			/* We will need some GGTT space for the rq's context */
++			igt_evict_ctl.fail_if_busy = true;
++			rq = i915_gem_request_alloc(engine, ctx);
++			igt_evict_ctl.fail_if_busy = false;
++
++			if (IS_ERR(rq)) {
++				/* When full, fail_if_busy will trigger EBUSY */
++				if (PTR_ERR(rq) != -EBUSY) {
++					pr_err("Unexpected error from request alloc (ctx hw id %u, on %s): %d\n",
++					       ctx->hw_id, engine->name,
++					       (int)PTR_ERR(rq));
++					err = PTR_ERR(rq);
++				}
++				break;
++			}
++
++			/* Keep every request/ctx pinned until we are full */
++			err = i915_sw_fence_await_sw_fence_gfp(&rq->submit,
++							       &fence,
++							       GFP_KERNEL);
++			if (err < 0)
++				break;
++
++			i915_add_request(rq);
++			count++;
++			err = 0;
++		} while(1);
++		mutex_unlock(&i915->drm.struct_mutex);
++
++		onstack_fence_fini(&fence);
++		pr_info("Submitted %lu contexts/requests on %s\n",
++			count, engine->name);
++
++		mock_file_free(i915, file);
++		if (err)
++			break;
++	}
++
++	mutex_lock(&i915->drm.struct_mutex);
++out_locked:
++	while (reserved) {
++		struct reserved *next = reserved->next;
++
++		drm_mm_remove_node(&reserved->node);
++		kfree(reserved);
++
++		reserved = next;
++	}
++	if (drm_mm_node_allocated(&hole))
++		drm_mm_remove_node(&hole);
++	mutex_unlock(&i915->drm.struct_mutex);
++
++	return err;
++}
++
+ int i915_gem_evict_mock_selftests(void)
+ {
+ 	static const struct i915_subtest tests[] = {
+@@ -348,3 +493,12 @@ int i915_gem_evict_mock_selftests(void)
+ 	drm_dev_unref(&i915->drm);
+ 	return err;
+ }
++
++int i915_gem_evict_live_selftests(struct drm_i915_private *i915)
++{
++	static const struct i915_subtest tests[] = {
++		SUBTEST(igt_evict_contexts),
++	};
++
++	return i915_subtests(tests, i915);
++}
+--- a/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
++++ b/drivers/gpu/drm/i915/selftests/i915_live_selftests.h
+@@ -15,6 +15,7 @@ selftest(objects, i915_gem_object_live_s
+ selftest(dmabuf, i915_gem_dmabuf_live_selftests)
+ selftest(coherency, i915_gem_coherency_live_selftests)
+ selftest(gtt, i915_gem_gtt_live_selftests)
++selftest(evict, i915_gem_evict_live_selftests)
+ selftest(hugepages, i915_gem_huge_page_live_selftests)
+ selftest(contexts, i915_gem_context_live_selftests)
+ selftest(hangcheck, intel_hangcheck_live_selftests)
+--- a/drivers/gpu/drm/i915/selftests/mock_context.c
++++ b/drivers/gpu/drm/i915/selftests/mock_context.c
+@@ -73,11 +73,7 @@ err_put:
+ 
+ void mock_context_close(struct i915_gem_context *ctx)
+ {
+-	i915_gem_context_set_closed(ctx);
+-
+-	i915_ppgtt_close(&ctx->ppgtt->base);
+-
+-	i915_gem_context_put(ctx);
++	context_close(ctx);
+ }
+ 
+ void mock_init_contexts(struct drm_i915_private *i915)

@@ -1,0 +1,228 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 16 Jul 2018 14:21:54 +0100
+Subject: drm/i915/selftests: Force a preemption hang
+Git-commit: 0f6b79fa138d781b978bcff22680662fd351cd2d
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Inject a failure into preemption completion to pretend as if the HW
+didn't successfully handle preemption and we are forced to do a reset in
+the middle.
+
+v2: Wait for preemption, to force testing with the missed preemption.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180716132154.12539-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/intel_guc_submission.c |    3 
+ drivers/gpu/drm/i915/intel_lrc.c            |    3 
+ drivers/gpu/drm/i915/intel_ringbuffer.h     |   27 ++++++
+ drivers/gpu/drm/i915/selftests/intel_lrc.c  |  115 ++++++++++++++++++++++++++++
+ 4 files changed, 148 insertions(+)
+
+--- a/drivers/gpu/drm/i915/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/intel_guc_submission.c
+@@ -628,6 +628,9 @@ static void complete_preempt_context(str
+ 
+ 	GEM_BUG_ON(!execlists_is_active(execlists, EXECLISTS_ACTIVE_PREEMPT));
+ 
++	if (inject_preempt_hang(execlists))
++		return;
++
+ 	execlists_cancel_port_requests(execlists);
+ 	execlists_unwind_incomplete_requests(execlists);
+ 
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -559,6 +559,9 @@ static void complete_preempt_context(str
+ {
+ 	GEM_BUG_ON(!execlists_is_active(execlists, EXECLISTS_ACTIVE_PREEMPT));
+ 
++	if (inject_preempt_hang(execlists))
++		return;
++
+ 	execlists_cancel_port_requests(execlists);
+ 	__unwind_incomplete_requests(container_of(execlists,
+ 						  struct intel_engine_cs,
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -192,6 +192,11 @@ struct i915_priolist {
+ 	int priority;
+ };
+ 
++struct st_preempt_hang {
++	struct completion completion;
++	bool inject_hang;
++};
++
+ /**
+  * struct intel_engine_execlists - execlist submission queue and port state
+  *
+@@ -332,6 +337,8 @@ struct intel_engine_execlists {
+ 	 * @csb_head: context status buffer head
+ 	 */
+ 	u8 csb_head;
++
++	I915_SELFTEST_DECLARE(struct st_preempt_hang preempt_hang;)
+ };
+ 
+ #define INTEL_ENGINE_CS_MAX_NAME 8
+@@ -1154,4 +1161,24 @@ void intel_disable_engine_stats(struct i
+ 
+ ktime_t intel_engine_get_busy_time(struct intel_engine_cs *engine);
+ 
++#if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
++
++static inline bool inject_preempt_hang(struct intel_engine_execlists *execlists)
++{
++	if (!execlists->preempt_hang.inject_hang)
++		return false;
++
++	complete(&execlists->preempt_hang.completion);
++	return true;
++}
++
++#else
++
++static inline bool inject_preempt_hang(struct intel_engine_execlists *execlists)
++{
++	return false;
++}
++
++#endif
++
+ #endif /* _INTEL_RINGBUFFER_H_ */
+--- a/drivers/gpu/drm/i915/selftests/intel_lrc.c
++++ b/drivers/gpu/drm/i915/selftests/intel_lrc.c
+@@ -451,12 +451,127 @@ err_wedged:
+ 	goto err_ctx_lo;
+ }
+ 
++static int live_preempt_hang(void *arg)
++{
++	struct drm_i915_private *i915 = arg;
++	struct i915_gem_context *ctx_hi, *ctx_lo;
++	struct spinner spin_hi, spin_lo;
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	int err = -ENOMEM;
++
++	if (!HAS_LOGICAL_RING_PREEMPTION(i915))
++		return 0;
++
++	if (!intel_has_reset_engine(i915))
++		return 0;
++
++	mutex_lock(&i915->drm.struct_mutex);
++
++	if (spinner_init(&spin_hi, i915))
++		goto err_unlock;
++
++	if (spinner_init(&spin_lo, i915))
++		goto err_spin_hi;
++
++	ctx_hi = kernel_context(i915);
++	if (!ctx_hi)
++		goto err_spin_lo;
++	ctx_hi->sched.priority = I915_CONTEXT_MAX_USER_PRIORITY;
++
++	ctx_lo = kernel_context(i915);
++	if (!ctx_lo)
++		goto err_ctx_hi;
++	ctx_lo->sched.priority = I915_CONTEXT_MIN_USER_PRIORITY;
++
++	for_each_engine(engine, i915, id) {
++		struct i915_request *rq;
++
++		if (!intel_engine_has_preemption(engine))
++			continue;
++
++		rq = spinner_create_request(&spin_lo, ctx_lo, engine,
++					    MI_ARB_CHECK);
++		if (IS_ERR(rq)) {
++			err = PTR_ERR(rq);
++			goto err_ctx_lo;
++		}
++
++		i915_request_add(rq);
++		if (!wait_for_spinner(&spin_lo, rq)) {
++			GEM_TRACE("lo spinner failed to start\n");
++			GEM_TRACE_DUMP();
++			i915_gem_set_wedged(i915);
++			err = -EIO;
++			goto err_ctx_lo;
++		}
++
++		rq = spinner_create_request(&spin_hi, ctx_hi, engine,
++					    MI_ARB_CHECK);
++		if (IS_ERR(rq)) {
++			spinner_end(&spin_lo);
++			err = PTR_ERR(rq);
++			goto err_ctx_lo;
++		}
++
++		init_completion(&engine->execlists.preempt_hang.completion);
++		engine->execlists.preempt_hang.inject_hang = true;
++
++		i915_request_add(rq);
++
++		if (!wait_for_completion_timeout(&engine->execlists.preempt_hang.completion,
++						 HZ / 10)) {
++			pr_err("Preemption did not occur within timeout!");
++			GEM_TRACE_DUMP();
++			i915_gem_set_wedged(i915);
++			err = -EIO;
++			goto err_ctx_lo;
++		}
++
++		set_bit(I915_RESET_ENGINE + id, &i915->gpu_error.flags);
++		i915_reset_engine(engine, NULL);
++		clear_bit(I915_RESET_ENGINE + id, &i915->gpu_error.flags);
++
++		engine->execlists.preempt_hang.inject_hang = false;
++
++		if (!wait_for_spinner(&spin_hi, rq)) {
++			GEM_TRACE("hi spinner failed to start\n");
++			GEM_TRACE_DUMP();
++			i915_gem_set_wedged(i915);
++			err = -EIO;
++			goto err_ctx_lo;
++		}
++
++		spinner_end(&spin_hi);
++		spinner_end(&spin_lo);
++		if (igt_flush_test(i915, I915_WAIT_LOCKED)) {
++			err = -EIO;
++			goto err_ctx_lo;
++		}
++	}
++
++	err = 0;
++err_ctx_lo:
++	kernel_context_close(ctx_lo);
++err_ctx_hi:
++	kernel_context_close(ctx_hi);
++err_spin_lo:
++	spinner_fini(&spin_lo);
++err_spin_hi:
++	spinner_fini(&spin_hi);
++err_unlock:
++	igt_flush_test(i915, I915_WAIT_LOCKED);
++	mutex_unlock(&i915->drm.struct_mutex);
++	return err;
++}
++
+ int intel_execlists_live_selftests(struct drm_i915_private *i915)
+ {
+ 	static const struct i915_subtest tests[] = {
+ 		SUBTEST(live_sanitycheck),
+ 		SUBTEST(live_preempt),
+ 		SUBTEST(live_late_preempt),
++		SUBTEST(live_preempt_hang),
+ 	};
+ 
+ 	if (!HAS_EXECLISTS(i915))

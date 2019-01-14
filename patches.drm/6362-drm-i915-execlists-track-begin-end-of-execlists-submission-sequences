@@ -1,0 +1,213 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Sat, 31 Mar 2018 14:06:26 +0100
+Subject: drm/i915/execlists: Track begin/end of execlists submission sequences
+Git-commit: f26052079070cd0e8940717a7a7cb7cdd512ac05
+Patch-mainline: v4.18-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+We would like to start doing some bookkeeping at the beginning, between
+contexts and at the end of execlists submission. We already mark the
+beginning and end using EXECLISTS_ACTIVE_USER, to provide an indication
+when the HW is idle. This give us a pair of sequence points we can then
+expand on for further bookkeeping.
+
+v2: Refactor guc submission to share the same begin/end.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Francisco Jerez <currojerez@riseup.net>
+Reviewed-by: Francisco Jerez <currojerez@riseup.net>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180331130626.10712-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/intel_guc_submission.c |   17 +++++----
+ drivers/gpu/drm/i915/intel_lrc.c            |   50 +++++++++++++++++++++-------
+ drivers/gpu/drm/i915/intel_ringbuffer.h     |   15 +++++++-
+ 3 files changed, 63 insertions(+), 19 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/intel_guc_submission.c
+@@ -728,7 +728,7 @@ done:
+ 	execlists->first = rb;
+ 	if (submit) {
+ 		port_assign(port, last);
+-		execlists_set_active(execlists, EXECLISTS_ACTIVE_USER);
++		execlists_user_begin(execlists, execlists->port);
+ 		guc_submit(engine);
+ 	}
+ 
+@@ -748,17 +748,20 @@ static void guc_submission_tasklet(unsig
+ 	struct execlist_port *port = execlists->port;
+ 	struct i915_request *rq;
+ 
+-	rq = port_request(&port[0]);
++	rq = port_request(port);
+ 	while (rq && i915_request_completed(rq)) {
+ 		trace_i915_request_out(rq);
+ 		i915_request_put(rq);
+ 
+-		execlists_port_complete(execlists, port);
+-
+-		rq = port_request(&port[0]);
++		port = execlists_port_complete(execlists, port);
++		if (port_isset(port)) {
++			execlists_user_begin(execlists, port);
++			rq = port_request(port);
++		} else {
++			execlists_user_end(execlists);
++			rq = NULL;
++		}
+ 	}
+-	if (!rq)
+-		execlists_clear_active(execlists, EXECLISTS_ACTIVE_USER);
+ 
+ 	if (execlists_is_active(execlists, EXECLISTS_ACTIVE_PREEMPT) &&
+ 	    intel_read_status_page(engine, I915_GEM_HWS_PREEMPT_INDEX) ==
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -374,6 +374,19 @@ execlists_context_status_change(struct i
+ 				   status, rq);
+ }
+ 
++inline void
++execlists_user_begin(struct intel_engine_execlists *execlists,
++		     const struct execlist_port *port)
++{
++	execlists_set_active_once(execlists, EXECLISTS_ACTIVE_USER);
++}
++
++inline void
++execlists_user_end(struct intel_engine_execlists *execlists)
++{
++	execlists_clear_active(execlists, EXECLISTS_ACTIVE_USER);
++}
++
+ static inline void
+ execlists_context_schedule_in(struct i915_request *rq)
+ {
+@@ -711,7 +724,7 @@ unlock:
+ 	spin_unlock_irq(&engine->timeline->lock);
+ 
+ 	if (submit) {
+-		execlists_set_active(execlists, EXECLISTS_ACTIVE_USER);
++		execlists_user_begin(execlists, execlists->port);
+ 		execlists_submit_ports(engine);
+ 	}
+ 
+@@ -742,7 +755,7 @@ execlists_cancel_port_requests(struct in
+ 		port++;
+ 	}
+ 
+-	execlists_clear_active(execlists, EXECLISTS_ACTIVE_USER);
++	execlists_user_end(execlists);
+ }
+ 
+ static void clear_gtiir(struct intel_engine_cs *engine)
+@@ -873,7 +886,7 @@ static void execlists_submission_tasklet
+ {
+ 	struct intel_engine_cs * const engine = (struct intel_engine_cs *)data;
+ 	struct intel_engine_execlists * const execlists = &engine->execlists;
+-	struct execlist_port * const port = execlists->port;
++	struct execlist_port *port = execlists->port;
+ 	struct drm_i915_private *dev_priv = engine->i915;
+ 	bool fw = false;
+ 
+@@ -1013,10 +1026,28 @@ static void execlists_submission_tasklet
+ 
+ 			GEM_BUG_ON(count == 0);
+ 			if (--count == 0) {
++				/*
++				 * On the final event corresponding to the
++				 * submission of this context, we expect either
++				 * an element-switch event or a completion
++				 * event (and on completion, the active-idle
++				 * marker). No more preemptions, lite-restore
++				 * or otherwise.
++				 */
+ 				GEM_BUG_ON(status & GEN8_CTX_STATUS_PREEMPTED);
+ 				GEM_BUG_ON(port_isset(&port[1]) &&
+ 					   !(status & GEN8_CTX_STATUS_ELEMENT_SWITCH));
++				GEM_BUG_ON(!port_isset(&port[1]) &&
++					   !(status & GEN8_CTX_STATUS_ACTIVE_IDLE));
++
++				/*
++				 * We rely on the hardware being strongly
++				 * ordered, that the breadcrumb write is
++				 * coherent (visible from the CPU) before the
++				 * user interrupt and CSB is processed.
++				 */
+ 				GEM_BUG_ON(!i915_request_completed(rq));
++
+ 				execlists_context_schedule_out(rq);
+ 				trace_i915_request_out(rq);
+ 				i915_request_put(rq);
+@@ -1024,17 +1055,14 @@ static void execlists_submission_tasklet
+ 				GEM_TRACE("%s completed ctx=%d\n",
+ 					  engine->name, port->context_id);
+ 
+-				execlists_port_complete(execlists, port);
++				port = execlists_port_complete(execlists, port);
++				if (port_isset(port))
++					execlists_user_begin(execlists, port);
++				else
++					execlists_user_end(execlists);
+ 			} else {
+ 				port_set(port, port_pack(rq, count));
+ 			}
+-
+-			/* After the final element, the hw should be idle */
+-			GEM_BUG_ON(port_count(port) == 0 &&
+-				   !(status & GEN8_CTX_STATUS_ACTIVE_IDLE));
+-			if (port_count(port) == 0)
+-				execlists_clear_active(execlists,
+-						       EXECLISTS_ACTIVE_USER);
+ 		}
+ 
+ 		if (head != execlists->csb_head) {
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -637,6 +637,13 @@ execlists_set_active(struct intel_engine
+ 	__set_bit(bit, (unsigned long *)&execlists->active);
+ }
+ 
++static inline bool
++execlists_set_active_once(struct intel_engine_execlists *execlists,
++			  unsigned int bit)
++{
++	return !__test_and_set_bit(bit, (unsigned long *)&execlists->active);
++}
++
+ static inline void
+ execlists_clear_active(struct intel_engine_execlists *execlists,
+ 		       unsigned int bit)
+@@ -651,6 +658,10 @@ execlists_is_active(const struct intel_e
+ 	return test_bit(bit, (unsigned long *)&execlists->active);
+ }
+ 
++void execlists_user_begin(struct intel_engine_execlists *execlists,
++			  const struct execlist_port *port);
++void execlists_user_end(struct intel_engine_execlists *execlists);
++
+ void
+ execlists_cancel_port_requests(struct intel_engine_execlists * const execlists);
+ 
+@@ -663,7 +674,7 @@ execlists_num_ports(const struct intel_e
+ 	return execlists->port_mask + 1;
+ }
+ 
+-static inline void
++static inline struct execlist_port *
+ execlists_port_complete(struct intel_engine_execlists * const execlists,
+ 			struct execlist_port * const port)
+ {
+@@ -674,6 +685,8 @@ execlists_port_complete(struct intel_eng
+ 
+ 	memmove(port, port + 1, m * sizeof(struct execlist_port));
+ 	memset(port + m, 0, sizeof(struct execlist_port));
++
++	return port;
+ }
+ 
+ static inline unsigned int

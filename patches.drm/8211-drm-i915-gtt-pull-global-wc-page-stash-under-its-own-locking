@@ -1,0 +1,477 @@
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 4 Jul 2018 19:55:18 +0100
+Subject: drm/i915/gtt: Pull global wc page stash under its own locking
+Git-commit: 63fd659fb1a52262a37293a9a034a912a2406b26
+Patch-mainline: v4.19-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Currently, the wc-stash used for providing flushed WC pages ready for
+constructing the page directories is assumed to be protected by the
+struct_mutex. However, we want to remove this global lock and so must
+install a replacement global lock for accessing the global wc-stash (the
+per-vm stash continues to be guarded by the vm).
+
+We need to push ahead on this patch due to an oversight in hastily
+removing the struct_mutex guard around the igt_ppgtt_alloc selftest. No
+matter, it will prove very useful (i.e. will be required) in the near
+future.
+
+v2: Restore the onstack stash so that we can drop the vm->mutex in
+future across the allocation.
+v3: Restore the lost pagevec_init of the onstack allocation, and repaint
+function names.
+v4: Reorder init so that we don't try and use i915_address_space before
+it is ininitialised.
+
+Fixes: 1f6f00238abf ("drm/i915/selftests: Drop struct_mutex around lowlevel pggtt allocation")
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180704185518.4193-1-chris@chris-wilson.co.uk
+
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h               |    2 
+ drivers/gpu/drm/i915/i915_gem_context.c       |    2 
+ drivers/gpu/drm/i915/i915_gem_gtt.c           |  210 ++++++++++++++++----------
+ drivers/gpu/drm/i915/i915_gem_gtt.h           |   10 -
+ drivers/gpu/drm/i915/selftests/huge_pages.c   |    2 
+ drivers/gpu/drm/i915/selftests/i915_gem_gtt.c |    2 
+ drivers/gpu/drm/i915/selftests/mock_gtt.c     |    2 
+ 7 files changed, 144 insertions(+), 86 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -952,7 +952,7 @@ struct i915_gem_mm {
+ 	/**
+ 	 * Small stash of WC pages
+ 	 */
+-	struct pagevec wc_stash;
++	struct pagestash wc_stash;
+ 
+ 	/**
+ 	 * tmpfs instance used for shmem backed objects
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -374,7 +374,7 @@ i915_gem_create_context(struct drm_i915_
+ 	if (USES_FULL_PPGTT(dev_priv)) {
+ 		struct i915_hw_ppgtt *ppgtt;
+ 
+-		ppgtt = i915_ppgtt_create(dev_priv, file_priv, ctx->name);
++		ppgtt = i915_ppgtt_create(dev_priv, file_priv);
+ 		if (IS_ERR(ppgtt)) {
+ 			DRM_DEBUG_DRIVER("PPGTT setup failed (%ld)\n",
+ 					 PTR_ERR(ppgtt));
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -375,37 +375,70 @@ static gen6_pte_t iris_pte_encode(dma_ad
+ 	return pte;
+ }
+ 
++static void stash_init(struct pagestash *stash)
++{
++	pagevec_init(&stash->pvec);
++	spin_lock_init(&stash->lock);
++}
++
++static struct page *stash_pop_page(struct pagestash *stash)
++{
++	struct page *page = NULL;
++
++	spin_lock(&stash->lock);
++	if (likely(stash->pvec.nr))
++		page = stash->pvec.pages[--stash->pvec.nr];
++	spin_unlock(&stash->lock);
++
++	return page;
++}
++
++static void stash_push_pagevec(struct pagestash *stash, struct pagevec *pvec)
++{
++	int nr;
++
++	spin_lock_nested(&stash->lock, SINGLE_DEPTH_NESTING);
++
++	nr = min_t(int, pvec->nr, pagevec_space(&stash->pvec));
++	memcpy(stash->pvec.pages + stash->pvec.nr,
++	       pvec->pages + pvec->nr - nr,
++	       sizeof(pvec->pages[0]) * nr);
++	stash->pvec.nr += nr;
++
++	spin_unlock(&stash->lock);
++
++	pvec->nr -= nr;
++}
++
+ static struct page *vm_alloc_page(struct i915_address_space *vm, gfp_t gfp)
+ {
+-	struct pagevec *pvec = &vm->free_pages;
+-	struct pagevec stash;
++	struct pagevec stack;
++	struct page *page;
+ 
+ 	if (I915_SELFTEST_ONLY(should_fail(&vm->fault_attr, 1)))
+ 		i915_gem_shrink_all(vm->i915);
+ 
+-	if (likely(pvec->nr))
+-		return pvec->pages[--pvec->nr];
++	page = stash_pop_page(&vm->free_pages);
++	if (page)
++		return page;
+ 
+ 	if (!vm->pt_kmap_wc)
+ 		return alloc_page(gfp);
+ 
+-	/* A placeholder for a specific mutex to guard the WC stash */
+-	lockdep_assert_held(&vm->i915->drm.struct_mutex);
+-
+ 	/* Look in our global stash of WC pages... */
+-	pvec = &vm->i915->mm.wc_stash;
+-	if (likely(pvec->nr))
+-		return pvec->pages[--pvec->nr];
++	page = stash_pop_page(&vm->i915->mm.wc_stash);
++	if (page)
++		return page;
+ 
+ 	/*
+-	 * Otherwise batch allocate pages to amoritize cost of set_pages_wc.
++	 * Otherwise batch allocate pages to amortize cost of set_pages_wc.
+ 	 *
+ 	 * We have to be careful as page allocation may trigger the shrinker
+ 	 * (via direct reclaim) which will fill up the WC stash underneath us.
+ 	 * So we add our WB pages into a temporary pvec on the stack and merge
+ 	 * them into the WC stash after all the allocations are complete.
+ 	 */
+-	pagevec_init(&stash);
++	pagevec_init(&stack);
+ 	do {
+ 		struct page *page;
+ 
+@@ -413,59 +446,67 @@ static struct page *vm_alloc_page(struct
+ 		if (unlikely(!page))
+ 			break;
+ 
+-		stash.pages[stash.nr++] = page;
+-	} while (stash.nr < pagevec_space(pvec));
++		stack.pages[stack.nr++] = page;
++	} while (pagevec_space(&stack));
+ 
+-	if (stash.nr) {
+-		int nr = min_t(int, stash.nr, pagevec_space(pvec));
+-		struct page **pages = stash.pages + stash.nr - nr;
++	if (stack.nr && !set_pages_array_wc(stack.pages, stack.nr)) {
++		page = stack.pages[--stack.nr];
+ 
+-		if (nr && !set_pages_array_wc(pages, nr)) {
+-			memcpy(pvec->pages + pvec->nr,
+-			       pages, sizeof(pages[0]) * nr);
+-			pvec->nr += nr;
+-			stash.nr -= nr;
+-		}
++		/* Merge spare WC pages to the global stash */
++		stash_push_pagevec(&vm->i915->mm.wc_stash, &stack);
+ 
+-		pagevec_release(&stash);
++		/* Push any surplus WC pages onto the local VM stash */
++		if (stack.nr)
++			stash_push_pagevec(&vm->free_pages, &stack);
+ 	}
+ 
+-	return likely(pvec->nr) ? pvec->pages[--pvec->nr] : NULL;
++	/* Return unwanted leftovers */
++	if (unlikely(stack.nr)) {
++		WARN_ON_ONCE(set_pages_array_wb(stack.pages, stack.nr));
++		__pagevec_release(&stack);
++	}
++
++	return page;
+ }
+ 
+ static void vm_free_pages_release(struct i915_address_space *vm,
+ 				  bool immediate)
+ {
+-	struct pagevec *pvec = &vm->free_pages;
++	struct pagevec *pvec = &vm->free_pages.pvec;
++	struct pagevec stack;
+ 
++	lockdep_assert_held(&vm->free_pages.lock);
+ 	GEM_BUG_ON(!pagevec_count(pvec));
+ 
+ 	if (vm->pt_kmap_wc) {
+-		struct pagevec *stash = &vm->i915->mm.wc_stash;
+-
+-		/* When we use WC, first fill up the global stash and then
++		/*
++		 * When we use WC, first fill up the global stash and then
+ 		 * only if full immediately free the overflow.
+ 		 */
++		stash_push_pagevec(&vm->i915->mm.wc_stash, pvec);
+ 
+-		lockdep_assert_held(&vm->i915->drm.struct_mutex);
+-		if (pagevec_space(stash)) {
+-			do {
+-				stash->pages[stash->nr++] =
+-					pvec->pages[--pvec->nr];
+-				if (!pvec->nr)
+-					return;
+-			} while (pagevec_space(stash));
+-
+-			/* As we have made some room in the VM's free_pages,
+-			 * we can wait for it to fill again. Unless we are
+-			 * inside i915_address_space_fini() and must
+-			 * immediately release the pages!
+-			 */
+-			if (!immediate)
+-				return;
+-		}
++		/*
++		 * As we have made some room in the VM's free_pages,
++		 * we can wait for it to fill again. Unless we are
++		 * inside i915_address_space_fini() and must
++		 * immediately release the pages!
++		 */
++		if (pvec->nr <= (immediate ? 0 : PAGEVEC_SIZE - 1))
++			return;
+ 
++		/*
++		 * We have to drop the lock to allow ourselves to sleep,
++		 * so take a copy of the pvec and clear the stash for
++		 * others to use it as we sleep.
++		 */
++		stack = *pvec;
++		pagevec_reinit(pvec);
++		spin_unlock(&vm->free_pages.lock);
++
++		pvec = &stack;
+ 		set_pages_array_wb(pvec->pages, pvec->nr);
++
++		spin_lock(&vm->free_pages.lock);
+ 	}
+ 
+ 	__pagevec_release(pvec);
+@@ -481,8 +522,38 @@ static void vm_free_page(struct i915_add
+ 	 * unconditional might_sleep() for everybody.
+ 	 */
+ 	might_sleep();
+-	if (!pagevec_add(&vm->free_pages, page))
++	spin_lock(&vm->free_pages.lock);
++	if (!pagevec_add(&vm->free_pages.pvec, page))
+ 		vm_free_pages_release(vm, false);
++	spin_unlock(&vm->free_pages.lock);
++}
++
++static void i915_address_space_init(struct i915_address_space *vm,
++				    struct drm_i915_private *dev_priv)
++{
++	GEM_BUG_ON(!vm->total);
++	drm_mm_init(&vm->mm, 0, vm->total);
++	vm->mm.head_node.color = I915_COLOR_UNEVICTABLE;
++
++	stash_init(&vm->free_pages);
++
++	INIT_LIST_HEAD(&vm->active_list);
++	INIT_LIST_HEAD(&vm->inactive_list);
++	INIT_LIST_HEAD(&vm->unbound_list);
++
++	list_add_tail(&vm->global_link, &dev_priv->vm_list);
++}
++
++static void i915_address_space_fini(struct i915_address_space *vm)
++{
++	spin_lock(&vm->free_pages.lock);
++	if (pagevec_count(&vm->free_pages.pvec))
++		vm_free_pages_release(vm, true);
++	GEM_BUG_ON(pagevec_count(&vm->free_pages.pvec));
++	spin_unlock(&vm->free_pages.lock);
++
++	drm_mm_takedown(&vm->mm);
++	list_del(&vm->global_link);
+ }
+ 
+ static int __setup_page_dma(struct i915_address_space *vm,
+@@ -1562,6 +1633,8 @@ static struct i915_hw_ppgtt *gen8_ppgtt_
+ 	if (!ppgtt)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	kref_init(&ppgtt->ref);
++
+ 	ppgtt->vm.i915 = i915;
+ 	ppgtt->vm.dma = &i915->drm.pdev->dev;
+ 
+@@ -1569,6 +1642,8 @@ static struct i915_hw_ppgtt *gen8_ppgtt_
+ 		1ULL << 48 :
+ 		1ULL << 32;
+ 
++	i915_address_space_init(&ppgtt->vm, i915);
++
+ 	/* There are only few exceptions for gen >=6. chv and bxt.
+ 	 * And we are not sure about the latter so play safe for now.
+ 	 */
+@@ -2068,11 +2143,15 @@ static struct i915_hw_ppgtt *gen6_ppgtt_
+ 	if (!ppgtt)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	kref_init(&ppgtt->base.ref);
++
+ 	ppgtt->base.vm.i915 = i915;
+ 	ppgtt->base.vm.dma = &i915->drm.pdev->dev;
+ 
+ 	ppgtt->base.vm.total = I915_PDES * GEN6_PTES * PAGE_SIZE;
+ 
++	i915_address_space_init(&ppgtt->base.vm, i915);
++
+ 	ppgtt->base.vm.allocate_va_range = gen6_alloc_va_range;
+ 	ppgtt->base.vm.clear_range = gen6_ppgtt_clear_range;
+ 	ppgtt->base.vm.insert_entries = gen6_ppgtt_insert_entries;
+@@ -2105,30 +2184,6 @@ err_free:
+ 	return ERR_PTR(err);
+ }
+ 
+-static void i915_address_space_init(struct i915_address_space *vm,
+-				    struct drm_i915_private *dev_priv,
+-				    const char *name)
+-{
+-	drm_mm_init(&vm->mm, 0, vm->total);
+-	vm->mm.head_node.color = I915_COLOR_UNEVICTABLE;
+-
+-	INIT_LIST_HEAD(&vm->active_list);
+-	INIT_LIST_HEAD(&vm->inactive_list);
+-	INIT_LIST_HEAD(&vm->unbound_list);
+-
+-	list_add_tail(&vm->global_link, &dev_priv->vm_list);
+-	pagevec_init(&vm->free_pages);
+-}
+-
+-static void i915_address_space_fini(struct i915_address_space *vm)
+-{
+-	if (pagevec_count(&vm->free_pages))
+-		vm_free_pages_release(vm, true);
+-
+-	drm_mm_takedown(&vm->mm);
+-	list_del(&vm->global_link);
+-}
+-
+ static void gtt_write_workarounds(struct drm_i915_private *dev_priv)
+ {
+ 	/* This function is for gtt related workarounds. This function is
+@@ -2199,8 +2254,7 @@ __hw_ppgtt_create(struct drm_i915_privat
+ 
+ struct i915_hw_ppgtt *
+ i915_ppgtt_create(struct drm_i915_private *i915,
+-		  struct drm_i915_file_private *fpriv,
+-		  const char *name)
++		  struct drm_i915_file_private *fpriv)
+ {
+ 	struct i915_hw_ppgtt *ppgtt;
+ 
+@@ -2208,8 +2262,6 @@ i915_ppgtt_create(struct drm_i915_privat
+ 	if (IS_ERR(ppgtt))
+ 		return ppgtt;
+ 
+-	kref_init(&ppgtt->ref);
+-	i915_address_space_init(&ppgtt->vm, i915, name);
+ 	ppgtt->vm.file = fpriv;
+ 
+ 	trace_i915_ppgtt_create(&ppgtt->vm);
+@@ -2788,7 +2840,7 @@ int i915_gem_init_aliasing_ppgtt(struct
+ 	struct i915_hw_ppgtt *ppgtt;
+ 	int err;
+ 
+-	ppgtt = i915_ppgtt_create(i915, ERR_PTR(-EPERM), "[alias]");
++	ppgtt = i915_ppgtt_create(i915, ERR_PTR(-EPERM));
+ 	if (IS_ERR(ppgtt))
+ 		return PTR_ERR(ppgtt);
+ 
+@@ -2918,7 +2970,7 @@ void i915_ggtt_cleanup_hw(struct drm_i91
+ 
+ 	ggtt->vm.cleanup(&ggtt->vm);
+ 
+-	pvec = &dev_priv->mm.wc_stash;
++	pvec = &dev_priv->mm.wc_stash.pvec;
+ 	if (pvec->nr) {
+ 		set_pages_array_wb(pvec->pages, pvec->nr);
+ 		__pagevec_release(pvec);
+@@ -3518,6 +3570,8 @@ int i915_ggtt_init_hw(struct drm_i915_pr
+ 	struct i915_ggtt *ggtt = &dev_priv->ggtt;
+ 	int ret;
+ 
++	stash_init(&dev_priv->mm.wc_stash);
++
+ 	INIT_LIST_HEAD(&dev_priv->vm_list);
+ 
+ 	/* Note that we use page colouring to enforce a guard page at the
+@@ -3526,7 +3580,7 @@ int i915_ggtt_init_hw(struct drm_i915_pr
+ 	 * and beyond the end of the GTT if we do not provide a guard.
+ 	 */
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+-	i915_address_space_init(&ggtt->vm, dev_priv, "[global]");
++	i915_address_space_init(&ggtt->vm, dev_priv);
+ 	if (!HAS_LLC(dev_priv) && !USES_PPGTT(dev_priv))
+ 		ggtt->vm.mm.color_adjust = i915_gtt_color_adjust;
+ 	mutex_unlock(&dev_priv->drm.struct_mutex);
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.h
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.h
+@@ -270,6 +270,11 @@ struct i915_vma_ops {
+ 	void (*clear_pages)(struct i915_vma *vma);
+ };
+ 
++struct pagestash {
++	spinlock_t lock;
++	struct pagevec pvec;
++};
++
+ struct i915_address_space {
+ 	struct drm_mm mm;
+ 	struct drm_i915_private *i915;
+@@ -324,7 +329,7 @@ struct i915_address_space {
+ 	 */
+ 	struct list_head unbound_list;
+ 
+-	struct pagevec free_pages;
++	struct pagestash free_pages;
+ 	bool pt_kmap_wc;
+ 
+ 	/* FIXME: Need a more generic return type */
+@@ -615,8 +620,7 @@ void i915_ggtt_cleanup_hw(struct drm_i91
+ int i915_ppgtt_init_hw(struct drm_i915_private *dev_priv);
+ void i915_ppgtt_release(struct kref *kref);
+ struct i915_hw_ppgtt *i915_ppgtt_create(struct drm_i915_private *dev_priv,
+-					struct drm_i915_file_private *fpriv,
+-					const char *name);
++					struct drm_i915_file_private *fpriv);
+ void i915_ppgtt_close(struct i915_address_space *vm);
+ static inline void i915_ppgtt_get(struct i915_hw_ppgtt *ppgtt)
+ {
+--- a/drivers/gpu/drm/i915/selftests/huge_pages.c
++++ b/drivers/gpu/drm/i915/selftests/huge_pages.c
+@@ -1694,7 +1694,7 @@ int i915_gem_huge_page_mock_selftests(vo
+ 	dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(39));
+ 
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+-	ppgtt = i915_ppgtt_create(dev_priv, ERR_PTR(-ENODEV), "mock");
++	ppgtt = i915_ppgtt_create(dev_priv, ERR_PTR(-ENODEV));
+ 	if (IS_ERR(ppgtt)) {
+ 		err = PTR_ERR(ppgtt);
+ 		goto out_unlock;
+--- a/drivers/gpu/drm/i915/selftests/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/selftests/i915_gem_gtt.c
+@@ -1004,7 +1004,7 @@ static int exercise_ppgtt(struct drm_i91
+ 		return PTR_ERR(file);
+ 
+ 	mutex_lock(&dev_priv->drm.struct_mutex);
+-	ppgtt = i915_ppgtt_create(dev_priv, file->driver_priv, "mock");
++	ppgtt = i915_ppgtt_create(dev_priv, file->driver_priv);
+ 	if (IS_ERR(ppgtt)) {
+ 		err = PTR_ERR(ppgtt);
+ 		goto out_unlock;
+--- a/drivers/gpu/drm/i915/selftests/mock_gtt.c
++++ b/drivers/gpu/drm/i915/selftests/mock_gtt.c
+@@ -124,7 +124,7 @@ void mock_init_ggtt(struct drm_i915_priv
+ 	ggtt->vm.vma_ops.set_pages   = ggtt_set_pages;
+ 	ggtt->vm.vma_ops.clear_pages = clear_pages;
+ 
+-	i915_address_space_init(&ggtt->vm, i915, "global");
++	i915_address_space_init(&ggtt->vm, i915);
+ }
+ 
+ void mock_fini_ggtt(struct drm_i915_private *i915)

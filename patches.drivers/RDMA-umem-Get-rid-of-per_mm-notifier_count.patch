@@ -1,0 +1,258 @@
+From: Jason Gunthorpe <jgg@mellanox.com>
+Date: Sun, 16 Sep 2018 20:48:09 +0300
+Subject: RDMA/umem: Get rid of per_mm->notifier_count
+Patch-mainline: v4.20-rc1
+Git-commit: ca748c39ea3f3c755295d64d69ba0b4375e34b5d
+References: bsc#1103992 FATE#326009
+
+This is intrinsically racy and the scheme is simply unnecessary. New MR
+registration can wait for any on going invalidation to fully complete.
+
+      CPU0                              CPU1
+                                  if (atomic_read())
+ if (atomic_dec_and_test() &&
+     !list_empty())
+  { /* not taken */ }
+                                       list_add()
+
+Putting the new UMEM into some kind of purgatory until another invalidate
+rolls through..
+
+Instead hold the read side of the umem_rwsem across the pair'd start/end
+and get rid of the racy 'deferred add' approach.
+
+Since all umem's in the rbt are always ready to go, also get rid of the
+mn_counters_active stuff.
+
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/core/umem_odp.c |  104 +++++--------------------------------
+ include/rdma/ib_umem_odp.h         |   15 -----
+ 2 files changed, 16 insertions(+), 103 deletions(-)
+
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@ -47,83 +47,29 @@
+ static void ib_umem_notifier_start_account(struct ib_umem_odp *umem_odp)
+ {
+ 	mutex_lock(&umem_odp->umem_mutex);
+-
+-	/* Only update private counters for this umem if it has them.
+-	 * Otherwise skip it. All page faults will be delayed for this umem. */
+-	if (umem_odp->mn_counters_active) {
+-		int notifiers_count = umem_odp->notifiers_count++;
+-
+-		if (notifiers_count == 0)
+-			/* Initialize the completion object for waiting on
+-			 * notifiers. Since notifier_count is zero, no one
+-			 * should be waiting right now. */
+-			reinit_completion(&umem_odp->notifier_completion);
+-	}
++	if (umem_odp->notifiers_count++ == 0)
++		/*
++		 * Initialize the completion object for waiting on
++		 * notifiers. Since notifier_count is zero, no one should be
++		 * waiting right now.
++		 */
++		reinit_completion(&umem_odp->notifier_completion);
+ 	mutex_unlock(&umem_odp->umem_mutex);
+ }
+ 
+ static void ib_umem_notifier_end_account(struct ib_umem_odp *umem_odp)
+ {
+ 	mutex_lock(&umem_odp->umem_mutex);
+-
+-	/* Only update private counters for this umem if it has them.
+-	 * Otherwise skip it. All page faults will be delayed for this umem. */
+-	if (umem_odp->mn_counters_active) {
+-		/*
+-		 * This sequence increase will notify the QP page fault that
+-		 * the page that is going to be mapped in the spte could have
+-		 * been freed.
+-		 */
+-		++umem_odp->notifiers_seq;
+-		if (--umem_odp->notifiers_count == 0)
+-			complete_all(&umem_odp->notifier_completion);
+-	}
++	/*
++	 * This sequence increase will notify the QP page fault that the page
++	 * that is going to be mapped in the spte could have been freed.
++	 */
++	++umem_odp->notifiers_seq;
++	if (--umem_odp->notifiers_count == 0)
++		complete_all(&umem_odp->notifier_completion);
+ 	mutex_unlock(&umem_odp->umem_mutex);
+ }
+ 
+-/* Account for a new mmu notifier in an ib_ucontext. */
+-static void
+-ib_ucontext_notifier_start_account(struct ib_ucontext_per_mm *per_mm)
+-{
+-	atomic_inc(&per_mm->notifier_count);
+-}
+-
+-/* Account for a terminating mmu notifier in an ib_ucontext.
+- *
+- * Must be called with the ib_ucontext->umem_rwsem semaphore unlocked, since
+- * the function takes the semaphore itself. */
+-static void ib_ucontext_notifier_end_account(struct ib_ucontext_per_mm *per_mm)
+-{
+-	int zero_notifiers = atomic_dec_and_test(&per_mm->notifier_count);
+-
+-	if (zero_notifiers &&
+-	    !list_empty(&per_mm->no_private_counters)) {
+-		/* No currently running mmu notifiers. Now is the chance to
+-		 * add private accounting to all previously added umems. */
+-		struct ib_umem_odp *odp_data, *next;
+-
+-		/* Prevent concurrent mmu notifiers from working on the
+-		 * no_private_counters list. */
+-		down_write(&per_mm->umem_rwsem);
+-
+-		/* Read the notifier_count again, with the umem_rwsem
+-		 * semaphore taken for write. */
+-		if (!atomic_read(&per_mm->notifier_count)) {
+-			list_for_each_entry_safe(odp_data, next,
+-						 &per_mm->no_private_counters,
+-						 no_private_counters) {
+-				mutex_lock(&odp_data->umem_mutex);
+-				odp_data->mn_counters_active = true;
+-				list_del(&odp_data->no_private_counters);
+-				complete_all(&odp_data->notifier_completion);
+-				mutex_unlock(&odp_data->umem_mutex);
+-			}
+-		}
+-
+-		up_write(&per_mm->umem_rwsem);
+-	}
+-}
+-
+ static int ib_umem_notifier_release_trampoline(struct ib_umem_odp *umem_odp,
+ 					       u64 start, u64 end, void *cookie)
+ {
+@@ -153,7 +99,6 @@ static void ib_umem_notifier_release(str
+ 	if (!per_mm->context->invalidate_range)
+ 		return;
+ 
+-	ib_ucontext_notifier_start_account(per_mm);
+ 	down_read(&per_mm->umem_rwsem);
+ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, 0,
+ 				      ULLONG_MAX,
+@@ -182,12 +127,10 @@ static void ib_umem_notifier_invalidate_
+ 		return;
+ 
+ 	down_read(&per_mm->umem_rwsem);
+-	ib_ucontext_notifier_start_account(per_mm);
+ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, address,
+ 				      address + PAGE_SIZE,
+ 				      invalidate_page_trampoline, NULL);
+ 	up_read(&per_mm->umem_rwsem);
+-	ib_ucontext_notifier_end_account(per_mm);
+ }
+ 
+ static int invalidate_range_start_trampoline(struct ib_umem_odp *item,
+@@ -210,11 +153,8 @@ static void ib_umem_notifier_invalidate_
+ 		return;
+ 
+ 	down_read(&per_mm->umem_rwsem);
+-	ib_ucontext_notifier_start_account(per_mm);
+-	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start,
+-				      end,
++	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start, end,
+ 				      invalidate_range_start_trampoline, NULL);
+-	up_read(&per_mm->umem_rwsem);
+ }
+ 
+ static int invalidate_range_end_trampoline(struct ib_umem_odp *item, u64 start,
+@@ -235,12 +175,10 @@ static void ib_umem_notifier_invalidate_
+ 	if (!per_mm->context->invalidate_range)
+ 		return;
+ 
+-	down_read(&per_mm->umem_rwsem);
+ 	rbt_ib_umem_for_each_in_range(&per_mm->umem_tree, start,
+ 				      end,
+ 				      invalidate_range_end_trampoline, NULL);
+ 	up_read(&per_mm->umem_rwsem);
+-	ib_ucontext_notifier_end_account(per_mm);
+ }
+ 
+ static const struct mmu_notifier_ops ib_umem_notifiers = {
+@@ -259,12 +197,6 @@ static void add_umem_to_per_mm(struct ib
+ 	if (likely(ib_umem_start(umem) != ib_umem_end(umem)))
+ 		rbt_ib_umem_insert(&umem_odp->interval_tree,
+ 				   &per_mm->umem_tree);
+-
+-	if (likely(!atomic_read(&per_mm->notifier_count)))
+-		umem_odp->mn_counters_active = true;
+-	else
+-		list_add(&umem_odp->no_private_counters,
+-			 &per_mm->no_private_counters);
+ 	up_write(&per_mm->umem_rwsem);
+ }
+ 
+@@ -277,10 +209,7 @@ static void remove_umem_from_per_mm(stru
+ 	if (likely(ib_umem_start(umem) != ib_umem_end(umem)))
+ 		rbt_ib_umem_remove(&umem_odp->interval_tree,
+ 				   &per_mm->umem_tree);
+-	if (!umem_odp->mn_counters_active) {
+-		list_del(&umem_odp->no_private_counters);
+-		complete_all(&umem_odp->notifier_completion);
+-	}
++	complete_all(&umem_odp->notifier_completion);
+ 
+ 	up_write(&per_mm->umem_rwsem);
+ }
+@@ -299,7 +228,6 @@ static struct ib_ucontext_per_mm *alloc_
+ 	per_mm->mm = mm;
+ 	per_mm->umem_tree = RB_ROOT;
+ 	init_rwsem(&per_mm->umem_rwsem);
+-	INIT_LIST_HEAD(&per_mm->no_private_counters);
+ 
+ 	rcu_read_lock();
+ 	per_mm->tgid = get_task_pid(current->group_leader, PIDTYPE_PID);
+--- a/include/rdma/ib_umem_odp.h
++++ b/include/rdma/ib_umem_odp.h
+@@ -67,15 +67,9 @@ struct ib_umem_odp {
+ 	struct mutex		umem_mutex;
+ 	void			*private; /* for the HW driver to use. */
+ 
+-	/* When false, use the notifier counter in the ucontext struct. */
+-	bool mn_counters_active;
+ 	int notifiers_seq;
+ 	int notifiers_count;
+ 
+-	/* A linked list of umems that don't have private mmu notifier
+-	 * counters yet. */
+-	struct list_head no_private_counters;
+-
+ 	/* Tree tracking */
+ 	struct umem_odp_node	interval_tree;
+ 
+@@ -99,11 +93,8 @@ struct ib_ucontext_per_mm {
+ 	struct rb_root umem_tree;
+ 	/* Protects umem_tree */
+ 	struct rw_semaphore umem_rwsem;
+-	atomic_t notifier_count;
+ 
+ 	struct mmu_notifier mn;
+-	/* A list of umems that don't have private mmu notifier counters yet. */
+-	struct list_head no_private_counters;
+ 	unsigned int odp_mrs_count;
+ 
+ 	struct list_head ucontext_list;
+@@ -162,12 +153,6 @@ static inline int ib_umem_mmu_notifier_r
+ 	 * and the ucontext umem_mutex semaphore locked for read).
+ 	 */
+ 
+-	/* Do not allow page faults while the new ib_umem hasn't seen a state
+-	 * with zero notifiers yet, and doesn't have its own valid set of
+-	 * private counters. */
+-	if (!umem_odp->mn_counters_active)
+-		return 1;
+-
+ 	if (unlikely(umem_odp->notifiers_count))
+ 		return 1;
+ 	if (umem_odp->notifiers_seq != mmu_seq)

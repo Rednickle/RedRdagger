@@ -1,0 +1,300 @@
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Thu, 22 Mar 2018 10:26:37 +0100
+Subject: drm/vmwgfx: Improve on hibernation
+Git-commit: c3b9b165734492b7e42bdd898aba93e1120f9084
+Patch-mainline: v4.17-rc1
+References: FATE#326289 FATE#326079 FATE#326049 FATE#322398 FATE#326166
+
+Make it possible to hibernate also with masters that don't switch VT at
+hibernation time. We save and restore modesetting state unless fbdev is
+active and enabled at hibernation time.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Sinclair Yeh <syeh@vmware.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c |   75 ++++++++++++++++++++++++------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h |    5 ++
+ drivers/gpu/drm/vmwgfx/vmwgfx_fb.c  |   35 ++++++++++++----
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c |   47 ++++++++++++++++++++++
+ 4 files changed, 129 insertions(+), 33 deletions(-)
+
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -1279,8 +1279,7 @@ static void vmw_master_drop(struct drm_d
+ 	ttm_lock_set_kill(&dev_priv->fbdev_master.lock, false, SIGTERM);
+ 	ttm_vt_unlock(&dev_priv->fbdev_master.lock);
+ 
+-	if (dev_priv->enable_fb)
+-		vmw_fb_on(dev_priv);
++	vmw_fb_refresh(dev_priv);
+ }
+ 
+ /**
+@@ -1383,28 +1382,23 @@ static int vmwgfx_pm_notifier(struct not
+ 
+ 	switch (val) {
+ 	case PM_HIBERNATION_PREPARE:
+-		if (dev_priv->enable_fb)
+-			vmw_fb_off(dev_priv);
+-		ttm_suspend_lock(&dev_priv->reservation_sem);
+-
+ 		/*
+-		 * This empties VRAM and unbinds all GMR bindings.
+-		 * Buffer contents is moved to swappable memory.
++		 * Take the reservation sem in write mode, which will make sure
++		 * there are no other processes holding a buffer object
++		 * reservation, meaning we should be able to evict all buffer
++		 * objects if needed.
++		 * Once user-space processes have been frozen, we can release
++		 * the lock again.
+ 		 */
+-		vmw_execbuf_release_pinned_bo(dev_priv);
+-		vmw_resource_evict_all(dev_priv);
+-		vmw_release_device_early(dev_priv);
+-		ttm_bo_swapout_all(&dev_priv->bdev);
+-		vmw_fence_fifo_down(dev_priv->fman);
++		ttm_suspend_lock(&dev_priv->reservation_sem);
++		dev_priv->suspend_locked = true;
+ 		break;
+ 	case PM_POST_HIBERNATION:
+ 	case PM_POST_RESTORE:
+-		vmw_fence_fifo_up(dev_priv->fman);
+-		ttm_suspend_unlock(&dev_priv->reservation_sem);
+-		if (dev_priv->enable_fb)
+-			vmw_fb_on(dev_priv);
+-		break;
+-	case PM_RESTORE_PREPARE:
++		if (READ_ONCE(dev_priv->suspend_locked)) {
++			dev_priv->suspend_locked = false;
++			ttm_suspend_unlock(&dev_priv->reservation_sem);
++		}
+ 		break;
+ 	default:
+ 		break;
+@@ -1455,25 +1449,50 @@ static int vmw_pm_freeze(struct device *
+ 	struct pci_dev *pdev = to_pci_dev(kdev);
+ 	struct drm_device *dev = pci_get_drvdata(pdev);
+ 	struct vmw_private *dev_priv = vmw_priv(dev);
++	int ret;
+ 
++	/*
++	 * Unlock for vmw_kms_suspend.
++	 * No user-space processes should be running now.
++	 */
++	ttm_suspend_unlock(&dev_priv->reservation_sem);
++	ret = vmw_kms_suspend(dev_priv->dev);
++	if (ret) {
++		ttm_suspend_lock(&dev_priv->reservation_sem);
++		DRM_ERROR("Failed to freeze modesetting.\n");
++		return ret;
++	}
+ 	dev_priv->suspended = true;
+ 	if (dev_priv->enable_fb)
+-		vmw_fifo_resource_dec(dev_priv);
++		vmw_fb_off(dev_priv);
+ 
++	ttm_suspend_lock(&dev_priv->reservation_sem);
++	vmw_execbuf_release_pinned_bo(dev_priv);
++	vmw_resource_evict_all(dev_priv);
++	vmw_release_device_early(dev_priv);
++	ttm_bo_swapout_all(&dev_priv->bdev);
++	if (dev_priv->enable_fb)
++		vmw_fifo_resource_dec(dev_priv);
+ 	if (atomic_read(&dev_priv->num_fifo_resources) != 0) {
+ 		DRM_ERROR("Can't hibernate while 3D resources are active.\n");
+ 		if (dev_priv->enable_fb)
+ 			vmw_fifo_resource_inc(dev_priv);
+ 		WARN_ON(vmw_request_device_late(dev_priv));
++		dev_priv->suspend_locked = false;
++		ttm_suspend_unlock(&dev_priv->reservation_sem);
++		if (dev_priv->suspend_state)
++			vmw_kms_resume(dev);
++		if (dev_priv->enable_fb)
++			vmw_fb_on(dev_priv);
+ 		dev_priv->suspended = false;
++		vmw_fb_refresh(dev_priv);
+ 		return -EBUSY;
+ 	}
+ 
+-	if (dev_priv->enable_fb)
+-		__vmw_svga_disable(dev_priv);
++	vmw_fence_fifo_down(dev_priv->fman);
++	__vmw_svga_disable(dev_priv);
+ 	
+ 	vmw_release_device_late(dev_priv);
+-
+ 	return 0;
+ }
+ 
+@@ -1497,7 +1516,17 @@ static int vmw_pm_restore(struct device
+ 	if (dev_priv->enable_fb)
+ 		__vmw_svga_enable(dev_priv);
+ 
++	vmw_fence_fifo_up(dev_priv->fman);
++	dev_priv->suspend_locked = false;
++	ttm_suspend_unlock(&dev_priv->reservation_sem);
++	if (dev_priv->suspend_state)
++		vmw_kms_resume(dev_priv->dev);
++
++	if (dev_priv->enable_fb)
++		vmw_fb_on(dev_priv);
++
+ 	dev_priv->suspended = false;
++	vmw_fb_refresh(dev_priv);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -425,6 +425,7 @@ struct vmw_private {
+ 	struct vmw_framebuffer *implicit_fb;
+ 	struct mutex global_kms_state_mutex;
+ 	spinlock_t cursor_lock;
++	struct drm_atomic_state *suspend_state;
+ 
+ 	/*
+ 	 * Context and surface management.
+@@ -498,6 +499,7 @@ struct vmw_private {
+ 	struct notifier_block pm_nb;
+ 	bool suspended;
+ 	bool refuse_hibernation;
++	bool suspend_locked;
+ 
+ 	struct mutex release_mutex;
+ 	atomic_t num_fifo_resources;
+@@ -909,6 +911,7 @@ int vmw_fb_init(struct vmw_private *vmw_
+ int vmw_fb_close(struct vmw_private *dev_priv);
+ int vmw_fb_off(struct vmw_private *vmw_priv);
+ int vmw_fb_on(struct vmw_private *vmw_priv);
++void vmw_fb_refresh(struct vmw_private *vmw_priv);
+ 
+ /**
+  * Kernel modesetting - vmwgfx_kms.c
+@@ -945,6 +948,8 @@ int vmw_kms_present(struct vmw_private *
+ int vmw_kms_update_layout_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *file_priv);
+ void vmw_kms_legacy_hotspot_clear(struct vmw_private *dev_priv);
++int vmw_kms_suspend(struct drm_device *dev);
++int vmw_kms_resume(struct drm_device *dev);
+ void vmw_kms_lost_device(struct drm_device *dev);
+ 
+ int vmw_dumb_create(struct drm_file *file_priv,
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+@@ -161,10 +161,17 @@ static int vmw_fb_blank(int blank, struc
+ 	return 0;
+ }
+ 
+-/*
+- * Dirty code
++/**
++ * vmw_fb_dirty_flush - flush dirty regions to the kms framebuffer
++ *
++ * @work: The struct work_struct associated with this task.
++ *
++ * This function flushes the dirty regions of the vmalloc framebuffer to the
++ * kms framebuffer, and if the kms framebuffer is visible, also updated the
++ * corresponding displays. Note that this function runs even if the kms
++ * framebuffer is not bound to a crtc and thus not visible, but it's turned
++ * off during hibernation using the par->dirty.active bool.
+  */
+-
+ static void vmw_fb_dirty_flush(struct work_struct *work)
+ {
+ 	struct vmw_fb_par *par = container_of(work, struct vmw_fb_par,
+@@ -852,12 +859,6 @@ int vmw_fb_off(struct vmw_private *vmw_p
+ 	flush_delayed_work(&info->deferred_work);
+ 	flush_delayed_work(&par->local_work);
+ 
+-	mutex_lock(&par->bo_mutex);
+-	drm_modeset_lock_all(vmw_priv->dev);
+-	(void) vmw_fb_kms_detach(par, true, false);
+-	drm_modeset_unlock_all(vmw_priv->dev);
+-	mutex_unlock(&par->bo_mutex);
+-
+ 	return 0;
+ }
+ 
+@@ -873,10 +874,24 @@ int vmw_fb_on(struct vmw_private *vmw_pr
+ 	info = vmw_priv->fb_info;
+ 	par = info->par;
+ 
+-	vmw_fb_set_par(info);
+ 	spin_lock_irqsave(&par->dirty.lock, flags);
+ 	par->dirty.active = true;
+ 	spin_unlock_irqrestore(&par->dirty.lock, flags);
+  
+ 	return 0;
+ }
++
++/**
++ * vmw_fb_refresh - Refresh fb display
++ *
++ * @vmw_priv: Pointer to device private
++ *
++ * Call into kms to show the fbdev display(s).
++ */
++void vmw_fb_refresh(struct vmw_private *vmw_priv)
++{
++	if (!vmw_priv->fb_info)
++		return;
++
++	vmw_fb_set_par(vmw_priv->fb_info);
++}
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -2861,6 +2861,53 @@ int vmw_kms_set_config(struct drm_mode_s
+ 
+ 
+ /**
++ * vmw_kms_suspend - Save modesetting state and turn modesetting off.
++ *
++ * @dev: Pointer to the drm device
++ * Return: 0 on success. Negative error code on failure.
++ */
++int vmw_kms_suspend(struct drm_device *dev)
++{
++	struct vmw_private *dev_priv = vmw_priv(dev);
++
++	dev_priv->suspend_state = drm_atomic_helper_suspend(dev);
++	if (IS_ERR(dev_priv->suspend_state)) {
++		int ret = PTR_ERR(dev_priv->suspend_state);
++
++		DRM_ERROR("Failed kms suspend: %d\n", ret);
++		dev_priv->suspend_state = NULL;
++
++		return ret;
++	}
++
++	return 0;
++}
++
++
++/**
++ * vmw_kms_resume - Re-enable modesetting and restore state
++ *
++ * @dev: Pointer to the drm device
++ * Return: 0 on success. Negative error code on failure.
++ *
++ * State is resumed from a previous vmw_kms_suspend(). It's illegal
++ * to call this function without a previous vmw_kms_suspend().
++ */
++int vmw_kms_resume(struct drm_device *dev)
++{
++	struct vmw_private *dev_priv = vmw_priv(dev);
++	int ret;
++
++	if (WARN_ON(!dev_priv->suspend_state))
++		return 0;
++
++	ret = drm_atomic_helper_resume(dev, dev_priv->suspend_state);
++	dev_priv->suspend_state = NULL;
++
++	return ret;
++}
++
++/**
+  * vmw_kms_lost_device - Notify kms that modesetting capabilities will be lost
+  *
+  * @dev: Pointer to the drm device
