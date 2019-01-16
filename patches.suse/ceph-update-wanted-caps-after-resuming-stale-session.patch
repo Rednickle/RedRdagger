@@ -1,0 +1,216 @@
+From: "Yan, Zheng" <zyan@redhat.com>
+Date: Mon, 10 Dec 2018 16:35:09 +0800
+Subject: ceph: update wanted caps after resuming stale session
+Git-commit: d2f8bb27c87945ab696bdaea25b0465dee94fb6d
+Patch-mainline: v5.0-rc1
+References: bsc#1122215
+
+mds contains an optimization, it does not re-issue stale caps if
+client does not want any cap.
+
+A special case of the optimization is that client wants some caps,
+but skipped updating 'wanted'. For this case, client needs to update
+'wanted' when stale session get renewed.
+
+Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ fs/ceph/caps.c       |   40 +++++++++++++++++++++++-----------------
+ fs/ceph/mds_client.c |   35 ++++++++++++++++++++++++++---------
+ fs/ceph/mds_client.h |   14 ++++++++------
+ 3 files changed, 57 insertions(+), 32 deletions(-)
+
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -654,6 +654,9 @@ void ceph_add_cap(struct inode *inode,
+ 		session->s_nr_caps++;
+ 		spin_unlock(&session->s_cap_lock);
+ 	} else {
++		if (cap->cap_gen < session->s_cap_gen)
++			cap->issued = cap->implemented = CEPH_CAP_PIN;
++
+ 		/*
+ 		 * auth mds of the inode changed. we received the cap export
+ 		 * message, but still haven't received the cap import message.
+@@ -3062,21 +3065,6 @@ static void handle_cap_grant(struct inod
+ 
+ 
+ 	/*
+-	 * auth mds of the inode changed. we received the cap export message,
+-	 * but still haven't received the cap import message. handle_cap_export
+-	 * updated the new auth MDS' cap.
+-	 *
+-	 * "ceph_seq_cmp(seq, cap->seq) <= 0" means we are processing a message
+-	 * that was sent before the cap import message. So don't remove caps.
+-	 */
+-	if (ceph_seq_cmp(seq, cap->seq) <= 0) {
+-		WARN_ON(cap != ci->i_auth_cap);
+-		WARN_ON(cap->cap_id != le64_to_cpu(grant->cap_id));
+-		seq = cap->seq;
+-		newcaps |= cap->issued;
+-	}
+-
+-	/*
+ 	 * If CACHE is being revoked, and we have no dirty buffers,
+ 	 * try to invalidate (once).  (If there are dirty buffers, we
+ 	 * will invalidate _after_ writeback.)
+@@ -3095,6 +3083,24 @@ static void handle_cap_grant(struct inod
+ 		}
+ 	}
+ 
++	if (was_stale)
++		cap->issued = cap->implemented = CEPH_CAP_PIN;
++
++	/*
++	 * auth mds of the inode changed. we received the cap export message,
++	 * but still haven't received the cap import message. handle_cap_export
++	 * updated the new auth MDS' cap.
++	 *
++	 * "ceph_seq_cmp(seq, cap->seq) <= 0" means we are processing a message
++	 * that was sent before the cap import message. So don't remove caps.
++	 */
++	if (ceph_seq_cmp(seq, cap->seq) <= 0) {
++		WARN_ON(cap != ci->i_auth_cap);
++		WARN_ON(cap->cap_id != le64_to_cpu(grant->cap_id));
++		seq = cap->seq;
++		newcaps |= cap->issued;
++	}
++
+ 	/* side effects now are allowed */
+ 	cap->cap_gen = session->s_cap_gen;
+ 	cap->seq = seq;
+@@ -3545,9 +3551,9 @@ retry:
+ 		goto out_unlock;
+ 
+ 	if (target < 0) {
+-		__ceph_remove_cap(cap, false);
+-		if (!ci->i_auth_cap)
++		if (cap->mds_wanted | cap->issued)
+ 			ci->i_ceph_flags |= CEPH_I_CAP_DROPPED;
++		__ceph_remove_cap(cap, false);
+ 		goto out_unlock;
+ 	}
+ 
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -1231,13 +1231,13 @@ static int remove_session_caps_cb(struct
+ 	dout("removing cap %p, ci is %p, inode is %p\n",
+ 	     cap, ci, &ci->vfs_inode);
+ 	spin_lock(&ci->i_ceph_lock);
++	if (cap->mds_wanted | cap->issued)
++		ci->i_ceph_flags |= CEPH_I_CAP_DROPPED;
+ 	__ceph_remove_cap(cap, false);
+ 	if (!ci->i_auth_cap) {
+ 		struct ceph_cap_flush *cf;
+ 		struct ceph_mds_client *mdsc = fsc->mdsc;
+ 
+-		ci->i_ceph_flags |= CEPH_I_CAP_DROPPED;
+-
+ 		if (ci->i_wrbuffer_ref > 0 &&
+ 		    READ_ONCE(fsc->mount_state) == CEPH_MOUNT_SHUTDOWN)
+ 			invalidate = true;
+@@ -1354,6 +1354,12 @@ static void remove_session_caps(struct c
+ 	dispose_cap_releases(session->s_mdsc, &dispose);
+ }
+ 
++enum {
++	RECONNECT,
++	RENEWCAPS,
++	FORCE_RO,
++};
++
+ /*
+  * wake up any threads waiting on this session's caps.  if the cap is
+  * old (didn't get renewed on the client reconnect), remove it now.
+@@ -1364,23 +1370,34 @@ static int wake_up_session_cb(struct ino
+ 			      void *arg)
+ {
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
++	unsigned long ev = (unsigned long)arg;
+ 
+-	if (arg) {
++	if (ev == RECONNECT) {
+ 		spin_lock(&ci->i_ceph_lock);
+ 		ci->i_wanted_max_size = 0;
+ 		ci->i_requested_max_size = 0;
+ 		spin_unlock(&ci->i_ceph_lock);
++	} else if (ev == RENEWCAPS) {
++		if (cap->cap_gen < cap->session->s_cap_gen) {
++			/* mds did not re-issue stale cap */
++			spin_lock(&ci->i_ceph_lock);
++			cap->issued = cap->implemented = CEPH_CAP_PIN;
++			/* make sure mds knows what we want */
++			if (__ceph_caps_file_wanted(ci) & ~cap->mds_wanted)
++				ci->i_ceph_flags |= CEPH_I_CAP_DROPPED;
++			spin_unlock(&ci->i_ceph_lock);
++		}
++	} else if (ev == FORCE_RO) {
+ 	}
+ 	wake_up_all(&ci->i_cap_wq);
+ 	return 0;
+ }
+ 
+-static void wake_up_session_caps(struct ceph_mds_session *session,
+-				 int reconnect)
++static void wake_up_session_caps(struct ceph_mds_session *session, int ev)
+ {
+ 	dout("wake_up_session_caps %p mds%d\n", session, session->s_mds);
+ 	iterate_session_caps(session, wake_up_session_cb,
+-			     (void *)(unsigned long)reconnect);
++			     (void *)(unsigned long)ev);
+ }
+ 
+ /*
+@@ -1465,7 +1482,7 @@ static void renewed_caps(struct ceph_mds
+ 	spin_unlock(&session->s_cap_lock);
+ 
+ 	if (wake)
+-		wake_up_session_caps(session, 0);
++		wake_up_session_caps(session, RENEWCAPS);
+ }
+ 
+ /*
+@@ -2845,7 +2862,7 @@ static void handle_session(struct ceph_m
+ 		spin_lock(&session->s_cap_lock);
+ 		session->s_readonly = true;
+ 		spin_unlock(&session->s_cap_lock);
+-		wake_up_session_caps(session, 0);
++		wake_up_session_caps(session, FORCE_RO);
+ 		break;
+ 
+ 	case CEPH_SESSION_REJECT:
+@@ -3336,7 +3353,7 @@ static void check_new_map(struct ceph_md
+ 				pr_info("mds%d recovery completed\n", s->s_mds);
+ 			kick_requests(mdsc, i);
+ 			ceph_kick_flushing_caps(mdsc, s);
+-			wake_up_session_caps(s, 1);
++			wake_up_session_caps(s, RECONNECT);
+ 		}
+ 	}
+ 
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -16,14 +16,16 @@
+ #include <linux/ceph/auth.h>
+ 
+ /* The first 8 bits are reserved for old ceph releases */
+-#define CEPHFS_FEATURE_MIMIC    8
++#define CEPHFS_FEATURE_MIMIC		8
++#define CEPHFS_FEATURE_REPLY_ENCODING	9
++#define CEPHFS_FEATURE_RECLAIM_CLIENT	10
++#define CEPHFS_FEATURE_LAZY_CAP_WANTED	11
+ 
+-#define CEPHFS_FEATURES_ALL {           \
+-  0, 1, 2, 3, 4, 5, 6, 7,		\
+-  CEPHFS_FEATURE_MIMIC,                 \
++#define CEPHFS_FEATURES_CLIENT_SUPPORTED { 	\
++	0, 1, 2, 3, 4, 5, 6, 7,			\
++	CEPHFS_FEATURE_MIMIC,			\
++	CEPHFS_FEATURE_LAZY_CAP_WANTED,		\
+ }
+-
+-#define CEPHFS_FEATURES_CLIENT_SUPPORTED CEPHFS_FEATURES_ALL
+ #define CEPHFS_FEATURES_CLIENT_REQUIRED {}
+ 
+ 
