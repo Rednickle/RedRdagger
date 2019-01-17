@@ -1,0 +1,474 @@
+From 90098efacc4c3e2e4f6262a657d6b520ecfb2555 Mon Sep 17 00:00:00 2001
+From: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date: Wed, 5 Dec 2018 11:33:24 +0000
+Subject: drm/i915: Introduce per-engine workarounds
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 90098efacc4c3e2e4f6262a657d6b520ecfb2555
+Patch-mainline: v4.20-rc7
+References: bsc#1113956
+
+We stopped re-applying the GT workarounds after engine reset since commit
+59b449d5c82a ("drm/i915: Split out functions for different kinds of
+workarounds").
+
+Issue with this is that some of the GT workarounds live in the MMIO space
+which gets lost during engine resets. So far the registers in 0x2xxx and
+0xbxxx address range have been identified to be affected.
+
+This losing of applied workarounds has obvious negative effects and can
+even lead to hard system hangs (see the linked Bugzilla).
+
+Rather than just restoring this re-application, because we have also
+observed that it is not safe to just re-write all GT workarounds after
+engine resets (GPU might be live and weird hardware states can happen),
+we introduce a new class of per-engine workarounds and move only the
+affected GT workarounds over.
+
+Using the framework introduced in the previous patch, we therefore after
+engine reset, re-apply only the workarounds living in the affected MMIO
+address ranges.
+
+v2:
+ * Move Wa_1406609255:icl to engine workarounds as well.
+ * Rename API. (Chris Wilson)
+ * Drop redundant IS_KABYLAKE. (Chris Wilson)
+ * Re-order engine wa/ init so latest platforms are first. (Rodrigo Vivi)
+
+Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Bugzilla: https://bugzilla.freedesktop.org/show_bug.cgi?id=107945
+Fixes: 59b449d5c82a ("drm/i915: Split out functions for different kinds of workarounds")
+Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: intel-gfx@lists.freedesktop.org
+Acked-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20181203133341.10258-1-tvrtko.ursulin@linux.intel.com
+(cherry picked from commit 4a15c75c42460252a63d30f03b4766a52945fb47)
+Signed-off-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+---
+ drivers/gpu/drm/i915/intel_engine_cs.c   |    2 
+ drivers/gpu/drm/i915/intel_lrc.c         |    4 
+ drivers/gpu/drm/i915/intel_ringbuffer.h  |    2 
+ drivers/gpu/drm/i915/intel_workarounds.c |  257 ++++++++++++++++---------------
+ drivers/gpu/drm/i915/intel_workarounds.h |    3 
+ 5 files changed, 151 insertions(+), 117 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_engine_cs.c
++++ b/drivers/gpu/drm/i915/intel_engine_cs.c
+@@ -739,6 +739,8 @@ void intel_engine_cleanup_common(struct
+ 	__intel_context_unpin(i915->kernel_context, engine);
+ 
+ 	i915_timeline_fini(&engine->timeline);
++
++	intel_wa_list_free(&engine->wa_list);
+ }
+ 
+ u64 intel_engine_get_active_head(const struct intel_engine_cs *engine)
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1789,6 +1789,8 @@ static int gen8_init_common_ring(struct
+ {
+ 	int ret;
+ 
++	intel_engine_apply_workarounds(engine);
++
+ 	ret = intel_mocs_init_engine(engine);
+ 	if (ret)
+ 		return ret;
+@@ -2451,6 +2453,8 @@ static int logical_ring_init(struct inte
+ 	}
+ 	reset_csb_pointers(execlists);
+ 
++	intel_engine_init_workarounds(engine);
++
+ 	return 0;
+ 
+ error:
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -12,6 +12,7 @@
+ #include "i915_selftest.h"
+ #include "i915_timeline.h"
+ #include "intel_gpu_commands.h"
++#include "intel_workarounds.h"
+ 
+ struct drm_printer;
+ struct i915_sched_attr;
+@@ -437,6 +438,7 @@ struct intel_engine_cs {
+ 
+ 	struct intel_hw_status_page status_page;
+ 	struct i915_ctx_workarounds wa_ctx;
++	struct i915_wa_list wa_list;
+ 	struct i915_vma *scratch;
+ 
+ 	u32             irq_keep_mask; /* always keep these interrupts */
+--- a/drivers/gpu/drm/i915/intel_workarounds.c
++++ b/drivers/gpu/drm/i915/intel_workarounds.c
+@@ -661,17 +661,6 @@ static void gen9_gt_workarounds_init(str
+ {
+ 	struct i915_wa_list *wal = &i915->gt_wa_list;
+ 
+-	/* WaContextSwitchWithConcurrentTLBInvalidate:skl,bxt,kbl,glk,cfl */
+-	wa_masked_en(wal,
+-		     GEN9_CSFE_CHICKEN1_RCS,
+-		     GEN9_PREEMPT_GPGPU_SYNC_SWITCH_DISABLE);
+-
+-
+-	/* WaEnableLbsSlaRetryTimerDecrement:skl,bxt,kbl,glk,cfl */
+-	wa_write_or(wal,
+-		    BDW_SCRATCH1,
+-		    GEN9_LBS_SLA_RETRY_TIMER_DECREMENT_ENABLE);
+-
+ 	/* WaDisableKillLogic:bxt,skl,kbl */
+ 	if (!IS_COFFEELAKE(i915))
+ 		wa_write_or(wal,
+@@ -693,24 +682,6 @@ static void gen9_gt_workarounds_init(str
+ 	wa_write_or(wal,
+ 		    GAM_ECOCHK,
+ 		    BDW_DISABLE_HDC_INVALIDATION);
+-
+-	/* WaProgramL3SqcReg1DefaultForPerf:bxt,glk */
+-	if (IS_GEN9_LP(i915))
+-		wa_write_masked_or(wal,
+-				   GEN8_L3SQCREG1,
+-				   L3_PRIO_CREDITS_MASK,
+-				   L3_GENERAL_PRIO_CREDITS(62) |
+-				   L3_HIGH_PRIO_CREDITS(2));
+-
+-	/* WaOCLCoherentLineFlush:skl,bxt,kbl,cfl */
+-	wa_write_or(wal,
+-		    GEN8_L3SQCREG4,
+-		    GEN8_LQSC_FLUSH_COHERENT_LINES);
+-
+-	/* WaEnablePreemptionGranularityControlByUMD:skl,bxt,kbl,cfl,[cnl] */
+-	wa_masked_en(wal,
+-		     GEN7_FF_SLICE_CS_CHICKEN1,
+-		     GEN9_FFSC_PERCTX_PREEMPT_CTRL);
+ }
+ 
+ static void skl_gt_workarounds_init(struct drm_i915_private *i915)
+@@ -719,11 +690,6 @@ static void skl_gt_workarounds_init(stru
+ 
+ 	gen9_gt_workarounds_init(i915);
+ 
+-	/* WaEnableGapsTsvCreditFix:skl */
+-	wa_write_or(wal,
+-		    GEN8_GARBCNTL,
+-		    GEN9_GAPS_TSV_CREDIT_DISABLE);
+-
+ 	/* WaDisableGafsUnitClkGating:skl */
+ 	wa_write_or(wal,
+ 		    GEN7_UCGCTL4,
+@@ -742,11 +708,6 @@ static void bxt_gt_workarounds_init(stru
+ 
+ 	gen9_gt_workarounds_init(i915);
+ 
+-	/* WaDisablePooledEuLoadBalancingFix:bxt */
+-	wa_masked_en(wal,
+-		     FF_SLICE_CS_CHICKEN2,
+-		     GEN9_POOLED_EU_LOAD_BALANCING_FIX_DISABLE);
+-
+ 	/* WaInPlaceDecompressionHang:bxt */
+ 	wa_write_or(wal,
+ 		    GEN9_GAMT_ECO_REG_RW_IA,
+@@ -759,11 +720,6 @@ static void kbl_gt_workarounds_init(stru
+ 
+ 	gen9_gt_workarounds_init(i915);
+ 
+-	/* WaEnableGapsTsvCreditFix:kbl */
+-	wa_write_or(wal,
+-		    GEN8_GARBCNTL,
+-		    GEN9_GAPS_TSV_CREDIT_DISABLE);
+-
+ 	/* WaDisableDynamicCreditSharing:kbl */
+ 	if (IS_KBL_REVID(i915, 0, KBL_REVID_B0))
+ 		wa_write_or(wal,
+@@ -779,21 +735,6 @@ static void kbl_gt_workarounds_init(stru
+ 	wa_write_or(wal,
+ 		    GEN9_GAMT_ECO_REG_RW_IA,
+ 		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS);
+-
+-	/* WaKBLVECSSemaphoreWaitPoll:kbl */
+-	if (IS_KBL_REVID(i915, KBL_REVID_A0, KBL_REVID_E0)) {
+-		struct intel_engine_cs *engine;
+-		unsigned int tmp;
+-
+-		for_each_engine(engine, i915, tmp) {
+-			if (engine->id == RCS)
+-				continue;
+-
+-			wa_write(wal,
+-				 RING_SEMA_WAIT_POLL(engine->mmio_base),
+-				 1);
+-		}
+-	}
+ }
+ 
+ static void glk_gt_workarounds_init(struct drm_i915_private *i915)
+@@ -807,11 +748,6 @@ static void cfl_gt_workarounds_init(stru
+ 
+ 	gen9_gt_workarounds_init(i915);
+ 
+-	/* WaEnableGapsTsvCreditFix:cfl */
+-	wa_write_or(wal,
+-		    GEN8_GARBCNTL,
+-		    GEN9_GAPS_TSV_CREDIT_DISABLE);
+-
+ 	/* WaDisableGafsUnitClkGating:cfl */
+ 	wa_write_or(wal,
+ 		    GEN7_UCGCTL4,
+@@ -902,11 +838,6 @@ static void cnl_gt_workarounds_init(stru
+ 	wa_write_or(wal,
+ 		    GEN9_GAMT_ECO_REG_RW_IA,
+ 		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS);
+-
+-	/* WaEnablePreemptionGranularityControlByUMD:cnl */
+-	wa_masked_en(wal,
+-		     GEN7_FF_SLICE_CS_CHICKEN1,
+-		     GEN9_FFSC_PERCTX_PREEMPT_CTRL);
+ }
+ 
+ static void icl_gt_workarounds_init(struct drm_i915_private *i915)
+@@ -915,53 +846,17 @@ static void icl_gt_workarounds_init(stru
+ 
+ 	wa_init_mcr(i915);
+ 
+-	/* This is not an Wa. Enable for better image quality */
+-	wa_masked_en(wal,
+-		     _3D_CHICKEN3,
+-		     _3D_CHICKEN3_AA_LINE_QUALITY_FIX_ENABLE);
+-
+ 	/* WaInPlaceDecompressionHang:icl */
+ 	wa_write_or(wal,
+ 		    GEN9_GAMT_ECO_REG_RW_IA,
+ 		    GAMT_ECO_ENABLE_IN_PLACE_DECOMPRESS);
+ 
+-	/* WaPipelineFlushCoherentLines:icl */
+-	wa_write_or(wal,
+-		    GEN8_L3SQCREG4,
+-		    GEN8_LQSC_FLUSH_COHERENT_LINES);
+-
+-	/* Wa_1405543622:icl
+-	 * Formerly known as WaGAPZPriorityScheme
+-	 */
+-	wa_write_or(wal,
+-		    GEN8_GARBCNTL,
+-		    GEN11_ARBITRATION_PRIO_ORDER_MASK);
+-
+-	/* Wa_1604223664:icl
+-	 * Formerly known as WaL3BankAddressHashing
+-	 */
+-	wa_write_masked_or(wal,
+-			   GEN8_GARBCNTL,
+-			   GEN11_HASH_CTRL_EXCL_MASK,
+-			   GEN11_HASH_CTRL_EXCL_BIT0);
+-	wa_write_masked_or(wal,
+-			   GEN11_GLBLINVL,
+-			   GEN11_BANK_HASH_ADDR_EXCL_MASK,
+-			   GEN11_BANK_HASH_ADDR_EXCL_BIT0);
+-
+ 	/* WaModifyGamTlbPartitioning:icl */
+ 	wa_write_masked_or(wal,
+ 			   GEN11_GACB_PERF_CTRL,
+ 			   GEN11_HASH_CTRL_MASK,
+ 			   GEN11_HASH_CTRL_BIT0 | GEN11_HASH_CTRL_BIT4);
+ 
+-	/* Wa_1405733216:icl
+-	 * Formerly known as WaDisableCleanEvicts
+-	 */
+-	wa_write_or(wal,
+-		    GEN8_L3SQCREG4,
+-		    GEN11_LQSC_CLEAN_EVICT_DISABLE);
+-
+ 	/* Wa_1405766107:icl
+ 	 * Formerly known as WaCL2SFHalfMaxAlloc
+ 	 */
+@@ -988,24 +883,12 @@ static void icl_gt_workarounds_init(stru
+ 		    SUBSLICE_UNIT_LEVEL_CLKGATE,
+ 		    GWUNIT_CLKGATE_DIS);
+ 
+-	/* Wa_1604302699:icl */
+-	wa_write_or(wal,
+-		    GEN10_L3_CHICKEN_MODE_REGISTER,
+-		    GEN11_I2M_WRITE_DISABLE);
+-
+ 	/* Wa_1406838659:icl (pre-prod) */
+ 	if (IS_ICL_REVID(i915, ICL_REVID_A0, ICL_REVID_B0))
+ 		wa_write_or(wal,
+ 			    INF_UNIT_LEVEL_CLKGATE,
+ 			    CGPSF_CLKGATE_DIS);
+ 
+-	/* WaForwardProgressSoftReset:icl */
+-	wa_write_or(wal,
+-		    GEN10_SCRATCH_LNCF2,
+-		    PMFLUSHDONE_LNICRSDROP |
+-		    PMFLUSH_GAPL3UNBLOCK |
+-		    PMFLUSHDONE_LNEBLK);
+-
+ 	/* Wa_1406463099:icl
+ 	 * Formerly known as WaGamTlbPendError
+ 	 */
+@@ -1243,6 +1126,146 @@ void intel_whitelist_workarounds_apply(s
+ 	whitelist_apply(engine, whitelist_build(engine, &w));
+ }
+ 
++static void rcs_engine_wa_init(struct intel_engine_cs *engine)
++{
++	struct drm_i915_private *i915 = engine->i915;
++	struct i915_wa_list *wal = &engine->wa_list;
++
++	if (IS_ICELAKE(i915)) {
++		/* This is not an Wa. Enable for better image quality */
++		wa_masked_en(wal,
++			     _3D_CHICKEN3,
++			     _3D_CHICKEN3_AA_LINE_QUALITY_FIX_ENABLE);
++
++		/* WaPipelineFlushCoherentLines:icl */
++		wa_write_or(wal,
++			    GEN8_L3SQCREG4,
++			    GEN8_LQSC_FLUSH_COHERENT_LINES);
++
++		/*
++		 * Wa_1405543622:icl
++		 * Formerly known as WaGAPZPriorityScheme
++		 */
++		wa_write_or(wal,
++			    GEN8_GARBCNTL,
++			    GEN11_ARBITRATION_PRIO_ORDER_MASK);
++
++		/*
++		 * Wa_1604223664:icl
++		 * Formerly known as WaL3BankAddressHashing
++		 */
++		wa_write_masked_or(wal,
++				   GEN8_GARBCNTL,
++				   GEN11_HASH_CTRL_EXCL_MASK,
++				   GEN11_HASH_CTRL_EXCL_BIT0);
++		wa_write_masked_or(wal,
++				   GEN11_GLBLINVL,
++				   GEN11_BANK_HASH_ADDR_EXCL_MASK,
++				   GEN11_BANK_HASH_ADDR_EXCL_BIT0);
++
++		/*
++		 * Wa_1405733216:icl
++		 * Formerly known as WaDisableCleanEvicts
++		 */
++		wa_write_or(wal,
++			    GEN8_L3SQCREG4,
++			    GEN11_LQSC_CLEAN_EVICT_DISABLE);
++
++		/* Wa_1604302699:icl */
++		wa_write_or(wal,
++			    GEN10_L3_CHICKEN_MODE_REGISTER,
++			    GEN11_I2M_WRITE_DISABLE);
++
++		/* WaForwardProgressSoftReset:icl */
++		wa_write_or(wal,
++			    GEN10_SCRATCH_LNCF2,
++			    PMFLUSHDONE_LNICRSDROP |
++			    PMFLUSH_GAPL3UNBLOCK |
++			    PMFLUSHDONE_LNEBLK);
++	}
++
++	if (IS_GEN9(i915) || IS_CANNONLAKE(i915)) {
++		/* WaEnablePreemptionGranularityControlByUMD:skl,bxt,kbl,cfl,cnl */
++		wa_masked_en(wal,
++			     GEN7_FF_SLICE_CS_CHICKEN1,
++			     GEN9_FFSC_PERCTX_PREEMPT_CTRL);
++	}
++
++	if (IS_SKYLAKE(i915) || IS_KABYLAKE(i915) || IS_COFFEELAKE(i915)) {
++		/* WaEnableGapsTsvCreditFix:skl,kbl,cfl */
++		wa_write_or(wal,
++			    GEN8_GARBCNTL,
++			    GEN9_GAPS_TSV_CREDIT_DISABLE);
++	}
++
++	if (IS_BROXTON(i915)) {
++		/* WaDisablePooledEuLoadBalancingFix:bxt */
++		wa_masked_en(wal,
++			     FF_SLICE_CS_CHICKEN2,
++			     GEN9_POOLED_EU_LOAD_BALANCING_FIX_DISABLE);
++	}
++
++	if (IS_GEN9(i915)) {
++		/* WaContextSwitchWithConcurrentTLBInvalidate:skl,bxt,kbl,glk,cfl */
++		wa_masked_en(wal,
++			     GEN9_CSFE_CHICKEN1_RCS,
++			     GEN9_PREEMPT_GPGPU_SYNC_SWITCH_DISABLE);
++
++		/* WaEnableLbsSlaRetryTimerDecrement:skl,bxt,kbl,glk,cfl */
++		wa_write_or(wal,
++			    BDW_SCRATCH1,
++			    GEN9_LBS_SLA_RETRY_TIMER_DECREMENT_ENABLE);
++
++		/* WaProgramL3SqcReg1DefaultForPerf:bxt,glk */
++		if (IS_GEN9_LP(i915))
++			wa_write_masked_or(wal,
++					   GEN8_L3SQCREG1,
++					   L3_PRIO_CREDITS_MASK,
++					   L3_GENERAL_PRIO_CREDITS(62) |
++					   L3_HIGH_PRIO_CREDITS(2));
++
++		/* WaOCLCoherentLineFlush:skl,bxt,kbl,cfl */
++		wa_write_or(wal,
++			    GEN8_L3SQCREG4,
++			    GEN8_LQSC_FLUSH_COHERENT_LINES);
++	}
++}
++
++static void xcs_engine_wa_init(struct intel_engine_cs *engine)
++{
++	struct drm_i915_private *i915 = engine->i915;
++	struct i915_wa_list *wal = &engine->wa_list;
++
++	/* WaKBLVECSSemaphoreWaitPoll:kbl */
++	if (IS_KBL_REVID(i915, KBL_REVID_A0, KBL_REVID_E0)) {
++		wa_write(wal,
++			 RING_SEMA_WAIT_POLL(engine->mmio_base),
++			 1);
++	}
++}
++
++void intel_engine_init_workarounds(struct intel_engine_cs *engine)
++{
++	struct i915_wa_list *wal = &engine->wa_list;
++
++	if (GEM_WARN_ON(INTEL_GEN(engine->i915) < 8))
++		return;
++
++	wa_init_start(wal, engine->name);
++
++	if (engine->id == RCS)
++		rcs_engine_wa_init(engine);
++	else
++		xcs_engine_wa_init(engine);
++
++	wa_init_finish(wal);
++}
++
++void intel_engine_apply_workarounds(struct intel_engine_cs *engine)
++{
++	wa_list_apply(engine->i915, &engine->wa_list);
++}
++
+ #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+ #include "selftests/intel_workarounds.c"
+ #endif
+--- a/drivers/gpu/drm/i915/intel_workarounds.h
++++ b/drivers/gpu/drm/i915/intel_workarounds.h
+@@ -35,4 +35,7 @@ void intel_gt_apply_workarounds(struct d
+ 
+ void intel_whitelist_workarounds_apply(struct intel_engine_cs *engine);
+ 
++void intel_engine_init_workarounds(struct intel_engine_cs *engine);
++void intel_engine_apply_workarounds(struct intel_engine_cs *engine);
++
+ #endif
