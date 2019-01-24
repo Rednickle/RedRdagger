@@ -1,0 +1,259 @@
+From: Venkat Duvvuru <venkatkumar.duvvuru@broadcom.com>
+Date: Thu, 20 Dec 2018 03:38:48 -0500
+Subject: bnxt_en: Add support for 2nd firmware message channel.
+Patch-mainline: v5.0-rc1
+Git-commit: 760b6d33410cda351f236058585471cb0f417978
+References: bsc#1104745 FATE#325918
+
+Earlier, some of the firmware commands (ex: CFA_FLOW_*) which are processed
+by KONG processor were sent to the CHIMP processor from the host. This
+approach was taken as there was no direct message channel to KONG.
+CHIMP in turn used to send them to KONG. Newer firmware supports a new
+message channel which the host can send messages directly to the KONG
+processor.
+
+This patch adds support for required changes needed in the driver
+to support direct KONG message channel.  This speeds up flow related
+messages sent to the firmware for CLS_FLOWER offload.
+
+Signed-off-by: Venkat Duvvuru <venkatkumar.duvvuru@broadcom.com>
+Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c |   62 +++++++++++++++++++++----
+ drivers/net/ethernet/broadcom/bnxt/bnxt.h |   73 ++++++++++++++++++++++++++----
+ 2 files changed, 117 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -3279,6 +3279,27 @@ static void bnxt_free_hwrm_resources(str
+ 				  bp->hwrm_cmd_resp_dma_addr);
+ 		bp->hwrm_cmd_resp_addr = NULL;
+ 	}
++
++	if (bp->hwrm_cmd_kong_resp_addr) {
++		dma_free_coherent(&pdev->dev, PAGE_SIZE,
++				  bp->hwrm_cmd_kong_resp_addr,
++				  bp->hwrm_cmd_kong_resp_dma_addr);
++		bp->hwrm_cmd_kong_resp_addr = NULL;
++	}
++}
++
++static int bnxt_alloc_kong_hwrm_resources(struct bnxt *bp)
++{
++	struct pci_dev *pdev = bp->pdev;
++
++	bp->hwrm_cmd_kong_resp_addr =
++		dma_alloc_coherent(&pdev->dev, PAGE_SIZE,
++				   &bp->hwrm_cmd_kong_resp_dma_addr,
++				   GFP_KERNEL);
++	if (!bp->hwrm_cmd_kong_resp_addr)
++		return -ENOMEM;
++
++	return 0;
+ }
+ 
+ static int bnxt_alloc_hwrm_resources(struct bnxt *bp)
+@@ -3740,7 +3761,10 @@ void bnxt_hwrm_cmd_hdr_init(struct bnxt
+ 	req->req_type = cpu_to_le16(req_type);
+ 	req->cmpl_ring = cpu_to_le16(cmpl_ring);
+ 	req->target_id = cpu_to_le16(target_id);
+-	req->resp_addr = cpu_to_le64(bp->hwrm_cmd_resp_dma_addr);
++	if (bnxt_kong_hwrm_message(bp, req))
++		req->resp_addr = cpu_to_le64(bp->hwrm_cmd_kong_resp_dma_addr);
++	else
++		req->resp_addr = cpu_to_le64(bp->hwrm_cmd_resp_dma_addr);
+ }
+ 
+ static int bnxt_hwrm_do_send_msg(struct bnxt *bp, void *msg, u32 msg_len,
+@@ -3758,11 +3782,7 @@ static int bnxt_hwrm_do_send_msg(struct
+ 	u32 doorbell_offset = BNXT_GRCPF_REG_CHIMP_COMM_TRIGGER;
+ 	u8 *resp_addr = (u8 *)bp->hwrm_cmd_resp_addr;
+ 	u32 bar_offset = BNXT_GRCPF_REG_CHIMP_COMM;
+-
+-	req->seq_id = cpu_to_le16(bnxt_get_hwrm_seq_id(bp));
+-	memset(resp, 0, PAGE_SIZE);
+-	cp_ring_id = le16_to_cpu(req->cmpl_ring);
+-	intr_process = (cp_ring_id == INVALID_HW_RING_ID) ? 0 : 1;
++	u16 dst = BNXT_HWRM_CHNL_CHIMP;
+ 
+ 	if (msg_len > BNXT_HWRM_MAX_REQ_LEN) {
+ 		if (msg_len > bp->hwrm_max_ext_req_len ||
+@@ -3770,6 +3790,23 @@ static int bnxt_hwrm_do_send_msg(struct
+ 			return -EINVAL;
+ 	}
+ 
++	if (bnxt_hwrm_kong_chnl(bp, req)) {
++		dst = BNXT_HWRM_CHNL_KONG;
++		bar_offset = BNXT_GRCPF_REG_KONG_COMM;
++		doorbell_offset = BNXT_GRCPF_REG_KONG_COMM_TRIGGER;
++		resp = bp->hwrm_cmd_kong_resp_addr;
++		resp_addr = (u8 *)bp->hwrm_cmd_kong_resp_addr;
++	}
++
++	memset(resp, 0, PAGE_SIZE);
++	cp_ring_id = le16_to_cpu(req->cmpl_ring);
++	intr_process = (cp_ring_id == INVALID_HW_RING_ID) ? 0 : 1;
++
++	req->seq_id = cpu_to_le16(bnxt_get_hwrm_seq_id(bp, dst));
++	/* currently supports only one outstanding message */
++	if (intr_process)
++		bp->hwrm_intr_seq_id = le16_to_cpu(req->seq_id);
++
+ 	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
+ 	    msg_len > BNXT_HWRM_MAX_REQ_LEN) {
+ 		void *short_cmd_req = bp->hwrm_short_cmd_req_addr;
+@@ -3808,10 +3845,6 @@ static int bnxt_hwrm_do_send_msg(struct
+ 	for (i = msg_len; i < max_req_len; i += 4)
+ 		writel(0, bp->bar0 + bar_offset + i);
+ 
+-	/* currently supports only one outstanding message */
+-	if (intr_process)
+-		bp->hwrm_intr_seq_id = le16_to_cpu(req->seq_id);
+-
+ 	/* Ring channel doorbell */
+ 	writel(1, bp->bar0 + doorbell_offset);
+ 
+@@ -6488,6 +6521,9 @@ static int bnxt_hwrm_ver_get(struct bnxt
+ 	    (dev_caps_cfg & VER_GET_RESP_DEV_CAPS_CFG_SHORT_CMD_REQUIRED))
+ 		bp->fw_cap |= BNXT_FW_CAP_SHORT_CMD;
+ 
++	if (dev_caps_cfg & VER_GET_RESP_DEV_CAPS_CFG_KONG_MB_CHNL_SUPPORTED)
++		bp->fw_cap |= BNXT_FW_CAP_KONG_MB_CHNL;
++
+ hwrm_ver_get_exit:
+ 	mutex_unlock(&bp->hwrm_cmd_lock);
+ 	return rc;
+@@ -10226,6 +10262,12 @@ static int bnxt_init_one(struct pci_dev
+ 	if (rc)
+ 		goto init_err_pci_clean;
+ 
++	if (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL) {
++		rc = bnxt_alloc_kong_hwrm_resources(bp);
++		if (rc)
++			bp->fw_cap &= ~BNXT_FW_CAP_KONG_MB_CHNL;
++	}
++
+ 	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
+ 	    bp->hwrm_max_ext_req_len > BNXT_HWRM_MAX_REQ_LEN) {
+ 		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -584,6 +584,9 @@ struct nqe_cn {
+ 
+ #define HWRM_VALID_BIT_DELAY_USEC	20
+ 
++#define BNXT_HWRM_CHNL_CHIMP	0
++#define BNXT_HWRM_CHNL_KONG	1
++
+ #define BNXT_RX_EVENT	1
+ #define BNXT_AGG_EVENT	2
+ #define BNXT_TX_EVENT	4
+@@ -1118,6 +1121,9 @@ struct bnxt_test_info {
+ #define BNXT_CAG_REG_LEGACY_INT_STATUS		0x4014
+ #define BNXT_CAG_REG_BASE			0x300000
+ 
++#define BNXT_GRCPF_REG_KONG_COMM		0xA00
++#define BNXT_GRCPF_REG_KONG_COMM_TRIGGER	0xB00
++
+ struct bnxt_tc_flow_stats {
+ 	u64		packets;
+ 	u64		bytes;
+@@ -1458,20 +1464,24 @@ struct bnxt {
+ 	u32			msg_enable;
+ 
+ 	u32			fw_cap;
+-	#define BNXT_FW_CAP_SHORT_CMD	0x00000001
+-	#define BNXT_FW_CAP_LLDP_AGENT	0x00000002
+-	#define BNXT_FW_CAP_DCBX_AGENT	0x00000004
+-	#define BNXT_FW_CAP_NEW_RM	0x00000008
+-	#define BNXT_FW_CAP_IF_CHANGE	0x00000010
++	#define BNXT_FW_CAP_SHORT_CMD			0x00000001
++	#define BNXT_FW_CAP_LLDP_AGENT			0x00000002
++	#define BNXT_FW_CAP_DCBX_AGENT			0x00000004
++	#define BNXT_FW_CAP_NEW_RM			0x00000008
++	#define BNXT_FW_CAP_IF_CHANGE			0x00000010
++	#define BNXT_FW_CAP_KONG_MB_CHNL		0x00000080
+ 
+ #define BNXT_NEW_RM(bp)		((bp)->fw_cap & BNXT_FW_CAP_NEW_RM)
+ 	u32			hwrm_spec_code;
+ 	u16			hwrm_cmd_seq;
++	u16                     hwrm_cmd_kong_seq;
+ 	u16			hwrm_intr_seq_id;
+ 	void			*hwrm_short_cmd_req_addr;
+ 	dma_addr_t		hwrm_short_cmd_req_dma_addr;
+ 	void			*hwrm_cmd_resp_addr;
+ 	dma_addr_t		hwrm_cmd_resp_dma_addr;
++	void			*hwrm_cmd_kong_resp_addr;
++	dma_addr_t		hwrm_cmd_kong_resp_dma_addr;
+ 
+ 	struct rtnl_link_stats64	net_stats_prev;
+ 	struct rx_port_stats	*hw_rx_port_stats;
+@@ -1673,16 +1683,63 @@ static inline void bnxt_db_write(struct
+ 	}
+ }
+ 
++static inline bool bnxt_cfa_hwrm_message(u16 req_type)
++{
++	switch (req_type) {
++	case HWRM_CFA_ENCAP_RECORD_ALLOC:
++	case HWRM_CFA_ENCAP_RECORD_FREE:
++	case HWRM_CFA_DECAP_FILTER_ALLOC:
++	case HWRM_CFA_DECAP_FILTER_FREE:
++	case HWRM_CFA_NTUPLE_FILTER_ALLOC:
++	case HWRM_CFA_NTUPLE_FILTER_FREE:
++	case HWRM_CFA_NTUPLE_FILTER_CFG:
++	case HWRM_CFA_EM_FLOW_ALLOC:
++	case HWRM_CFA_EM_FLOW_FREE:
++	case HWRM_CFA_EM_FLOW_CFG:
++	case HWRM_CFA_FLOW_ALLOC:
++	case HWRM_CFA_FLOW_FREE:
++	case HWRM_CFA_FLOW_INFO:
++	case HWRM_CFA_FLOW_FLUSH:
++	case HWRM_CFA_FLOW_STATS:
++	case HWRM_CFA_METER_PROFILE_ALLOC:
++	case HWRM_CFA_METER_PROFILE_FREE:
++	case HWRM_CFA_METER_PROFILE_CFG:
++	case HWRM_CFA_METER_INSTANCE_ALLOC:
++	case HWRM_CFA_METER_INSTANCE_FREE:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static inline bool bnxt_kong_hwrm_message(struct bnxt *bp, struct input *req)
++{
++	return (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL &&
++		bnxt_cfa_hwrm_message(le16_to_cpu(req->req_type)));
++}
++
++static inline bool bnxt_hwrm_kong_chnl(struct bnxt *bp, struct input *req)
++{
++	return (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL &&
++		req->resp_addr == cpu_to_le64(bp->hwrm_cmd_kong_resp_dma_addr));
++}
++
+ static inline void *bnxt_get_hwrm_resp_addr(struct bnxt *bp, void *req)
+ {
+-	return bp->hwrm_cmd_resp_addr;
++	if (bnxt_hwrm_kong_chnl(bp, (struct input *)req))
++		return bp->hwrm_cmd_kong_resp_addr;
++	else
++		return bp->hwrm_cmd_resp_addr;
+ }
+ 
+-static inline u16 bnxt_get_hwrm_seq_id(struct bnxt *bp)
++static inline u16 bnxt_get_hwrm_seq_id(struct bnxt *bp, u16 dst)
+ {
+ 	u16 seq_id;
+ 
+-	seq_id = bp->hwrm_cmd_seq++;
++	if (dst == BNXT_HWRM_CHNL_CHIMP)
++		seq_id = bp->hwrm_cmd_seq++;
++	else
++		seq_id = bp->hwrm_cmd_kong_seq++;
+ 	return seq_id;
+ }
+ 
