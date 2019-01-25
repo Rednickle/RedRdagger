@@ -3,7 +3,7 @@ SRCVERSION=4.12
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:SLE-15-SP1:Update
+OBS_PROJECT=SUSE:SLE-15:Update
 IBS_PROJECT=SUSE:SLE-15-SP1:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
