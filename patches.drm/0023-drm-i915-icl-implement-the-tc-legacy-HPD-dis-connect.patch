@@ -1,0 +1,229 @@
+From 39d1e234e1e13f65f4d53715d34aadfb6249eeaf Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Wed, 1 Aug 2018 10:34:41 -0700
+Subject: drm/i915/icl: implement the tc/legacy HPD {dis,}connect flows
+Git-commit: 39d1e234e1e13f65f4d53715d34aadfb6249eeaf
+Patch-mainline: v4.20-rc1
+References: fate#326289
+
+Unlike the other ports, TC ports are not available to use as soon as
+we get a hotplug. The TC PHYs can be shared between multiple
+controllers: display, USB, etc. As a result, handshaking through FIA
+is required around connect and disconnect to cleanly transfer
+ownership with the controller and set the type-C power state.
+
+This patch implements the flow sequences described by our
+specification. We opt to grab ownership of the ports as soon as we get
+the hotplugs in order to simplify the interactions and avoid surprises
+in the user space side. We may consider changing this in the future,
+once we improve our testing capabilities on this area.
+
+v2:
+ * This unifies the DP and HDMI patches so we can discuss everything
+   at once so people looking at random single patches can actually
+   understand the direction.
+ * I found out the spec was updated a while ago. There's a small
+   difference in the connect flow and the patch was updated for that.
+ * Our spec also now gives a good explanation on what is really
+   happening. As a result, comments were added.
+ * Add some more comments as requested by Rodrigo (Rodrigo).
+v3:
+ * Downgrade a DRM_ERROR that shouldn't ever happen but we can't act
+   on in case it does (Chris).
+
+BSpec: 21750, 4250.
+Cc: Animesh Manna <animesh.manna@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20180801173441.9789-1-paulo.r.zanoni@intel.com
+Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+---
+ drivers/gpu/drm/i915/i915_reg.h   |    6 ++
+ drivers/gpu/drm/i915/intel_dp.c   |  110 +++++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_hdmi.c |   10 ++-
+ 3 files changed, 122 insertions(+), 4 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -10710,4 +10710,10 @@ enum skl_power_gate {
+ #define   DP_LANE_ASSIGNMENT_MASK(tc_port)	(0xf << ((tc_port) * 8))
+ #define   DP_LANE_ASSIGNMENT(tc_port, x)	((x) << ((tc_port) * 8))
+ 
++#define PORT_TX_DFLEXDPPMS				_MMIO(0x163890)
++#define   DP_PHY_MODE_STATUS_COMPLETED(tc_port)		(1 << (tc_port))
++
++#define PORT_TX_DFLEXDPCSSS				_MMIO(0x163894)
++#define   DP_PHY_MODE_STATUS_NOT_SAFE(tc_port)		(1 << (tc_port))
++
+ #endif /* _I915_REG_H_ */
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -4785,6 +4785,104 @@ static void icl_update_tc_port_type(stru
+ 			      type_str);
+ }
+ 
++/*
++ * This function implements the first part of the Connect Flow described by our
++ * specification, Gen11 TypeC Programming chapter. The rest of the flow (reading
++ * lanes, EDID, etc) is done as needed in the typical places.
++ *
++ * Unlike the other ports, type-C ports are not available to use as soon as we
++ * get a hotplug. The type-C PHYs can be shared between multiple controllers:
++ * display, USB, etc. As a result, handshaking through FIA is required around
++ * connect and disconnect to cleanly transfer ownership with the controller and
++ * set the type-C power state.
++ *
++ * We could opt to only do the connect flow when we actually try to use the AUX
++ * channels or do a modeset, then immediately run the disconnect flow after
++ * usage, but there are some implications on this for a dynamic environment:
++ * things may go away or change behind our backs. So for now our driver is
++ * always trying to acquire ownership of the controller as soon as it gets an
++ * interrupt (or polls state and sees a port is connected) and only gives it
++ * back when it sees a disconnect. Implementation of a more fine-grained model
++ * will require a lot of coordination with user space and thorough testing for
++ * the extra possible cases.
++ */
++static bool icl_tc_phy_connect(struct drm_i915_private *dev_priv,
++			       struct intel_digital_port *dig_port)
++{
++	enum tc_port tc_port = intel_port_to_tc(dev_priv, dig_port->base.port);
++	u32 val;
++
++	if (dig_port->tc_type != TC_PORT_LEGACY &&
++	    dig_port->tc_type != TC_PORT_TYPEC)
++		return true;
++
++	val = I915_READ(PORT_TX_DFLEXDPPMS);
++	if (!(val & DP_PHY_MODE_STATUS_COMPLETED(tc_port))) {
++		DRM_DEBUG_KMS("DP PHY for TC port %d not ready\n", tc_port);
++		return false;
++	}
++
++	/*
++	 * This function may be called many times in a row without an HPD event
++	 * in between, so try to avoid the write when we can.
++	 */
++	val = I915_READ(PORT_TX_DFLEXDPCSSS);
++	if (!(val & DP_PHY_MODE_STATUS_NOT_SAFE(tc_port))) {
++		val |= DP_PHY_MODE_STATUS_NOT_SAFE(tc_port);
++		I915_WRITE(PORT_TX_DFLEXDPCSSS, val);
++	}
++
++	/*
++	 * Now we have to re-check the live state, in case the port recently
++	 * became disconnected. Not necessary for legacy mode.
++	 */
++	if (dig_port->tc_type == TC_PORT_TYPEC &&
++	    !(I915_READ(PORT_TX_DFLEXDPSP) & TC_LIVE_STATE_TC(tc_port))) {
++		DRM_DEBUG_KMS("TC PHY %d sudden disconnect.\n", tc_port);
++		val = I915_READ(PORT_TX_DFLEXDPCSSS);
++		val &= ~DP_PHY_MODE_STATUS_NOT_SAFE(tc_port);
++		I915_WRITE(PORT_TX_DFLEXDPCSSS, val);
++		return false;
++	}
++
++	return true;
++}
++
++/*
++ * See the comment at the connect function. This implements the Disconnect
++ * Flow.
++ */
++static void icl_tc_phy_disconnect(struct drm_i915_private *dev_priv,
++				  struct intel_digital_port *dig_port)
++{
++	enum tc_port tc_port = intel_port_to_tc(dev_priv, dig_port->base.port);
++	u32 val;
++
++	if (dig_port->tc_type != TC_PORT_LEGACY &&
++	    dig_port->tc_type != TC_PORT_TYPEC)
++		return;
++
++	/*
++	 * This function may be called many times in a row without an HPD event
++	 * in between, so try to avoid the write when we can.
++	 */
++	val = I915_READ(PORT_TX_DFLEXDPCSSS);
++	if (val & DP_PHY_MODE_STATUS_NOT_SAFE(tc_port)) {
++		val &= ~DP_PHY_MODE_STATUS_NOT_SAFE(tc_port);
++		I915_WRITE(PORT_TX_DFLEXDPCSSS, val);
++	}
++}
++
++/*
++ * The type-C ports are different because even when they are connected, they may
++ * not be available/usable by the graphics driver: see the comment on
++ * icl_tc_phy_connect(). So in our driver instead of adding the additional
++ * concept of "usable" and make everything check for "connected and usable" we
++ * define a port as "connected" when it is not only connected, but also when it
++ * is usable by the rest of the driver. That maintains the old assumption that
++ * connected ports are usable, and avoids exposing to the users objects they
++ * can't really use.
++ */
+ static bool icl_tc_port_connected(struct drm_i915_private *dev_priv,
+ 				  struct intel_digital_port *intel_dig_port)
+ {
+@@ -4803,12 +4901,17 @@ static bool icl_tc_port_connected(struct
+ 	is_typec = dpsp & TC_LIVE_STATE_TC(tc_port);
+ 	is_tbt = dpsp & TC_LIVE_STATE_TBT(tc_port);
+ 
+-	if (!is_legacy && !is_typec && !is_tbt)
++	if (!is_legacy && !is_typec && !is_tbt) {
++		icl_tc_phy_disconnect(dev_priv, intel_dig_port);
+ 		return false;
++	}
+ 
+ 	icl_update_tc_port_type(dev_priv, intel_dig_port, is_legacy, is_typec,
+ 				is_tbt);
+ 
++	if (!icl_tc_phy_connect(dev_priv, intel_dig_port))
++		return false;
++
+ 	return true;
+ }
+ 
+@@ -4836,6 +4939,11 @@ static bool icl_digital_port_connected(s
+  * intel_digital_port_connected - is the specified port connected?
+  * @encoder: intel_encoder
+  *
++ * In cases where there's a connector physically connected but it can't be used
++ * by our hardware we also return false, since the rest of the driver should
++ * pretty much treat the port as disconnected. This is relevant for type-C
++ * (starting on ICL) where there's ownership involved.
++ *
+  * Return %true if port is connected, %false otherwise.
+  */
+ bool intel_digital_port_connected(struct intel_encoder *encoder)
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1911,22 +1911,26 @@ intel_hdmi_set_edid(struct drm_connector
+ static enum drm_connector_status
+ intel_hdmi_detect(struct drm_connector *connector, bool force)
+ {
+-	enum drm_connector_status status;
++	enum drm_connector_status status = connector_status_disconnected;
+ 	struct drm_i915_private *dev_priv = to_i915(connector->dev);
+ 	struct intel_hdmi *intel_hdmi = intel_attached_hdmi(connector);
++	struct intel_encoder *encoder = &hdmi_to_dig_port(intel_hdmi)->base;
+ 
+ 	DRM_DEBUG_KMS("[CONNECTOR:%d:%s]\n",
+ 		      connector->base.id, connector->name);
+ 
+ 	intel_display_power_get(dev_priv, POWER_DOMAIN_GMBUS);
+ 
++	if (IS_ICELAKE(dev_priv) &&
++	    !intel_digital_port_connected(encoder))
++		goto out;
++
+ 	intel_hdmi_unset_edid(connector);
+ 
+ 	if (intel_hdmi_set_edid(connector))
+ 		status = connector_status_connected;
+-	else
+-		status = connector_status_disconnected;
+ 
++out:
+ 	intel_display_power_put(dev_priv, POWER_DOMAIN_GMBUS);
+ 
+ 	if (status != connector_status_connected)

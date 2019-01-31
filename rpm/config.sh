@@ -6,6 +6,6 @@ VARIANT=
 OBS_PROJECT=openSUSE:Leap:15.1
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15"
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP1"
 # Check the sorted patches section of series.conf
 SORT_SERIES=yes
