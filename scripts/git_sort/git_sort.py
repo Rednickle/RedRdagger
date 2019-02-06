@@ -214,6 +214,7 @@ remotes = (
     Head(RepoURL("klassert/ipsec-next.git")),
     Head(RepoURL("mkp/scsi.git"), "queue"),
     Head(RepoURL("mkp/scsi.git"), "fixes"),
+    Head(RepoURL("mkp/scsi.git"), "5.0/scsi-fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.19"),

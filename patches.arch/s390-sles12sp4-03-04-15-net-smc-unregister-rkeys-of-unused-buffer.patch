@@ -1,0 +1,127 @@
+From: Karsten Graul <kgraul@linux.ibm.com>
+Subject: net/smc: unregister rkeys of unused buffer
+Patch-mainline: v5.0-rc1
+Git-commit: c7674c001b1143a5bc6b36efc7adc4bdd8ff5e76
+References: bnc#1117947, LTC#173662
+
+Description:  net/smc: bugfix and compatibility patches
+Symptom:      Random hangs in smc processing:
+                user space application hangs in socket send() or recv() call or
+                does never get a notification from a select() call.
+              Missing compatibility to other platforms:
+                confirm rkey and delete rkey processing is required by the
+                design, but delete rkey processing is missing. This leads to
+                protocol failures when communicating with other platforms like
+                zOS. The SMC-D shutdown signal support is missing, so there is
+                no detection if the remote peer closed the link group.
+              Broken administration of available WR send payload buffers due to
+              a use-after-free condition.
+Problem:      Misbehaviour regarding the user space api can lead to hang
+              situations. SMC is not fully compatible to some other platforms
+              due to missing rkey processing and SMC-D shutdown signal support.
+Solution:     Fixed protocoll deficiencies by implementing the required rkey
+              processing. For SMC-D, the cursors are now handled atomically to
+              handle parallel modifications. The SMC-D shutdown signal is now
+              processed when received and sent to the remote peer if needed.
+              Prereq patches are included.
+Reproduction: Run SMC on a loaded system against zOS as peer system.
+
+Upstream-Description:
+
+              net/smc: unregister rkeys of unused buffer
+
+              When an rmb is no longer in use by a connection, unregister its rkey at
+              the remote peer with an LLC DELETE RKEY message. With this change,
+              unused buffers held in the buffer pool are no longer registered at the
+              remote peer. They are registered before the buffer is actually used and
+              unregistered when they are no longer used by a connection.
+
+              Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+              Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+              Signed-off-by: David S. Miller <davem@davemloft.net>
+
+
+Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ net/smc/af_smc.c   |   22 +++++++++++-----------
+ net/smc/smc_core.c |    7 ++++++-
+ net/smc/smc_core.h |    2 +-
+ 3 files changed, 18 insertions(+), 13 deletions(-)
+
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -299,14 +299,17 @@ static void smc_copy_sock_settings_to_sm
+ 	smc_copy_sock_settings(&smc->sk, smc->clcsock->sk, SK_FLAGS_CLC_TO_SMC);
+ }
+ 
+-/* register a new rmb, optionally send confirm_rkey msg to register with peer */
++/* register a new rmb, send confirm_rkey msg to register with peer */
+ static int smc_reg_rmb(struct smc_link *link, struct smc_buf_desc *rmb_desc,
+ 		       bool conf_rkey)
+ {
+-	/* register memory region for new rmb */
+-	if (smc_wr_reg_send(link, rmb_desc->mr_rx[SMC_SINGLE_LINK])) {
+-		rmb_desc->regerr = 1;
+-		return -EFAULT;
++	if (!rmb_desc->wr_reg) {
++		/* register memory region for new rmb */
++		if (smc_wr_reg_send(link, rmb_desc->mr_rx[SMC_SINGLE_LINK])) {
++			rmb_desc->regerr = 1;
++			return -EFAULT;
++		}
++		rmb_desc->wr_reg = 1;
+ 	}
+ 	if (!conf_rkey)
+ 		return 0;
+@@ -581,8 +584,7 @@ static int smc_connect_rdma(struct smc_s
+ 			return smc_connect_abort(smc, SMC_CLC_DECL_ERR_RDYLNK,
+ 						 local_contact);
+ 	} else {
+-		if (!smc->conn.rmb_desc->reused &&
+-		    smc_reg_rmb(link, smc->conn.rmb_desc, true))
++		if (smc_reg_rmb(link, smc->conn.rmb_desc, true))
+ 			return smc_connect_abort(smc, SMC_CLC_DECL_ERR_REGRMB,
+ 						 local_contact);
+ 	}
+@@ -1143,10 +1145,8 @@ static int smc_listen_rdma_reg(struct sm
+ 	struct smc_link *link = &new_smc->conn.lgr->lnk[SMC_SINGLE_LINK];
+ 
+ 	if (local_contact != SMC_FIRST_CONTACT) {
+-		if (!new_smc->conn.rmb_desc->reused) {
+-			if (smc_reg_rmb(link, new_smc->conn.rmb_desc, true))
+-				return SMC_CLC_DECL_ERR_REGRMB;
+-		}
++		if (smc_reg_rmb(link, new_smc->conn.rmb_desc, true))
++			return SMC_CLC_DECL_ERR_REGRMB;
+ 	}
+ 	smc_rmb_sync_sg_for_device(&new_smc->conn);
+ 
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -298,8 +298,13 @@ static void smc_buf_unuse(struct smc_con
+ 		conn->sndbuf_desc->used = 0;
+ 	if (conn->rmb_desc) {
+ 		if (!conn->rmb_desc->regerr) {
+-			conn->rmb_desc->reused = 1;
+ 			conn->rmb_desc->used = 0;
++			if (!lgr->is_smcd) {
++				/* unregister rmb with peer */
++				smc_llc_do_delete_rkey(
++						&lgr->lnk[SMC_SINGLE_LINK],
++						conn->rmb_desc);
++			}
+ 		} else {
+ 			/* buf registration failed, reuse not possible */
+ 			write_lock_bh(&lgr->rmbs_lock);
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@ -129,7 +129,7 @@ struct smc_buf_desc {
+ 	struct page		*pages;
+ 	int			len;		/* length of buffer */
+ 	u32			used;		/* currently used / unused */
+-	u8			reused	: 1;	/* new created / reused */
++	u8			wr_reg	: 1;	/* mem region registered */
+ 	u8			regerr	: 1;	/* err during registration */
+ 	union {
+ 		struct { /* SMC-R */

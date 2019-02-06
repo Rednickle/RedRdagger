@@ -1,0 +1,213 @@
+From: Karsten Graul <kgraul@linux.ibm.com>
+Subject: net/smc: add SMC-D shutdown signal
+Patch-mainline: v4.20-rc4
+Git-commit: 0512f69e388c963dbe955d4bd9ae0f7d88d2dc54
+References: bnc#1117947, LTC#173662
+
+Description:  net/smc: bugfix and compatibility patches
+Symptom:      Random hangs in smc processing:
+                user space application hangs in socket send() or recv() call or
+                does never get a notification from a select() call.
+              Missing compatibility to other platforms:
+                confirm rkey and delete rkey processing is required by the
+                design, but delete rkey processing is missing. This leads to
+                protocol failures when communicating with other platforms like
+                zOS. The SMC-D shutdown signal support is missing, so there is
+                no detection if the remote peer closed the link group.
+              Broken administration of available WR send payload buffers due to
+              a use-after-free condition.
+Problem:      Misbehaviour regarding the user space api can lead to hang
+              situations. SMC is not fully compatible to some other platforms
+              due to missing rkey processing and SMC-D shutdown signal support.
+Solution:     Fixed protocoll deficiencies by implementing the required rkey
+              processing. For SMC-D, the cursors are now handled atomically to
+              handle parallel modifications. The SMC-D shutdown signal is now
+              processed when received and sent to the remote peer if needed.
+              Prereq patches are included.
+Reproduction: Run SMC on a loaded system against zOS as peer system.
+
+Upstream-Description:
+
+              net/smc: add SMC-D shutdown signal
+
+              When a SMC-D link group is freed, a shutdown signal should be sent to
+              the peer to indicate that the link group is invalid. This patch adds the
+              shutdown signal to the SMC code.
+
+              Signed-off-by: Hans Wippel <hwippel@linux.ibm.com>
+              Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+              Signed-off-by: David S. Miller <davem@davemloft.net>
+
+
+Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ net/smc/smc_core.c |   11 +++++++++--
+ net/smc/smc_core.h |    3 ++-
+ net/smc/smc_ism.c  |   44 +++++++++++++++++++++++++++++++++-----------
+ net/smc/smc_ism.h  |    1 +
+ 4 files changed, 45 insertions(+), 14 deletions(-)
+
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -15,6 +15,7 @@
+ #include <net/tcp.h>
+ #include <net/sock.h>
+ #include <rdma/ib_verbs.h>
++#include <linux/if_vlan.h>
+ 
+ #include "smc.h"
+ #include "smc_clc.h"
+@@ -187,6 +188,8 @@ free:
+ 
+ 		if (!lgr->is_smcd && lnk->state != SMC_LNK_INACTIVE)
+ 			smc_llc_link_inactive(lnk);
++		if (lgr->is_smcd)
++			smc_ism_signal_shutdown(lgr);
+ 		smc_lgr_free(lgr);
+ 	}
+ }
+@@ -495,7 +498,7 @@ void smc_port_terminate(struct smc_ib_de
+ }
+ 
+ /* Called when SMC-D device is terminated or peer is lost */
+-void smc_smcd_terminate(struct smcd_dev *dev, u64 peer_gid)
++void smc_smcd_terminate(struct smcd_dev *dev, u64 peer_gid, unsigned short vlan)
+ {
+ 	struct smc_link_group *lgr, *l;
+ 	LIST_HEAD(lgr_free_list);
+@@ -505,7 +508,7 @@ void smc_smcd_terminate(struct smcd_dev
+ 	list_for_each_entry_safe(lgr, l, &smc_lgr_list.list, list) {
+ 		if (lgr->is_smcd && lgr->smcd == dev &&
+ 		    (!peer_gid || lgr->peer_gid == peer_gid) &&
+-		    !list_empty(&lgr->list)) {
++		    (vlan == VLAN_VID_MASK || lgr->vlan_id == vlan)) {
+ 			__smc_lgr_terminate(lgr);
+ 			list_move(&lgr->list, &lgr_free_list);
+ 		}
+@@ -516,6 +519,8 @@ void smc_smcd_terminate(struct smcd_dev
+ 	list_for_each_entry_safe(lgr, l, &lgr_free_list, list) {
+ 		list_del_init(&lgr->list);
+ 		cancel_delayed_work_sync(&lgr->free_work);
++		if (!peer_gid && vlan == VLAN_VID_MASK) /* dev terminated? */
++			smc_ism_signal_shutdown(lgr);
+ 		smc_lgr_free(lgr);
+ 	}
+ }
+@@ -1036,6 +1041,8 @@ void smc_core_exit(void)
+ 			smc_llc_link_inactive(lnk);
+ 		}
+ 		cancel_delayed_work_sync(&lgr->free_work);
++		if (lgr->is_smcd)
++			smc_ism_signal_shutdown(lgr);
+ 		smc_lgr_free(lgr); /* free link group */
+ 	}
+ }
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@ -248,7 +248,8 @@ struct smc_clc_msg_local;
+ void smc_lgr_forget(struct smc_link_group *lgr);
+ void smc_lgr_terminate(struct smc_link_group *lgr);
+ void smc_port_terminate(struct smc_ib_device *smcibdev, u8 ibport);
+-void smc_smcd_terminate(struct smcd_dev *dev, u64 peer_gid);
++void smc_smcd_terminate(struct smcd_dev *dev, u64 peer_gid,
++			unsigned short vlan);
+ int smc_buf_create(struct smc_sock *smc, bool is_smcd);
+ int smc_uncompress_bufsize(u8 compressed);
+ int smc_rmb_rtoken_handling(struct smc_connection *conn,
+--- a/net/smc/smc_ism.c
++++ b/net/smc/smc_ism.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/spinlock.h>
+ #include <linux/slab.h>
++#include <linux/if_vlan.h>
+ #include <asm/page.h>
+ 
+ #include "smc.h"
+@@ -187,22 +188,28 @@ struct smc_ism_event_work {
+ #define ISM_EVENT_REQUEST		0x0001
+ #define ISM_EVENT_RESPONSE		0x0002
+ #define ISM_EVENT_REQUEST_IR		0x00000001
++#define ISM_EVENT_CODE_SHUTDOWN		0x80
+ #define ISM_EVENT_CODE_TESTLINK		0x83
+ 
++union smcd_sw_event_info {
++	u64	info;
++	struct {
++		u8		uid[SMC_LGR_ID_SIZE];
++		unsigned short	vlan_id;
++		u16		code;
++	};
++};
++
+ static void smcd_handle_sw_event(struct smc_ism_event_work *wrk)
+ {
+-	union {
+-		u64	info;
+-		struct {
+-			u32		uid;
+-			unsigned short	vlanid;
+-			u16		code;
+-		};
+-	} ev_info;
++	union smcd_sw_event_info ev_info;
+ 
++	ev_info.info = wrk->event.info;
+ 	switch (wrk->event.code) {
++	case ISM_EVENT_CODE_SHUTDOWN:	/* Peer shut down DMBs */
++		smc_smcd_terminate(wrk->smcd, wrk->event.tok, ev_info.vlan_id);
++		break;
+ 	case ISM_EVENT_CODE_TESTLINK:	/* Activity timer */
+-		ev_info.info = wrk->event.info;
+ 		if (ev_info.code == ISM_EVENT_REQUEST) {
+ 			ev_info.code = ISM_EVENT_RESPONSE;
+ 			wrk->smcd->ops->signal_event(wrk->smcd,
+@@ -215,6 +222,21 @@ static void smcd_handle_sw_event(struct
+ 	}
+ }
+ 
++int smc_ism_signal_shutdown(struct smc_link_group *lgr)
++{
++	int rc;
++	union smcd_sw_event_info ev_info;
++
++	memcpy(ev_info.uid, lgr->id, SMC_LGR_ID_SIZE);
++	ev_info.vlan_id = lgr->vlan_id;
++	ev_info.code = ISM_EVENT_REQUEST;
++	rc = lgr->smcd->ops->signal_event(lgr->smcd, lgr->peer_gid,
++					  ISM_EVENT_REQUEST_IR,
++					  ISM_EVENT_CODE_SHUTDOWN,
++					  ev_info.info);
++	return rc;
++}
++
+ /* worker for SMC-D events */
+ static void smc_ism_event_work(struct work_struct *work)
+ {
+@@ -223,7 +245,7 @@ static void smc_ism_event_work(struct wo
+ 
+ 	switch (wrk->event.type) {
+ 	case ISM_EVENT_GID:	/* GID event, token is peer GID */
+-		smc_smcd_terminate(wrk->smcd, wrk->event.tok);
++		smc_smcd_terminate(wrk->smcd, wrk->event.tok, VLAN_VID_MASK);
+ 		break;
+ 	case ISM_EVENT_DMB:
+ 		break;
+@@ -289,7 +311,7 @@ void smcd_unregister_dev(struct smcd_dev
+ 	spin_unlock(&smcd_dev_list.lock);
+ 	flush_workqueue(smcd->event_wq);
+ 	destroy_workqueue(smcd->event_wq);
+-	smc_smcd_terminate(smcd, 0);
++	smc_smcd_terminate(smcd, 0, VLAN_VID_MASK);
+ 
+ 	device_del(&smcd->dev);
+ }
+--- a/net/smc/smc_ism.h
++++ b/net/smc/smc_ism.h
+@@ -45,4 +45,5 @@ int smc_ism_register_dmb(struct smc_link
+ int smc_ism_unregister_dmb(struct smcd_dev *dev, struct smc_buf_desc *dmb_desc);
+ int smc_ism_write(struct smcd_dev *dev, const struct smc_ism_position *pos,
+ 		  void *data, size_t len);
++int smc_ism_signal_shutdown(struct smc_link_group *lgr);
+ #endif
