@@ -1,0 +1,234 @@
+From: Lan Tianyu <Tianyu.Lan@microsoft.com>
+Date: Thu, 6 Dec 2018 21:21:05 +0800
+Patch-mainline: v5.0-rc1
+Subject: x86/hyper-v: Add HvFlushGuestAddressList hypercall support
+Git-commit: cc4edae4b924b39877b5abb25074065930c5a6d5
+References: fate#323887
+
+Hyper-V provides HvFlushGuestAddressList() hypercall to flush EPT tlb
+with specified ranges. This patch is to add the hypercall support.
+
+Reviewed-by:  Michael Kelley <mikelley@microsoft.com>
+Signed-off-by: Lan Tianyu <Tianyu.Lan@microsoft.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ arch/x86/hyperv/nested.c            | 80 +++++++++++++++++++++++++++++++++++++
+ arch/x86/include/asm/hyperv-tlfs.h  | 32 +++++++++++++++
+ arch/x86/include/asm/mshyperv.h     | 15 +++++++
+ arch/x86/include/asm/trace/hyperv.h | 14 +++++++
+ 4 files changed, 141 insertions(+)
+
+diff --git a/arch/x86/hyperv/nested.c b/arch/x86/hyperv/nested.c
+--- a/arch/x86/hyperv/nested.c
++++ b/arch/x86/hyperv/nested.c
+@@ -7,6 +7,7 @@
+  *
+  * Author : Lan Tianyu <Tianyu.Lan@microsoft.com>
+  */
++#define pr_fmt(fmt)  "Hyper-V: " fmt
+ 
+ 
+ #include <linux/types.h>
+@@ -54,3 +55,82 @@ fault:
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(hyperv_flush_guest_mapping);
++
++int hyperv_fill_flush_guest_mapping_list(
++		struct hv_guest_mapping_flush_list *flush,
++		u64 start_gfn, u64 pages)
++{
++	u64 cur = start_gfn;
++	u64 additional_pages;
++	int gpa_n = 0;
++
++	do {
++		/*
++		 * If flush requests exceed max flush count, go back to
++		 * flush tlbs without range.
++		 */
++		if (gpa_n >= HV_MAX_FLUSH_REP_COUNT)
++			return -ENOSPC;
++
++		additional_pages = min_t(u64, pages, HV_MAX_FLUSH_PAGES) - 1;
++
++		flush->gpa_list[gpa_n].page.additional_pages = additional_pages;
++		flush->gpa_list[gpa_n].page.largepage = false;
++		flush->gpa_list[gpa_n].page.basepfn = cur;
++
++		pages -= additional_pages + 1;
++		cur += additional_pages + 1;
++		gpa_n++;
++	} while (pages > 0);
++
++	return gpa_n;
++}
++EXPORT_SYMBOL_GPL(hyperv_fill_flush_guest_mapping_list);
++
++int hyperv_flush_guest_mapping_range(u64 as,
++		hyperv_fill_flush_list_func fill_flush_list_func, void *data)
++{
++	struct hv_guest_mapping_flush_list **flush_pcpu;
++	struct hv_guest_mapping_flush_list *flush;
++	u64 status = 0;
++	unsigned long flags;
++	int ret = -ENOTSUPP;
++	int gpa_n = 0;
++
++	if (!hv_hypercall_pg || !fill_flush_list_func)
++		goto fault;
++
++	local_irq_save(flags);
++
++	flush_pcpu = (struct hv_guest_mapping_flush_list **)
++		this_cpu_ptr(hyperv_pcpu_input_arg);
++
++	flush = *flush_pcpu;
++	if (unlikely(!flush)) {
++		local_irq_restore(flags);
++		goto fault;
++	}
++
++	flush->address_space = as;
++	flush->flags = 0;
++
++	gpa_n = fill_flush_list_func(flush, data);
++	if (gpa_n < 0) {
++		local_irq_restore(flags);
++		goto fault;
++	}
++
++	status = hv_do_rep_hypercall(HVCALL_FLUSH_GUEST_PHYSICAL_ADDRESS_LIST,
++				     gpa_n, 0, flush, NULL);
++
++	local_irq_restore(flags);
++
++	if (!(status & HV_HYPERCALL_RESULT_MASK))
++		ret = 0;
++	else
++		ret = status;
++fault:
++	trace_hyperv_nested_flush_guest_mapping_range(as, ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(hyperv_flush_guest_mapping_range);
+diff --git a/arch/x86/include/asm/hyperv-tlfs.h b/arch/x86/include/asm/hyperv-tlfs.h
+--- a/arch/x86/include/asm/hyperv-tlfs.h
++++ b/arch/x86/include/asm/hyperv-tlfs.h
+@@ -10,6 +10,7 @@
+ #define _ASM_X86_HYPERV_TLFS_H
+ 
+ #include <linux/types.h>
++#include <asm/page.h>
+ 
+ /*
+  * The below CPUID leaves are present if VersionAndFeatures.HypervisorPresent
+@@ -353,6 +354,7 @@ struct hv_tsc_emulation_status {
+ #define HVCALL_POST_MESSAGE			0x005c
+ #define HVCALL_SIGNAL_EVENT			0x005d
+ #define HVCALL_FLUSH_GUEST_PHYSICAL_ADDRESS_SPACE 0x00af
++#define HVCALL_FLUSH_GUEST_PHYSICAL_ADDRESS_LIST 0x00b0
+ 
+ #define HV_X64_MSR_VP_ASSIST_PAGE_ENABLE	0x00000001
+ #define HV_X64_MSR_VP_ASSIST_PAGE_ADDRESS_SHIFT	12
+@@ -818,6 +820,36 @@ struct hv_guest_mapping_flush {
+ 	u64 flags;
+ } __packed;
+ 
++/*
++ *  HV_MAX_FLUSH_PAGES = "additional_pages" + 1. It's limited
++ *  by the bitwidth of "additional_pages" in union hv_gpa_page_range.
++ */
++#define HV_MAX_FLUSH_PAGES (2048)
++
++/* HvFlushGuestPhysicalAddressList hypercall */
++union hv_gpa_page_range {
++	u64 address_space;
++	struct {
++		u64 additional_pages:11;
++		u64 largepage:1;
++		u64 basepfn:52;
++	} page;
++};
++
++/*
++ * All input flush parameters should be in single page. The max flush
++ * count is equal with how many entries of union hv_gpa_page_range can
++ * be populated into the input parameter page.
++ */
++#define HV_MAX_FLUSH_REP_COUNT (PAGE_SIZE - 2 * sizeof(u64) /	\
++				sizeof(union hv_gpa_page_range))
++
++struct hv_guest_mapping_flush_list {
++	u64 address_space;
++	u64 flags;
++	union hv_gpa_page_range gpa_list[HV_MAX_FLUSH_REP_COUNT];
++};
++
+ /* HvFlushVirtualAddressSpace, HvFlushVirtualAddressList hypercalls */
+ struct hv_tlb_flush {
+ 	u64 address_space;
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -22,6 +22,11 @@ struct ms_hyperv_info {
+ 
+ extern struct ms_hyperv_info ms_hyperv;
+ 
++
++typedef int (*hyperv_fill_flush_list_func)(
++		struct hv_guest_mapping_flush_list *flush,
++		void *data);
++
+ /*
+  * Generate the guest ID.
+  */
+@@ -348,6 +353,11 @@ void set_hv_tscchange_cb(void (*cb)(void));
+ void clear_hv_tscchange_cb(void);
+ void hyperv_stop_tsc_emulation(void);
+ int hyperv_flush_guest_mapping(u64 as);
++int hyperv_flush_guest_mapping_range(u64 as,
++		hyperv_fill_flush_list_func fill_func, void *data);
++int hyperv_fill_flush_guest_mapping_list(
++		struct hv_guest_mapping_flush_list *flush,
++		u64 start_gfn, u64 end_gfn);
+ 
+ #ifdef CONFIG_X86_64
+ void hv_apic_init(void);
+@@ -370,6 +380,11 @@ static inline struct hv_vp_assist_page *hv_get_vp_assist_page(unsigned int cpu)
+ 	return NULL;
+ }
+ static inline int hyperv_flush_guest_mapping(u64 as) { return -1; }
++static inline int hyperv_flush_guest_mapping_range(u64 as,
++		hyperv_fill_flush_list_func fill_func, void *data)
++{
++	return -1;
++}
+ #endif /* CONFIG_HYPERV */
+ 
+ #ifdef CONFIG_HYPERV_TSCPAGE
+diff --git a/arch/x86/include/asm/trace/hyperv.h b/arch/x86/include/asm/trace/hyperv.h
+--- a/arch/x86/include/asm/trace/hyperv.h
++++ b/arch/x86/include/asm/trace/hyperv.h
+@@ -42,6 +42,20 @@ TRACE_EVENT(hyperv_nested_flush_guest_mapping,
+ 		      __entry->addr, __entry->end)
+ 	);
+ 
++TRACE_EVENT(hyperv_nested_flush_guest_mapping_range,
++	    TP_PROTO(u64 as, int ret),
++	    TP_ARGS(as, ret),
++
++	    TP_STRUCT__entry(
++		    __field(u64, as)
++		    __field(int, ret)
++		    ),
++	    TP_fast_assign(__entry->as = as;
++			   __entry->ret = ret;
++		    ),
++	    TP_printk("address space %llx ret %d", __entry->as, __entry->ret)
++	);
++
+ TRACE_EVENT(hyperv_send_ipi_mask,
+ 	    TP_PROTO(const struct cpumask *cpus,
+ 		     int vector),
