@@ -1,0 +1,149 @@
+From: Huazhong Tan <tanhuazhong@huawei.com>
+Date: Fri, 9 Nov 2018 22:07:49 +0800
+Subject: net: hns3: add reset handling for VF when doing Core/Global/IMP reset
+Patch-mainline: v5.0-rc1
+Git-commit: b90fcc5bd904fe1ec1b4b0a5ba8299cd2625a16c
+References: bsc#1104353 FATE#326415
+
+When a Core/Global/IMP reset occurs, the hardware sets the reset status
+register of all PF/VF and reports a reset interrupt to all PF/VF and
+firmware.
+
+When receiving the reset interrupt:
+1. The firmware will wait for 100 ms before resetting the hardware and
+   clear the reset status register of all PF when hardware reset is done.
+2. The PF/VF driver needs to down the netdev within 100 ms and then wait
+   for hardware reset to finish.
+3. After firmware clearing the reset status register of all PF, the PF
+   driver reinitializes the hardware and clear the reset status register
+   of it's VF.
+4. After PF driver clearing the reset status register of VF, the VF driver
+   reinitializes the hardware.
+
+This patch mainly add handling for the step 4.
+
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c |   50 ++++++++++----
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h |    8 ++
+ 2 files changed, 46 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
+@@ -1226,7 +1226,12 @@ static enum hnae3_reset_type hclgevf_get
+ 	enum hnae3_reset_type rst_level = HNAE3_NONE_RESET;
+ 
+ 	/* return the highest priority reset level amongst all */
+-	if (test_bit(HNAE3_VF_FULL_RESET, addr)) {
++	if (test_bit(HNAE3_VF_RESET, addr)) {
++		rst_level = HNAE3_VF_RESET;
++		clear_bit(HNAE3_VF_RESET, addr);
++		clear_bit(HNAE3_VF_PF_FUNC_RESET, addr);
++		clear_bit(HNAE3_VF_FUNC_RESET, addr);
++	} else if (test_bit(HNAE3_VF_FULL_RESET, addr)) {
+ 		rst_level = HNAE3_VF_FULL_RESET;
+ 		clear_bit(HNAE3_VF_FULL_RESET, addr);
+ 		clear_bit(HNAE3_VF_FUNC_RESET, addr);
+@@ -1447,24 +1452,36 @@ static void hclgevf_clear_event_cause(st
+ 	hclgevf_write_dev(&hdev->hw, HCLGEVF_VECTOR0_CMDQ_SRC_REG, regclr);
+ }
+ 
+-static bool hclgevf_check_event_cause(struct hclgevf_dev *hdev, u32 *clearval)
++static enum hclgevf_evt_cause hclgevf_check_evt_cause(struct hclgevf_dev *hdev,
++						      u32 *clearval)
+ {
+-	u32 cmdq_src_reg;
++	u32 cmdq_src_reg, rst_ing_reg;
+ 
+ 	/* fetch the events from their corresponding regs */
+ 	cmdq_src_reg = hclgevf_read_dev(&hdev->hw,
+ 					HCLGEVF_VECTOR0_CMDQ_SRC_REG);
+ 
++	if (BIT(HCLGEVF_VECTOR0_RST_INT_B) & cmdq_src_reg) {
++		rst_ing_reg = hclgevf_read_dev(&hdev->hw, HCLGEVF_RST_ING);
++		dev_info(&hdev->pdev->dev,
++			 "receive reset interrupt 0x%x!\n", rst_ing_reg);
++		set_bit(HNAE3_VF_RESET, &hdev->reset_pending);
++		set_bit(HCLGEVF_RESET_PENDING, &hdev->reset_state);
++		cmdq_src_reg &= ~BIT(HCLGEVF_VECTOR0_RST_INT_B);
++		*clearval = cmdq_src_reg;
++		return HCLGEVF_VECTOR0_EVENT_RST;
++	}
++
+ 	/* check for vector0 mailbox(=CMDQ RX) event source */
+ 	if (BIT(HCLGEVF_VECTOR0_RX_CMDQ_INT_B) & cmdq_src_reg) {
+ 		cmdq_src_reg &= ~BIT(HCLGEVF_VECTOR0_RX_CMDQ_INT_B);
+ 		*clearval = cmdq_src_reg;
+-		return true;
++		return HCLGEVF_VECTOR0_EVENT_MBX;
+ 	}
+ 
+ 	dev_dbg(&hdev->pdev->dev, "vector 0 interrupt from unknown source\n");
+ 
+-	return false;
++	return HCLGEVF_VECTOR0_EVENT_OTHER;
+ }
+ 
+ static void hclgevf_enable_vector(struct hclgevf_misc_vector *vector, bool en)
+@@ -1474,19 +1491,28 @@ static void hclgevf_enable_vector(struct
+ 
+ static irqreturn_t hclgevf_misc_irq_handle(int irq, void *data)
+ {
++	enum hclgevf_evt_cause event_cause;
+ 	struct hclgevf_dev *hdev = data;
+ 	u32 clearval;
+ 
+ 	hclgevf_enable_vector(&hdev->misc_vector, false);
+-	if (!hclgevf_check_event_cause(hdev, &clearval))
+-		goto skip_sched;
++	event_cause = hclgevf_check_evt_cause(hdev, &clearval);
+ 
+-	hclgevf_mbx_handler(hdev);
+-
+-	hclgevf_clear_event_cause(hdev, clearval);
++	switch (event_cause) {
++	case HCLGEVF_VECTOR0_EVENT_RST:
++		hclgevf_reset_task_schedule(hdev);
++		break;
++	case HCLGEVF_VECTOR0_EVENT_MBX:
++		hclgevf_mbx_handler(hdev);
++		break;
++	default:
++		break;
++	}
+ 
+-skip_sched:
+-	hclgevf_enable_vector(&hdev->misc_vector, true);
++	if (event_cause != HCLGEVF_VECTOR0_EVENT_OTHER) {
++		hclgevf_clear_event_cause(hdev, clearval);
++		hclgevf_enable_vector(&hdev->misc_vector, true);
++	}
+ 
+ 	return IRQ_HANDLED;
+ }
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
+@@ -31,6 +31,8 @@
+ #define HCLGEVF_VECTOR0_CMDQ_SRC_REG	0x27100
+ /* CMDQ register bits for RX event(=MBX event) */
+ #define HCLGEVF_VECTOR0_RX_CMDQ_INT_B	1
++/* RST register bits for RESET event */
++#define HCLGEVF_VECTOR0_RST_INT_B	2
+ 
+ #define HCLGEVF_TQP_RESET_TRY_TIMES	10
+ /* Reset related Registers */
+@@ -60,6 +62,12 @@
+ #define HCLGEVF_S_IP_BIT		BIT(3)
+ #define HCLGEVF_V_TAG_BIT		BIT(4)
+ 
++enum hclgevf_evt_cause {
++	HCLGEVF_VECTOR0_EVENT_RST,
++	HCLGEVF_VECTOR0_EVENT_MBX,
++	HCLGEVF_VECTOR0_EVENT_OTHER,
++};
++
+ /* states of hclgevf device & tasks */
+ enum hclgevf_states {
+ 	/* device states */
