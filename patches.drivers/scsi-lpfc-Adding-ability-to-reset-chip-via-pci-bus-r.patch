@@ -1,0 +1,403 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Thu, 13 Dec 2018 15:17:57 -0800
+Subject: [PATCH] scsi: lpfc: Adding ability to reset chip via pci bus reset
+Git-commit: 5021267af1327724a6f1859bb1594660a4c22bd3
+Patch-mainline: v5.0-rc1
+References: bsc#1123236
+
+This patch adds a "pci_bus_reset" option to the board_mode sysfs attribute.
+This option uses the pci_reset_bus() api to reset the PCIe link the adapter
+is on, which will reset the chip/adapter.  Prior to issuing this option,
+all functions on the same chip must be placed in the offline state by the
+admin. After the reset, all of the instances may be brought online again.
+
+The primary purpose of this functionality is to support cases where
+firmware update required a chip reset but the admin did not want to reboot
+the machine in order to instantiate the firmware update.
+
+Sanity checks take place prior to the reset to ensure the adapter is the
+sole entity on the PCIe bus and that all functions are in the offline
+state.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <jsmart2021@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/scsi/lpfc/lpfc_attr.c |  84 ++++++++++++++++++++++++++++-
+ drivers/scsi/lpfc/lpfc_crtn.h |   1 +
+ drivers/scsi/lpfc/lpfc_hw4.h  |  12 +++++
+ drivers/scsi/lpfc/lpfc_scsi.c | 121 +++++++++++++++++++++++++++++++++++-------
+ drivers/scsi/lpfc/lpfc_sli.c  |  42 +++++++++++++--
+ 5 files changed, 233 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index 513ac1be861f..4bae72cbf3f6 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -1191,6 +1191,82 @@ lpfc_do_offline(struct lpfc_hba *phba, uint32_t type)
+ 	return 0;
+ }
+ 
++/**
++ * lpfc_reset_pci_bus - resets PCI bridge controller's secondary bus of an HBA
++ * @phba: lpfc_hba pointer.
++ *
++ * Description:
++ * Issues a PCI secondary bus reset for the phba->pcidev.
++ *
++ * Notes:
++ * First walks the bus_list to ensure only PCI devices with Emulex
++ * vendor id, device ids that support hot reset, only one occurrence
++ * of function 0, and all ports on the bus are in offline mode to ensure the
++ * hot reset only affects one valid HBA.
++ *
++ * Returns:
++ * -ENOTSUPP, cfg_enable_hba_reset must be of value 2
++ * -ENODEV,   NULL ptr to pcidev
++ * -EBADSLT,  detected invalid device
++ * -EBUSY,    port is not in offline state
++ *      0,    successful
++ */
++int
++lpfc_reset_pci_bus(struct lpfc_hba *phba)
++{
++	struct pci_dev *pdev = phba->pcidev;
++	struct Scsi_Host *shost = NULL;
++	struct lpfc_hba *phba_other = NULL;
++	struct pci_dev *ptr = NULL;
++	int res;
++
++	if (phba->cfg_enable_hba_reset != 2)
++		return -ENOTSUPP;
++
++	if (!pdev) {
++		lpfc_printf_log(phba, KERN_INFO, LOG_INIT, "8345 pdev NULL!\n");
++		return -ENODEV;
++	}
++
++	res = lpfc_check_pci_resettable(phba);
++	if (res)
++		return res;
++
++	/* Walk the list of devices on the pci_dev's bus */
++	list_for_each_entry(ptr, &pdev->bus->devices, bus_list) {
++		/* Check port is offline */
++		shost = pci_get_drvdata(ptr);
++		if (shost) {
++			phba_other =
++				((struct lpfc_vport *)shost->hostdata)->phba;
++			if (!(phba_other->pport->fc_flag & FC_OFFLINE_MODE)) {
++				lpfc_printf_log(phba_other, KERN_INFO, LOG_INIT,
++						"8349 WWPN = 0x%02x%02x%02x%02x"
++						"%02x%02x%02x%02x is not "
++						"offline!\n",
++						phba_other->wwpn[0],
++						phba_other->wwpn[1],
++						phba_other->wwpn[2],
++						phba_other->wwpn[3],
++						phba_other->wwpn[4],
++						phba_other->wwpn[5],
++						phba_other->wwpn[6],
++						phba_other->wwpn[7]);
++				return -EBUSY;
++			}
++		}
++	}
++
++	/* Issue PCI bus reset */
++	res = pci_reset_bus(pdev);
++	if (res) {
++		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++				"8350 PCI reset bus failed: %d\n", res);
++	}
++
++	return res;
++}
++
+ /**
+  * lpfc_selective_reset - Offline then onlines the port
+  * @phba: lpfc_hba pointer.
+@@ -1618,6 +1694,9 @@ lpfc_board_mode_store(struct device *dev, struct device_attribute *attr,
+ 		status = lpfc_sli4_pdev_reg_request(phba, LPFC_FW_RESET);
+ 	else if (strncmp(buf, "dv_reset", sizeof("dv_reset") - 1) == 0)
+ 		status = lpfc_sli4_pdev_reg_request(phba, LPFC_DV_RESET);
++	else if (strncmp(buf, "pci_bus_reset", sizeof("pci_bus_reset") - 1)
++		 == 0)
++		status = lpfc_reset_pci_bus(phba);
+ 	else if (strncmp(buf, "trunk", sizeof("trunk") - 1) == 0)
+ 		status = lpfc_set_trunking(phba, (char *)buf + sizeof("trunk"));
+ 	else
+@@ -5376,9 +5455,10 @@ LPFC_ATTR_R(nvme_io_channel,
+ # lpfc_enable_hba_reset: Allow or prevent HBA resets to the hardware.
+ #       0  = HBA resets disabled
+ #       1  = HBA resets enabled (default)
+-# Value range is [0,1]. Default value is 1.
++#       2  = HBA reset via PCI bus reset enabled
++# Value range is [0,2]. Default value is 1.
+ */
+-LPFC_ATTR_R(enable_hba_reset, 1, 0, 1, "Enable HBA resets from the driver.");
++LPFC_ATTR_RW(enable_hba_reset, 1, 0, 2, "Enable HBA resets from the driver.");
+ 
+ /*
+ # lpfc_enable_hba_heartbeat: Disable HBA heartbeat timer..
+diff --git a/drivers/scsi/lpfc/lpfc_crtn.h b/drivers/scsi/lpfc/lpfc_crtn.h
+index 6a8c5b804c2d..39f3fa988732 100644
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -383,6 +383,7 @@ void lpfc_rq_buf_free(struct lpfc_hba *phba, struct lpfc_dmabuf *mp);
+ int lpfc_link_reset(struct lpfc_vport *vport);
+ 
+ /* Function prototypes. */
++int lpfc_check_pci_resettable(const struct lpfc_hba *phba);
+ const char* lpfc_info(struct Scsi_Host *);
+ int lpfc_scan_finished(struct Scsi_Host *, unsigned long);
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 4e7fa3c44eee..c15b9b6fb840 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -3850,6 +3850,9 @@ struct lpfc_mbx_wr_object {
+ #define lpfc_wr_object_eof_SHIFT		31
+ #define lpfc_wr_object_eof_MASK			0x00000001
+ #define lpfc_wr_object_eof_WORD			word4
++#define lpfc_wr_object_eas_SHIFT		29
++#define lpfc_wr_object_eas_MASK			0x00000001
++#define lpfc_wr_object_eas_WORD			word4
+ #define lpfc_wr_object_write_length_SHIFT	0
+ #define lpfc_wr_object_write_length_MASK	0x00FFFFFF
+ #define lpfc_wr_object_write_length_WORD	word4
+@@ -3860,6 +3863,15 @@ struct lpfc_mbx_wr_object {
+ 		} request;
+ 		struct {
+ 			uint32_t actual_write_length;
++			uint32_t word5;
++#define lpfc_wr_object_change_status_SHIFT	0
++#define lpfc_wr_object_change_status_MASK	0x000000FF
++#define lpfc_wr_object_change_status_WORD	word5
++#define LPFC_CHANGE_STATUS_NO_RESET_NEEDED	0x00
++#define LPFC_CHANGE_STATUS_PHYS_DEV_RESET	0x01
++#define LPFC_CHANGE_STATUS_FW_RESET		0x02
++#define LPFC_CHANGE_STATUS_PORT_MIGRATION	0x04
++#define LPFC_CHANGE_STATUS_PCI_RESET		0x05
+ 		} response;
+ 	} u;
+ };
+diff --git a/drivers/scsi/lpfc/lpfc_scsi.c b/drivers/scsi/lpfc/lpfc_scsi.c
+index 473d255f15c0..f61de71ff713 100644
+--- a/drivers/scsi/lpfc/lpfc_scsi.c
++++ b/drivers/scsi/lpfc/lpfc_scsi.c
+@@ -4459,6 +4459,66 @@ lpfc_tskmgmt_def_cmpl(struct lpfc_hba *phba,
+ 	return;
+ }
+ 
++/**
++ * lpfc_check_pci_resettable - Walks list of devices on pci_dev's bus to check
++ *                             if issuing a pci_bus_reset is possibly unsafe
++ * @phba: lpfc_hba pointer.
++ *
++ * Description:
++ * Walks the bus_list to ensure only PCI devices with Emulex
++ * vendor id, device ids that support hot reset, and only one occurrence
++ * of function 0.
++ *
++ * Returns:
++ * -EBADSLT,  detected invalid device
++ *      0,    successful
++ */
++int
++lpfc_check_pci_resettable(const struct lpfc_hba *phba)
++{
++	const struct pci_dev *pdev = phba->pcidev;
++	struct pci_dev *ptr = NULL;
++	u8 counter = 0;
++
++	/* Walk the list of devices on the pci_dev's bus */
++	list_for_each_entry(ptr, &pdev->bus->devices, bus_list) {
++		/* Check for Emulex Vendor ID */
++		if (ptr->vendor != PCI_VENDOR_ID_EMULEX) {
++			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++					"8346 Non-Emulex vendor found: "
++					"0x%04x\n", ptr->vendor);
++			return -EBADSLT;
++		}
++
++		/* Check for valid Emulex Device ID */
++		switch (ptr->device) {
++		case PCI_DEVICE_ID_LANCER_FC:
++		case PCI_DEVICE_ID_LANCER_G6_FC:
++		case PCI_DEVICE_ID_LANCER_G7_FC:
++			break;
++		default:
++			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++					"8347 Invalid device found: "
++					"0x%04x\n", ptr->device);
++			return -EBADSLT;
++		}
++
++		/* Check for only one function 0 ID to ensure only one HBA on
++		 * secondary bus
++		 */
++		if (ptr->devfn == 0) {
++			if (++counter > 1) {
++				lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++						"8348 More than one device on "
++						"secondary bus found\n");
++				return -EBADSLT;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ /**
+  * lpfc_info - Info entry point of scsi_host_template data structure
+  * @host: The scsi host for which this call is being executed.
+@@ -4473,32 +4533,53 @@ lpfc_info(struct Scsi_Host *host)
+ {
+ 	struct lpfc_vport *vport = (struct lpfc_vport *) host->hostdata;
+ 	struct lpfc_hba   *phba = vport->phba;
+-	int len, link_speed = 0;
+-	static char  lpfcinfobuf[384];
++	int link_speed = 0;
++	static char lpfcinfobuf[384];
++	char tmp[384] = {0};
+ 
+-	memset(lpfcinfobuf,0,384);
++	memset(lpfcinfobuf, 0, sizeof(lpfcinfobuf));
+ 	if (phba && phba->pcidev){
+-		strncpy(lpfcinfobuf, phba->ModelDesc, 256);
+-		len = strlen(lpfcinfobuf);
+-		snprintf(lpfcinfobuf + len,
+-			384-len,
+-			" on PCI bus %02x device %02x irq %d",
+-			phba->pcidev->bus->number,
+-			phba->pcidev->devfn,
+-			phba->pcidev->irq);
+-		len = strlen(lpfcinfobuf);
++		/* Model Description */
++		scnprintf(tmp, sizeof(tmp), phba->ModelDesc);
++		if (strlcat(lpfcinfobuf, tmp, sizeof(lpfcinfobuf)) >=
++		    sizeof(lpfcinfobuf))
++			goto buffer_done;
++
++		/* PCI Info */
++		scnprintf(tmp, sizeof(tmp),
++			  " on PCI bus %02x device %02x irq %d",
++			  phba->pcidev->bus->number, phba->pcidev->devfn,
++			  phba->pcidev->irq);
++		if (strlcat(lpfcinfobuf, tmp, sizeof(lpfcinfobuf)) >=
++		    sizeof(lpfcinfobuf))
++			goto buffer_done;
++
++		/* Port Number */
+ 		if (phba->Port[0]) {
+-			snprintf(lpfcinfobuf + len,
+-				 384-len,
+-				 " port %s",
+-				 phba->Port);
++			scnprintf(tmp, sizeof(tmp), " port %s", phba->Port);
++			if (strlcat(lpfcinfobuf, tmp, sizeof(lpfcinfobuf)) >=
++			    sizeof(lpfcinfobuf))
++				goto buffer_done;
+ 		}
+-		len = strlen(lpfcinfobuf);
++
++		/* Link Speed */
+ 		link_speed = lpfc_sli_port_speed_get(phba);
+-		if (link_speed != 0)
+-			snprintf(lpfcinfobuf + len, 384-len,
+-				 " Logical Link Speed: %d Mbps", link_speed);
++		if (link_speed != 0) {
++			scnprintf(tmp, sizeof(tmp),
++				  " Logical Link Speed: %d Mbps", link_speed);
++			if (strlcat(lpfcinfobuf, tmp, sizeof(lpfcinfobuf)) >=
++			    sizeof(lpfcinfobuf))
++				goto buffer_done;
++		}
++
++		/* PCI resettable */
++		if (!lpfc_check_pci_resettable(phba)) {
++			scnprintf(tmp, sizeof(tmp), " PCI resettable");
++			strlcat(lpfcinfobuf, tmp, sizeof(lpfcinfobuf));
++		}
+ 	}
++
++buffer_done:
+ 	return lpfcinfobuf;
+ }
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index f3cb6b4c52ff..766722e993c2 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -19264,11 +19264,11 @@ lpfc_wr_object(struct lpfc_hba *phba, struct list_head *dmabuf_list,
+ 	struct lpfc_mbx_wr_object *wr_object;
+ 	LPFC_MBOXQ_t *mbox;
+ 	int rc = 0, i = 0;
+-	uint32_t shdr_status, shdr_add_status;
++	uint32_t shdr_status, shdr_add_status, shdr_change_status;
+ 	uint32_t mbox_tmo;
+-	union lpfc_sli4_cfg_shdr *shdr;
+ 	struct lpfc_dmabuf *dmabuf;
+ 	uint32_t written = 0;
++	bool check_change_status = false;
+ 
+ 	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
+ 	if (!mbox)
+@@ -19296,6 +19296,8 @@ lpfc_wr_object(struct lpfc_hba *phba, struct list_head *dmabuf_list,
+ 				(size - written);
+ 			written += (size - written);
+ 			bf_set(lpfc_wr_object_eof, &wr_object->u.request, 1);
++			bf_set(lpfc_wr_object_eas, &wr_object->u.request, 1);
++			check_change_status = true;
+ 		} else {
+ 			wr_object->u.request.bde[i].tus.f.bdeSize =
+ 				SLI4_PAGE_SIZE;
+@@ -19312,9 +19314,39 @@ lpfc_wr_object(struct lpfc_hba *phba, struct list_head *dmabuf_list,
+ 		rc = lpfc_sli_issue_mbox_wait(phba, mbox, mbox_tmo);
+ 	}
+ 	/* The IOCTL status is embedded in the mailbox subheader. */
+-	shdr = (union lpfc_sli4_cfg_shdr *) &wr_object->header.cfg_shdr;
+-	shdr_status = bf_get(lpfc_mbox_hdr_status, &shdr->response);
+-	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status, &shdr->response);
++	shdr_status = bf_get(lpfc_mbox_hdr_status,
++			     &wr_object->header.cfg_shdr.response);
++	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status,
++				 &wr_object->header.cfg_shdr.response);
++	if (check_change_status) {
++		shdr_change_status = bf_get(lpfc_wr_object_change_status,
++					    &wr_object->u.response);
++		switch (shdr_change_status) {
++		case (LPFC_CHANGE_STATUS_PHYS_DEV_RESET):
++			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++					"3198 Firmware write complete: System "
++					"reboot required to instantiate\n");
++			break;
++		case (LPFC_CHANGE_STATUS_FW_RESET):
++			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++					"3199 Firmware write complete: Firmware"
++					" reset required to instantiate\n");
++			break;
++		case (LPFC_CHANGE_STATUS_PORT_MIGRATION):
++			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++					"3200 Firmware write complete: Port "
++					"Migration or PCI Reset required to "
++					"instantiate\n");
++			break;
++		case (LPFC_CHANGE_STATUS_PCI_RESET):
++			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++					"3201 Firmware write complete: PCI "
++					"Reset required to instantiate\n");
++			break;
++		default:
++			break;
++		}
++	}
+ 	if (rc != MBX_TIMEOUT)
+ 		mempool_free(mbox, phba->mbox_mem_pool);
+ 	if (shdr_status || shdr_add_status || rc) {
+-- 
+2.16.4
+
