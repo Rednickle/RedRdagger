@@ -200,6 +200,7 @@ remotes = (
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
+    Head(RepoURL("s390/linux.git"), "fixes"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("https://github.com/kdave/btrfs-devel.git"), "misc-next"),
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
@@ -216,6 +217,7 @@ remotes = (
     Head(RepoURL("mkp/scsi.git"), "queue"),
     Head(RepoURL("mkp/scsi.git"), "fixes"),
     Head(RepoURL("mkp/scsi.git"), "4.21/scsi-queue"),
+    Head(RepoURL("mkp/scsi.git"), "5.0/scsi-fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
     Head(RepoURL("dhowells/linux-fs.git")),
@@ -225,6 +227,7 @@ remotes = (
     Head(RepoURL("jeyu/linux.git"), "modules-next"),
     Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-for-next"),
     Head(RepoURL("axboe/linux-block.git"), "for-4.21/block"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.0"),
 )
 
 

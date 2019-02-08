@@ -1,0 +1,357 @@
+From: Huazhong Tan <tanhuazhong@huawei.com>
+Date: Fri, 9 Nov 2018 22:07:48 +0800
+Subject: net: hns3: add reset handling for VF when doing PF reset
+Patch-mainline: v5.0-rc1
+Git-commit: aa5c4f175be66696f73eb9f4e18028c6aa2ce652
+References: bsc#1104353 FATE#326415
+
+When PF performs a function reset, the hardware will reset both PF
+and all the VF belong to this PF. Hence, both PF's driver and VF's
+driver need to perform corresponding reset operations.
+
+Before PF driver asserting function reset to hardware, it firstly
+set up VF's hardware reset status, and inform the VF driver with
+HNAE3_VF_PF_FUNC_RESET, then VF driver sets this reset type to
+reset_pending and shechule reset task to stop IO and waits for the
+hardware reset status to clear. When PF driver has reinitialized the
+hardware and is ready to process mailbox from VF, PF driver clears
+VF's hardware reset status for VF to continue its reset process.
+
+Also, this patch uses readl_poll_timeout to simplify the hardware reset
+status waitting.
+
+Signed-off-by: Huazhong Tan <tanhuazhong@huawei.com>
+Signed-off-by: Yunsheng Lin <linyunsheng@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h           |    6 
+ drivers/net/ethernet/hisilicon/hns3/hnae3.h               |    1 
+ drivers/net/ethernet/hisilicon/hns3/hns3_enet.h           |    3 
+ drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c   |   91 ++++++++++++++
+ drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h   |    1 
+ drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_mbx.c    |   11 +
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c |   39 +++---
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h |   10 +
+ drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_mbx.c  |    4 
+ 9 files changed, 146 insertions(+), 20 deletions(-)
+
+--- a/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hclge_mbx.h
+@@ -85,6 +85,12 @@ struct hclge_mbx_pf_to_vf_cmd {
+ 	u16 msg[8];
+ };
+ 
++struct hclge_vf_rst_cmd {
++	u8 dest_vfid;
++	u8 vf_rst;
++	u8 rsv[22];
++};
++
+ /* used by VF to store the received Async responses from PF */
+ struct hclgevf_mbx_arq_ring {
+ #define HCLGE_MBX_MAX_ARQ_MSG_SIZE	8
+--- a/drivers/net/ethernet/hisilicon/hns3/hnae3.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hnae3.h
+@@ -125,6 +125,7 @@ enum hnae3_reset_notify_type {
+ enum hnae3_reset_type {
+ 	HNAE3_VF_RESET,
+ 	HNAE3_VF_FUNC_RESET,
++	HNAE3_VF_PF_FUNC_RESET,
+ 	HNAE3_VF_FULL_RESET,
+ 	HNAE3_FUNC_RESET,
+ 	HNAE3_CORE_RESET,
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
+@@ -594,7 +594,8 @@ static inline void hns3_write_reg(void _
+ static inline bool hns3_dev_ongoing_func_reset(struct hnae3_ae_dev *ae_dev)
+ {
+ 	return (ae_dev && (ae_dev->reset_type == HNAE3_FUNC_RESET ||
+-			   ae_dev->reset_type == HNAE3_VF_FUNC_RESET));
++			   ae_dev->reset_type == HNAE3_VF_FUNC_RESET ||
++			   ae_dev->reset_type == HNAE3_VF_PF_FUNC_RESET));
+ }
+ 
+ #define hns3_read_dev(a, reg) \
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.c
+@@ -2392,6 +2392,55 @@ static int hclge_reset_wait(struct hclge
+ 	return 0;
+ }
+ 
++static int hclge_set_vf_rst(struct hclge_dev *hdev, int func_id, bool reset)
++{
++	struct hclge_vf_rst_cmd *req;
++	struct hclge_desc desc;
++
++	req = (struct hclge_vf_rst_cmd *)desc.data;
++	hclge_cmd_setup_basic_desc(&desc, HCLGE_OPC_GBL_RST_STATUS, false);
++	req->dest_vfid = func_id;
++
++	if (reset)
++		req->vf_rst = 0x1;
++
++	return hclge_cmd_send(&hdev->hw, &desc, 1);
++}
++
++int hclge_set_all_vf_rst(struct hclge_dev *hdev, bool reset)
++{
++	int i;
++
++	for (i = hdev->num_vmdq_vport + 1; i < hdev->num_alloc_vport; i++) {
++		struct hclge_vport *vport = &hdev->vport[i];
++		int ret;
++
++		/* Send cmd to set/clear VF's FUNC_RST_ING */
++		ret = hclge_set_vf_rst(hdev, vport->vport_id, reset);
++		if (ret) {
++			dev_err(&hdev->pdev->dev,
++				"set vf(%d) rst failded %d!\n",
++				vport->vport_id, ret);
++			return ret;
++		}
++
++		if (!reset)
++			continue;
++
++		/* Inform VF to process the reset.
++		 * hclge_inform_reset_assert_to_vf may fail if VF
++		 * driver is not loaded.
++		 */
++		ret = hclge_inform_reset_assert_to_vf(vport);
++		if (ret)
++			dev_warn(&hdev->pdev->dev,
++				 "inform reset to vf(%d) failded %d!\n",
++				 vport->vport_id, ret);
++	}
++
++	return 0;
++}
++
+ int hclge_func_reset_cmd(struct hclge_dev *hdev, int func_id)
+ {
+ 	struct hclge_desc desc;
+@@ -2495,12 +2544,31 @@ static void hclge_clear_reset_cause(stru
+ 	hclge_enable_vector(&hdev->misc_vector, true);
+ }
+ 
++static int hclge_reset_prepare_down(struct hclge_dev *hdev)
++{
++	int ret = 0;
++
++	switch (hdev->reset_type) {
++	case HNAE3_FUNC_RESET:
++		ret = hclge_set_all_vf_rst(hdev, true);
++		break;
++	default:
++		break;
++	}
++
++	return ret;
++}
++
+ static int hclge_reset_prepare_wait(struct hclge_dev *hdev)
+ {
+ 	int ret = 0;
+ 
+ 	switch (hdev->reset_type) {
+ 	case HNAE3_FUNC_RESET:
++		/* There is no mechanism for PF to know if VF has stopped IO
++		 * for now, just wait 100 ms for VF to stop IO
++		 */
++		msleep(100);
+ 		ret = hclge_func_reset_cmd(hdev, 0);
+ 		if (ret) {
+ 			dev_err(&hdev->pdev->dev,
+@@ -2562,6 +2630,21 @@ static bool hclge_reset_err_handle(struc
+ 	return false;
+ }
+ 
++static int hclge_reset_prepare_up(struct hclge_dev *hdev)
++{
++	int ret = 0;
++
++	switch (hdev->reset_type) {
++	case HNAE3_FUNC_RESET:
++		ret = hclge_set_all_vf_rst(hdev, false);
++		break;
++	default:
++		break;
++	}
++
++	return ret;
++}
++
+ static void hclge_reset(struct hclge_dev *hdev)
+ {
+ 	struct hnae3_ae_dev *ae_dev = pci_get_drvdata(hdev->pdev);
+@@ -2579,6 +2662,10 @@ static void hclge_reset(struct hclge_dev
+ 	if (ret)
+ 		goto err_reset;
+ 
++	ret = hclge_reset_prepare_down(hdev);
++	if (ret)
++		goto err_reset;
++
+ 	rtnl_lock();
+ 	ret = hclge_notify_client(hdev, HNAE3_DOWN_CLIENT);
+ 	if (ret)
+@@ -2614,6 +2701,10 @@ static void hclge_reset(struct hclge_dev
+ 
+ 	hclge_clear_reset_cause(hdev);
+ 
++	ret = hclge_reset_prepare_up(hdev);
++	if (ret)
++		goto err_reset_lock;
++
+ 	ret = hclge_notify_client(hdev, HNAE3_UP_CLIENT);
+ 	if (ret)
+ 		goto err_reset_lock;
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_main.h
+@@ -785,6 +785,7 @@ int hclge_buffer_alloc(struct hclge_dev
+ int hclge_rss_init_hw(struct hclge_dev *hdev);
+ void hclge_rss_indir_init_cfg(struct hclge_dev *hdev);
+ 
++int hclge_inform_reset_assert_to_vf(struct hclge_vport *vport);
+ void hclge_mbx_handler(struct hclge_dev *hdev);
+ int hclge_reset_tqp(struct hnae3_handle *handle, u16 queue_id);
+ void hclge_reset_vf_queue(struct hclge_vport *vport, u16 queue_id);
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_mbx.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_mbx.c
+@@ -81,13 +81,22 @@ static int hclge_send_mbx_msg(struct hcl
+ 
+ int hclge_inform_reset_assert_to_vf(struct hclge_vport *vport)
+ {
++	struct hclge_dev *hdev = vport->back;
++	enum hnae3_reset_type reset_type;
+ 	u8 msg_data[2];
+ 	u8 dest_vfid;
+ 
+ 	dest_vfid = (u8)vport->vport_id;
+ 
++	if (hdev->reset_type == HNAE3_FUNC_RESET)
++		reset_type = HNAE3_VF_PF_FUNC_RESET;
++	else
++		return -EINVAL;
++
++	memcpy(&msg_data[0], &reset_type, sizeof(u16));
++
+ 	/* send this requested info to VF */
+-	return hclge_send_mbx_msg(vport, msg_data, sizeof(u8),
++	return hclge_send_mbx_msg(vport, msg_data, sizeof(msg_data),
+ 				  HCLGE_MBX_ASSERTING_RESET, dest_vfid);
+ }
+ 
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.c
+@@ -2,6 +2,7 @@
+ // Copyright (c) 2016-2017 Hisilicon Limited.
+ 
+ #include <linux/etherdevice.h>
++#include <linux/iopoll.h>
+ #include <net/rtnetlink.h>
+ #include "hclgevf_cmd.h"
+ #include "hclgevf_main.h"
+@@ -1094,24 +1095,28 @@ static int hclgevf_notify_client(struct
+ 
+ static int hclgevf_reset_wait(struct hclgevf_dev *hdev)
+ {
+-#define HCLGEVF_RESET_WAIT_MS	500
+-#define HCLGEVF_RESET_WAIT_CNT	20
+-	u32 val, cnt = 0;
++#define HCLGEVF_RESET_WAIT_US	20000
++#define HCLGEVF_RESET_WAIT_CNT	2000
++#define HCLGEVF_RESET_WAIT_TIMEOUT_US	\
++	(HCLGEVF_RESET_WAIT_US * HCLGEVF_RESET_WAIT_CNT)
++
++	u32 val;
++	int ret;
+ 
+ 	/* wait to check the hardware reset completion status */
+-	val = hclgevf_read_dev(&hdev->hw, HCLGEVF_FUN_RST_ING);
+-	while (hnae3_get_bit(val, HCLGEVF_FUN_RST_ING_B) &&
+-	       (cnt < HCLGEVF_RESET_WAIT_CNT)) {
+-		msleep(HCLGEVF_RESET_WAIT_MS);
+-		val = hclgevf_read_dev(&hdev->hw, HCLGEVF_FUN_RST_ING);
+-		cnt++;
+-	}
++	val = hclgevf_read_dev(&hdev->hw, HCLGEVF_RST_ING);
++	dev_info(&hdev->pdev->dev, "checking vf resetting status: %x\n", val);
++
++	ret = readl_poll_timeout(hdev->hw.io_base + HCLGEVF_RST_ING, val,
++				 !(val & HCLGEVF_RST_ING_BITS),
++				 HCLGEVF_RESET_WAIT_US,
++				 HCLGEVF_RESET_WAIT_TIMEOUT_US);
+ 
+ 	/* hardware completion status should be available by this time */
+-	if (cnt >= HCLGEVF_RESET_WAIT_CNT) {
+-		dev_warn(&hdev->pdev->dev,
+-			 "could'nt get reset done status from h/w, timeout!\n");
+-		return -EBUSY;
++	if (ret) {
++		dev_err(&hdev->pdev->dev,
++			"could'nt get reset done status from h/w, timeout!\n");
++		return ret;
+ 	}
+ 
+ 	/* we will wait a bit more to let reset of the stack to complete. This
+@@ -1225,6 +1230,10 @@ static enum hnae3_reset_type hclgevf_get
+ 		rst_level = HNAE3_VF_FULL_RESET;
+ 		clear_bit(HNAE3_VF_FULL_RESET, addr);
+ 		clear_bit(HNAE3_VF_FUNC_RESET, addr);
++	} else if (test_bit(HNAE3_VF_PF_FUNC_RESET, addr)) {
++		rst_level = HNAE3_VF_PF_FUNC_RESET;
++		clear_bit(HNAE3_VF_PF_FUNC_RESET, addr);
++		clear_bit(HNAE3_VF_FUNC_RESET, addr);
+ 	} else if (test_bit(HNAE3_VF_FUNC_RESET, addr)) {
+ 		rst_level = HNAE3_VF_FUNC_RESET;
+ 		clear_bit(HNAE3_VF_FUNC_RESET, addr);
+@@ -2179,7 +2188,7 @@ static bool hclgevf_get_hw_reset_stat(st
+ {
+ 	struct hclgevf_dev *hdev = hclgevf_ae_get_hdev(handle);
+ 
+-	return !!hclgevf_read_dev(&hdev->hw, HCLGEVF_FUN_RST_ING);
++	return !!hclgevf_read_dev(&hdev->hw, HCLGEVF_RST_ING);
+ }
+ 
+ static bool hclgevf_ae_dev_resetting(struct hnae3_handle *handle)
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_main.h
+@@ -34,8 +34,14 @@
+ 
+ #define HCLGEVF_TQP_RESET_TRY_TIMES	10
+ /* Reset related Registers */
+-#define HCLGEVF_FUN_RST_ING		0x20C00
+-#define HCLGEVF_FUN_RST_ING_B		0
++#define HCLGEVF_RST_ING			0x20C00
++#define HCLGEVF_FUN_RST_ING_BIT		BIT(0)
++#define HCLGEVF_GLOBAL_RST_ING_BIT	BIT(5)
++#define HCLGEVF_CORE_RST_ING_BIT	BIT(6)
++#define HCLGEVF_IMP_RST_ING_BIT		BIT(7)
++#define HCLGEVF_RST_ING_BITS \
++	(HCLGEVF_FUN_RST_ING_BIT | HCLGEVF_GLOBAL_RST_ING_BIT | \
++	 HCLGEVF_CORE_RST_ING_BIT | HCLGEVF_IMP_RST_ING_BIT)
+ 
+ #define HCLGEVF_RSS_IND_TBL_SIZE		512
+ #define HCLGEVF_RSS_SET_BITMAP_MSK	0xffff
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_mbx.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_mbx.c
+@@ -233,6 +233,7 @@ void hclgevf_mbx_handler(struct hclgevf_
+ 
+ void hclgevf_mbx_async_handler(struct hclgevf_dev *hdev)
+ {
++	enum hnae3_reset_type reset_type;
+ 	u16 link_status;
+ 	u16 *msg_q;
+ 	u8 duplex;
+@@ -267,7 +268,8 @@ void hclgevf_mbx_async_handler(struct hc
+ 			 * has been completely reset. After this stack should
+ 			 * eventually be re-initialized.
+ 			 */
+-			set_bit(HNAE3_VF_FULL_RESET, &hdev->reset_pending);
++			reset_type = le16_to_cpu(msg_q[1]);
++			set_bit(reset_type, &hdev->reset_pending);
+ 			set_bit(HCLGEVF_RESET_PENDING, &hdev->reset_state);
+ 			hclgevf_reset_task_schedule(hdev);
+ 
