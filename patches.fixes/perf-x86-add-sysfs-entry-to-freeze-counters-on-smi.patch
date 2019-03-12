@@ -1,0 +1,194 @@
+From: Kan Liang <Kan.liang@intel.com>
+Subject: perf/x86: Add sysfs entry to freeze counters on SMI
+Date: Fri May 12 07:51:13 2017 -0700
+Git-commit: 6089327f5424f227bb6a8cf92363c2617e054453
+Patch-mainline: v4.13-rc1
+References: bsc#1121805
+Signed-off-by: Tony Jones <tonyj@suse.de>
+X-Info: dependent patch
+
+    Currently, the SMIs are visible to all performance counters, because
+    many users want to measure everything including SMIs. But in some
+    cases, the SMI cycles should not be counted - for example, to calculate
+    the cost of an SMI itself. So a knob is needed.
+    
+    When setting FREEZE_WHILE_SMM bit in IA32_DEBUGCTL, all performance
+    counters will be effected. There is no way to do per-counter freeze
+    on SMI. So it should not use the per-event interface (e.g. ioctl or
+    event attribute) to set FREEZE_WHILE_SMM bit.
+    
+    Adds sysfs entry /sys/device/cpu/freeze_on_smi to set FREEZE_WHILE_SMM
+    bit in IA32_DEBUGCTL. When set, freezes perfmon and trace messages
+    while in SMM.
+    
+    Value has to be 0 or 1. It will be applied to all processors.
+    
+    Also serialize the entire setting so we don't get multiple concurrent
+    threads trying to update to different values.
+    
+    Signed-off-by: Kan Liang <Kan.liang@intel.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+    Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Stephane Eranian <eranian@google.com>
+    Cc: Vince Weaver <vincent.weaver@maine.edu>
+    Cc: acme@kernel.org
+    Cc: bp@alien8.de
+    Cc: jolsa@kernel.org
+    Link: http://lkml.kernel.org/r/1494600673-244667-1-git-send-email-kan.liang@intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 580b60f5ac83..e6f5e4b163ac 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1750,6 +1750,8 @@ ssize_t x86_event_sysfs_show(char *page, u64 config, u64 event)
+ 	return ret;
+ }
+ 
++static struct attribute_group x86_pmu_attr_group;
++
+ static int __init init_hw_perf_events(void)
+ {
+ 	struct x86_pmu_quirk *quirk;
+@@ -1813,6 +1815,14 @@ static int __init init_hw_perf_events(void)
+ 			x86_pmu_events_group.attrs = tmp;
+ 	}
+ 
++	if (x86_pmu.attrs) {
++		struct attribute **tmp;
++
++		tmp = merge_attr(x86_pmu_attr_group.attrs, x86_pmu.attrs);
++		if (!WARN_ON(!tmp))
++			x86_pmu_attr_group.attrs = tmp;
++	}
++
+ 	pr_info("... version:                %d\n",     x86_pmu.version);
+ 	pr_info("... bit width:              %d\n",     x86_pmu.cntval_bits);
+ 	pr_info("... generic registers:      %d\n",     x86_pmu.num_counters);
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index a6d91d4e37a1..da9047eec7ba 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -3160,6 +3160,19 @@ static int intel_pmu_cpu_prepare(int cpu)
+ 	return -ENOMEM;
+ }
+ 
++static void flip_smm_bit(void *data)
++{
++	unsigned long set = *(unsigned long *)data;
++
++	if (set > 0) {
++		msr_set_bit(MSR_IA32_DEBUGCTLMSR,
++			    DEBUGCTLMSR_FREEZE_IN_SMM_BIT);
++	} else {
++		msr_clear_bit(MSR_IA32_DEBUGCTLMSR,
++			      DEBUGCTLMSR_FREEZE_IN_SMM_BIT);
++	}
++}
++
+ static void intel_pmu_cpu_starting(int cpu)
+ {
+ 	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
+@@ -3174,6 +3187,8 @@ static void intel_pmu_cpu_starting(int cpu)
+ 
+ 	cpuc->lbr_sel = NULL;
+ 
++	flip_smm_bit(&x86_pmu.attr_freeze_on_smi);
++
+ 	if (!cpuc->shared_regs)
+ 		return;
+ 
+@@ -3595,6 +3610,52 @@ static struct attribute *hsw_events_attrs[] = {
+ 	NULL
+ };
+ 
++static ssize_t freeze_on_smi_show(struct device *cdev,
++				  struct device_attribute *attr,
++				  char *buf)
++{
++	return sprintf(buf, "%lu\n", x86_pmu.attr_freeze_on_smi);
++}
++
++static DEFINE_MUTEX(freeze_on_smi_mutex);
++
++static ssize_t freeze_on_smi_store(struct device *cdev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t count)
++{
++	unsigned long val;
++	ssize_t ret;
++
++	ret = kstrtoul(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	if (val > 1)
++		return -EINVAL;
++
++	mutex_lock(&freeze_on_smi_mutex);
++
++	if (x86_pmu.attr_freeze_on_smi == val)
++		goto done;
++
++	x86_pmu.attr_freeze_on_smi = val;
++
++	get_online_cpus();
++	on_each_cpu(flip_smm_bit, &val, 1);
++	put_online_cpus();
++done:
++	mutex_unlock(&freeze_on_smi_mutex);
++
++	return count;
++}
++
++static DEVICE_ATTR_RW(freeze_on_smi);
++
++static struct attribute *intel_pmu_attrs[] = {
++	&dev_attr_freeze_on_smi.attr,
++	NULL,
++};
++
+ __init int intel_pmu_init(void)
+ {
+ 	union cpuid10_edx edx;
+@@ -3641,6 +3702,8 @@ __init int intel_pmu_init(void)
+ 
+ 	x86_pmu.max_pebs_events		= min_t(unsigned, MAX_PEBS_EVENTS, x86_pmu.num_counters);
+ 
++
++	x86_pmu.attrs			= intel_pmu_attrs;
+ 	/*
+ 	 * Quirk: v2 perfmon does not report fixed-purpose events, so
+ 	 * assume at least 3 events, when not running in a hypervisor:
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index be3d36254040..53728eea1bed 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -562,6 +562,9 @@ struct x86_pmu {
+ 	ssize_t		(*events_sysfs_show)(char *page, u64 config);
+ 	struct attribute **cpu_events;
+ 
++	unsigned long	attr_freeze_on_smi;
++	struct attribute **attrs;
++
+ 	/*
+ 	 * CPU Hotplug hooks
+ 	 */
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 673f9ac50f6d..18b162322eff 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -137,6 +137,8 @@
+ #define DEBUGCTLMSR_BTS_OFF_OS		(1UL <<  9)
+ #define DEBUGCTLMSR_BTS_OFF_USR		(1UL << 10)
+ #define DEBUGCTLMSR_FREEZE_LBRS_ON_PMI	(1UL << 11)
++#define DEBUGCTLMSR_FREEZE_IN_SMM_BIT	14
++#define DEBUGCTLMSR_FREEZE_IN_SMM	(1UL << DEBUGCTLMSR_FREEZE_IN_SMM_BIT)
+ 
+ #define MSR_PEBS_FRONTEND		0x000003f7
+ 
