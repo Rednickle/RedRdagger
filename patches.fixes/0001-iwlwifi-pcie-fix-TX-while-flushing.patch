@@ -1,0 +1,128 @@
+From 2ae48edcf76721d6cfcec97e5ff18cd7983b7974 Mon Sep 17 00:00:00 2001
+From: Sara Sharon <sara.sharon@intel.com>
+Date: Tue, 25 Dec 2018 12:16:32 +0200
+Subject: [PATCH] iwlwifi: pcie: fix TX while flushing
+Git-commit: 2ae48edcf76721d6cfcec97e5ff18cd7983b7974
+Patch-mainline: v5.1
+References: bsc#1120902
+
+When flushing TX queues no new TX should go into the system.
+However, in the following scenario we get TX:
+1. Queues are stopped and there are packets in overflow queue
+2. Station is removed and flush begins
+3. Flush empties space, and reclaim path TXes SKB from overflow
+   queue.
+
+Note that the fact the queues are stopped during the process
+doesn't matter - the packet will be TXed since the TX path
+doesn't care if TX queues are stopped or not, just if there is
+space in the queue, which there is, since we just freed a
+packet.
+
+A fix here is rather complicated, since the flow is very racy.
+
+Change code not to warn if we are TXing from overflow TX.
+In case there is TX from both overflow TX and TX path we will
+miss a warning we optimally had, but we can live with that.
+
+Make sure we don't return before overflow queue is empty, otherwise
+we will think queues are empty, but they will be refilled, resulting
+with assert.
+
+Signed-off-by: Sara Sharon <sara.sharon@intel.com>
+Fixes: 3955525d5d17 ("iwlwifi: pcie: buffer packets to avoid overflowing Tx queues")
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/net/wireless/intel/iwlwifi/pcie/internal.h |    2 +
+ drivers/net/wireless/intel/iwlwifi/pcie/trans.c    |   24 +++++++++++++++++++--
+ drivers/net/wireless/intel/iwlwifi/pcie/tx.c       |   10 ++++++++
+ 3 files changed, 34 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+@@ -290,6 +290,8 @@ struct iwl_txq {
+ 	u32 id;
+ 	int low_mark;
+ 	int high_mark;
++
++	bool overflow_tx;
+ };
+ 
+ static inline dma_addr_t
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+@@ -2069,6 +2069,7 @@ static int iwl_trans_pcie_wait_txq_empty
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+ 	struct iwl_txq *txq;
+ 	unsigned long now = jiffies;
++	bool overflow_tx;
+ 	u8 wr_ptr;
+ 
+ 	if (!test_bit(txq_idx, trans_pcie->queue_used))
+@@ -2076,18 +2077,37 @@ static int iwl_trans_pcie_wait_txq_empty
+ 
+ 	IWL_DEBUG_TX_QUEUES(trans, "Emptying queue %d...\n", txq_idx);
+ 	txq = trans_pcie->txq[txq_idx];
++
++	spin_lock_bh(&txq->lock);
++	overflow_tx = txq->overflow_tx ||
++		      !skb_queue_empty(&txq->overflow_q);
++	spin_unlock_bh(&txq->lock);
++
+ 	wr_ptr = READ_ONCE(txq->write_ptr);
+ 
+-	while (txq->read_ptr != READ_ONCE(txq->write_ptr) &&
++	while ((txq->read_ptr != READ_ONCE(txq->write_ptr) ||
++		overflow_tx) &&
+ 	       !time_after(jiffies,
+ 			   now + msecs_to_jiffies(IWL_FLUSH_WAIT_MS))) {
+ 		u8 write_ptr = READ_ONCE(txq->write_ptr);
+ 
+-		if (WARN_ONCE(wr_ptr != write_ptr,
++		/*
++		 * If write pointer moved during the wait, warn only
++		 * if the TX came from op mode. In case TX came from
++		 * trans layer (overflow TX) don't warn.
++		 */
++		if (WARN_ONCE(wr_ptr != write_ptr && !overflow_tx,
+ 			      "WR pointer moved while flushing %d -> %d\n",
+ 			      wr_ptr, write_ptr))
+ 			return -ETIMEDOUT;
++		wr_ptr = write_ptr;
++
+ 		usleep_range(1000, 2000);
++
++		spin_lock_bh(&txq->lock);
++		overflow_tx = txq->overflow_tx ||
++			      !skb_queue_empty(&txq->overflow_q);
++		spin_unlock_bh(&txq->lock);
+ 	}
+ 
+ 	if (txq->read_ptr != txq->write_ptr) {
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/tx.c
+@@ -1128,6 +1128,15 @@ void iwl_trans_pcie_reclaim(struct iwl_t
+ 		skb_queue_splice_init(&txq->overflow_q, &overflow_skbs);
+ 
+ 		/*
++		 * We are going to transmit from the overflow queue.
++		 * Remember this state so that wait_for_txq_empty will know we
++		 * are adding more packets to the TFD queue. It cannot rely on
++		 * the state of &txq->overflow_q, as we just emptied it, but
++		 * haven't TXed the content yet.
++		 */
++		txq->overflow_tx = true;
++
++		/*
+ 		 * This is tricky: we are in reclaim path which is non
+ 		 * re-entrant, so noone will try to take the access the
+ 		 * txq data from that path. We stopped tx, so we can't
+@@ -1151,6 +1160,7 @@ void iwl_trans_pcie_reclaim(struct iwl_t
+ 			iwl_trans_pcie_tx(trans, skb, dev_cmd_ptr, txq_id);
+ 		}
+ 		spin_lock_bh(&txq->lock);
++		txq->overflow_tx = false;
+ 
+ 		if (iwl_queue_space(txq) > txq->low_mark)
+ 			iwl_wake_queue(trans, txq);
