@@ -408,7 +408,7 @@ sub create_package {
 	$writer->dataElement("title", $title);
 	$writer->dataElement("description", $description);
 	# XXX: HACK
-	if ($package =~ /^kernel-(subpackage|obs-(qa|build))/) {
+	if ($package =~ /^kernel-obs-(qa|build)/) {
 		$writer->startTag("build");
 		$writer->emptyTag("disable");
 		for my $repo (@{$prj->{qa_repos} || []}) {
