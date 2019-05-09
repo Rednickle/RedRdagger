@@ -1,0 +1,690 @@
+From: Don Brace <don.brace@microsemi.com>
+Date: Fri, 7 Dec 2018 16:30:05 -0600
+Subject: scsi: smartpqi: add smp_utils support
+Git-commit: 3d46a59a191e81f7ada771b8db71553916b851da
+Patch-mainline: v5.0-rc1
+References: bsc#1133547
+
+Reviewed-by: Scott Benesh <scott.benesh@microsemi.com>
+Reviewed-by: Mahesh Rajashekhara <mahesh.rajashekhara@microsemi.com>
+Reviewed-by: Scott Teel <scott.teel@microsemi.com>
+Reviewed-by: Dave Carroll <david.carroll@microsemi.com>
+Reviewed-by: Kevin Barnett <kevin.barnett@microsemi.com>
+Signed-off-by: Don Brace <don.brace@microsemi.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/smartpqi/smartpqi.h               |  89 ++++++++++++++
+ drivers/scsi/smartpqi/smartpqi_init.c          | 131 ++++++++++++--------
+ drivers/scsi/smartpqi/smartpqi_sas_transport.c | 164 +++++++++++++++++++++++--
+ 3 files changed, 324 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/scsi/smartpqi/smartpqi.h b/drivers/scsi/smartpqi/smartpqi.h
+index 4f52b5be3693..ba499a636f43 100644
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@ -21,6 +21,9 @@
+ #if !defined(_SMARTPQI_H)
+ #define _SMARTPQI_H
+ 
++#include <scsi/scsi_host.h>
++#include <linux/bsg-lib.h>
++
+ #pragma pack(1)
+ 
+ #define PQI_DEVICE_SIGNATURE	"PQI DREG"
+@@ -855,6 +858,7 @@ struct pqi_scsi_dev {
+ 	u8	unique_id[16];
+ 	u8	is_physical_device : 1;
+ 	u8	is_external_raid_device : 1;
++	u8	is_expander_smp_device : 1;
+ 	u8	target_lun_valid : 1;
+ 	u8	device_gone : 1;
+ 	u8	new_device : 1;
+@@ -964,6 +968,7 @@ struct pqi_sas_node {
+ struct pqi_sas_port {
+ 	struct list_head port_list_entry;
+ 	u64	sas_address;
++	struct pqi_scsi_dev *device;
+ 	struct sas_port *port;
+ 	int	next_phy_index;
+ 	struct list_head phy_list_head;
+@@ -1129,11 +1134,14 @@ enum pqi_ctrl_mode {
+ #define BMIC_WRITE				0x27
+ #define BMIC_SENSE_CONTROLLER_PARAMETERS	0x64
+ #define BMIC_SENSE_SUBSYSTEM_INFORMATION	0x66
++#define BMIC_CSMI_PASSTHRU			0x68
+ #define BMIC_WRITE_HOST_WELLNESS		0xa5
+ #define BMIC_FLUSH_CACHE			0xc2
+ #define BMIC_SET_DIAG_OPTIONS			0xf4
+ #define BMIC_SENSE_DIAG_OPTIONS			0xf5
+ 
++#define CSMI_CC_SAS_SMP_PASSTHRU		0X17
++
+ #define SA_FLUSH_CACHE				0x1
+ 
+ #define MASKED_DEVICE(lunid)			((lunid)[3] & 0xc0)
+@@ -1160,6 +1168,10 @@ struct bmic_identify_controller {
+ 	u8	reserved3[32];
+ };
+ 
++#define SA_EXPANDER_SMP_DEVICE		0x05
++/*SCSI Invalid Device Type for SAS devices*/
++#define PQI_SAS_SCSI_INVALID_DEVTYPE	0xff
++
+ struct bmic_identify_physical_device {
+ 	u8	scsi_bus;		/* SCSI Bus number on controller */
+ 	u8	scsi_id;		/* SCSI ID on this bus */
+@@ -1240,6 +1252,50 @@ struct bmic_identify_physical_device {
+ 	u8	padding_to_multiple_of_512[9];
+ };
+ 
++struct bmic_smp_request {
++	u8	frame_type;
++	u8	function;
++	u8	allocated_response_length;
++	u8	request_length;
++	u8	additional_request_bytes[1016];
++};
++
++struct  bmic_smp_response {
++	u8	frame_type;
++	u8	function;
++	u8	function_result;
++	u8	response_length;
++	u8	additional_response_bytes[1016];
++};
++
++struct bmic_csmi_ioctl_header {
++	__le32	header_length;
++	u8	signature[8];
++	__le32	timeout;
++	__le32	control_code;
++	__le32	return_code;
++	__le32	length;
++};
++
++struct bmic_csmi_smp_passthru {
++	u8	phy_identifier;
++	u8	port_identifier;
++	u8	connection_rate;
++	u8	reserved;
++	__be64	destination_sas_address;
++	__le32	request_length;
++	struct bmic_smp_request request;
++	u8	connection_status;
++	u8	reserved1[3];
++	__le32	response_length;
++	struct bmic_smp_response response;
++};
++
++struct bmic_csmi_smp_passthru_buffer {
++	struct bmic_csmi_ioctl_header ioctl_header;
++	struct bmic_csmi_smp_passthru parameters;
++};
++
+ struct bmic_flush_cache {
+ 	u8	disable_flag;
+ 	u8	system_power_action;
+@@ -1263,6 +1319,36 @@ struct bmic_diag_options {
+ 
+ #pragma pack()
+ 
++static inline struct pqi_ctrl_info *shost_to_hba(struct Scsi_Host *shost)
++{
++	void *hostdata = shost_priv(shost);
++
++	return *((struct pqi_ctrl_info **)hostdata);
++}
++
++static inline bool pqi_ctrl_offline(struct pqi_ctrl_info *ctrl_info)
++{
++	return !ctrl_info->controller_online;
++}
++
++static inline void pqi_ctrl_busy(struct pqi_ctrl_info *ctrl_info)
++{
++	atomic_inc(&ctrl_info->num_busy_threads);
++}
++
++static inline void pqi_ctrl_unbusy(struct pqi_ctrl_info *ctrl_info)
++{
++	atomic_dec(&ctrl_info->num_busy_threads);
++}
++
++static inline bool pqi_ctrl_blocked(struct pqi_ctrl_info *ctrl_info)
++{
++	return ctrl_info->block_requests;
++}
++
++void pqi_sas_smp_handler(struct bsg_job *job, struct Scsi_Host *shost,
++	struct sas_rphy *rphy);
++
+ int pqi_add_sas_host(struct Scsi_Host *shost, struct pqi_ctrl_info *ctrl_info);
+ void pqi_delete_sas_host(struct pqi_ctrl_info *ctrl_info);
+ int pqi_add_sas_device(struct pqi_sas_node *pqi_sas_node,
+@@ -1271,6 +1357,9 @@ void pqi_remove_sas_device(struct pqi_scsi_dev *device);
+ struct pqi_scsi_dev *pqi_find_device_by_sas_rphy(
+ 	struct pqi_ctrl_info *ctrl_info, struct sas_rphy *rphy);
+ void pqi_prep_for_scsi_done(struct scsi_cmnd *scmd);
++int pqi_csmi_smp_passthru(struct pqi_ctrl_info *ctrl_info,
++	struct bmic_csmi_smp_passthru_buffer *buffer, size_t buffer_length,
++	struct pqi_raid_error_info *error_info);
+ 
+ extern struct sas_function_template pqi_sas_transport_functions;
+ 
+diff --git a/drivers/scsi/smartpqi/smartpqi_init.c b/drivers/scsi/smartpqi/smartpqi_init.c
+index 509a081a6f17..96e171038eb6 100644
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@ -188,13 +188,6 @@ static inline bool pqi_scsi3addr_equal(u8 *scsi3addr1, u8 *scsi3addr2)
+ 	return memcmp(scsi3addr1, scsi3addr2, 8) == 0;
+ }
+ 
+-static inline struct pqi_ctrl_info *shost_to_hba(struct Scsi_Host *shost)
+-{
+-	void *hostdata = shost_priv(shost);
+-
+-	return *((struct pqi_ctrl_info **)hostdata);
+-}
+-
+ static inline bool pqi_is_logical_device(struct pqi_scsi_dev *device)
+ {
+ 	return !device->is_physical_device;
+@@ -205,11 +198,6 @@ static inline bool pqi_is_external_raid_addr(u8 *scsi3addr)
+ 	return scsi3addr[2] != 0;
+ }
+ 
+-static inline bool pqi_ctrl_offline(struct pqi_ctrl_info *ctrl_info)
+-{
+-	return !ctrl_info->controller_online;
+-}
+-
+ static inline void pqi_check_ctrl_health(struct pqi_ctrl_info *ctrl_info)
+ {
+ 	if (ctrl_info->controller_online)
+@@ -248,11 +236,6 @@ static inline void pqi_ctrl_unblock_requests(struct pqi_ctrl_info *ctrl_info)
+ 	scsi_unblock_requests(ctrl_info->scsi_host);
+ }
+ 
+-static inline bool pqi_ctrl_blocked(struct pqi_ctrl_info *ctrl_info)
+-{
+-	return ctrl_info->block_requests;
+-}
+-
+ static unsigned long pqi_wait_if_ctrl_blocked(struct pqi_ctrl_info *ctrl_info,
+ 	unsigned long timeout_msecs)
+ {
+@@ -282,16 +265,6 @@ static unsigned long pqi_wait_if_ctrl_blocked(struct pqi_ctrl_info *ctrl_info,
+ 	return remaining_msecs;
+ }
+ 
+-static inline void pqi_ctrl_busy(struct pqi_ctrl_info *ctrl_info)
+-{
+-	atomic_inc(&ctrl_info->num_busy_threads);
+-}
+-
+-static inline void pqi_ctrl_unbusy(struct pqi_ctrl_info *ctrl_info)
+-{
+-	atomic_dec(&ctrl_info->num_busy_threads);
+-}
+-
+ static inline void pqi_ctrl_wait_until_quiesced(struct pqi_ctrl_info *ctrl_info)
+ {
+ 	while (atomic_read(&ctrl_info->num_busy_threads) >
+@@ -472,6 +445,13 @@ static int pqi_build_raid_path_request(struct pqi_ctrl_info *ctrl_info,
+ 		cdb[6] = cmd;
+ 		put_unaligned_be16(cdb_length, &cdb[7]);
+ 		break;
++	case BMIC_CSMI_PASSTHRU:
++		request->data_direction = SOP_BIDIRECTIONAL;
++		cdb[0] = BMIC_WRITE;
++		cdb[5] = CSMI_CC_SAS_SMP_PASSTHRU;
++		cdb[6] = cmd;
++		put_unaligned_be16(cdb_length, &cdb[7]);
++		break;
+ 	default:
+ 		dev_err(&ctrl_info->pci_dev->dev, "unknown command 0x%c\n",
+ 			cmd);
+@@ -713,6 +693,13 @@ static int pqi_flush_cache(struct pqi_ctrl_info *ctrl_info,
+ 	return rc;
+ }
+ 
++int pqi_csmi_smp_passthru(struct pqi_ctrl_info *ctrl_info,
++	struct bmic_csmi_smp_passthru_buffer *buffer, size_t buffer_length,
++	struct pqi_raid_error_info *error_info)
++{
++	return pqi_send_ctrl_raid_with_error(ctrl_info, BMIC_CSMI_PASSTHRU,
++		buffer, buffer_length, error_info);
++}
+ 
+ #define PQI_FETCH_PTRAID_DATA (1UL<<31)
+ 
+@@ -1298,6 +1285,9 @@ static int pqi_get_device_info(struct pqi_ctrl_info *ctrl_info,
+ 	u8 *buffer;
+ 	unsigned int retries;
+ 
++	if (device->is_expander_smp_device)
++		return 0;
++
+ 	buffer = kmalloc(64, GFP_KERNEL);
+ 	if (!buffer)
+ 		return -ENOMEM;
+@@ -1585,6 +1575,14 @@ static enum pqi_find_result pqi_scsi_find_entry(struct pqi_ctrl_info *ctrl_info,
+ 	return DEVICE_NOT_FOUND;
+ }
+ 
++static inline const char *pqi_device_type(struct pqi_scsi_dev *device)
++{
++	if (device->is_expander_smp_device)
++		return "Enclosure SMP    ";
++
++	return scsi_device_type(device->devtype);
++}
++
+ #define PQI_DEV_INFO_BUFFER_LENGTH	128
+ 
+ static void pqi_dev_info(struct pqi_ctrl_info *ctrl_info,
+@@ -1620,7 +1618,7 @@ static void pqi_dev_info(struct pqi_ctrl_info *ctrl_info,
+ 
+ 	count += snprintf(buffer + count, PQI_DEV_INFO_BUFFER_LENGTH - count,
+ 		" %s %.8s %.16s ",
+-		scsi_device_type(device->devtype),
++		pqi_device_type(device),
+ 		device->vendor,
+ 		device->model);
+ 
+@@ -1665,6 +1663,8 @@ static void pqi_scsi_update_device(struct pqi_scsi_dev *existing_device,
+ 	existing_device->is_physical_device = new_device->is_physical_device;
+ 	existing_device->is_external_raid_device =
+ 		new_device->is_external_raid_device;
++	existing_device->is_expander_smp_device =
++		new_device->is_expander_smp_device;
+ 	existing_device->aio_enabled = new_device->aio_enabled;
+ 	memcpy(existing_device->vendor, new_device->vendor,
+ 		sizeof(existing_device->vendor));
+@@ -1721,6 +1721,14 @@ static inline void pqi_fixup_botched_add(struct pqi_ctrl_info *ctrl_info,
+ 	device->keep_device = false;
+ }
+ 
++static inline bool pqi_is_device_added(struct pqi_scsi_dev *device)
++{
++	if (device->is_expander_smp_device)
++		return device->sas_port != NULL;
++
++	return device->sdev != NULL;
++}
++
+ static void pqi_update_device_list(struct pqi_ctrl_info *ctrl_info,
+ 	struct pqi_scsi_dev *new_device_list[], unsigned int num_new_devices)
+ {
+@@ -1815,7 +1823,7 @@ static void pqi_update_device_list(struct pqi_ctrl_info *ctrl_info,
+ 		} else {
+ 			pqi_dev_info(ctrl_info, "removed", device);
+ 		}
+-		if (device->sdev)
++		if (pqi_is_device_added(device))
+ 			pqi_remove_device(ctrl_info, device);
+ 		list_del(&device->delete_list_entry);
+ 		pqi_free_device(device);
+@@ -1837,7 +1845,7 @@ static void pqi_update_device_list(struct pqi_ctrl_info *ctrl_info,
+ 
+ 	/* Expose any new devices. */
+ 	list_for_each_entry_safe(device, next, &add_list, add_list_entry) {
+-		if (!device->sdev) {
++		if (!pqi_is_device_added(device)) {
+ 			pqi_dev_info(ctrl_info, "added", device);
+ 			rc = pqi_add_device(ctrl_info, device);
+ 			if (rc) {
+@@ -1854,7 +1862,12 @@ static void pqi_update_device_list(struct pqi_ctrl_info *ctrl_info,
+ 
+ static bool pqi_is_supported_device(struct pqi_scsi_dev *device)
+ {
+-	bool is_supported = false;
++	bool is_supported;
++
++	if (device->is_expander_smp_device)
++		return true;
++
++	is_supported = false;
+ 
+ 	switch (device->devtype) {
+ 	case TYPE_DISK:
+@@ -1888,6 +1901,24 @@ static inline bool pqi_skip_device(u8 *scsi3addr)
+ 	return false;
+ }
+ 
++static inline bool pqi_is_device_with_sas_address(struct pqi_scsi_dev *device)
++{
++	if (!device->is_physical_device)
++		return false;
++
++	if (device->is_expander_smp_device)
++		return true;
++
++	switch (device->devtype) {
++	case TYPE_DISK:
++	case TYPE_ZBC:
++	case TYPE_ENCLOSURE:
++		return true;
++	}
++
++	return false;
++}
++
+ static inline bool pqi_expose_device(struct pqi_scsi_dev *device)
+ {
+ 	return !device->is_physical_device ||
+@@ -2002,9 +2033,14 @@ static int pqi_update_scsi_devices(struct pqi_ctrl_info *ctrl_info)
+ 
+ 		memcpy(device->scsi3addr, scsi3addr, sizeof(device->scsi3addr));
+ 		device->is_physical_device = is_physical_device;
+-		if (!is_physical_device)
++		if (is_physical_device) {
++			if (phys_lun_ext_entry->device_type ==
++				SA_EXPANDER_SMP_DEVICE)
++				device->is_expander_smp_device = true;
++		} else {
+ 			device->is_external_raid_device =
+ 				pqi_is_external_raid_addr(scsi3addr);
++		}
+ 
+ 		/* Gather information about the device. */
+ 		rc = pqi_get_device_info(ctrl_info, device);
+@@ -2037,30 +2073,23 @@ static int pqi_update_scsi_devices(struct pqi_ctrl_info *ctrl_info)
+ 			device->wwid = phys_lun_ext_entry->wwid;
+ 			if ((phys_lun_ext_entry->device_flags &
+ 				REPORT_PHYS_LUN_DEV_FLAG_AIO_ENABLED) &&
+-				phys_lun_ext_entry->aio_handle)
++				phys_lun_ext_entry->aio_handle) {
+ 				device->aio_enabled = true;
++					device->aio_handle =
++						phys_lun_ext_entry->aio_handle;
++			}
++			if (device->devtype == TYPE_DISK ||
++				device->devtype == TYPE_ZBC) {
++				pqi_get_physical_disk_info(ctrl_info,
++					device, id_phys);
++			}
+ 		} else {
+ 			memcpy(device->volume_id, log_lun_ext_entry->volume_id,
+ 				sizeof(device->volume_id));
+ 		}
+ 
+-		switch (device->devtype) {
+-		case TYPE_DISK:
+-		case TYPE_ZBC:
+-		case TYPE_ENCLOSURE:
+-			if (device->is_physical_device) {
+-				device->sas_address =
+-					get_unaligned_be64(&device->wwid);
+-				if (device->devtype == TYPE_DISK ||
+-					device->devtype == TYPE_ZBC) {
+-					device->aio_handle =
+-						phys_lun_ext_entry->aio_handle;
+-					pqi_get_physical_disk_info(ctrl_info,
+-						device, id_phys);
+-				}
+-			}
+-			break;
+-		}
++		if (pqi_is_device_with_sas_address(device))
++			device->sas_address = get_unaligned_be64(&device->wwid);
+ 
+ 		new_device_list[num_valid_devices++] = device;
+ 	}
+@@ -2103,7 +2132,7 @@ static void pqi_remove_all_scsi_devices(struct pqi_ctrl_info *ctrl_info)
+ 		if (!device)
+ 			break;
+ 
+-		if (device->sdev)
++		if (pqi_is_device_added(device))
+ 			pqi_remove_device(ctrl_info, device);
+ 		pqi_free_device(device);
+ 	}
+diff --git a/drivers/scsi/smartpqi/smartpqi_sas_transport.c b/drivers/scsi/smartpqi/smartpqi_sas_transport.c
+index b209a35e482e..0e4ef215115f 100644
+--- a/drivers/scsi/smartpqi/smartpqi_sas_transport.c
++++ b/drivers/scsi/smartpqi/smartpqi_sas_transport.c
+@@ -17,9 +17,11 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/bsg-lib.h>
+ #include <scsi/scsi_host.h>
+ #include <scsi/scsi_cmnd.h>
+ #include <scsi/scsi_transport_sas.h>
++#include <asm/unaligned.h>
+ #include "smartpqi.h"
+ 
+ static struct pqi_sas_phy *pqi_alloc_sas_phy(struct pqi_sas_port *pqi_sas_port)
+@@ -97,14 +99,32 @@ static int pqi_sas_port_add_rphy(struct pqi_sas_port *pqi_sas_port,
+ 
+ 	identify = &rphy->identify;
+ 	identify->sas_address = pqi_sas_port->sas_address;
+-	identify->initiator_port_protocols = SAS_PROTOCOL_STP;
+-	identify->target_port_protocols = SAS_PROTOCOL_STP;
++
++	if (pqi_sas_port->device &&
++		pqi_sas_port->device->is_expander_smp_device) {
++		identify->initiator_port_protocols = SAS_PROTOCOL_SMP;
++		identify->target_port_protocols = SAS_PROTOCOL_SMP;
++	} else {
++		identify->initiator_port_protocols = SAS_PROTOCOL_STP;
++		identify->target_port_protocols = SAS_PROTOCOL_STP;
++	}
+ 
+ 	return sas_rphy_add(rphy);
+ }
+ 
++static struct sas_rphy *pqi_sas_rphy_alloc(struct pqi_sas_port *pqi_sas_port)
++{
++	if (pqi_sas_port->device &&
++		pqi_sas_port->device->is_expander_smp_device)
++		return sas_expander_alloc(pqi_sas_port->port,
++				SAS_FANOUT_EXPANDER_DEVICE);
++
++	return sas_end_device_alloc(pqi_sas_port->port);
++}
++
+ static struct pqi_sas_port *pqi_alloc_sas_port(
+-	struct pqi_sas_node *pqi_sas_node, u64 sas_address)
++	struct pqi_sas_node *pqi_sas_node, u64 sas_address,
++	struct pqi_scsi_dev *device)
+ {
+ 	int rc;
+ 	struct pqi_sas_port *pqi_sas_port;
+@@ -127,6 +147,7 @@ static struct pqi_sas_port *pqi_alloc_sas_port(
+ 
+ 	pqi_sas_port->port = port;
+ 	pqi_sas_port->sas_address = sas_address;
++	pqi_sas_port->device = device;
+ 	list_add_tail(&pqi_sas_port->port_list_entry,
+ 		&pqi_sas_node->port_list_head);
+ 
+@@ -146,7 +167,7 @@ static void pqi_free_sas_port(struct pqi_sas_port *pqi_sas_port)
+ 	struct pqi_sas_phy *next;
+ 
+ 	list_for_each_entry_safe(pqi_sas_phy, next,
+-			&pqi_sas_port->phy_list_head, phy_list_entry)
++		&pqi_sas_port->phy_list_head, phy_list_entry)
+ 		pqi_free_sas_phy(pqi_sas_phy);
+ 
+ 	sas_port_delete(pqi_sas_port->port);
+@@ -176,7 +197,7 @@ static void pqi_free_sas_node(struct pqi_sas_node *pqi_sas_node)
+ 		return;
+ 
+ 	list_for_each_entry_safe(pqi_sas_port, next,
+-			&pqi_sas_node->port_list_head, port_list_entry)
++		&pqi_sas_node->port_list_head, port_list_entry)
+ 		pqi_free_sas_port(pqi_sas_port);
+ 
+ 	kfree(pqi_sas_node);
+@@ -206,13 +227,14 @@ int pqi_add_sas_host(struct Scsi_Host *shost, struct pqi_ctrl_info *ctrl_info)
+ 	struct pqi_sas_port *pqi_sas_port;
+ 	struct pqi_sas_phy *pqi_sas_phy;
+ 
+-	parent_dev = &shost->shost_gendev;
++	parent_dev = &shost->shost_dev;
+ 
+ 	pqi_sas_node = pqi_alloc_sas_node(parent_dev);
+ 	if (!pqi_sas_node)
+ 		return -ENOMEM;
+ 
+-	pqi_sas_port = pqi_alloc_sas_port(pqi_sas_node, ctrl_info->sas_address);
++	pqi_sas_port = pqi_alloc_sas_port(pqi_sas_node,
++		ctrl_info->sas_address, NULL);
+ 	if (!pqi_sas_port) {
+ 		rc = -ENODEV;
+ 		goto free_sas_node;
+@@ -254,11 +276,12 @@ int pqi_add_sas_device(struct pqi_sas_node *pqi_sas_node,
+ 	struct pqi_sas_port *pqi_sas_port;
+ 	struct sas_rphy *rphy;
+ 
+-	pqi_sas_port = pqi_alloc_sas_port(pqi_sas_node, device->sas_address);
++	pqi_sas_port = pqi_alloc_sas_port(pqi_sas_node,
++		device->sas_address, device);
+ 	if (!pqi_sas_port)
+ 		return -ENOMEM;
+ 
+-	rphy = sas_end_device_alloc(pqi_sas_port->port);
++	rphy = pqi_sas_rphy_alloc(pqi_sas_port);
+ 	if (!rphy) {
+ 		rc = -ENODEV;
+ 		goto free_sas_port;
+@@ -329,6 +352,128 @@ static int pqi_sas_phy_speed(struct sas_phy *phy,
+ 	return -EINVAL;
+ }
+ 
++#define CSMI_IOCTL_TIMEOUT	60
++#define SMP_CRC_FIELD_LENGTH	4
++
++static struct bmic_csmi_smp_passthru_buffer *
++pqi_build_csmi_smp_passthru_buffer(struct sas_rphy *rphy,
++	struct bsg_job *job)
++{
++	struct bmic_csmi_smp_passthru_buffer *smp_buf;
++	struct bmic_csmi_ioctl_header *ioctl_header;
++	struct bmic_csmi_smp_passthru *parameters;
++	u32 req_size;
++	u32 resp_size;
++
++	smp_buf = kzalloc(sizeof(*smp_buf), GFP_KERNEL);
++	if (!smp_buf)
++		return NULL;
++
++	req_size = job->request_payload.payload_len;
++	resp_size = job->reply_payload.payload_len;
++
++	ioctl_header = &smp_buf->ioctl_header;
++	put_unaligned_le32(sizeof(smp_buf->ioctl_header),
++		&ioctl_header->header_length);
++	put_unaligned_le32(CSMI_IOCTL_TIMEOUT, &ioctl_header->timeout);
++	put_unaligned_le32(CSMI_CC_SAS_SMP_PASSTHRU,
++		&ioctl_header->control_code);
++	put_unaligned_le32(sizeof(smp_buf->parameters), &ioctl_header->length);
++
++	parameters = &smp_buf->parameters;
++	parameters->phy_identifier = rphy->identify.phy_identifier;
++	parameters->port_identifier = 0;
++	parameters->connection_rate = 0;
++	put_unaligned_be64(rphy->identify.sas_address,
++		&parameters->destination_sas_address);
++
++	if (req_size > SMP_CRC_FIELD_LENGTH)
++		req_size -= SMP_CRC_FIELD_LENGTH;
++
++	put_unaligned_le32(req_size, &parameters->request_length);
++
++	put_unaligned_le32(resp_size, &parameters->response_length);
++
++	sg_copy_to_buffer(job->request_payload.sg_list,
++		job->reply_payload.sg_cnt, &parameters->request,
++		req_size);
++
++	return smp_buf;
++}
++
++static unsigned int pqi_build_sas_smp_handler_reply(
++	struct bmic_csmi_smp_passthru_buffer *smp_buf, struct bsg_job *job,
++	struct pqi_raid_error_info *error_info)
++{
++	sg_copy_from_buffer(job->reply_payload.sg_list,
++		job->reply_payload.sg_cnt, &smp_buf->parameters.response,
++		le32_to_cpu(smp_buf->parameters.response_length));
++
++	job->reply_len = le16_to_cpu(error_info->sense_data_length);
++	memcpy(job->reply, error_info->data,
++			le16_to_cpu(error_info->sense_data_length));
++
++	return job->reply_payload.payload_len -
++		get_unaligned_le32(&error_info->data_in_transferred);
++}
++
++void pqi_sas_smp_handler(struct bsg_job *job, struct Scsi_Host *shost,
++	struct sas_rphy *rphy)
++{
++	int rc;
++	struct pqi_ctrl_info *ctrl_info = shost_to_hba(shost);
++	struct bmic_csmi_smp_passthru_buffer *smp_buf;
++	struct pqi_raid_error_info error_info;
++	unsigned int reslen = 0;
++
++	pqi_ctrl_busy(ctrl_info);
++
++	if (job->reply_payload.payload_len == 0) {
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	if (!rphy) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	if (rphy->identify.device_type != SAS_FANOUT_EXPANDER_DEVICE) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	if (job->request_payload.sg_cnt > 1 || job->reply_payload.sg_cnt > 1) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	if (pqi_ctrl_offline(ctrl_info)) {
++		rc = -ENXIO;
++		goto out;
++	}
++
++	if (pqi_ctrl_blocked(ctrl_info)) {
++		rc = -EBUSY;
++		goto out;
++	}
++
++	smp_buf = pqi_build_csmi_smp_passthru_buffer(rphy, job);
++	if (!smp_buf) {
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	rc = pqi_csmi_smp_passthru(ctrl_info, smp_buf, sizeof(*smp_buf),
++		&error_info);
++	if (rc)
++		goto out;
++
++	reslen = pqi_build_sas_smp_handler_reply(smp_buf, job, &error_info);
++out:
++	bsg_job_done(job, rc, reslen);
++	pqi_ctrl_unbusy(ctrl_info);
++}
+ struct sas_function_template pqi_sas_transport_functions = {
+ 	.get_linkerrors = pqi_sas_get_linkerrors,
+ 	.get_enclosure_identifier = pqi_sas_get_enclosure_identifier,
+@@ -338,4 +483,5 @@ struct sas_function_template pqi_sas_transport_functions = {
+ 	.phy_setup = pqi_sas_phy_setup,
+ 	.phy_release = pqi_sas_phy_release,
+ 	.set_phy_speed = pqi_sas_phy_speed,
++	.smp_handler = pqi_sas_smp_handler,
+ };
+
