@@ -1,0 +1,181 @@
+From: Mahesh Rajashekhara <mahesh.rajashekhara@microsemi.com>
+Date: Fri, 7 Dec 2018 16:29:24 -0600
+Subject: scsi: smartpqi: check for null device pointers
+Git-commit: 1e46731efd9c9322cb4699f845c739d2ea68555c
+Patch-mainline: v5.0-rc1
+References: bsc#1133547
+
+- wait on all outstanding I/O to complete before the device is removed.
+
+- check for null device pointers in IO entry/completion functions.
+
+Reviewed-by: Scott Teel <scott.teel@microsemi.com>
+Reviewed-by: Murthy Bhat <murthy.bhat@microsemi.com>
+Reviewed-by: Dave Carroll <david.carroll@microsemi.com>
+Reviewed-by: Kevin Barnett <kevin.barnett@microsemi.com>
+Signed-off-by: Mahesh Rajashekhara <mahesh.rajashekhara@microsemi.com>
+Signed-off-by: Don Brace <don.brace@microsemi.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/smartpqi/smartpqi.h      |  2 ++
+ drivers/scsi/smartpqi/smartpqi_init.c | 65 +++++++++++++++++++++++++++++++++--
+ 2 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/scsi/smartpqi/smartpqi.h b/drivers/scsi/smartpqi/smartpqi.h
+index a39c324dedab..4f52b5be3693 100644
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@ -862,6 +862,7 @@ struct pqi_scsi_dev {
+ 	u8	volume_offline : 1;
+ 	bool	aio_enabled;		/* only valid for physical disks */
+ 	bool	in_reset;
++	bool	in_remove;
+ 	bool	device_offline;
+ 	u8	vendor[8];		/* bytes 8-15 of inquiry data */
+ 	u8	model[16];		/* bytes 16-31 of inquiry data */
+@@ -1063,6 +1064,7 @@ struct pqi_ctrl_info {
+ 	struct mutex	lun_reset_mutex;
+ 	bool		controller_online;
+ 	bool		block_requests;
++	bool		in_shutdown;
+ 	u8		inbound_spanning_supported : 1;
+ 	u8		outbound_spanning_supported : 1;
+ 	u8		pqi_mode_enabled : 1;
+diff --git a/drivers/scsi/smartpqi/smartpqi_init.c b/drivers/scsi/smartpqi/smartpqi_init.c
+index 3678bd7ac8b7..8c848e136d33 100644
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@ -74,6 +74,8 @@ static int pqi_aio_submit_io(struct pqi_ctrl_info *ctrl_info,
+ 	struct scsi_cmnd *scmd, u32 aio_handle, u8 *cdb,
+ 	unsigned int cdb_length, struct pqi_queue_group *queue_group,
+ 	struct pqi_encryption_info *encryption_info, bool raid_bypass);
++static int pqi_device_wait_for_pending_io(struct pqi_ctrl_info *ctrl_info,
++	struct pqi_scsi_dev *device, unsigned long timeout_secs);
+ 
+ /* for flags argument to pqi_submit_raid_request_synchronous() */
+ #define PQI_SYNC_FLAGS_INTERRUPTABLE	0x1
+@@ -317,6 +319,17 @@ static inline bool pqi_device_in_reset(struct pqi_scsi_dev *device)
+ 	return device->in_reset;
+ }
+ 
++static inline void pqi_device_remove_start(struct pqi_scsi_dev *device)
++{
++	device->in_remove = true;
++}
++
++static inline bool pqi_device_in_remove(struct pqi_ctrl_info *ctrl_info,
++					struct pqi_scsi_dev *device)
++{
++	return device->in_remove & !ctrl_info->in_shutdown;
++}
++
+ static inline void pqi_schedule_rescan_worker_with_delay(
+ 	struct pqi_ctrl_info *ctrl_info, unsigned long delay)
+ {
+@@ -1487,9 +1500,24 @@ static int pqi_add_device(struct pqi_ctrl_info *ctrl_info,
+ 	return rc;
+ }
+ 
++#define PQI_PENDING_IO_TIMEOUT_SECS	20
++
+ static inline void pqi_remove_device(struct pqi_ctrl_info *ctrl_info,
+ 	struct pqi_scsi_dev *device)
+ {
++	int rc;
++
++	pqi_device_remove_start(device);
++
++	rc = pqi_device_wait_for_pending_io(ctrl_info, device,
++		PQI_PENDING_IO_TIMEOUT_SECS);
++	if (rc)
++		dev_err(&ctrl_info->pci_dev->dev,
++			"scsi %d:%d:%d:%d removing device with %d outstanding commands\n",
++			ctrl_info->scsi_host->host_no, device->bus,
++			device->target, device->lun,
++			atomic_read(&device->scsi_cmds_outstanding));
++
+ 	if (pqi_is_logical_device(device))
+ 		scsi_remove_device(device->sdev);
+ 	else
+@@ -5042,7 +5070,17 @@ void pqi_prep_for_scsi_done(struct scsi_cmnd *scmd)
+ {
+ 	struct pqi_scsi_dev *device;
+ 
++	if (!scmd->device) {
++		set_host_byte(scmd, DID_NO_CONNECT);
++		return;
++	}
++
+ 	device = scmd->device->hostdata;
++	if (!device) {
++		set_host_byte(scmd, DID_NO_CONNECT);
++		return;
++	}
++
+ 	atomic_dec(&device->scsi_cmds_outstanding);
+ }
+ 
+@@ -5059,9 +5097,16 @@ static int pqi_scsi_queue_command(struct Scsi_Host *shost,
+ 	device = scmd->device->hostdata;
+ 	ctrl_info = shost_to_hba(shost);
+ 
++	if (!device) {
++		set_host_byte(scmd, DID_NO_CONNECT);
++		pqi_scsi_done(scmd);
++		return 0;
++	}
++
+ 	atomic_inc(&device->scsi_cmds_outstanding);
+ 
+-	if (pqi_ctrl_offline(ctrl_info)) {
++	if (pqi_ctrl_offline(ctrl_info) || pqi_device_in_remove(ctrl_info,
++								device)) {
+ 		set_host_byte(scmd, DID_NO_CONNECT);
+ 		pqi_scsi_done(scmd);
+ 		return 0;
+@@ -5214,12 +5259,23 @@ static void pqi_fail_io_queued_for_device(struct pqi_ctrl_info *ctrl_info,
+ }
+ 
+ static int pqi_device_wait_for_pending_io(struct pqi_ctrl_info *ctrl_info,
+-	struct pqi_scsi_dev *device)
++	struct pqi_scsi_dev *device, unsigned long timeout_secs)
+ {
++	unsigned long timeout;
++
++	timeout = (timeout_secs * HZ) + jiffies;
++
+ 	while (atomic_read(&device->scsi_cmds_outstanding)) {
+ 		pqi_check_ctrl_health(ctrl_info);
+ 		if (pqi_ctrl_offline(ctrl_info))
+ 			return -ENXIO;
++		if (timeout_secs != NO_TIMEOUT) {
++			if (time_after(jiffies, timeout)) {
++				dev_err(&ctrl_info->pci_dev->dev,
++					"timed out waiting for pending IO\n");
++				return -ETIMEDOUT;
++			}
++		}
+ 		usleep_range(1000, 2000);
+ 	}
+ 
+@@ -5345,7 +5401,8 @@ static int pqi_device_reset(struct pqi_ctrl_info *ctrl_info,
+ 		msleep(PQI_LUN_RESET_RETRY_INTERVAL_MSECS);
+ 	}
+ 	if (rc == 0)
+-		rc = pqi_device_wait_for_pending_io(ctrl_info, device);
++		rc = pqi_device_wait_for_pending_io(ctrl_info,
++			device, NO_TIMEOUT);
+ 
+ 	return rc == 0 ? SUCCESS : FAILED;
+ }
+@@ -7188,6 +7245,8 @@ static void pqi_pci_remove(struct pci_dev *pci_dev)
+ 	if (!ctrl_info)
+ 		return;
+ 
++	ctrl_info->in_shutdown = true;
++
+ 	pqi_remove_ctrl(ctrl_info);
+ }
+ 
+
