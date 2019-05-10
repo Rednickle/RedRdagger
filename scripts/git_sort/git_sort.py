@@ -235,6 +235,8 @@ remotes = (
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-5.0"),
     Head(RepoURL("git://git.linux-nfs.org/projects/anna/linux-nfs.git"), "linux-next"),
     Head(RepoURL("acme/linux.git"), "perf/core"),
+    Head(RepoURL("will/linux.git"), "for-joerg/arm-smmu/updates"),
+    Head(RepoURL("joro/iommu.git"), "next"),
 )
 
 
