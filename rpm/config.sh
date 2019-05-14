@@ -3,7 +3,7 @@ SRCVERSION=4.12
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # buildservice projects to build the kernel against
-OBS_PROJECT=openSUSE:Leap:15.1
+OBS_PROJECT=openSUSE:Leap:15.1:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP1"
