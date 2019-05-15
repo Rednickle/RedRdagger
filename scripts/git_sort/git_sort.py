@@ -27,12 +27,13 @@ import operator
 import os
 import os.path
 import pprint
-import pygit2
 import re
 import shelve
 import subprocess
 import sys
 import types
+
+import pygit2_wrapper as pygit2
 
 
 class GSException(BaseException):
@@ -213,8 +214,7 @@ remotes = (
     Head(RepoURL("horms/ipvs-next.git")),
     Head(RepoURL("klassert/ipsec.git")),
     Head(RepoURL("klassert/ipsec-next.git")),
-    Head(RepoURL("mkp/scsi.git"), "queue"),
-    Head(RepoURL("mkp/scsi.git"), "fixes"),
+    Head(RepoURL("mkp/scsi.git"), "4.19/scsi-queue"),
     Head(RepoURL("mkp/scsi.git"), "5.0/scsi-fixes"),
     Head(RepoURL("git://git.kernel.dk/linux-block.git"), "for-next"),
     Head(RepoURL("git://git.kernel.org/pub/scm/virt/kvm/kvm.git"), "queue"),
@@ -281,7 +281,6 @@ def get_heads(repo):
         result = collections.OrderedDict(
             [(Head(RepoURL(None), "HEAD"),
               str(repo.revparse_single("HEAD").id),)])
-        print("WARNING: Did not find %s in LINUX_GIT remotes." % remotes[0].repo_url.url)
 
     return result
 
@@ -644,10 +643,14 @@ if __name__ == "__main__":
         path = os.environ["GIT_DIR"]
     except KeyError:
         try:
+            # depending on the pygit2 version, discover_repository() will either
+            # raise KeyError or return None if a repository is not found.
             path = pygit2.discover_repository(os.getcwd())
         except KeyError:
-            print("Error: Not a git repository", file=sys.stderr)
-            sys.exit(1)
+            path = None
+    if path is None:
+        print("Error: Not a git repository", file=sys.stderr)
+        sys.exit(1)
     repo = pygit2.Repository(path)
 
     if args.dump_heads:
