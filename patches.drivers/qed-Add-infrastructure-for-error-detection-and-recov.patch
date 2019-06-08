@@ -1,0 +1,507 @@
+From: Tomer Tayar <tomer.tayar@cavium.com>
+Date: Mon, 28 Jan 2019 19:27:55 +0200
+Subject: qed: Add infrastructure for error detection and recovery
+Patch-mainline: v5.1-rc1
+Git-commit: 64515dc899df898991b2b7e56f69f56f014ea888
+References: bsc#1136460 jsc#SLE-4691 bsc#1136461 jsc#SLE-4692
+
+This patch adds the detection and handling of a parity error ("process kill
+event"), including the update of the protocol drivers, and the prevention
+of any HW access that will lead to device access towards the host while
+recovery is in progress.
+It also provides the means for the protocol drivers to trigger a recovery
+process on their decision.
+
+Signed-off-by: Tomer Tayar <tomer.tayar@cavium.com>
+Signed-off-by: Ariel Elior <ariel.elior@cavium.com>
+Signed-off-by: Michal Kalderon <michal.kalderon@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qed/qed.h          |    4 +
+ drivers/net/ethernet/qlogic/qed/qed_dev.c      |   41 +++++++---
+ drivers/net/ethernet/qlogic/qed/qed_hsi.h      |    2 
+ drivers/net/ethernet/qlogic/qed/qed_hw.c       |   11 ++
+ drivers/net/ethernet/qlogic/qed/qed_main.c     |   30 +++++++
+ drivers/net/ethernet/qlogic/qed/qed_mcp.c      |   94 +++++++++++++++++++++++++
+ drivers/net/ethernet/qlogic/qed/qed_mcp.h      |   32 ++++++++
+ drivers/net/ethernet/qlogic/qed/qed_reg_addr.h |    2 
+ drivers/net/ethernet/qlogic/qed/qed_spq.c      |   22 +++++
+ drivers/net/ethernet/qlogic/qed/qed_sriov.c    |    9 ++
+ include/linux/qed/qed_if.h                     |   20 +++++
+ 11 files changed, 251 insertions(+), 16 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -804,6 +804,9 @@ struct qed_dev {
+ 
+ 	u32				mcp_nvm_resp;
+ 
++	/* Recovery */
++	bool recov_in_prog;
++
+ 	/* Linux specific here */
+ 	struct  qede_dev		*edev;
+ 	struct  pci_dev			*pdev;
+@@ -943,6 +946,7 @@ void qed_link_update(struct qed_hwfn *hw
+ u32 qed_unzip_data(struct qed_hwfn *p_hwfn,
+ 		   u32 input_len, u8 *input_buf,
+ 		   u32 max_size, u8 *unzip_buf);
++void qed_schedule_recovery_handler(struct qed_hwfn *p_hwfn);
+ void qed_get_protocol_stats(struct qed_dev *cdev,
+ 			    enum qed_mcp_protocol_type type,
+ 			    union qed_mcp_protocol_stats *stats);
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -2140,6 +2140,11 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 			   "Load request was sent. Load code: 0x%x\n",
+ 			   load_code);
+ 
++		/* Only relevant for recovery:
++		 * Clear the indication after LOAD_REQ is responded by the MFW.
++		 */
++		cdev->recov_in_prog = false;
++
+ 		qed_mcp_set_capabilities(p_hwfn, p_hwfn->p_main_ptt);
+ 
+ 		qed_reset_mb_shadow(p_hwfn, p_hwfn->p_main_ptt);
+@@ -2291,6 +2296,9 @@ static void qed_hw_timers_stop(struct qe
+ 	qed_wr(p_hwfn, p_ptt, TM_REG_PF_ENABLE_CONN, 0x0);
+ 	qed_wr(p_hwfn, p_ptt, TM_REG_PF_ENABLE_TASK, 0x0);
+ 
++	if (cdev->recov_in_prog)
++		return;
++
+ 	for (i = 0; i < QED_HW_STOP_RETRY_LIMIT; i++) {
+ 		if ((!qed_rd(p_hwfn, p_ptt,
+ 			     TM_REG_PF_SCAN_ACTIVE_CONN)) &&
+@@ -2353,12 +2361,14 @@ int qed_hw_stop(struct qed_dev *cdev)
+ 		p_hwfn->hw_init_done = false;
+ 
+ 		/* Send unload command to MCP */
+-		rc = qed_mcp_unload_req(p_hwfn, p_ptt);
+-		if (rc) {
+-			DP_NOTICE(p_hwfn,
+-				  "Failed sending a UNLOAD_REQ command. rc = %d.\n",
+-				  rc);
+-			rc2 = -EINVAL;
++		if (!cdev->recov_in_prog) {
++			rc = qed_mcp_unload_req(p_hwfn, p_ptt);
++			if (rc) {
++				DP_NOTICE(p_hwfn,
++					  "Failed sending a UNLOAD_REQ command. rc = %d.\n",
++					  rc);
++				rc2 = -EINVAL;
++			}
+ 		}
+ 
+ 		qed_slowpath_irq_sync(p_hwfn);
+@@ -2400,16 +2410,18 @@ int qed_hw_stop(struct qed_dev *cdev)
+ 		qed_wr(p_hwfn, p_ptt, DORQ_REG_PF_DB_ENABLE, 0);
+ 		qed_wr(p_hwfn, p_ptt, QM_REG_PF_EN, 0);
+ 
+-		qed_mcp_unload_done(p_hwfn, p_ptt);
+-		if (rc) {
+-			DP_NOTICE(p_hwfn,
+-				  "Failed sending a UNLOAD_DONE command. rc = %d.\n",
+-				  rc);
+-			rc2 = -EINVAL;
++		if (!cdev->recov_in_prog) {
++			rc = qed_mcp_unload_done(p_hwfn, p_ptt);
++			if (rc) {
++				DP_NOTICE(p_hwfn,
++					  "Failed sending a UNLOAD_DONE command. rc = %d.\n",
++					  rc);
++				rc2 = -EINVAL;
++			}
+ 		}
+ 	}
+ 
+-	if (IS_PF(cdev)) {
++	if (IS_PF(cdev) && !cdev->recov_in_prog) {
+ 		p_hwfn = QED_LEADING_HWFN(cdev);
+ 		p_ptt = QED_LEADING_HWFN(cdev)->p_main_ptt;
+ 
+@@ -3459,6 +3471,7 @@ static int qed_hw_prepare_single(struct
+ 				 void __iomem *p_doorbells,
+ 				 enum qed_pci_personality personality)
+ {
++	struct qed_dev *cdev = p_hwfn->cdev;
+ 	int rc = 0;
+ 
+ 	/* Split PCI bars evenly between hwfns */
+@@ -3511,7 +3524,7 @@ static int qed_hw_prepare_single(struct
+ 	/* Sending a mailbox to the MFW should be done after qed_get_hw_info()
+ 	 * is called as it sets the ports number in an engine.
+ 	 */
+-	if (IS_LEAD_HWFN(p_hwfn)) {
++	if (IS_LEAD_HWFN(p_hwfn) && !cdev->recov_in_prog) {
+ 		rc = qed_mcp_initiate_pf_flr(p_hwfn, p_hwfn->p_main_ptt);
+ 		if (rc)
+ 			DP_NOTICE(p_hwfn, "Failed to initiate PF FLR\n");
+--- a/drivers/net/ethernet/qlogic/qed/qed_hsi.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_hsi.h
+@@ -12827,7 +12827,7 @@ enum MFW_DRV_MSG_TYPE {
+ 	MFW_DRV_MSG_LLDP_DATA_UPDATED,
+ 	MFW_DRV_MSG_DCBX_REMOTE_MIB_UPDATED,
+ 	MFW_DRV_MSG_DCBX_OPERATIONAL_MIB_UPDATED,
+-	MFW_DRV_MSG_RESERVED4,
++	MFW_DRV_MSG_ERROR_RECOVERY,
+ 	MFW_DRV_MSG_BW_UPDATE,
+ 	MFW_DRV_MSG_S_TAG_UPDATE,
+ 	MFW_DRV_MSG_GET_LAN_STATS,
+--- a/drivers/net/ethernet/qlogic/qed/qed_hw.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_hw.c
+@@ -703,6 +703,17 @@ static int qed_dmae_execute_command(stru
+ 	int qed_status = 0;
+ 	u32 offset = 0;
+ 
++	if (p_hwfn->cdev->recov_in_prog) {
++		DP_VERBOSE(p_hwfn,
++			   NETIF_MSG_HW,
++			   "Recovery is in progress. Avoid DMAE transaction [{src: addr 0x%llx, type %d}, {dst: addr 0x%llx, type %d}, size %d].\n",
++			   src_addr, src_type, dst_addr, dst_type,
++			   size_in_dwords);
++
++		/* Let the flow complete w/o any error handling */
++		return 0;
++	}
++
+ 	qed_dmae_opcode(p_hwfn,
+ 			(src_type == QED_DMAE_ADDRESS_GRC),
+ 			(dst_type == QED_DMAE_ADDRESS_GRC),
+--- a/drivers/net/ethernet/qlogic/qed/qed_main.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_main.c
+@@ -359,6 +359,8 @@ static struct qed_dev *qed_probe(struct
+ 
+ 	qed_init_dp(cdev, params->dp_module, params->dp_level);
+ 
++	cdev->recov_in_prog = params->recov_in_prog;
++
+ 	rc = qed_init_pci(cdev, pdev);
+ 	if (rc) {
+ 		DP_ERR(cdev, "init pci failed\n");
+@@ -2203,6 +2205,15 @@ static int qed_nvm_get_image(struct qed_
+ 	return qed_mcp_get_nvm_image(hwfn, type, buf, len);
+ }
+ 
++void qed_schedule_recovery_handler(struct qed_hwfn *p_hwfn)
++{
++	struct qed_common_cb_ops *ops = p_hwfn->cdev->protocol_ops.common;
++	void *cookie = p_hwfn->cdev->ops_cookie;
++
++	if (ops && ops->schedule_recovery_handler)
++		ops->schedule_recovery_handler(cookie);
++}
++
+ static int qed_set_coalesce(struct qed_dev *cdev, u16 rx_coal, u16 tx_coal,
+ 			    void *handle)
+ {
+@@ -2226,6 +2237,23 @@ static int qed_set_led(struct qed_dev *c
+ 	return status;
+ }
+ 
++static int qed_recovery_process(struct qed_dev *cdev)
++{
++	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
++	struct qed_ptt *p_ptt;
++	int rc = 0;
++
++	p_ptt = qed_ptt_acquire(p_hwfn);
++	if (!p_ptt)
++		return -EAGAIN;
++
++	rc = qed_start_recovery_process(p_hwfn, p_ptt);
++
++	qed_ptt_release(p_hwfn, p_ptt);
++
++	return rc;
++}
++
+ static int qed_update_wol(struct qed_dev *cdev, bool enabled)
+ {
+ 	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+@@ -2380,6 +2408,8 @@ const struct qed_common_ops qed_common_o
+ 	.nvm_get_image = &qed_nvm_get_image,
+ 	.set_coalesce = &qed_set_coalesce,
+ 	.set_led = &qed_set_led,
++	.recovery_process = &qed_recovery_process,
++	.recovery_prolog = &qed_recovery_prolog,
+ 	.update_drv_state = &qed_update_drv_state,
+ 	.update_mac = &qed_update_mac,
+ 	.update_mtu = &qed_update_mtu,
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -1549,6 +1549,60 @@ int qed_mcp_set_link(struct qed_hwfn *p_
+ 	return 0;
+ }
+ 
++u32 qed_get_process_kill_counter(struct qed_hwfn *p_hwfn,
++				 struct qed_ptt *p_ptt)
++{
++	u32 path_offsize_addr, path_offsize, path_addr, proc_kill_cnt;
++
++	if (IS_VF(p_hwfn->cdev))
++		return -EINVAL;
++
++	path_offsize_addr = SECTION_OFFSIZE_ADDR(p_hwfn->mcp_info->public_base,
++						 PUBLIC_PATH);
++	path_offsize = qed_rd(p_hwfn, p_ptt, path_offsize_addr);
++	path_addr = SECTION_ADDR(path_offsize, QED_PATH_ID(p_hwfn));
++
++	proc_kill_cnt = qed_rd(p_hwfn, p_ptt,
++			       path_addr +
++			       offsetof(struct public_path, process_kill)) &
++			PROCESS_KILL_COUNTER_MASK;
++
++	return proc_kill_cnt;
++}
++
++static void qed_mcp_handle_process_kill(struct qed_hwfn *p_hwfn,
++					struct qed_ptt *p_ptt)
++{
++	struct qed_dev *cdev = p_hwfn->cdev;
++	u32 proc_kill_cnt;
++
++	/* Prevent possible attentions/interrupts during the recovery handling
++	 * and till its load phase, during which they will be re-enabled.
++	 */
++	qed_int_igu_disable_int(p_hwfn, p_ptt);
++
++	DP_NOTICE(p_hwfn, "Received a process kill indication\n");
++
++	/* The following operations should be done once, and thus in CMT mode
++	 * are carried out by only the first HW function.
++	 */
++	if (p_hwfn != QED_LEADING_HWFN(cdev))
++		return;
++
++	if (cdev->recov_in_prog) {
++		DP_NOTICE(p_hwfn,
++			  "Ignoring the indication since a recovery process is already in progress\n");
++		return;
++	}
++
++	cdev->recov_in_prog = true;
++
++	proc_kill_cnt = qed_get_process_kill_counter(p_hwfn, p_ptt);
++	DP_NOTICE(p_hwfn, "Process kill counter: %d\n", proc_kill_cnt);
++
++	qed_schedule_recovery_handler(p_hwfn);
++}
++
+ static void qed_mcp_send_protocol_stats(struct qed_hwfn *p_hwfn,
+ 					struct qed_ptt *p_ptt,
+ 					enum MFW_DRV_MSG_TYPE type)
+@@ -1779,6 +1833,9 @@ int qed_mcp_handle_events(struct qed_hwf
+ 		case MFW_DRV_MSG_TRANSCEIVER_STATE_CHANGE:
+ 			qed_mcp_handle_transceiver_change(p_hwfn, p_ptt);
+ 			break;
++		case MFW_DRV_MSG_ERROR_RECOVERY:
++			qed_mcp_handle_process_kill(p_hwfn, p_ptt);
++			break;
+ 		case MFW_DRV_MSG_GET_LAN_STATS:
+ 		case MFW_DRV_MSG_GET_FCOE_STATS:
+ 		case MFW_DRV_MSG_GET_ISCSI_STATS:
+@@ -2324,6 +2381,43 @@ int qed_mcp_get_flash_size(struct qed_hw
+ 	return 0;
+ }
+ 
++int qed_start_recovery_process(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	struct qed_dev *cdev = p_hwfn->cdev;
++
++	if (cdev->recov_in_prog) {
++		DP_NOTICE(p_hwfn,
++			  "Avoid triggering a recovery since such a process is already in progress\n");
++		return -EAGAIN;
++	}
++
++	DP_NOTICE(p_hwfn, "Triggering a recovery process\n");
++	qed_wr(p_hwfn, p_ptt, MISC_REG_AEU_GENERAL_ATTN_35, 0x1);
++
++	return 0;
++}
++
++#define QED_RECOVERY_PROLOG_SLEEP_MS    100
++
++int qed_recovery_prolog(struct qed_dev *cdev)
++{
++	struct qed_hwfn *p_hwfn = QED_LEADING_HWFN(cdev);
++	struct qed_ptt *p_ptt = p_hwfn->p_main_ptt;
++	int rc;
++
++	/* Allow ongoing PCIe transactions to complete */
++	msleep(QED_RECOVERY_PROLOG_SLEEP_MS);
++
++	/* Clear the PF's internal FID_enable in the PXP */
++	rc = qed_pglueb_set_pfid_enable(p_hwfn, p_ptt, false);
++	if (rc)
++		DP_NOTICE(p_hwfn,
++			  "qed_pglueb_set_pfid_enable() failed. rc = %d.\n",
++			  rc);
++
++	return rc;
++}
++
+ static int
+ qed_mcp_config_vf_msix_bb(struct qed_hwfn *p_hwfn,
+ 			  struct qed_ptt *p_ptt, u8 vf_id, u8 num)
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+@@ -441,6 +441,38 @@ qed_mcp_send_drv_version(struct qed_hwfn
+ 			 struct qed_mcp_drv_version *p_ver);
+ 
+ /**
++ * @brief Read the MFW process kill counter
++ *
++ * @param p_hwfn
++ * @param p_ptt
++ *
++ * @return u32
++ */
++u32 qed_get_process_kill_counter(struct qed_hwfn *p_hwfn,
++				 struct qed_ptt *p_ptt);
++
++/**
++ * @brief Trigger a recovery process
++ *
++ *  @param p_hwfn
++ *  @param p_ptt
++ *
++ * @return int
++ */
++int qed_start_recovery_process(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
++
++/**
++ * @brief A recovery handler must call this function as its first step.
++ *        It is assumed that the handler is not run from an interrupt context.
++ *
++ *  @param cdev
++ *  @param p_ptt
++ *
++ * @return int
++ */
++int qed_recovery_prolog(struct qed_dev *cdev);
++
++/**
+  * @brief Notify MFW about the change in base device properties
+  *
+  *  @param p_hwfn
+--- a/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_reg_addr.h
+@@ -518,6 +518,8 @@
+ 	0x180824UL
+ #define  MISC_REG_AEU_GENERAL_ATTN_0 \
+ 	0x008400UL
++#define MISC_REG_AEU_GENERAL_ATTN_35 \
++	0x00848cUL
+ #define  CAU_REG_SB_ADDR_MEMORY \
+ 	0x1c8000UL
+ #define  CAU_REG_SB_VAR_MEMORY \
+--- a/drivers/net/ethernet/qlogic/qed/qed_spq.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_spq.c
+@@ -795,6 +795,17 @@ int qed_spq_pend_post(struct qed_hwfn *p
+ 				 SPQ_HIGH_PRI_RESERVE_DEFAULT);
+ }
+ 
++static void qed_spq_recov_set_ret_code(struct qed_spq_entry *p_ent,
++				       u8 *fw_return_code)
++{
++	if (!fw_return_code)
++		return;
++
++	if (p_ent->elem.hdr.protocol_id == PROTOCOLID_ROCE ||
++	    p_ent->elem.hdr.protocol_id == PROTOCOLID_IWARP)
++		*fw_return_code = RDMA_RETURN_OK;
++}
++
+ /* Avoid overriding of SPQ entries when getting out-of-order completions, by
+  * marking the completions in a bitmap and increasing the chain consumer only
+  * for the first successive completed entries.
+@@ -830,6 +841,17 @@ int qed_spq_post(struct qed_hwfn *p_hwfn
+ 		return -EINVAL;
+ 	}
+ 
++	if (p_hwfn->cdev->recov_in_prog) {
++		DP_VERBOSE(p_hwfn,
++			   QED_MSG_SPQ,
++			   "Recovery is in progress. Skip spq post [cmd %02x protocol %02x]\n",
++			   p_ent->elem.hdr.cmd_id, p_ent->elem.hdr.protocol_id);
++
++		/* Let the flow complete w/o any error handling */
++		qed_spq_recov_set_ret_code(p_ent, fw_return_code);
++		return 0;
++	}
++
+ 	/* Complete the entry */
+ 	rc = qed_spq_fill_entry(p_hwfn, p_ent);
+ 
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@ -4449,6 +4449,13 @@ int qed_sriov_disable(struct qed_dev *cd
+ 	if (cdev->p_iov_info && cdev->p_iov_info->num_vfs && pci_enabled)
+ 		pci_disable_sriov(cdev->pdev);
+ 
++	if (cdev->recov_in_prog) {
++		DP_VERBOSE(cdev,
++			   QED_MSG_IOV,
++			   "Skip SRIOV disable operations in the device since a recovery is in progress\n");
++		goto out;
++	}
++
+ 	for_each_hwfn(cdev, i) {
+ 		struct qed_hwfn *hwfn = &cdev->hwfns[i];
+ 		struct qed_ptt *ptt = qed_ptt_acquire(hwfn);
+@@ -4488,7 +4495,7 @@ int qed_sriov_disable(struct qed_dev *cd
+ 
+ 		qed_ptt_release(hwfn, ptt);
+ 	}
+-
++out:
+ 	qed_iov_set_vfs_to_disable(cdev, false);
+ 
+ 	return 0;
+--- a/include/linux/qed/qed_if.h
++++ b/include/linux/qed/qed_if.h
+@@ -763,6 +763,7 @@ struct qed_probe_params {
+ 	u32 dp_module;
+ 	u8 dp_level;
+ 	bool is_vf;
++	bool recov_in_prog;
+ };
+ 
+ #define QED_DRV_VER_STR_SIZE 12
+@@ -809,6 +810,7 @@ struct qed_common_cb_ops {
+ 	void (*arfs_filter_op)(void *dev, void *fltr, u8 fw_rc);
+ 	void	(*link_update)(void			*dev,
+ 			       struct qed_link_output	*link);
++	void (*schedule_recovery_handler)(void *dev);
+ 	void	(*dcbx_aen)(void *dev, struct qed_dcbx_get *get, u32 mib_type);
+ 	void (*get_generic_tlv_data)(void *dev, struct qed_generic_tlvs *data);
+ 	void (*get_protocol_tlv_data)(void *dev, void *data);
+@@ -1057,6 +1059,24 @@ struct qed_common_ops {
+ 			       void __iomem *db_addr, void *db_data);
+ 
+ /**
++ * @brief recovery_process - Trigger a recovery process
++ *
++ * @param cdev
++ *
++ * @return 0 on success, error otherwise.
++ */
++	int (*recovery_process)(struct qed_dev *cdev);
++
++/**
++ * @brief recovery_prolog - Execute the prolog operations of a recovery process
++ *
++ * @param cdev
++ *
++ * @return 0 on success, error otherwise.
++ */
++	int (*recovery_prolog)(struct qed_dev *cdev);
++
++/**
+  * @brief update_drv_state - API to inform the change in the driver state.
+  *
+  * @param cdev
