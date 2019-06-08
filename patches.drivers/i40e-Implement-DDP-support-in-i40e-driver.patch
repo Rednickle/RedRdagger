@@ -1,0 +1,953 @@
+From: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Date: Wed, 6 Feb 2019 15:08:16 -0800
+Subject: i40e: Implement DDP support in i40e driver
+Patch-mainline: v5.2-rc1
+Git-commit: cdc594e00370e153c323cf8aa9c43b66679e09a0
+References: jsc#SLE-4797
+
+This patch introduces DDP (Dynamic Device Personalization) which allows
+loading profiles that change the way internal parser interprets processed
+frames. To load DDP profiles it utilizes ethtool flash feature. The files
+with recipes must be located in /var/lib/firmware directory. Afterwards
+the recipe can be loaded by invoking:
+
+    ethtool -f <if_name> <file_name> 100
+    ethtool -f <if_name> - 100
+
+See further details of this feature in the i40e documentation, or
+visit
+https://www.intel.com/content/www/us/en/architecture-and-technology/ethernet/dynamic-device-personalization-brief.html
+
+The driver shall verify DDP profile can be loaded in accordance with
+the rules:
+* Package with Group ID 0 are exclusive and can only be loaded the first.
+* Packages with Group ID 0x01-0xFE can only be loaded simultaneously
+   with the packages from the same group.
+* Packages with Group ID 0xFF are compatible with all other packages.
+
+Signed-off-by: Aleksandr Loktionov <aleksandr.loktionov@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/intel/i40e/Makefile         |    1 
+ drivers/net/ethernet/intel/i40e/i40e.h           |   25 +
+ drivers/net/ethernet/intel/i40e/i40e_common.c    |  253 +++++++++++-
+ drivers/net/ethernet/intel/i40e/i40e_ddp.c       |  481 +++++++++++++++++++++++
+ drivers/net/ethernet/intel/i40e/i40e_ethtool.c   |    1 
+ drivers/net/ethernet/intel/i40e/i40e_main.c      |    1 
+ drivers/net/ethernet/intel/i40e/i40e_prototype.h |    6 
+ drivers/net/ethernet/intel/i40e/i40e_type.h      |   23 +
+ 8 files changed, 769 insertions(+), 22 deletions(-)
+ create mode 100644 drivers/net/ethernet/intel/i40e/i40e_ddp.c
+
+--- a/drivers/net/ethernet/intel/i40e/Makefile
++++ b/drivers/net/ethernet/intel/i40e/Makefile
+@@ -44,6 +44,7 @@ i40e-objs := i40e_main.o \
+ 	i40e_diag.o	\
+ 	i40e_txrx.o	\
+ 	i40e_ptp.o	\
++	i40e_ddp.o \
+ 	i40e_client.o   \
+ 	i40e_virtchnl_pf.o \
+ 	i40e_xsk.o
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -344,6 +344,29 @@ struct i40e_udp_port_config {
+ 	u8 filter_index;
+ };
+ 
++#define I40_DDP_FLASH_REGION 100
++#define I40E_PROFILE_INFO_SIZE 48
++#define I40E_MAX_PROFILE_NUM 16
++#define I40E_PROFILE_LIST_SIZE \
++	(I40E_PROFILE_INFO_SIZE * I40E_MAX_PROFILE_NUM + 4)
++#define I40E_DDP_PROFILE_PATH "intel/i40e/ddp/"
++#define I40E_DDP_PROFILE_NAME_MAX 64
++
++int i40e_ddp_load(struct net_device *netdev, const u8 *data, size_t size,
++		  bool is_add);
++int i40e_ddp_flash(struct net_device *netdev, struct ethtool_flash *flash);
++
++struct i40e_ddp_profile_list {
++	u32 p_count;
++	struct i40e_profile_info p_info[0];
++};
++
++struct i40e_ddp_old_profile_list {
++	struct list_head list;
++	size_t old_ddp_size;
++	u8 old_ddp_buf[0];
++};
++
+ /* macros related to FLX_PIT */
+ #define I40E_FLEX_SET_FSIZE(fsize) (((fsize) << \
+ 				    I40E_PRTQF_FLX_PIT_FSIZE_SHIFT) & \
+@@ -633,6 +656,8 @@ struct i40e_pf {
+ 	u16 override_q_count;
+ 	u16 last_sw_conf_flags;
+ 	u16 last_sw_conf_valid_flags;
++	/* List to keep previous DDP profiles to be rolled back in the future */
++	struct list_head ddp_old_prof;
+ };
+ 
+ /**
+--- a/drivers/net/ethernet/intel/i40e/i40e_common.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_common.c
+@@ -5471,6 +5471,163 @@ i40e_find_segment_in_package(u32 segment
+ 	return NULL;
+ }
+ 
++/* Get section table in profile */
++#define I40E_SECTION_TABLE(profile, sec_tbl)				\
++	do {								\
++		struct i40e_profile_segment *p = (profile);		\
++		u32 count;						\
++		u32 *nvm;						\
++		count = p->device_table_count;				\
++		nvm = (u32 *)&p->device_table[count];			\
++		sec_tbl = (struct i40e_section_table *)&nvm[nvm[0] + 1]; \
++	} while (0)
++
++/* Get section header in profile */
++#define I40E_SECTION_HEADER(profile, offset)				\
++	(struct i40e_profile_section_header *)((u8 *)(profile) + (offset))
++
++/**
++ * i40e_find_section_in_profile
++ * @section_type: the section type to search for (i.e., SECTION_TYPE_NOTE)
++ * @profile: pointer to the i40e segment header to be searched
++ *
++ * This function searches i40e segment for a particular section type. On
++ * success it returns a pointer to the section header, otherwise it will
++ * return NULL.
++ **/
++struct i40e_profile_section_header *
++i40e_find_section_in_profile(u32 section_type,
++			     struct i40e_profile_segment *profile)
++{
++	struct i40e_profile_section_header *sec;
++	struct i40e_section_table *sec_tbl;
++	u32 sec_off;
++	u32 i;
++
++	if (profile->header.type != SEGMENT_TYPE_I40E)
++		return NULL;
++
++	I40E_SECTION_TABLE(profile, sec_tbl);
++
++	for (i = 0; i < sec_tbl->section_count; i++) {
++		sec_off = sec_tbl->section_offset[i];
++		sec = I40E_SECTION_HEADER(profile, sec_off);
++		if (sec->section.type == section_type)
++			return sec;
++	}
++
++	return NULL;
++}
++
++/**
++ * i40e_ddp_exec_aq_section - Execute generic AQ for DDP
++ * @hw: pointer to the hw struct
++ * @aq: command buffer containing all data to execute AQ
++ **/
++static enum
++i40e_status_code i40e_ddp_exec_aq_section(struct i40e_hw *hw,
++					  struct i40e_profile_aq_section *aq)
++{
++	i40e_status status;
++	struct i40e_aq_desc desc;
++	u8 *msg = NULL;
++	u16 msglen;
++
++	i40e_fill_default_direct_cmd_desc(&desc, aq->opcode);
++	desc.flags |= cpu_to_le16(aq->flags);
++	memcpy(desc.params.raw, aq->param, sizeof(desc.params.raw));
++
++	msglen = aq->datalen;
++	if (msglen) {
++		desc.flags |= cpu_to_le16((u16)(I40E_AQ_FLAG_BUF |
++						I40E_AQ_FLAG_RD));
++		if (msglen > I40E_AQ_LARGE_BUF)
++			desc.flags |= cpu_to_le16((u16)I40E_AQ_FLAG_LB);
++		desc.datalen = cpu_to_le16(msglen);
++		msg = &aq->data[0];
++	}
++
++	status = i40e_asq_send_command(hw, &desc, msg, msglen, NULL);
++
++	if (status) {
++		i40e_debug(hw, I40E_DEBUG_PACKAGE,
++			   "unable to exec DDP AQ opcode %u, error %d\n",
++			   aq->opcode, status);
++		return status;
++	}
++
++	/* copy returned desc to aq_buf */
++	memcpy(aq->param, desc.params.raw, sizeof(desc.params.raw));
++
++	return 0;
++}
++
++/**
++ * i40e_validate_profile
++ * @hw: pointer to the hardware structure
++ * @profile: pointer to the profile segment of the package to be validated
++ * @track_id: package tracking id
++ * @rollback: flag if the profile is for rollback.
++ *
++ * Validates supported devices and profile's sections.
++ */
++static enum i40e_status_code
++i40e_validate_profile(struct i40e_hw *hw, struct i40e_profile_segment *profile,
++		      u32 track_id, bool rollback)
++{
++	struct i40e_profile_section_header *sec = NULL;
++	i40e_status status = 0;
++	struct i40e_section_table *sec_tbl;
++	u32 vendor_dev_id;
++	u32 dev_cnt;
++	u32 sec_off;
++	u32 i;
++
++	if (track_id == I40E_DDP_TRACKID_INVALID) {
++		i40e_debug(hw, I40E_DEBUG_PACKAGE, "Invalid track_id\n");
++		return I40E_NOT_SUPPORTED;
++	}
++
++	dev_cnt = profile->device_table_count;
++	for (i = 0; i < dev_cnt; i++) {
++		vendor_dev_id = profile->device_table[i].vendor_dev_id;
++		if ((vendor_dev_id >> 16) == PCI_VENDOR_ID_INTEL &&
++		    hw->device_id == (vendor_dev_id & 0xFFFF))
++			break;
++	}
++	if (dev_cnt && i == dev_cnt) {
++		i40e_debug(hw, I40E_DEBUG_PACKAGE,
++			   "Device doesn't support DDP\n");
++		return I40E_ERR_DEVICE_NOT_SUPPORTED;
++	}
++
++	I40E_SECTION_TABLE(profile, sec_tbl);
++
++	/* Validate sections types */
++	for (i = 0; i < sec_tbl->section_count; i++) {
++		sec_off = sec_tbl->section_offset[i];
++		sec = I40E_SECTION_HEADER(profile, sec_off);
++		if (rollback) {
++			if (sec->section.type == SECTION_TYPE_MMIO ||
++			    sec->section.type == SECTION_TYPE_AQ ||
++			    sec->section.type == SECTION_TYPE_RB_AQ) {
++				i40e_debug(hw, I40E_DEBUG_PACKAGE,
++					   "Not a roll-back package\n");
++				return I40E_NOT_SUPPORTED;
++			}
++		} else {
++			if (sec->section.type == SECTION_TYPE_RB_AQ ||
++			    sec->section.type == SECTION_TYPE_RB_MMIO) {
++				i40e_debug(hw, I40E_DEBUG_PACKAGE,
++					   "Not an original package\n");
++				return I40E_NOT_SUPPORTED;
++			}
++		}
++	}
++
++	return status;
++}
++
+ /**
+  * i40e_write_profile
+  * @hw: pointer to the hardware structure
+@@ -5486,47 +5643,99 @@ i40e_write_profile(struct i40e_hw *hw, s
+ 	i40e_status status = 0;
+ 	struct i40e_section_table *sec_tbl;
+ 	struct i40e_profile_section_header *sec = NULL;
+-	u32 dev_cnt;
+-	u32 vendor_dev_id;
+-	u32 *nvm;
++	struct i40e_profile_aq_section *ddp_aq;
+ 	u32 section_size = 0;
+ 	u32 offset = 0, info = 0;
++	u32 sec_off;
+ 	u32 i;
+ 
+-	dev_cnt = profile->device_table_count;
++	status = i40e_validate_profile(hw, profile, track_id, false);
++	if (status)
++		return status;
+ 
+-	for (i = 0; i < dev_cnt; i++) {
+-		vendor_dev_id = profile->device_table[i].vendor_dev_id;
+-		if ((vendor_dev_id >> 16) == PCI_VENDOR_ID_INTEL)
+-			if (hw->device_id == (vendor_dev_id & 0xFFFF))
++	I40E_SECTION_TABLE(profile, sec_tbl);
++
++	for (i = 0; i < sec_tbl->section_count; i++) {
++		sec_off = sec_tbl->section_offset[i];
++		sec = I40E_SECTION_HEADER(profile, sec_off);
++		/* Process generic admin command */
++		if (sec->section.type == SECTION_TYPE_AQ) {
++			ddp_aq = (struct i40e_profile_aq_section *)&sec[1];
++			status = i40e_ddp_exec_aq_section(hw, ddp_aq);
++			if (status) {
++				i40e_debug(hw, I40E_DEBUG_PACKAGE,
++					   "Failed to execute aq: section %d, opcode %u\n",
++					   i, ddp_aq->opcode);
+ 				break;
++			}
++			sec->section.type = SECTION_TYPE_RB_AQ;
++		}
++
++		/* Skip any non-mmio sections */
++		if (sec->section.type != SECTION_TYPE_MMIO)
++			continue;
++
++		section_size = sec->section.size +
++			sizeof(struct i40e_profile_section_header);
++
++		/* Write MMIO section */
++		status = i40e_aq_write_ddp(hw, (void *)sec, (u16)section_size,
++					   track_id, &offset, &info, NULL);
++		if (status) {
++			i40e_debug(hw, I40E_DEBUG_PACKAGE,
++				   "Failed to write profile: section %d, offset %d, info %d\n",
++				   i, offset, info);
++			break;
++		}
+ 	}
+-	if (i == dev_cnt) {
+-		i40e_debug(hw, I40E_DEBUG_PACKAGE, "Device doesn't support DDP");
+-		return I40E_ERR_DEVICE_NOT_SUPPORTED;
+-	}
++	return status;
++}
++
++/**
++ * i40e_rollback_profile
++ * @hw: pointer to the hardware structure
++ * @profile: pointer to the profile segment of the package to be removed
++ * @track_id: package tracking id
++ *
++ * Rolls back previously loaded package.
++ */
++enum i40e_status_code
++i40e_rollback_profile(struct i40e_hw *hw, struct i40e_profile_segment *profile,
++		      u32 track_id)
++{
++	struct i40e_profile_section_header *sec = NULL;
++	i40e_status status = 0;
++	struct i40e_section_table *sec_tbl;
++	u32 offset = 0, info = 0;
++	u32 section_size = 0;
++	u32 sec_off;
++	int i;
+ 
+-	nvm = (u32 *)&profile->device_table[dev_cnt];
+-	sec_tbl = (struct i40e_section_table *)&nvm[nvm[0] + 1];
++	status = i40e_validate_profile(hw, profile, track_id, true);
++	if (status)
++		return status;
+ 
+-	for (i = 0; i < sec_tbl->section_count; i++) {
+-		sec = (struct i40e_profile_section_header *)((u8 *)profile +
+-					     sec_tbl->section_offset[i]);
++	I40E_SECTION_TABLE(profile, sec_tbl);
+ 
+-		/* Skip 'AQ', 'note' and 'name' sections */
+-		if (sec->section.type != SECTION_TYPE_MMIO)
++	/* For rollback write sections in reverse */
++	for (i = sec_tbl->section_count - 1; i >= 0; i--) {
++		sec_off = sec_tbl->section_offset[i];
++		sec = I40E_SECTION_HEADER(profile, sec_off);
++
++		/* Skip any non-rollback sections */
++		if (sec->section.type != SECTION_TYPE_RB_MMIO)
+ 			continue;
+ 
+ 		section_size = sec->section.size +
+ 			sizeof(struct i40e_profile_section_header);
+ 
+-		/* Write profile */
++		/* Write roll-back MMIO section */
+ 		status = i40e_aq_write_ddp(hw, (void *)sec, (u16)section_size,
+ 					   track_id, &offset, &info, NULL);
+ 		if (status) {
+ 			i40e_debug(hw, I40E_DEBUG_PACKAGE,
+-				   "Failed to write profile: offset %d, info %d",
+-				   offset, info);
++				   "Failed to write profile: section %d, offset %d, info %d\n",
++				   i, offset, info);
+ 			break;
+ 		}
+ 	}
+--- /dev/null
++++ b/drivers/net/ethernet/intel/i40e/i40e_ddp.c
+@@ -0,0 +1,481 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright(c) 2013 - 2018 Intel Corporation. */
++
++#include "i40e.h"
++
++#include <linux/firmware.h>
++
++/**
++ * i40e_ddp_profiles_eq - checks if DDP profiles are the equivalent
++ * @a: new profile info
++ * @b: old profile info
++ *
++ * checks if DDP profiles are the equivalent.
++ * Returns true if profiles are the same.
++ **/
++static bool i40e_ddp_profiles_eq(struct i40e_profile_info *a,
++				 struct i40e_profile_info *b)
++{
++	return a->track_id == b->track_id &&
++		!memcmp(&a->version, &b->version, sizeof(a->version)) &&
++		!memcmp(&a->name, &b->name, I40E_DDP_NAME_SIZE);
++}
++
++/**
++ * i40e_ddp_does_profile_exist - checks if DDP profile loaded already
++ * @hw: HW data structure
++ * @pinfo: DDP profile information structure
++ *
++ * checks if DDP profile loaded already.
++ * Returns >0 if the profile exists.
++ * Returns  0 if the profile is absent.
++ * Returns <0 if error.
++ **/
++static int i40e_ddp_does_profile_exist(struct i40e_hw *hw,
++				       struct i40e_profile_info *pinfo)
++{
++	struct i40e_ddp_profile_list *profile_list;
++	u8 buff[I40E_PROFILE_LIST_SIZE];
++	i40e_status status;
++	int i;
++
++	status = i40e_aq_get_ddp_list(hw, buff, I40E_PROFILE_LIST_SIZE, 0,
++				      NULL);
++	if (status)
++		return -1;
++
++	profile_list = (struct i40e_ddp_profile_list *)buff;
++	for (i = 0; i < profile_list->p_count; i++) {
++		if (i40e_ddp_profiles_eq(pinfo, &profile_list->p_info[i]))
++			return 1;
++	}
++	return 0;
++}
++
++/**
++ * i40e_ddp_profiles_overlap - checks if DDP profiles overlap.
++ * @new: new profile info
++ * @old: old profile info
++ *
++ * checks if DDP profiles overlap.
++ * Returns true if profiles are overlap.
++ **/
++static bool i40e_ddp_profiles_overlap(struct i40e_profile_info *new,
++				      struct i40e_profile_info *old)
++{
++	unsigned int group_id_old = (u8)((old->track_id & 0x00FF0000) >> 16);
++	unsigned int group_id_new = (u8)((new->track_id & 0x00FF0000) >> 16);
++
++	/* 0x00 group must be only the first */
++	if (group_id_new == 0)
++		return true;
++	/* 0xFF group is compatible with anything else */
++	if (group_id_new == 0xFF || group_id_old == 0xFF)
++		return false;
++	/* otherwise only profiles from the same group are compatible*/
++	return group_id_old != group_id_new;
++}
++
++/**
++ * i40e_ddp_does_profiles_ - checks if DDP overlaps with existing one.
++ * @hw: HW data structure
++ * @pinfo: DDP profile information structure
++ *
++ * checks if DDP profile overlaps with existing one.
++ * Returns >0 if the profile overlaps.
++ * Returns  0 if the profile is ok.
++ * Returns <0 if error.
++ **/
++static int i40e_ddp_does_profile_overlap(struct i40e_hw *hw,
++					 struct i40e_profile_info *pinfo)
++{
++	struct i40e_ddp_profile_list *profile_list;
++	u8 buff[I40E_PROFILE_LIST_SIZE];
++	i40e_status status;
++	int i;
++
++	status = i40e_aq_get_ddp_list(hw, buff, I40E_PROFILE_LIST_SIZE, 0,
++				      NULL);
++	if (status)
++		return -EIO;
++
++	profile_list = (struct i40e_ddp_profile_list *)buff;
++	for (i = 0; i < profile_list->p_count; i++) {
++		if (i40e_ddp_profiles_overlap(pinfo,
++					      &profile_list->p_info[i]))
++			return 1;
++	}
++	return 0;
++}
++
++/**
++ * i40e_add_pinfo
++ * @hw: pointer to the hardware structure
++ * @profile: pointer to the profile segment of the package
++ * @profile_info_sec: buffer for information section
++ * @track_id: package tracking id
++ *
++ * Register a profile to the list of loaded profiles.
++ */
++static enum i40e_status_code
++i40e_add_pinfo(struct i40e_hw *hw, struct i40e_profile_segment *profile,
++	       u8 *profile_info_sec, u32 track_id)
++{
++	struct i40e_profile_section_header *sec;
++	struct i40e_profile_info *pinfo;
++	i40e_status status;
++	u32 offset = 0, info = 0;
++
++	sec = (struct i40e_profile_section_header *)profile_info_sec;
++	sec->tbl_size = 1;
++	sec->data_end = sizeof(struct i40e_profile_section_header) +
++			sizeof(struct i40e_profile_info);
++	sec->section.type = SECTION_TYPE_INFO;
++	sec->section.offset = sizeof(struct i40e_profile_section_header);
++	sec->section.size = sizeof(struct i40e_profile_info);
++	pinfo = (struct i40e_profile_info *)(profile_info_sec +
++					     sec->section.offset);
++	pinfo->track_id = track_id;
++	pinfo->version = profile->version;
++	pinfo->op = I40E_DDP_ADD_TRACKID;
++
++	/* Clear reserved field */
++	memset(pinfo->reserved, 0, sizeof(pinfo->reserved));
++	memcpy(pinfo->name, profile->name, I40E_DDP_NAME_SIZE);
++
++	status = i40e_aq_write_ddp(hw, (void *)sec, sec->data_end,
++				   track_id, &offset, &info, NULL);
++	return status;
++}
++
++/**
++ * i40e_del_pinfo - delete DDP profile info from NIC
++ * @hw: HW data structure
++ * @profile: DDP profile segment to be deleted
++ * @profile_info_sec: DDP profile section header
++ * @track_id: track ID of the profile for deletion
++ *
++ * Removes DDP profile from the NIC.
++ **/
++static enum i40e_status_code
++i40e_del_pinfo(struct i40e_hw *hw, struct i40e_profile_segment *profile,
++	       u8 *profile_info_sec, u32 track_id)
++{
++	struct i40e_profile_section_header *sec;
++	struct i40e_profile_info *pinfo;
++	i40e_status status;
++	u32 offset = 0, info = 0;
++
++	sec = (struct i40e_profile_section_header *)profile_info_sec;
++	sec->tbl_size = 1;
++	sec->data_end = sizeof(struct i40e_profile_section_header) +
++			sizeof(struct i40e_profile_info);
++	sec->section.type = SECTION_TYPE_INFO;
++	sec->section.offset = sizeof(struct i40e_profile_section_header);
++	sec->section.size = sizeof(struct i40e_profile_info);
++	pinfo = (struct i40e_profile_info *)(profile_info_sec +
++					     sec->section.offset);
++	pinfo->track_id = track_id;
++	pinfo->version = profile->version;
++	pinfo->op = I40E_DDP_REMOVE_TRACKID;
++
++	/* Clear reserved field */
++	memset(pinfo->reserved, 0, sizeof(pinfo->reserved));
++	memcpy(pinfo->name, profile->name, I40E_DDP_NAME_SIZE);
++
++	status = i40e_aq_write_ddp(hw, (void *)sec, sec->data_end,
++				   track_id, &offset, &info, NULL);
++	return status;
++}
++
++/**
++ * i40e_ddp_is_pkg_hdr_valid - performs basic pkg header integrity checks
++ * @netdev: net device structure (for logging purposes)
++ * @pkg_hdr: pointer to package header
++ * @size_huge: size of the whole DDP profile package in size_t
++ *
++ * Checks correctness of pkg header: Version, size too big/small, and
++ * all segment offsets alignment and boundaries. This function lets
++ * reject non DDP profile file to be loaded by administrator mistake.
++ **/
++static bool i40e_ddp_is_pkg_hdr_valid(struct net_device *netdev,
++				      struct i40e_package_header *pkg_hdr,
++				      size_t size_huge)
++{
++	u32 size = 0xFFFFFFFFU & size_huge;
++	u32 pkg_hdr_size;
++	u32 segment;
++
++	if (!pkg_hdr)
++		return false;
++
++	if (pkg_hdr->version.major > 0) {
++		struct i40e_ddp_version ver = pkg_hdr->version;
++
++		netdev_err(netdev, "Unsupported DDP profile version %u.%u.%u.%u",
++			   ver.major, ver.minor, ver.update, ver.draft);
++		return false;
++	}
++	if (size_huge > size) {
++		netdev_err(netdev, "Invalid DDP profile - size is bigger than 4G");
++		return false;
++	}
++	if (size < (sizeof(struct i40e_package_header) +
++		sizeof(struct i40e_metadata_segment) + sizeof(u32) * 2)) {
++		netdev_err(netdev, "Invalid DDP profile - size is too small.");
++		return false;
++	}
++
++	pkg_hdr_size = sizeof(u32) * (pkg_hdr->segment_count + 2U);
++	if (size < pkg_hdr_size) {
++		netdev_err(netdev, "Invalid DDP profile - too many segments");
++		return false;
++	}
++	for (segment = 0; segment < pkg_hdr->segment_count; ++segment) {
++		u32 offset = pkg_hdr->segment_offset[segment];
++
++		if (0xFU & offset) {
++			netdev_err(netdev,
++				   "Invalid DDP profile %u segment alignment",
++				   segment);
++			return false;
++		}
++		if (pkg_hdr_size > offset || offset >= size) {
++			netdev_err(netdev,
++				   "Invalid DDP profile %u segment offset",
++				   segment);
++			return false;
++		}
++	}
++
++	return true;
++}
++
++/**
++ * i40e_ddp_load - performs DDP loading
++ * @netdev: net device structure
++ * @data: buffer containing recipe file
++ * @size: size of the buffer
++ * @is_add: true when loading profile, false when rolling back the previous one
++ *
++ * Checks correctness and loads DDP profile to the NIC. The function is
++ * also used for rolling back previously loaded profile.
++ **/
++int i40e_ddp_load(struct net_device *netdev, const u8 *data, size_t size,
++		  bool is_add)
++{
++	u8 profile_info_sec[sizeof(struct i40e_profile_section_header) +
++			    sizeof(struct i40e_profile_info)];
++	struct i40e_metadata_segment *metadata_hdr;
++	struct i40e_profile_segment *profile_hdr;
++	struct i40e_profile_info pinfo;
++	struct i40e_package_header *pkg_hdr;
++	i40e_status status;
++	struct i40e_netdev_priv *np = netdev_priv(netdev);
++	struct i40e_vsi *vsi = np->vsi;
++	struct i40e_pf *pf = vsi->back;
++	u32 track_id;
++	int istatus;
++
++	pkg_hdr = (struct i40e_package_header *)data;
++	if (!i40e_ddp_is_pkg_hdr_valid(netdev, pkg_hdr, size))
++		return -EINVAL;
++
++	if (size < (sizeof(struct i40e_package_header) +
++		    sizeof(struct i40e_metadata_segment) + sizeof(u32) * 2)) {
++		netdev_err(netdev, "Invalid DDP recipe size.");
++		return -EINVAL;
++	}
++
++	/* Find beginning of segment data in buffer */
++	metadata_hdr = (struct i40e_metadata_segment *)
++		i40e_find_segment_in_package(SEGMENT_TYPE_METADATA, pkg_hdr);
++	if (!metadata_hdr) {
++		netdev_err(netdev, "Failed to find metadata segment in DDP recipe.");
++		return -EINVAL;
++	}
++
++	track_id = metadata_hdr->track_id;
++	profile_hdr = (struct i40e_profile_segment *)
++		i40e_find_segment_in_package(SEGMENT_TYPE_I40E, pkg_hdr);
++	if (!profile_hdr) {
++		netdev_err(netdev, "Failed to find profile segment in DDP recipe.");
++		return -EINVAL;
++	}
++
++	pinfo.track_id = track_id;
++	pinfo.version = profile_hdr->version;
++	if (is_add)
++		pinfo.op = I40E_DDP_ADD_TRACKID;
++	else
++		pinfo.op = I40E_DDP_REMOVE_TRACKID;
++
++	memcpy(pinfo.name, profile_hdr->name, I40E_DDP_NAME_SIZE);
++
++	/* Check if profile data already exists*/
++	istatus = i40e_ddp_does_profile_exist(&pf->hw, &pinfo);
++	if (istatus < 0) {
++		netdev_err(netdev, "Failed to fetch loaded profiles.");
++		return istatus;
++	}
++	if (is_add) {
++		if (istatus > 0) {
++			netdev_err(netdev, "DDP profile already loaded.");
++			return -EINVAL;
++		}
++		istatus = i40e_ddp_does_profile_overlap(&pf->hw, &pinfo);
++		if (istatus < 0) {
++			netdev_err(netdev, "Failed to fetch loaded profiles.");
++			return istatus;
++		}
++		if (istatus > 0) {
++			netdev_err(netdev, "DDP profile overlaps with existing one.");
++			return -EINVAL;
++		}
++	} else {
++		if (istatus == 0) {
++			netdev_err(netdev,
++				   "DDP profile for deletion does not exist.");
++			return -EINVAL;
++		}
++	}
++
++	/* Load profile data */
++	if (is_add) {
++		status = i40e_write_profile(&pf->hw, profile_hdr, track_id);
++		if (status) {
++			if (status == I40E_ERR_DEVICE_NOT_SUPPORTED) {
++				netdev_err(netdev,
++					   "Profile is not supported by the device.");
++				return -EPERM;
++			}
++			netdev_err(netdev, "Failed to write DDP profile.");
++			return -EIO;
++		}
++	} else {
++		status = i40e_rollback_profile(&pf->hw, profile_hdr, track_id);
++		if (status) {
++			netdev_err(netdev, "Failed to remove DDP profile.");
++			return -EIO;
++		}
++	}
++
++	/* Add/remove profile to/from profile list in FW */
++	if (is_add) {
++		status = i40e_add_pinfo(&pf->hw, profile_hdr, profile_info_sec,
++					track_id);
++		if (status) {
++			netdev_err(netdev, "Failed to add DDP profile info.");
++			return -EIO;
++		}
++	} else {
++		status = i40e_del_pinfo(&pf->hw, profile_hdr, profile_info_sec,
++					track_id);
++		if (status) {
++			netdev_err(netdev, "Failed to restore DDP profile info.");
++			return -EIO;
++		}
++	}
++
++	return 0;
++}
++
++/**
++ * i40e_ddp_restore - restore previously loaded profile and remove from list
++ * @pf: PF data struct
++ *
++ * Restores previously loaded profile stored on the list in driver memory.
++ * After rolling back removes entry from the list.
++ **/
++static int i40e_ddp_restore(struct i40e_pf *pf)
++{
++	struct i40e_ddp_old_profile_list *entry;
++	struct net_device *netdev = pf->vsi[pf->lan_vsi]->netdev;
++	int status = 0;
++
++	if (!list_empty(&pf->ddp_old_prof)) {
++		entry = list_first_entry(&pf->ddp_old_prof,
++					 struct i40e_ddp_old_profile_list,
++					 list);
++		status = i40e_ddp_load(netdev, entry->old_ddp_buf,
++				       entry->old_ddp_size, false);
++		list_del(&entry->list);
++		kfree(entry);
++	}
++	return status;
++}
++
++/**
++ * i40e_ddp_flash - callback function for ethtool flash feature
++ * @netdev: net device structure
++ * @flash: kernel flash structure
++ *
++ * Ethtool callback function used for loading and unloading DDP profiles.
++ **/
++int i40e_ddp_flash(struct net_device *netdev, struct ethtool_flash *flash)
++{
++	const struct firmware *ddp_config;
++	struct i40e_netdev_priv *np = netdev_priv(netdev);
++	struct i40e_vsi *vsi = np->vsi;
++	struct i40e_pf *pf = vsi->back;
++	int status = 0;
++
++	/* Check for valid region first */
++	if (flash->region != I40_DDP_FLASH_REGION) {
++		netdev_err(netdev, "Requested firmware region is not recognized by this driver.");
++		return -EINVAL;
++	}
++	if (pf->hw.bus.func != 0) {
++		netdev_err(netdev, "Any DDP operation is allowed only on Phy0 NIC interface");
++		return -EINVAL;
++	}
++
++	/* If the user supplied "-" instead of file name rollback previously
++	 * stored profile.
++	 */
++	if (strncmp(flash->data, "-", 2) != 0) {
++		struct i40e_ddp_old_profile_list *list_entry;
++		char profile_name[sizeof(I40E_DDP_PROFILE_PATH)
++				  + I40E_DDP_PROFILE_NAME_MAX];
++
++		profile_name[sizeof(profile_name) - 1] = 0;
++		strncpy(profile_name, I40E_DDP_PROFILE_PATH,
++			sizeof(profile_name) - 1);
++		strncat(profile_name, flash->data, I40E_DDP_PROFILE_NAME_MAX);
++		/* Load DDP recipe. */
++		status = request_firmware(&ddp_config, profile_name,
++					  &netdev->dev);
++		if (status) {
++			netdev_err(netdev, "DDP recipe file request failed.");
++			return status;
++		}
++
++		status = i40e_ddp_load(netdev, ddp_config->data,
++				       ddp_config->size, true);
++
++		if (!status) {
++			list_entry =
++			  kzalloc(sizeof(struct i40e_ddp_old_profile_list) +
++				  ddp_config->size, GFP_KERNEL);
++			if (!list_entry) {
++				netdev_info(netdev, "Failed to allocate memory for previous DDP profile data.");
++				netdev_info(netdev, "New profile loaded but roll-back will be impossible.");
++			} else {
++				memcpy(list_entry->old_ddp_buf,
++				       ddp_config->data, ddp_config->size);
++				list_entry->old_ddp_size = ddp_config->size;
++				list_add(&list_entry->list, &pf->ddp_old_prof);
++			}
++		}
++
++		release_firmware(ddp_config);
++	} else {
++		if (!list_empty(&pf->ddp_old_prof)) {
++			status = i40e_ddp_restore(pf);
++		} else {
++			netdev_warn(netdev, "There is no DDP profile to restore.");
++			status = -ENOENT;
++		}
++	}
++	return status;
++}
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@ -5194,6 +5194,7 @@ static const struct ethtool_ops i40e_eth
+ 	.set_link_ksettings	= i40e_set_link_ksettings,
+ 	.get_fecparam = i40e_get_fec_param,
+ 	.set_fecparam = i40e_set_fec_param,
++	.flash_device = i40e_ddp_flash,
+ };
+ 
+ void i40e_set_ethtool_ops(struct net_device *netdev)
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -14052,6 +14052,7 @@ static int i40e_probe(struct pci_dev *pd
+ 
+ 	INIT_LIST_HEAD(&pf->l3_flex_pit_list);
+ 	INIT_LIST_HEAD(&pf->l4_flex_pit_list);
++	INIT_LIST_HEAD(&pf->ddp_old_prof);
+ 
+ 	/* set up the locks for the AQ, do this only once in probe
+ 	 * and destroy them only once in remove
+--- a/drivers/net/ethernet/intel/i40e/i40e_prototype.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_prototype.h
+@@ -452,10 +452,16 @@ i40e_status i40e_aq_get_ddp_list(struct
+ struct i40e_generic_seg_header *
+ i40e_find_segment_in_package(u32 segment_type,
+ 			     struct i40e_package_header *pkg_header);
++struct i40e_profile_section_header *
++i40e_find_section_in_profile(u32 section_type,
++			     struct i40e_profile_segment *profile);
+ enum i40e_status_code
+ i40e_write_profile(struct i40e_hw *hw, struct i40e_profile_segment *i40e_seg,
+ 		   u32 track_id);
+ enum i40e_status_code
++i40e_rollback_profile(struct i40e_hw *hw, struct i40e_profile_segment *i40e_seg,
++		      u32 track_id);
++enum i40e_status_code
+ i40e_add_pinfo_to_list(struct i40e_hw *hw,
+ 		       struct i40e_profile_segment *profile,
+ 		       u8 *profile_info_sec, u32 track_id);
+--- a/drivers/net/ethernet/intel/i40e/i40e_type.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_type.h
+@@ -1550,6 +1550,8 @@ struct i40e_generic_seg_header {
+ struct i40e_metadata_segment {
+ 	struct i40e_generic_seg_header header;
+ 	struct i40e_ddp_version version;
++#define I40E_DDP_TRACKID_RDONLY		0
++#define I40E_DDP_TRACKID_INVALID	0xFFFFFFFF
+ 	u32 track_id;
+ 	char name[I40E_DDP_NAME_SIZE];
+ };
+@@ -1578,15 +1580,36 @@ struct i40e_profile_section_header {
+ 	struct {
+ #define SECTION_TYPE_INFO	0x00000010
+ #define SECTION_TYPE_MMIO	0x00000800
++#define SECTION_TYPE_RB_MMIO	0x00001800
+ #define SECTION_TYPE_AQ		0x00000801
++#define SECTION_TYPE_RB_AQ	0x00001801
+ #define SECTION_TYPE_NOTE	0x80000000
+ #define SECTION_TYPE_NAME	0x80000001
++#define SECTION_TYPE_PROTO	0x80000002
++#define SECTION_TYPE_PCTYPE	0x80000003
++#define SECTION_TYPE_PTYPE	0x80000004
+ 		u32 type;
+ 		u32 offset;
+ 		u32 size;
+ 	} section;
+ };
+ 
++struct i40e_profile_tlv_section_record {
++	u8 rtype;
++	u8 type;
++	u16 len;
++	u8 data[12];
++};
++
++/* Generic AQ section in proflie */
++struct i40e_profile_aq_section {
++	u16 opcode;
++	u16 flags;
++	u8  param[16];
++	u16 datalen;
++	u8  data[1];
++};
++
+ struct i40e_profile_info {
+ 	u32 track_id;
+ 	struct i40e_ddp_version version;

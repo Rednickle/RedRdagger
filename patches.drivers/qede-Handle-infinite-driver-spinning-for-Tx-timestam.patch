@@ -1,0 +1,159 @@
+From: Sudarsana Reddy Kalluru <skalluru@marvell.com>
+Date: Mon, 27 May 2019 20:21:33 -0700
+Subject: qede: Handle infinite driver spinning for Tx timestamp.
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/davem/net-next.git
+Git-commit: 9adebac37e7d26c5cd73776a0279574afe3f410b
+References: bsc#1136460 jsc#SLE-4691 bsc#1136461 jsc#SLE-4692
+
+In PTP Tx implementation, driver kept scheduling a poll thread until the
+timestamp is available. In the error scenarios (e.g. app requesting the
+timestamp for non-ptp packet), this thread kept waiting for the timestamp
+forever.  This patch add changes to report such scenario as an error and
+terminate the thread. Added a timeout of 2 seconds i.e., max time to wait
+for Tx timestamp. Added a stat value ptp_skip_txts for reporting the number
+of packets for which Tx timestamping is skipped.
+
+Signed-off-by: Sudarsana Reddy Kalluru <skalluru@marvell.com>
+Signed-off-by: Michal Kalderon <mkalderon@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qede/qede.h         |    2 +
+ drivers/net/ethernet/qlogic/qede/qede_ethtool.c |    1 
+ drivers/net/ethernet/qlogic/qede/qede_main.c    |    3 +
+ drivers/net/ethernet/qlogic/qede/qede_ptp.c     |   37 +++++++++++++++++++-----
+ 4 files changed, 36 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@ -92,6 +92,7 @@ struct qede_stats_common {
+ 	u64 non_coalesced_pkts;
+ 	u64 coalesced_bytes;
+ 	u64 link_change_count;
++	u64 ptp_skip_txts;
+ 
+ 	/* port */
+ 	u64 rx_64_byte_packets;
+@@ -189,6 +190,7 @@ struct qede_dev {
+ 
+ 	const struct qed_eth_ops	*ops;
+ 	struct qede_ptp			*ptp;
++	u64				ptp_skip_txts;
+ 
+ 	struct qed_dev_eth_info dev_info;
+ #define QEDE_MAX_RSS_CNT(edev)	((edev)->dev_info.num_queues)
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@ -174,6 +174,7 @@ static const struct {
+ 	QEDE_STAT(coalesced_bytes),
+ 
+ 	QEDE_STAT(link_change_count),
++	QEDE_STAT(ptp_skip_txts),
+ };
+ 
+ #define QEDE_NUM_STATS	ARRAY_SIZE(qede_stats_arr)
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -390,6 +390,7 @@ void qede_fill_by_demand_stats(struct qe
+ 	p_common->brb_discards = stats.common.brb_discards;
+ 	p_common->tx_mac_ctrl_frames = stats.common.tx_mac_ctrl_frames;
+ 	p_common->link_change_count = stats.common.link_change_count;
++	p_common->ptp_skip_txts = edev->ptp_skip_txts;
+ 
+ 	if (QEDE_IS_BB(edev)) {
+ 		struct qede_stats_bb *p_bb = &edev->stats.bb;
+@@ -2232,6 +2233,8 @@ out:
+ 	if (mode != QEDE_UNLOAD_RECOVERY)
+ 		DP_NOTICE(edev, "Link is down\n");
+ 
++	edev->ptp_skip_txts = 0;
++
+ 	DP_INFO(edev, "Ending qede unload\n");
+ }
+ 
+--- a/drivers/net/ethernet/qlogic/qede/qede_ptp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ptp.c
+@@ -30,6 +30,7 @@
+  * SOFTWARE.
+  */
+ #include "qede_ptp.h"
++#define QEDE_PTP_TX_TIMEOUT (2 * HZ)
+ 
+ struct qede_ptp {
+ 	const struct qed_eth_ptp_ops	*ops;
+@@ -38,6 +39,7 @@ struct qede_ptp {
+ 	struct timecounter		tc;
+ 	struct ptp_clock		*clock;
+ 	struct work_struct		work;
++	unsigned long			ptp_tx_start;
+ 	struct qede_dev			*edev;
+ 	struct sk_buff			*tx_skb;
+ 
+@@ -160,18 +162,30 @@ static void qede_ptp_task(struct work_st
+ 	struct qede_dev *edev;
+ 	struct qede_ptp *ptp;
+ 	u64 timestamp, ns;
++	bool timedout;
+ 	int rc;
+ 
+ 	ptp = container_of(work, struct qede_ptp, work);
+ 	edev = ptp->edev;
++	timedout = time_is_before_jiffies(ptp->ptp_tx_start +
++					  QEDE_PTP_TX_TIMEOUT);
+ 
+ 	/* Read Tx timestamp registers */
+ 	spin_lock_bh(&ptp->lock);
+ 	rc = ptp->ops->read_tx_ts(edev->cdev, &timestamp);
+ 	spin_unlock_bh(&ptp->lock);
+ 	if (rc) {
+-		/* Reschedule to keep checking for a valid timestamp value */
+-		schedule_work(&ptp->work);
++		if (unlikely(timedout)) {
++			DP_INFO(edev, "Tx timestamp is not recorded\n");
++			dev_kfree_skb_any(ptp->tx_skb);
++			ptp->tx_skb = NULL;
++			clear_bit_unlock(QEDE_FLAGS_PTP_TX_IN_PRORGESS,
++					 &edev->flags);
++			edev->ptp_skip_txts++;
++		} else {
++			/* Reschedule to keep checking for a valid TS value */
++			schedule_work(&ptp->work);
++		}
+ 		return;
+ 	}
+ 
+@@ -514,19 +528,28 @@ void qede_ptp_tx_ts(struct qede_dev *ede
+ 	if (!ptp)
+ 		return;
+ 
+-	if (test_and_set_bit_lock(QEDE_FLAGS_PTP_TX_IN_PRORGESS, &edev->flags))
++	if (test_and_set_bit_lock(QEDE_FLAGS_PTP_TX_IN_PRORGESS,
++				  &edev->flags)) {
++		DP_ERR(edev, "Timestamping in progress\n");
++		edev->ptp_skip_txts++;
+ 		return;
++	}
+ 
+ 	if (unlikely(!test_bit(QEDE_FLAGS_TX_TIMESTAMPING_EN, &edev->flags))) {
+-		DP_NOTICE(edev,
+-			  "Tx timestamping was not enabled, this packet will not be timestamped\n");
++		DP_ERR(edev,
++		       "Tx timestamping was not enabled, this packet will not be timestamped\n");
++		clear_bit_unlock(QEDE_FLAGS_PTP_TX_IN_PRORGESS, &edev->flags);
++		edev->ptp_skip_txts++;
+ 	} else if (unlikely(ptp->tx_skb)) {
+-		DP_NOTICE(edev,
+-			  "The device supports only a single outstanding packet to timestamp, this packet will not be timestamped\n");
++		DP_ERR(edev,
++		       "The device supports only a single outstanding packet to timestamp, this packet will not be timestamped\n");
++		clear_bit_unlock(QEDE_FLAGS_PTP_TX_IN_PRORGESS, &edev->flags);
++		edev->ptp_skip_txts++;
+ 	} else {
+ 		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+ 		/* schedule check for Tx timestamp */
+ 		ptp->tx_skb = skb_get(skb);
++		ptp->ptp_tx_start = jiffies;
+ 		schedule_work(&ptp->work);
+ 	}
+ }

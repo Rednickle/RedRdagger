@@ -1,0 +1,519 @@
+From: Tomer Tayar <tomer.tayar@cavium.com>
+Date: Mon, 28 Jan 2019 19:27:54 +0200
+Subject: qed: Revise load sequence to avoid PCI errors
+Patch-mainline: v5.1-rc1
+Git-commit: 666db4862f2d373bb054b9fdde3d0ee1e7cd18c5
+References: bsc#1136460 jsc#SLE-4691 bsc#1136461 jsc#SLE-4692
+
+Initiating final cleanup after an ungraceful driver unload can lead to bad
+PCI accesses towards the host.
+This patch revises the load sequence so final cleanup is sent while the
+internal master enable is cleared, to prevent the host accesses, and clears
+the internal error indications just before enabling the internal master
+enable.
+
+Signed-off-by: Tomer Tayar <tomer.tayar@cavium.com>
+Signed-off-by: Ariel Elior <ariel.elior@cavium.com>
+Signed-off-by: Michal Kalderon <michal.kalderon@cavium.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/net/ethernet/qlogic/qed/qed.h         |    1 
+ drivers/net/ethernet/qlogic/qed/qed_dev.c     |  117 ++++++++++++++----------
+ drivers/net/ethernet/qlogic/qed/qed_dev_api.h |   12 ++
+ drivers/net/ethernet/qlogic/qed/qed_int.c     |  126 +++++++++++++-------------
+ drivers/net/ethernet/qlogic/qed/qed_int.h     |    3 
+ drivers/net/ethernet/qlogic/qed/qed_mcp.c     |   21 ++++
+ drivers/net/ethernet/qlogic/qed/qed_mcp.h     |   10 ++
+ 7 files changed, 178 insertions(+), 112 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@ -554,7 +554,6 @@ struct qed_hwfn {
+ 	u8				dp_level;
+ 	char				name[NAME_SIZE];
+ 
+-	bool				first_on_engine;
+ 	bool				hw_init_done;
+ 
+ 	u8				num_funcs_on_engine;
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev.c
+@@ -1959,11 +1959,6 @@ static int qed_hw_init_pf(struct qed_hwf
+ 		     (p_hwfn->hw_info.personality == QED_PCI_FCOE) ? 1 : 0);
+ 	STORE_RT_REG(p_hwfn, PRS_REG_SEARCH_ROCE_RT_OFFSET, 0);
+ 
+-	/* Cleanup chip from previous driver if such remains exist */
+-	rc = qed_final_cleanup(p_hwfn, p_ptt, rel_pf_id, false);
+-	if (rc)
+-		return rc;
+-
+ 	/* Sanity check before the PF init sequence that uses DMAE */
+ 	rc = qed_dmae_sanity(p_hwfn, p_ptt, "pf_phase");
+ 	if (rc)
+@@ -2007,17 +2002,15 @@ static int qed_hw_init_pf(struct qed_hwf
+ 	return rc;
+ }
+ 
+-static int qed_change_pci_hwfn(struct qed_hwfn *p_hwfn,
+-			       struct qed_ptt *p_ptt,
+-			       u8 enable)
++int qed_pglueb_set_pfid_enable(struct qed_hwfn *p_hwfn,
++			       struct qed_ptt *p_ptt, bool b_enable)
+ {
+-	u32 delay_idx = 0, val, set_val = enable ? 1 : 0;
++	u32 delay_idx = 0, val, set_val = b_enable ? 1 : 0;
+ 
+-	/* Change PF in PXP */
+-	qed_wr(p_hwfn, p_ptt,
+-	       PGLUE_B_REG_INTERNAL_PFID_ENABLE_MASTER, set_val);
++	/* Configure the PF's internal FID_enable for master transactions */
++	qed_wr(p_hwfn, p_ptt, PGLUE_B_REG_INTERNAL_PFID_ENABLE_MASTER, set_val);
+ 
+-	/* wait until value is set - try for 1 second every 50us */
++	/* Wait until value is set - try for 1 second every 50us */
+ 	for (delay_idx = 0; delay_idx < 20000; delay_idx++) {
+ 		val = qed_rd(p_hwfn, p_ptt,
+ 			     PGLUE_B_REG_INTERNAL_PFID_ENABLE_MASTER);
+@@ -2071,13 +2064,19 @@ static int qed_vf_start(struct qed_hwfn
+ 	return 0;
+ }
+ 
++static void qed_pglueb_clear_err(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	qed_wr(p_hwfn, p_ptt, PGLUE_B_REG_WAS_ERROR_PF_31_0_CLR,
++	       BIT(p_hwfn->abs_pf_id));
++}
++
+ int qed_hw_init(struct qed_dev *cdev, struct qed_hw_init_params *p_params)
+ {
+ 	struct qed_load_req_params load_req_params;
+ 	u32 load_code, resp, param, drv_mb_param;
+ 	bool b_default_mtu = true;
+ 	struct qed_hwfn *p_hwfn;
+-	int rc = 0, mfw_rc, i;
++	int rc = 0, i;
+ 	u16 ether_type;
+ 
+ 	if ((p_params->int_mode == QED_INT_MODE_MSI) && (cdev->num_hwfns > 1)) {
+@@ -2092,7 +2091,7 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 	}
+ 
+ 	for_each_hwfn(cdev, i) {
+-		struct qed_hwfn *p_hwfn = &cdev->hwfns[i];
++		p_hwfn = &cdev->hwfns[i];
+ 
+ 		/* If management didn't provide a default, set one of our own */
+ 		if (!p_hwfn->hw_info.mtu) {
+@@ -2105,9 +2104,6 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 			continue;
+ 		}
+ 
+-		/* Enable DMAE in PXP */
+-		rc = qed_change_pci_hwfn(p_hwfn, p_hwfn->p_main_ptt, true);
+-
+ 		rc = qed_calc_hw_mode(p_hwfn);
+ 		if (rc)
+ 			return rc;
+@@ -2148,8 +2144,34 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 
+ 		qed_reset_mb_shadow(p_hwfn, p_hwfn->p_main_ptt);
+ 
+-		p_hwfn->first_on_engine = (load_code ==
+-					   FW_MSG_CODE_DRV_LOAD_ENGINE);
++		/* Clean up chip from previous driver if such remains exist.
++		 * This is not needed when the PF is the first one on the
++		 * engine, since afterwards we are going to init the FW.
++		 */
++		if (load_code != FW_MSG_CODE_DRV_LOAD_ENGINE) {
++			rc = qed_final_cleanup(p_hwfn, p_hwfn->p_main_ptt,
++					       p_hwfn->rel_pf_id, false);
++			if (rc) {
++				DP_NOTICE(p_hwfn, "Final cleanup failed\n");
++				goto load_err;
++			}
++		}
++
++		/* Log and clear previous pglue_b errors if such exist */
++		qed_pglueb_rbc_attn_handler(p_hwfn, p_hwfn->p_main_ptt);
++
++		/* Enable the PF's internal FID_enable in the PXP */
++		rc = qed_pglueb_set_pfid_enable(p_hwfn, p_hwfn->p_main_ptt,
++						true);
++		if (rc)
++			goto load_err;
++
++		/* Clear the pglue_b was_error indication.
++		 * In E4 it must be done after the BME and the internal
++		 * FID_enable for the PF are set, since VDMs may cause the
++		 * indication to be set again.
++		 */
++		qed_pglueb_clear_err(p_hwfn, p_hwfn->p_main_ptt);
+ 
+ 		switch (load_code) {
+ 		case FW_MSG_CODE_DRV_LOAD_ENGINE:
+@@ -2180,39 +2202,29 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 			break;
+ 		}
+ 
+-		if (rc)
++		if (rc) {
+ 			DP_NOTICE(p_hwfn,
+ 				  "init phase failed for loadcode 0x%x (rc %d)\n",
+-				   load_code, rc);
++				  load_code, rc);
++			goto load_err;
++		}
+ 
+-		/* ACK mfw regardless of success or failure of initialization */
+-		mfw_rc = qed_mcp_cmd(p_hwfn, p_hwfn->p_main_ptt,
+-				     DRV_MSG_CODE_LOAD_DONE,
+-				     0, &load_code, &param);
++		rc = qed_mcp_load_done(p_hwfn, p_hwfn->p_main_ptt);
+ 		if (rc)
+ 			return rc;
+-		if (mfw_rc) {
+-			DP_NOTICE(p_hwfn, "Failed sending LOAD_DONE command\n");
+-			return mfw_rc;
+-		}
+-
+-		/* Check if there is a DID mismatch between nvm-cfg/efuse */
+-		if (param & FW_MB_PARAM_LOAD_DONE_DID_EFUSE_ERROR)
+-			DP_NOTICE(p_hwfn,
+-				  "warning: device configuration is not supported on this board type. The device may not function as expected.\n");
+ 
+ 		/* send DCBX attention request command */
+ 		DP_VERBOSE(p_hwfn,
+ 			   QED_MSG_DCB,
+ 			   "sending phony dcbx set command to trigger DCBx attention handling\n");
+-		mfw_rc = qed_mcp_cmd(p_hwfn, p_hwfn->p_main_ptt,
+-				     DRV_MSG_CODE_SET_DCBX,
+-				     1 << DRV_MB_PARAM_DCBX_NOTIFY_SHIFT,
+-				     &load_code, &param);
+-		if (mfw_rc) {
++		rc = qed_mcp_cmd(p_hwfn, p_hwfn->p_main_ptt,
++				 DRV_MSG_CODE_SET_DCBX,
++				 1 << DRV_MB_PARAM_DCBX_NOTIFY_SHIFT,
++				 &resp, &param);
++		if (rc) {
+ 			DP_NOTICE(p_hwfn,
+ 				  "Failed to send DCBX attention request\n");
+-			return mfw_rc;
++			return rc;
+ 		}
+ 
+ 		p_hwfn->hw_init_done = true;
+@@ -2261,6 +2273,12 @@ int qed_hw_init(struct qed_dev *cdev, st
+ 	}
+ 
+ 	return 0;
++
++load_err:
++	/* The MFW load lock should be released also when initialization fails.
++	 */
++	qed_mcp_load_done(p_hwfn, p_hwfn->p_main_ptt);
++	return rc;
+ }
+ 
+ #define QED_HW_STOP_RETRY_LIMIT (10)
+@@ -2395,14 +2413,16 @@ int qed_hw_stop(struct qed_dev *cdev)
+ 		p_hwfn = QED_LEADING_HWFN(cdev);
+ 		p_ptt = QED_LEADING_HWFN(cdev)->p_main_ptt;
+ 
+-		/* Disable DMAE in PXP - in CMT, this should only be done for
+-		 * first hw-function, and only after all transactions have
+-		 * stopped for all active hw-functions.
++		/* Clear the PF's internal FID_enable in the PXP.
++		 * In CMT this should only be done for first hw-function, and
++		 * only after all transactions have stopped for all active
++		 * hw-functions.
+ 		 */
+-		rc = qed_change_pci_hwfn(p_hwfn, p_ptt, false);
++		rc = qed_pglueb_set_pfid_enable(p_hwfn, p_ptt, false);
+ 		if (rc) {
+ 			DP_NOTICE(p_hwfn,
+-				  "qed_change_pci_hwfn failed. rc = %d.\n", rc);
++				  "qed_pglueb_set_pfid_enable() failed. rc = %d.\n",
++				  rc);
+ 			rc2 = -EINVAL;
+ 		}
+ 	}
+@@ -2502,9 +2522,8 @@ static void qed_hw_hwfn_prepare(struct q
+ 		       PGLUE_B_REG_PGL_ADDR_94_F0_BB, 0);
+ 	}
+ 
+-	/* Clean Previous errors if such exist */
+-	qed_wr(p_hwfn, p_hwfn->p_main_ptt,
+-	       PGLUE_B_REG_WAS_ERROR_PF_31_0_CLR, 1 << p_hwfn->abs_pf_id);
++	/* Clean previous pglue_b errors if such exist */
++	qed_pglueb_clear_err(p_hwfn, p_hwfn->p_main_ptt);
+ 
+ 	/* enable internal target-read */
+ 	qed_wr(p_hwfn, p_hwfn->p_main_ptt,
+--- a/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_dev_api.h
+@@ -473,6 +473,18 @@ int
+ qed_set_queue_coalesce(u16 rx_coal, u16 tx_coal, void *p_handle);
+ 
+ /**
++ * @brief qed_pglueb_set_pfid_enable - Enable or disable PCI BUS MASTER
++ *
++ * @param p_hwfn
++ * @param p_ptt
++ * @param b_enable - true/false
++ *
++ * @return int
++ */
++int qed_pglueb_set_pfid_enable(struct qed_hwfn *p_hwfn,
++			       struct qed_ptt *p_ptt, bool b_enable);
++
++/**
+  * @brief db_recovery_add - add doorbell information to the doorbell
+  * recovery mechanism.
+  *
+--- a/drivers/net/ethernet/qlogic/qed/qed_int.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_int.c
+@@ -255,112 +255,114 @@ out:
+ #define PGLUE_ATTENTION_ICPL_VALID		(1 << 23)
+ #define PGLUE_ATTENTION_ZLR_VALID		(1 << 25)
+ #define PGLUE_ATTENTION_ILT_VALID		(1 << 23)
+-static int qed_pglub_rbc_attn_cb(struct qed_hwfn *p_hwfn)
++
++int qed_pglueb_rbc_attn_handler(struct qed_hwfn *p_hwfn,
++				struct qed_ptt *p_ptt)
+ {
+ 	u32 tmp;
+ 
+-	tmp = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
+-		     PGLUE_B_REG_TX_ERR_WR_DETAILS2);
++	tmp = qed_rd(p_hwfn, p_ptt, PGLUE_B_REG_TX_ERR_WR_DETAILS2);
+ 	if (tmp & PGLUE_ATTENTION_VALID) {
+ 		u32 addr_lo, addr_hi, details;
+ 
+-		addr_lo = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_lo = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_TX_ERR_WR_ADD_31_0);
+-		addr_hi = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_hi = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_TX_ERR_WR_ADD_63_32);
+-		details = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		details = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_TX_ERR_WR_DETAILS);
+ 
+-		DP_INFO(p_hwfn,
+-			"Illegal write by chip to [%08x:%08x] blocked.\n"
+-			"Details: %08x [PFID %02x, VFID %02x, VF_VALID %02x]\n"
+-			"Details2 %08x [Was_error %02x BME deassert %02x FID_enable deassert %02x]\n",
+-			addr_hi, addr_lo, details,
+-			(u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_PFID),
+-			(u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_VFID),
+-			GET_FIELD(details,
+-				  PGLUE_ATTENTION_DETAILS_VF_VALID) ? 1 : 0,
+-			tmp,
+-			GET_FIELD(tmp,
+-				  PGLUE_ATTENTION_DETAILS2_WAS_ERR) ? 1 : 0,
+-			GET_FIELD(tmp,
+-				  PGLUE_ATTENTION_DETAILS2_BME) ? 1 : 0,
+-			GET_FIELD(tmp,
+-				  PGLUE_ATTENTION_DETAILS2_FID_EN) ? 1 : 0);
++		DP_NOTICE(p_hwfn,
++			  "Illegal write by chip to [%08x:%08x] blocked.\n"
++			  "Details: %08x [PFID %02x, VFID %02x, VF_VALID %02x]\n"
++			  "Details2 %08x [Was_error %02x BME deassert %02x FID_enable deassert %02x]\n",
++			  addr_hi, addr_lo, details,
++			  (u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_PFID),
++			  (u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_VFID),
++			  GET_FIELD(details,
++				    PGLUE_ATTENTION_DETAILS_VF_VALID) ? 1 : 0,
++			  tmp,
++			  GET_FIELD(tmp,
++				    PGLUE_ATTENTION_DETAILS2_WAS_ERR) ? 1 : 0,
++			  GET_FIELD(tmp,
++				    PGLUE_ATTENTION_DETAILS2_BME) ? 1 : 0,
++			  GET_FIELD(tmp,
++				    PGLUE_ATTENTION_DETAILS2_FID_EN) ? 1 : 0);
+ 	}
+ 
+-	tmp = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
+-		     PGLUE_B_REG_TX_ERR_RD_DETAILS2);
++	tmp = qed_rd(p_hwfn, p_ptt, PGLUE_B_REG_TX_ERR_RD_DETAILS2);
+ 	if (tmp & PGLUE_ATTENTION_RD_VALID) {
+ 		u32 addr_lo, addr_hi, details;
+ 
+-		addr_lo = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_lo = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_TX_ERR_RD_ADD_31_0);
+-		addr_hi = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_hi = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_TX_ERR_RD_ADD_63_32);
+-		details = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		details = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_TX_ERR_RD_DETAILS);
+ 
+-		DP_INFO(p_hwfn,
+-			"Illegal read by chip from [%08x:%08x] blocked.\n"
+-			" Details: %08x [PFID %02x, VFID %02x, VF_VALID %02x]\n"
+-			" Details2 %08x [Was_error %02x BME deassert %02x FID_enable deassert %02x]\n",
+-			addr_hi, addr_lo, details,
+-			(u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_PFID),
+-			(u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_VFID),
+-			GET_FIELD(details,
+-				  PGLUE_ATTENTION_DETAILS_VF_VALID) ? 1 : 0,
+-			tmp,
+-			GET_FIELD(tmp, PGLUE_ATTENTION_DETAILS2_WAS_ERR) ? 1
+-									 : 0,
+-			GET_FIELD(tmp, PGLUE_ATTENTION_DETAILS2_BME) ? 1 : 0,
+-			GET_FIELD(tmp, PGLUE_ATTENTION_DETAILS2_FID_EN) ? 1
+-									: 0);
++		DP_NOTICE(p_hwfn,
++			  "Illegal read by chip from [%08x:%08x] blocked.\n"
++			  "Details: %08x [PFID %02x, VFID %02x, VF_VALID %02x]\n"
++			  "Details2 %08x [Was_error %02x BME deassert %02x FID_enable deassert %02x]\n",
++			  addr_hi, addr_lo, details,
++			  (u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_PFID),
++			  (u8)GET_FIELD(details, PGLUE_ATTENTION_DETAILS_VFID),
++			  GET_FIELD(details,
++				    PGLUE_ATTENTION_DETAILS_VF_VALID) ? 1 : 0,
++			  tmp,
++			  GET_FIELD(tmp,
++				    PGLUE_ATTENTION_DETAILS2_WAS_ERR) ? 1 : 0,
++			  GET_FIELD(tmp,
++				    PGLUE_ATTENTION_DETAILS2_BME) ? 1 : 0,
++			  GET_FIELD(tmp,
++				    PGLUE_ATTENTION_DETAILS2_FID_EN) ? 1 : 0);
+ 	}
+ 
+-	tmp = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
+-		     PGLUE_B_REG_TX_ERR_WR_DETAILS_ICPL);
++	tmp = qed_rd(p_hwfn, p_ptt, PGLUE_B_REG_TX_ERR_WR_DETAILS_ICPL);
+ 	if (tmp & PGLUE_ATTENTION_ICPL_VALID)
+-		DP_INFO(p_hwfn, "ICPL error - %08x\n", tmp);
++		DP_NOTICE(p_hwfn, "ICPL error - %08x\n", tmp);
+ 
+-	tmp = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
+-		     PGLUE_B_REG_MASTER_ZLR_ERR_DETAILS);
++	tmp = qed_rd(p_hwfn, p_ptt, PGLUE_B_REG_MASTER_ZLR_ERR_DETAILS);
+ 	if (tmp & PGLUE_ATTENTION_ZLR_VALID) {
+ 		u32 addr_hi, addr_lo;
+ 
+-		addr_lo = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_lo = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_MASTER_ZLR_ERR_ADD_31_0);
+-		addr_hi = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_hi = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_MASTER_ZLR_ERR_ADD_63_32);
+ 
+-		DP_INFO(p_hwfn, "ZLR eror - %08x [Address %08x:%08x]\n",
+-			tmp, addr_hi, addr_lo);
++		DP_NOTICE(p_hwfn, "ZLR error - %08x [Address %08x:%08x]\n",
++			  tmp, addr_hi, addr_lo);
+ 	}
+ 
+-	tmp = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
+-		     PGLUE_B_REG_VF_ILT_ERR_DETAILS2);
++	tmp = qed_rd(p_hwfn, p_ptt, PGLUE_B_REG_VF_ILT_ERR_DETAILS2);
+ 	if (tmp & PGLUE_ATTENTION_ILT_VALID) {
+ 		u32 addr_hi, addr_lo, details;
+ 
+-		addr_lo = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_lo = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_VF_ILT_ERR_ADD_31_0);
+-		addr_hi = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		addr_hi = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_VF_ILT_ERR_ADD_63_32);
+-		details = qed_rd(p_hwfn, p_hwfn->p_dpc_ptt,
++		details = qed_rd(p_hwfn, p_ptt,
+ 				 PGLUE_B_REG_VF_ILT_ERR_DETAILS);
+ 
+-		DP_INFO(p_hwfn,
+-			"ILT error - Details %08x Details2 %08x [Address %08x:%08x]\n",
+-			details, tmp, addr_hi, addr_lo);
++		DP_NOTICE(p_hwfn,
++			  "ILT error - Details %08x Details2 %08x [Address %08x:%08x]\n",
++			  details, tmp, addr_hi, addr_lo);
+ 	}
+ 
+ 	/* Clear the indications */
+-	qed_wr(p_hwfn, p_hwfn->p_dpc_ptt,
+-	       PGLUE_B_REG_LATCHED_ERRORS_CLR, (1 << 2));
++	qed_wr(p_hwfn, p_ptt, PGLUE_B_REG_LATCHED_ERRORS_CLR, BIT(2));
+ 
+ 	return 0;
+ }
+ 
++static int qed_pglueb_rbc_attn_cb(struct qed_hwfn *p_hwfn)
++{
++	return qed_pglueb_rbc_attn_handler(p_hwfn, p_hwfn->p_dpc_ptt);
++}
++
+ #define QED_DORQ_ATTENTION_REASON_MASK  (0xfffff)
+ #define QED_DORQ_ATTENTION_OPAQUE_MASK  (0xffff)
+ #define QED_DORQ_ATTENTION_OPAQUE_SHIFT (0x0)
+@@ -540,7 +542,7 @@ static struct aeu_invert_reg aeu_descs[N
+ 			{"PGLUE misc_flr", ATTENTION_SINGLE,
+ 			 NULL, MAX_BLOCK_ID},
+ 			{"PGLUE B RBC", ATTENTION_PAR_INT,
+-			 qed_pglub_rbc_attn_cb, BLOCK_PGLUE_B},
++			 qed_pglueb_rbc_attn_cb, BLOCK_PGLUE_B},
+ 			{"PGLUE misc_mctp", ATTENTION_SINGLE,
+ 			 NULL, MAX_BLOCK_ID},
+ 			{"Flash event", ATTENTION_SINGLE, NULL, MAX_BLOCK_ID},
+--- a/drivers/net/ethernet/qlogic/qed/qed_int.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_int.h
+@@ -431,4 +431,7 @@ int qed_int_set_timer_res(struct qed_hwf
+ 
+ #define QED_MAPPING_MEMORY_SIZE(dev)	(NUM_OF_SBS(dev))
+ 
++int qed_pglueb_rbc_attn_handler(struct qed_hwfn *p_hwfn,
++				struct qed_ptt *p_ptt);
++
+ #endif
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.c
+@@ -1070,6 +1070,27 @@ int qed_mcp_load_req(struct qed_hwfn *p_
+ 	return 0;
+ }
+ 
++int qed_mcp_load_done(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
++{
++	u32 resp = 0, param = 0;
++	int rc;
++
++	rc = qed_mcp_cmd(p_hwfn, p_ptt, DRV_MSG_CODE_LOAD_DONE, 0, &resp,
++			 &param);
++	if (rc) {
++		DP_NOTICE(p_hwfn,
++			  "Failed to send a LOAD_DONE command, rc = %d\n", rc);
++		return rc;
++	}
++
++	/* Check if there is a DID mismatch between nvm-cfg/efuse */
++	if (param & FW_MB_PARAM_LOAD_DONE_DID_EFUSE_ERROR)
++		DP_NOTICE(p_hwfn,
++			  "warning: device configuration is not supported on this board type. The device may not function as expected.\n");
++
++	return 0;
++}
++
+ int qed_mcp_unload_req(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
+ {
+ 	struct qed_mcp_mb_params mb_params;
+--- a/drivers/net/ethernet/qlogic/qed/qed_mcp.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_mcp.h
+@@ -801,6 +801,16 @@ int qed_mcp_load_req(struct qed_hwfn *p_
+ 		     struct qed_load_req_params *p_params);
+ 
+ /**
++ * @brief Sends a LOAD_DONE message to the MFW
++ *
++ * @param p_hwfn
++ * @param p_ptt
++ *
++ * @return int - 0 - Operation was successful.
++ */
++int qed_mcp_load_done(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
++
++/**
+  * @brief Sends a UNLOAD_REQ message to the MFW
+  *
+  * @param p_hwfn

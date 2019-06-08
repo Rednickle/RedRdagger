@@ -1,0 +1,287 @@
+From: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Date: Wed, 28 Nov 2018 10:33:00 -0800
+Subject: IB/hfi1: Reduce lock contention on iowait_lock for sdma and pio
+Patch-mainline: v5.0-rc1
+Git-commit: 9aefcabe579bca06325ad9e577a36816f57386ff
+References: jsc#SLE-4925
+
+Commit 4e045572e2c2 ("IB/hfi1: Add unique txwait_lock for txreq events")
+laid the ground work to support per resource waiting locking.
+
+This patch adds that with a lock unique to each sdma engine and pio
+sendcontext and makes necessary changes for verbs, PSM, and vnic to use
+the new locks.
+
+This is particularly beneficial for smaller messages that will exhaust
+resources at a faster rate.
+
+Fixes: 7724105686e7 ("IB/hfi1: add driver files")
+Reviewed-by: Gary Leshner <Gary.S.Leshner@intel.com>
+Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hfi1/pio.c       |    6 +++---
+ drivers/infiniband/hw/hfi1/pio.h       |    2 ++
+ drivers/infiniband/hw/hfi1/qp.c        |   20 ++++++++------------
+ drivers/infiniband/hw/hfi1/sdma.c      |   10 +++++-----
+ drivers/infiniband/hw/hfi1/sdma.h      |    1 +
+ drivers/infiniband/hw/hfi1/user_sdma.c |    5 ++---
+ drivers/infiniband/hw/hfi1/verbs.c     |    7 +++----
+ drivers/infiniband/hw/hfi1/vnic_sdma.c |    7 +++----
+ 8 files changed, 27 insertions(+), 31 deletions(-)
+
+--- a/drivers/infiniband/hw/hfi1/pio.c
++++ b/drivers/infiniband/hw/hfi1/pio.c
+@@ -742,6 +742,7 @@ struct send_context *sc_alloc(struct hfi
+ 	spin_lock_init(&sc->alloc_lock);
+ 	spin_lock_init(&sc->release_lock);
+ 	spin_lock_init(&sc->credit_ctrl_lock);
++	seqlock_init(&sc->waitlock);
+ 	INIT_LIST_HEAD(&sc->piowait);
+ 	INIT_WORK(&sc->halt_work, sc_halted);
+ 	init_waitqueue_head(&sc->halt_wait);
+@@ -1593,7 +1594,6 @@ void hfi1_sc_wantpiobuf_intr(struct send
+ static void sc_piobufavail(struct send_context *sc)
+ {
+ 	struct hfi1_devdata *dd = sc->dd;
+-	struct hfi1_ibdev *dev = &dd->verbs_dev;
+ 	struct list_head *list;
+ 	struct rvt_qp *qps[PIO_WAIT_BATCH_SIZE];
+ 	struct rvt_qp *qp;
+@@ -1612,7 +1612,7 @@ static void sc_piobufavail(struct send_c
+ 	 * could end up with QPs on the wait list with the interrupt
+ 	 * disabled.
+ 	 */
+-	write_seqlock_irqsave(&dev->iowait_lock, flags);
++	write_seqlock_irqsave(&sc->waitlock, flags);
+ 	while (!list_empty(list)) {
+ 		struct iowait *wait;
+ 
+@@ -1636,7 +1636,7 @@ static void sc_piobufavail(struct send_c
+ 		if (!list_empty(list))
+ 			hfi1_sc_wantpiobuf_intr(sc, 1);
+ 	}
+-	write_sequnlock_irqrestore(&dev->iowait_lock, flags);
++	write_sequnlock_irqrestore(&sc->waitlock, flags);
+ 
+ 	/* Wake up the most starved one first */
+ 	if (n)
+--- a/drivers/infiniband/hw/hfi1/pio.h
++++ b/drivers/infiniband/hw/hfi1/pio.h
+@@ -127,6 +127,8 @@ struct send_context {
+ 	volatile __le64 *hw_free;	/* HW free counter */
+ 	/* list for PIO waiters */
+ 	struct list_head piowait  ____cacheline_aligned_in_smp;
++	seqlock_t waitlock;
++
+ 	spinlock_t credit_ctrl_lock ____cacheline_aligned_in_smp;
+ 	u32 credit_intr_count;		/* count of credit intr users */
+ 	u64 credit_ctrl;		/* cache for credit control */
+--- a/drivers/infiniband/hw/hfi1/qp.c
++++ b/drivers/infiniband/hw/hfi1/qp.c
+@@ -375,20 +375,18 @@ bool _hfi1_schedule_send(struct rvt_qp *
+ 
+ static void qp_pio_drain(struct rvt_qp *qp)
+ {
+-	struct hfi1_ibdev *dev;
+ 	struct hfi1_qp_priv *priv = qp->priv;
+ 
+ 	if (!priv->s_sendcontext)
+ 		return;
+-	dev = to_idev(qp->ibqp.device);
+ 	while (iowait_pio_pending(&priv->s_iowait)) {
+-		write_seqlock_irq(&dev->iowait_lock);
++		write_seqlock_irq(&priv->s_sendcontext->waitlock);
+ 		hfi1_sc_wantpiobuf_intr(priv->s_sendcontext, 1);
+-		write_sequnlock_irq(&dev->iowait_lock);
++		write_sequnlock_irq(&priv->s_sendcontext->waitlock);
+ 		iowait_pio_drain(&priv->s_iowait);
+-		write_seqlock_irq(&dev->iowait_lock);
++		write_seqlock_irq(&priv->s_sendcontext->waitlock);
+ 		hfi1_sc_wantpiobuf_intr(priv->s_sendcontext, 0);
+-		write_sequnlock_irq(&dev->iowait_lock);
++		write_sequnlock_irq(&priv->s_sendcontext->waitlock);
+ 	}
+ }
+ 
+@@ -459,7 +457,6 @@ static int iowait_sleep(
+ 	struct hfi1_qp_priv *priv;
+ 	unsigned long flags;
+ 	int ret = 0;
+-	struct hfi1_ibdev *dev;
+ 
+ 	qp = tx->qp;
+ 	priv = qp->priv;
+@@ -472,9 +469,8 @@ static int iowait_sleep(
+ 		 * buffer and undoing the side effects of the copy.
+ 		 */
+ 		/* Make a common routine? */
+-		dev = &sde->dd->verbs_dev;
+ 		list_add_tail(&stx->list, &wait->tx_head);
+-		write_seqlock(&dev->iowait_lock);
++		write_seqlock(&sde->waitlock);
+ 		if (sdma_progress(sde, seq, stx))
+ 			goto eagain;
+ 		if (list_empty(&priv->s_iowait.list)) {
+@@ -485,11 +481,11 @@ static int iowait_sleep(
+ 			qp->s_flags |= RVT_S_WAIT_DMA_DESC;
+ 			iowait_queue(pkts_sent, &priv->s_iowait,
+ 				     &sde->dmawait);
+-			priv->s_iowait.lock = &dev->iowait_lock;
++			priv->s_iowait.lock = &sde->waitlock;
+ 			trace_hfi1_qpsleep(qp, RVT_S_WAIT_DMA_DESC);
+ 			rvt_get_qp(qp);
+ 		}
+-		write_sequnlock(&dev->iowait_lock);
++		write_sequnlock(&sde->waitlock);
+ 		hfi1_qp_unbusy(qp, wait);
+ 		spin_unlock_irqrestore(&qp->s_lock, flags);
+ 		ret = -EBUSY;
+@@ -499,7 +495,7 @@ static int iowait_sleep(
+ 	}
+ 	return ret;
+ eagain:
+-	write_sequnlock(&dev->iowait_lock);
++	write_sequnlock(&sde->waitlock);
+ 	spin_unlock_irqrestore(&qp->s_lock, flags);
+ 	list_del_init(&stx->list);
+ 	return -EAGAIN;
+--- a/drivers/infiniband/hw/hfi1/sdma.c
++++ b/drivers/infiniband/hw/hfi1/sdma.c
+@@ -1424,6 +1424,7 @@ int sdma_init(struct hfi1_devdata *dd, u
+ 		seqlock_init(&sde->head_lock);
+ 		spin_lock_init(&sde->senddmactrl_lock);
+ 		spin_lock_init(&sde->flushlist_lock);
++		seqlock_init(&sde->waitlock);
+ 		/* insure there is always a zero bit */
+ 		sde->ahg_bits = 0xfffffffe00000000ULL;
+ 
+@@ -1757,7 +1758,6 @@ static void sdma_desc_avail(struct sdma_
+ 	struct iowait *wait, *nw;
+ 	struct iowait *waits[SDMA_WAIT_BATCH_SIZE];
+ 	uint i, n = 0, seq, max_idx = 0;
+-	struct hfi1_ibdev *dev = &sde->dd->verbs_dev;
+ 	u8 max_starved_cnt = 0;
+ 
+ #ifdef CONFIG_SDMA_VERBOSITY
+@@ -1767,10 +1767,10 @@ static void sdma_desc_avail(struct sdma_
+ #endif
+ 
+ 	do {
+-		seq = read_seqbegin(&dev->iowait_lock);
++		seq = read_seqbegin(&sde->waitlock);
+ 		if (!list_empty(&sde->dmawait)) {
+ 			/* at least one item */
+-			write_seqlock(&dev->iowait_lock);
++			write_seqlock(&sde->waitlock);
+ 			/* Harvest waiters wanting DMA descriptors */
+ 			list_for_each_entry_safe(
+ 					wait,
+@@ -1793,10 +1793,10 @@ static void sdma_desc_avail(struct sdma_
+ 				list_del_init(&wait->list);
+ 				waits[n++] = wait;
+ 			}
+-			write_sequnlock(&dev->iowait_lock);
++			write_sequnlock(&sde->waitlock);
+ 			break;
+ 		}
+-	} while (read_seqretry(&dev->iowait_lock, seq));
++	} while (read_seqretry(&sde->waitlock, seq));
+ 
+ 	/* Schedule the most starved one first */
+ 	if (n)
+--- a/drivers/infiniband/hw/hfi1/sdma.h
++++ b/drivers/infiniband/hw/hfi1/sdma.h
+@@ -382,6 +382,7 @@ struct sdma_engine {
+ 	u64                     progress_int_cnt;
+ 
+ 	/* private: */
++	seqlock_t            waitlock;
+ 	struct list_head      dmawait;
+ 
+ 	/* CONFIG SDMA for now, just blindly duplicate */
+--- a/drivers/infiniband/hw/hfi1/user_sdma.c
++++ b/drivers/infiniband/hw/hfi1/user_sdma.c
+@@ -130,7 +130,6 @@ static int defer_packet_queue(
+ {
+ 	struct hfi1_user_sdma_pkt_q *pq =
+ 		container_of(wait->iow, struct hfi1_user_sdma_pkt_q, busy);
+-	struct hfi1_ibdev *dev = &pq->dd->verbs_dev;
+ 	struct user_sdma_txreq *tx =
+ 		container_of(txreq, struct user_sdma_txreq, txreq);
+ 
+@@ -144,10 +143,10 @@ static int defer_packet_queue(
+ 	 * it is supposed to be enqueued.
+ 	 */
+ 	xchg(&pq->state, SDMA_PKT_Q_DEFERRED);
+-	write_seqlock(&dev->iowait_lock);
++	write_seqlock(&sde->waitlock);
+ 	if (list_empty(&pq->busy.list))
+ 		iowait_queue(pkts_sent, &pq->busy, &sde->dmawait);
+-	write_sequnlock(&dev->iowait_lock);
++	write_sequnlock(&sde->waitlock);
+ 	return -EBUSY;
+ eagain:
+ 	return -EAGAIN;
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -765,7 +765,6 @@ static int pio_wait(struct rvt_qp *qp,
+ {
+ 	struct hfi1_qp_priv *priv = qp->priv;
+ 	struct hfi1_devdata *dd = sc->dd;
+-	struct hfi1_ibdev *dev = &dd->verbs_dev;
+ 	unsigned long flags;
+ 	int ret = 0;
+ 
+@@ -777,7 +776,7 @@ static int pio_wait(struct rvt_qp *qp,
+ 	 */
+ 	spin_lock_irqsave(&qp->s_lock, flags);
+ 	if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK) {
+-		write_seqlock(&dev->iowait_lock);
++		write_seqlock(&sc->waitlock);
+ 		list_add_tail(&ps->s_txreq->txreq.list,
+ 			      &ps->wait->tx_head);
+ 		if (list_empty(&priv->s_iowait.list)) {
+@@ -790,14 +789,14 @@ static int pio_wait(struct rvt_qp *qp,
+ 			was_empty = list_empty(&sc->piowait);
+ 			iowait_queue(ps->pkts_sent, &priv->s_iowait,
+ 				     &sc->piowait);
+-			priv->s_iowait.lock = &dev->iowait_lock;
++			priv->s_iowait.lock = &sc->waitlock;
+ 			trace_hfi1_qpsleep(qp, RVT_S_WAIT_PIO);
+ 			rvt_get_qp(qp);
+ 			/* counting: only call wantpiobuf_intr if first user */
+ 			if (was_empty)
+ 				hfi1_sc_wantpiobuf_intr(sc, 1);
+ 		}
+-		write_sequnlock(&dev->iowait_lock);
++		write_sequnlock(&sc->waitlock);
+ 		hfi1_qp_unbusy(qp, ps->wait);
+ 		ret = -EBUSY;
+ 	}
+--- a/drivers/infiniband/hw/hfi1/vnic_sdma.c
++++ b/drivers/infiniband/hw/hfi1/vnic_sdma.c
+@@ -232,18 +232,17 @@ static int hfi1_vnic_sdma_sleep(struct s
+ {
+ 	struct hfi1_vnic_sdma *vnic_sdma =
+ 		container_of(wait->iow, struct hfi1_vnic_sdma, wait);
+-	struct hfi1_ibdev *dev = &vnic_sdma->dd->verbs_dev;
+ 
+-	write_seqlock(&dev->iowait_lock);
++	write_seqlock(&sde->waitlock);
+ 	if (sdma_progress(sde, seq, txreq)) {
+-		write_sequnlock(&dev->iowait_lock);
++		write_sequnlock(&sde->waitlock);
+ 		return -EAGAIN;
+ 	}
+ 
+ 	vnic_sdma->state = HFI1_VNIC_SDMA_Q_DEFERRED;
+ 	if (list_empty(&vnic_sdma->wait.list))
+ 		iowait_queue(pkts_sent, wait->iow, &sde->dmawait);
+-	write_sequnlock(&dev->iowait_lock);
++	write_sequnlock(&sde->waitlock);
+ 	return -EBUSY;
+ }
+ 
