@@ -1,0 +1,583 @@
+From: Sebastian Ott <sebott@linux.ibm.com>
+Date: Sun, 14 Apr 2019 15:38:01 +0200
+Subject: s390/pci: provide support for MIO instructions
+Git-commit: 71ba41c9b1d91042960e9d92a5c8f52dc8531eda
+Patch-mainline: v5.2-rc1
+References: jsc#SLE-5802 FATE#327055 bsc#1134738 LTC#173387
+
+Provide support for PCI I/O instructions that work on mapped IO addresses.
+
+Signed-off-by: Sebastian Ott <sebott@linux.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ arch/s390/include/asm/io.h       |   17 ++---
+ arch/s390/include/asm/pci.h      |    3 
+ arch/s390/include/asm/pci_clp.h  |   14 +++-
+ arch/s390/include/asm/pci_insn.h |    5 +
+ arch/s390/pci/pci.c              |  132 ++++++++++++++++++++++++++++++++++++---
+ arch/s390/pci/pci_clp.c          |   25 +++++--
+ arch/s390/pci/pci_insn.c         |  129 ++++++++++++++++++++++++++++++++++++--
+ 7 files changed, 294 insertions(+), 31 deletions(-)
+
+--- a/arch/s390/include/asm/io.h
++++ b/arch/s390/include/asm/io.h
+@@ -31,14 +31,8 @@ void unxlate_dev_mem_ptr(phys_addr_t phy
+ #define ioremap_wc			ioremap_nocache
+ #define ioremap_wt			ioremap_nocache
+ 
+-static inline void __iomem *ioremap(unsigned long offset, unsigned long size)
+-{
+-	return (void __iomem *) offset;
+-}
+-
+-static inline void iounmap(volatile void __iomem *addr)
+-{
+-}
++void __iomem *ioremap(unsigned long offset, unsigned long size);
++void iounmap(volatile void __iomem *addr);
+ 
+ static inline void __iomem *ioport_map(unsigned long port, unsigned int nr)
+ {
+@@ -56,14 +50,17 @@ static inline void ioport_unmap(void __i
+  * the corresponding device and create the mapping cookie.
+  */
+ #define pci_iomap pci_iomap
++#define pci_iomap_range pci_iomap_range
+ #define pci_iounmap pci_iounmap
+-#define pci_iomap_wc pci_iomap
+-#define pci_iomap_wc_range pci_iomap_range
++#define pci_iomap_wc pci_iomap_wc
++#define pci_iomap_wc_range pci_iomap_wc_range
+ 
+ #define memcpy_fromio(dst, src, count)	zpci_memcpy_fromio(dst, src, count)
+ #define memcpy_toio(dst, src, count)	zpci_memcpy_toio(dst, src, count)
+ #define memset_io(dst, val, count)	zpci_memset_io(dst, val, count)
+ 
++#define mmiowb()	zpci_barrier()
++
+ #define __raw_readb	zpci_read_u8
+ #define __raw_readw	zpci_read_u16
+ #define __raw_readl	zpci_read_u32
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -81,6 +81,8 @@ enum zpci_state {
+ 
+ struct zpci_bar_struct {
+ 	struct resource *res;		/* bus resource */
++	void __iomem	*mio_wb;
++	void __iomem	*mio_wt;
+ 	u32		val;		/* bar start & 3 flag bits */
+ 	u16		map_idx;	/* index into bar mapping array */
+ 	u8		size;		/* order 2 exponent */
+@@ -128,6 +130,7 @@ struct zpci_dev {
+ 	unsigned int	next_bit;
+ 
+ 	char res_name[16];
++	bool mio_capable;
+ 	struct zpci_bar_struct bars[PCI_BAR_COUNT];
+ 
+ 	u64		start_dma;	/* Start of available DMA addresses */
+--- a/arch/s390/include/asm/pci_clp.h
++++ b/arch/s390/include/asm/pci_clp.h
+@@ -42,6 +42,8 @@ struct clp_fh_list_entry {
+ 
+ #define CLP_SET_ENABLE_PCI_FN	0	/* Yes, 0 enables it */
+ #define CLP_SET_DISABLE_PCI_FN	1	/* Yes, 1 disables it */
++#define CLP_SET_ENABLE_MIO	2
++#define CLP_SET_DISABLE_MIO	3
+ 
+ #define CLP_UTIL_STR_LEN	64
+ #define CLP_PFIP_NR_SEGMENTS	4
+@@ -79,7 +81,8 @@ struct clp_req_query_pci {
+ struct clp_rsp_query_pci {
+ 	struct clp_rsp_hdr hdr;
+ 	u16 vfn;			/* virtual fn number */
+-	u16			:  7;
++	u16			:  6;
++	u16 mio_addr_avail	:  1;
+ 	u16 util_str_avail	:  1;	/* utility string available? */
+ 	u16 pfgid		:  8;	/* pci function group id */
+ 	u32 fid;			/* pci function id */
+@@ -95,6 +98,15 @@ struct clp_rsp_query_pci {
+ 	u32 reserved[11];
+ 	u32 uid;			/* user defined id */
+ 	u8 util_str[CLP_UTIL_STR_LEN];	/* utility string */
++	u32 reserved2[16];
++	u32 mio_valid : 6;
++	u32 : 26;
++	u32 : 32;
++	struct {
++		u64 wb;
++		u64 wt;
++	} addr[PCI_BAR_COUNT];
++	u32 reserved3[6];
+ } __packed;
+ 
+ /* Query PCI function group request */
+--- a/arch/s390/include/asm/pci_insn.h
++++ b/arch/s390/include/asm/pci_insn.h
+@@ -1,6 +1,8 @@
+ #ifndef _ASM_S390_PCI_INSN_H
+ #define _ASM_S390_PCI_INSN_H
+ 
++#include <linux/jump_label.h>
++
+ /* Load/Store status codes */
+ #define ZPCI_PCI_ST_FUNC_NOT_ENABLED		4
+ #define ZPCI_PCI_ST_FUNC_IN_ERR			8
+@@ -121,6 +123,8 @@ union zpci_sic_iib {
+ 	struct zpci_cdiib cdiib;
+ };
+ 
++DECLARE_STATIC_KEY_FALSE(have_mio);
++
+ u8 zpci_mod_fc(u64 req, struct zpci_fib *fib, u8 *status);
+ int zpci_refresh_trans(u64 fn, u64 addr, u64 range);
+ int __zpci_load(u64 *data, u64 req, u64 offset);
+@@ -128,6 +132,7 @@ int zpci_load(u64 *data, const volatile
+ int __zpci_store(u64 data, u64 req, u64 offset);
+ int zpci_store(const volatile void __iomem *addr, u64 data, unsigned long len);
+ int __zpci_store_block(const u64 *data, u64 req, u64 offset);
++void zpci_barrier(void);
+ int __zpci_set_irq_ctrl(u16 ctl, u8 isc, union zpci_sic_iib *iib);
+ 
+ static inline int zpci_set_irq_ctrl(u16 ctl, u8 isc)
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -24,6 +24,7 @@
+ #include <linux/export.h>
+ #include <linux/delay.h>
+ #include <linux/seq_file.h>
++#include <linux/jump_label.h>
+ #include <linux/pci.h>
+ #include <linux/msi.h>
+ 
+@@ -50,6 +51,8 @@ static unsigned long *zpci_iomap_bitmap;
+ struct zpci_iomap_entry *zpci_iomap_start;
+ EXPORT_SYMBOL_GPL(zpci_iomap_start);
+ 
++DEFINE_STATIC_KEY_FALSE(have_mio);
++
+ static struct kmem_cache *zdev_fmb_cache;
+ 
+ struct zpci_dev *get_zdev_by_fid(u32 fid)
+@@ -227,18 +230,48 @@ void __iowrite64_copy(void __iomem *to,
+        zpci_memcpy_toio(to, from, count);
+ }
+ 
++void __iomem *ioremap(unsigned long ioaddr, unsigned long size)
++{
++	struct vm_struct *area;
++	unsigned long offset;
++
++	if (!size)
++		return NULL;
++
++	if (!static_branch_unlikely(&have_mio))
++		return (void __iomem *) ioaddr;
++
++	offset = ioaddr & ~PAGE_MASK;
++	ioaddr &= PAGE_MASK;
++	size = PAGE_ALIGN(size + offset);
++	area = get_vm_area(size, VM_IOREMAP);
++	if (!area)
++		return NULL;
++
++	if (ioremap_page_range((unsigned long) area->addr,
++			       (unsigned long) area->addr + size,
++			       ioaddr, PAGE_KERNEL)) {
++		vunmap(area->addr);
++		return NULL;
++	}
++	return (void __iomem *) ((unsigned long) area->addr + offset);
++}
++EXPORT_SYMBOL(ioremap);
++
++void iounmap(volatile void __iomem *addr)
++{
++	if (static_branch_likely(&have_mio))
++		vunmap((__force void *) ((unsigned long) addr & PAGE_MASK));
++}
++EXPORT_SYMBOL(iounmap);
++
+ /* Create a virtual mapping cookie for a PCI BAR */
+-void __iomem *pci_iomap_range(struct pci_dev *pdev,
+-			      int bar,
+-			      unsigned long offset,
+-			      unsigned long max)
++static void __iomem *pci_iomap_range_fh(struct pci_dev *pdev, int bar,
++					unsigned long offset, unsigned long max)
+ {
+ 	struct zpci_dev *zdev =	to_zpci(pdev);
+ 	int idx;
+ 
+-	if (!pci_resource_len(pdev, bar))
+-		return NULL;
+-
+ 	idx = zdev->bars[bar].map_idx;
+ 	spin_lock(&zpci_iomap_lock);
+ 	/* Detect overrun */
+@@ -249,6 +282,30 @@ void __iomem *pci_iomap_range(struct pci
+ 
+ 	return (void __iomem *) ZPCI_ADDR(idx) + offset;
+ }
++
++static void __iomem *pci_iomap_range_mio(struct pci_dev *pdev, int bar,
++					 unsigned long offset,
++					 unsigned long max)
++{
++	unsigned long barsize = pci_resource_len(pdev, bar);
++	struct zpci_dev *zdev = to_zpci(pdev);
++	void __iomem *iova;
++
++	iova = ioremap((unsigned long) zdev->bars[bar].mio_wt, barsize);
++	return iova ? iova + offset : iova;
++}
++
++void __iomem *pci_iomap_range(struct pci_dev *pdev, int bar,
++			      unsigned long offset, unsigned long max)
++{
++	if (!pci_resource_len(pdev, bar) || bar >= PCI_BAR_COUNT)
++		return NULL;
++
++	if (static_branch_likely(&have_mio))
++		return pci_iomap_range_mio(pdev, bar, offset, max);
++	else
++		return pci_iomap_range_fh(pdev, bar, offset, max);
++}
+ EXPORT_SYMBOL(pci_iomap_range);
+ 
+ void __iomem *pci_iomap(struct pci_dev *dev, int bar, unsigned long maxlen)
+@@ -257,7 +314,37 @@ void __iomem *pci_iomap(struct pci_dev *
+ }
+ EXPORT_SYMBOL(pci_iomap);
+ 
+-void pci_iounmap(struct pci_dev *pdev, void __iomem *addr)
++static void __iomem *pci_iomap_wc_range_mio(struct pci_dev *pdev, int bar,
++					    unsigned long offset, unsigned long max)
++{
++	unsigned long barsize = pci_resource_len(pdev, bar);
++	struct zpci_dev *zdev = to_zpci(pdev);
++	void __iomem *iova;
++
++	iova = ioremap((unsigned long) zdev->bars[bar].mio_wb, barsize);
++	return iova ? iova + offset : iova;
++}
++
++void __iomem *pci_iomap_wc_range(struct pci_dev *pdev, int bar,
++				 unsigned long offset, unsigned long max)
++{
++	if (!pci_resource_len(pdev, bar) || bar >= PCI_BAR_COUNT)
++		return NULL;
++
++	if (static_branch_likely(&have_mio))
++		return pci_iomap_wc_range_mio(pdev, bar, offset, max);
++	else
++		return pci_iomap_range_fh(pdev, bar, offset, max);
++}
++EXPORT_SYMBOL(pci_iomap_wc_range);
++
++void __iomem *pci_iomap_wc(struct pci_dev *dev, int bar, unsigned long maxlen)
++{
++	return pci_iomap_wc_range(dev, bar, 0, maxlen);
++}
++EXPORT_SYMBOL(pci_iomap_wc);
++
++static void pci_iounmap_fh(struct pci_dev *pdev, void __iomem *addr)
+ {
+ 	unsigned int idx = ZPCI_IDX(addr);
+ 
+@@ -270,6 +357,19 @@ void pci_iounmap(struct pci_dev *pdev, v
+ 	}
+ 	spin_unlock(&zpci_iomap_lock);
+ }
++
++static void pci_iounmap_mio(struct pci_dev *pdev, void __iomem *addr)
++{
++	iounmap(addr);
++}
++
++void pci_iounmap(struct pci_dev *pdev, void __iomem *addr)
++{
++	if (static_branch_likely(&have_mio))
++		pci_iounmap_mio(pdev, addr);
++	else
++		pci_iounmap_fh(pdev, addr);
++}
+ EXPORT_SYMBOL(pci_iounmap);
+ 
+ static int pci_read(struct pci_bus *bus, unsigned int devfn, int where,
+@@ -307,6 +407,7 @@ static struct pci_ops pci_root_ops = {
+ 
+ static void zpci_map_resources(struct pci_dev *pdev)
+ {
++	struct zpci_dev *zdev = to_zpci(pdev);
+ 	resource_size_t len;
+ 	int i;
+ 
+@@ -314,8 +415,13 @@ static void zpci_map_resources(struct pc
+ 		len = pci_resource_len(pdev, i);
+ 		if (!len)
+ 			continue;
+-		pdev->resource[i].start =
+-			(resource_size_t __force) pci_iomap(pdev, i, 0);
++
++		if (static_branch_likely(&have_mio))
++			pdev->resource[i].start =
++				(resource_size_t __force) zdev->bars[i].mio_wb;
++		else
++			pdev->resource[i].start =
++				(resource_size_t __force) pci_iomap(pdev, i, 0);
+ 		pdev->resource[i].end = pdev->resource[i].start + len - 1;
+ 	}
+ }
+@@ -325,6 +431,9 @@ static void zpci_unmap_resources(struct
+ 	resource_size_t len;
+ 	int i;
+ 
++	if (static_branch_likely(&have_mio))
++		return;
++
+ 	for (i = 0; i < PCI_BAR_COUNT; i++) {
+ 		len = pci_resource_len(pdev, i);
+ 		if (!len)
+@@ -746,6 +855,9 @@ static int __init pci_base_init(void)
+ 	if (!test_facility(69) || !test_facility(71))
+ 		return 0;
+ 
++	if (test_facility(153))
++		static_branch_enable(&have_mio);
++
+ 	rc = zpci_debug_init();
+ 	if (rc)
+ 		goto out;
+--- a/arch/s390/pci/pci_clp.c
++++ b/arch/s390/pci/pci_clp.c
+@@ -155,7 +155,14 @@ static int clp_store_query_pci_fn(struct
+ 		memcpy(zdev->util_str, response->util_str,
+ 		       sizeof(zdev->util_str));
+ 	}
++	zdev->mio_capable = response->mio_addr_avail;
++	for (i = 0; i < PCI_BAR_COUNT; i++) {
++		if (!(response->mio_valid & (1 << (PCI_BAR_COUNT - i - 1))))
++			continue;
+ 
++		zdev->bars[i].mio_wb = (void __iomem *) response->addr[i].wb;
++		zdev->bars[i].mio_wt = (void __iomem *) response->addr[i].wt;
++	}
+ 	return 0;
+ }
+ 
+@@ -271,11 +278,18 @@ int clp_enable_fh(struct zpci_dev *zdev,
+ 	int rc;
+ 
+ 	rc = clp_set_pci_fn(&fh, nr_dma_as, CLP_SET_ENABLE_PCI_FN);
+-	if (!rc)
+-		/* Success -> store enabled handle in zdev */
+-		zdev->fh = fh;
++	zpci_dbg(3, "ena fid:%x, fh:%x, rc:%d\n", zdev->fid, fh, rc);
++	if (rc)
++		goto out;
+ 
+-	zpci_dbg(3, "ena fid:%x, fh:%x, rc:%d\n", zdev->fid, zdev->fh, rc);
++	zdev->fh = fh;
++	if (zdev->mio_capable) {
++		rc = clp_set_pci_fn(&fh, nr_dma_as, CLP_SET_ENABLE_MIO);
++		zpci_dbg(3, "ena mio fid:%x, fh:%x, rc:%d\n", zdev->fid, fh, rc);
++		if (rc)
++			clp_disable_fh(zdev);
++	}
++out:
+ 	return rc;
+ }
+ 
+@@ -288,11 +302,10 @@ int clp_disable_fh(struct zpci_dev *zdev
+ 		return 0;
+ 
+ 	rc = clp_set_pci_fn(&fh, 0, CLP_SET_DISABLE_PCI_FN);
++	zpci_dbg(3, "dis fid:%x, fh:%x, rc:%d\n", zdev->fid, fh, rc);
+ 	if (!rc)
+-		/* Success -> store disabled handle in zdev */
+ 		zdev->fh = fh;
+ 
+-	zpci_dbg(3, "dis fid:%x, fh:%x, rc:%d\n", zdev->fid, zdev->fh, rc);
+ 	return rc;
+ }
+ 
+--- a/arch/s390/pci/pci_insn.c
++++ b/arch/s390/pci/pci_insn.c
+@@ -7,6 +7,7 @@
+ #include <linux/export.h>
+ #include <linux/errno.h>
+ #include <linux/delay.h>
++#include <linux/jump_label.h>
+ #include <asm/facility.h>
+ #include <asm/pci_insn.h>
+ #include <asm/pci_debug.h>
+@@ -160,13 +161,50 @@ int __zpci_load(u64 *data, u64 req, u64
+ }
+ EXPORT_SYMBOL_GPL(__zpci_load);
+ 
+-int zpci_load(u64 *data, const volatile void __iomem *addr, unsigned long len)
++static inline int zpci_load_fh(u64 *data, const volatile void __iomem *addr,
++			       unsigned long len)
+ {
+ 	struct zpci_iomap_entry *entry = &zpci_iomap_start[ZPCI_IDX(addr)];
+ 	u64 req = ZPCI_CREATE_REQ(entry->fh, entry->bar, len);
+ 
+ 	return __zpci_load(data, req, ZPCI_OFFSET(addr));
+ }
++
++static inline int __pcilg_mio(u64 *data, u64 ioaddr, u64 len, u8 *status)
++{
++	register u64 addr asm("2") = ioaddr;
++	register u64 r3 asm("3") = len;
++	int cc = -ENXIO;
++	u64 __data;
++
++	asm volatile (
++		"       .insn   rre,0xb9d60000,%[data],%[ioaddr]\n"
++		"0:     ipm     %[cc]\n"
++		"       srl     %[cc],28\n"
++		"1:\n"
++		EX_TABLE(0b, 1b)
++		: [cc] "+d" (cc), [data] "=d" (__data), "+d" (r3)
++		: [ioaddr] "d" (addr)
++		: "cc");
++	*status = r3 >> 24 & 0xff;
++	*data = __data;
++	return cc;
++}
++
++int zpci_load(u64 *data, const volatile void __iomem *addr, unsigned long len)
++{
++	u8 status;
++	int cc;
++
++	if (!static_branch_unlikely(&have_mio))
++		return zpci_load_fh(data, addr, len);
++
++	cc = __pcilg_mio(data, (__force u64) addr, len, &status);
++	if (cc)
++		zpci_err_insn(cc, status, 0, (__force u64) addr);
++
++	return (cc > 0) ? -EIO : cc;
++}
+ EXPORT_SYMBOL_GPL(zpci_load);
+ 
+ /* PCI Store */
+@@ -207,13 +245,48 @@ int __zpci_store(u64 data, u64 req, u64
+ }
+ EXPORT_SYMBOL_GPL(__zpci_store);
+ 
+-int zpci_store(const volatile void __iomem *addr, u64 data, unsigned long len)
++static inline int zpci_store_fh(const volatile void __iomem *addr, u64 data,
++				unsigned long len)
+ {
+ 	struct zpci_iomap_entry *entry = &zpci_iomap_start[ZPCI_IDX(addr)];
+ 	u64 req = ZPCI_CREATE_REQ(entry->fh, entry->bar, len);
+ 
+ 	return __zpci_store(data, req, ZPCI_OFFSET(addr));
+ }
++
++static inline int __pcistg_mio(u64 data, u64 ioaddr, u64 len, u8 *status)
++{
++	register u64 addr asm("2") = ioaddr;
++	register u64 r3 asm("3") = len;
++	int cc = -ENXIO;
++
++	asm volatile (
++		"       .insn   rre,0xb9d40000,%[data],%[ioaddr]\n"
++		"0:     ipm     %[cc]\n"
++		"       srl     %[cc],28\n"
++		"1:\n"
++		EX_TABLE(0b, 1b)
++		: [cc] "+d" (cc), "+d" (r3)
++		: [data] "d" (data), [ioaddr] "d" (addr)
++		: "cc");
++	*status = r3 >> 24 & 0xff;
++	return cc;
++}
++
++int zpci_store(const volatile void __iomem *addr, u64 data, unsigned long len)
++{
++	u8 status;
++	int cc;
++
++	if (!static_branch_unlikely(&have_mio))
++		return zpci_store_fh(addr, data, len);
++
++	cc = __pcistg_mio(data, (__force u64) addr, len, &status);
++	if (cc)
++		zpci_err_insn(cc, status, 0, (__force u64) addr);
++
++	return (cc > 0) ? -EIO : cc;
++}
+ EXPORT_SYMBOL_GPL(zpci_store);
+ 
+ /* PCI Store Block */
+@@ -252,8 +325,8 @@ int __zpci_store_block(const u64 *data,
+ }
+ EXPORT_SYMBOL_GPL(__zpci_store_block);
+ 
+-int zpci_write_block(volatile void __iomem *dst,
+-		     const void *src, unsigned long len)
++static inline int zpci_write_block_fh(volatile void __iomem *dst,
++				      const void *src, unsigned long len)
+ {
+ 	struct zpci_iomap_entry *entry = &zpci_iomap_start[ZPCI_IDX(dst)];
+ 	u64 req = ZPCI_CREATE_REQ(entry->fh, entry->bar, len);
+@@ -261,4 +334,52 @@ int zpci_write_block(volatile void __iom
+ 
+ 	return __zpci_store_block(src, req, offset);
+ }
++
++static inline int __pcistb_mio(const u64 *data, u64 ioaddr, u64 len, u8 *status)
++{
++	int cc = -ENXIO;
++
++	asm volatile (
++		"       .insn   rsy,0xeb00000000d4,%[len],%[ioaddr],%[data]\n"
++		"0:     ipm     %[cc]\n"
++		"       srl     %[cc],28\n"
++		"1:\n"
++		EX_TABLE(0b, 1b)
++		: [cc] "+d" (cc), [len] "+d" (len)
++		: [ioaddr] "d" (ioaddr), [data] "Q" (*data)
++		: "cc");
++	*status = len >> 24 & 0xff;
++	return cc;
++}
++
++int zpci_write_block(volatile void __iomem *dst,
++		     const void *src, unsigned long len)
++{
++	u8 status;
++	int cc;
++
++	if (!static_branch_unlikely(&have_mio))
++		return zpci_write_block_fh(dst, src, len);
++
++	cc = __pcistb_mio(src, (__force u64) dst, len, &status);
++	if (cc)
++		zpci_err_insn(cc, status, 0, (__force u64) dst);
++
++	return (cc > 0) ? -EIO : cc;
++}
+ EXPORT_SYMBOL_GPL(zpci_write_block);
++
++static inline void __pciwb_mio(void)
++{
++	unsigned long unused = 0;
++
++	asm volatile (".insn    rre,0xb9d50000,%[op],%[op]\n"
++		      : [op] "+d" (unused));
++}
++
++void zpci_barrier(void)
++{
++	if (static_branch_likely(&have_mio))
++		__pciwb_mio();
++}
++EXPORT_SYMBOL_GPL(zpci_barrier);
