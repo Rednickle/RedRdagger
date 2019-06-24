@@ -1,0 +1,464 @@
+From: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+Date: Tue, 29 Jan 2019 01:38:14 -0800
+Subject: [PATCH] scsi: megaraid_sas: Add support for DEVICE_LIST DCMD in
+ driver
+References: bsc#1136271
+Git-commit: f6fe57310811780d55d79e30da51db98677f1a90
+Patch-mainline: v5.1-rc1
+
+This patch adds support for the new DEVICE_LIST DCMD.
+
+Driver currently sends two separate DCMDs for getting the list of PDs and
+LDs that are exposed to host.  The new DCMD provides a single interface to
+get a list of both PDs and LDs that are exposed to the host.  Based on the
+list of target IDs that are returned by this DCMD, driver will add the
+devices (PD/LD) to SML.  Driver will check for FW support for this new DCMD
+and based on the support will either send the new DCMD or will fall back to
+the earlier method of sending two separate DCMDs for PD and LD list.
+
+Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+Signed-off-by: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/megaraid/megaraid_sas.h        |  49 +++++-
+ drivers/scsi/megaraid/megaraid_sas_base.c   | 222 +++++++++++++++++++++++++---
+ drivers/scsi/megaraid/megaraid_sas_fusion.c |   1 +
+ drivers/scsi/megaraid/megaraid_sas_fusion.h |   1 +
+ 4 files changed, 250 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index 16536c41f0c5..fe1173f02c54 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -790,6 +790,37 @@ struct MR_LD_TARGETID_LIST {
+ 	u8	targetId[MAX_LOGICAL_DRIVES_EXT];
+ };
+ 
++struct MR_HOST_DEVICE_LIST_ENTRY {
++	struct {
++		union {
++			struct {
++#if defined(__BIG_ENDIAN_BITFIELD)
++				u8 reserved:7;
++				u8 is_sys_pd:1;
++#else
++				u8 is_sys_pd:1;
++				u8 reserved:7;
++#endif
++			} bits;
++			u8 byte;
++		} u;
++	} flags;
++	u8 scsi_type;
++	__le16 target_id;
++	u8 reserved[2];
++	__le64 sas_addr[2];
++} __packed;
++
++struct MR_HOST_DEVICE_LIST {
++	__le32			size;
++	__le32			count;
++	struct MR_HOST_DEVICE_LIST_ENTRY	host_device_list[1];
++} __packed;
++
++#define HOST_DEVICE_LIST_SZ (sizeof(struct MR_HOST_DEVICE_LIST) +	       \
++			      (sizeof(struct MR_HOST_DEVICE_LIST_ENTRY) *      \
++			      (MEGASAS_MAX_PD + MAX_LOGICAL_DRIVES_EXT - 1)))
++
+ 
+ /*
+  * SAS controller properties
+@@ -870,13 +901,17 @@ struct megasas_ctrl_prop {
+ 		u8 viewSpace;
+ 		struct {
+ #if   defined(__BIG_ENDIAN_BITFIELD)
+-			u16 reserved2:11;
++			u16 reserved3:9;
++			u16 enable_fw_dev_list:1;
++			u16 reserved2:1;
+ 			u16 enable_snap_dump:1;
+ 			u16 reserved1:4;
+ #else
+ 			u16 reserved1:4;
+ 			u16 enable_snap_dump:1;
+-			u16 reserved2:11;
++			u16 reserved2:1;
++			u16 enable_fw_dev_list:1;
++			u16 reserved3:9;
+ #endif
+ 		} on_off_properties2;
+ 	};
+@@ -1685,7 +1720,8 @@ union megasas_sgl_frame {
+ typedef union _MFI_CAPABILITIES {
+ 	struct {
+ #if   defined(__BIG_ENDIAN_BITFIELD)
+-	u32     reserved:17;
++	u32     reserved:16;
++	u32	support_fw_exposed_dev_list:1;
+ 	u32	support_nvme_passthru:1;
+ 	u32     support_64bit_mode:1;
+ 	u32 support_pd_map_target_id:1;
+@@ -1717,7 +1753,8 @@ typedef union _MFI_CAPABILITIES {
+ 	u32	support_pd_map_target_id:1;
+ 	u32     support_64bit_mode:1;
+ 	u32	support_nvme_passthru:1;
+-	u32     reserved:17;
++	u32	support_fw_exposed_dev_list:1;
++	u32     reserved:16;
+ #endif
+ 	} mfi_capabilities;
+ 	__le32		reg;
+@@ -2202,6 +2239,9 @@ struct megasas_instance {
+ 	struct MR_LD_TARGETID_LIST *ld_targetid_list_buf;
+ 	dma_addr_t ld_targetid_list_buf_h;
+ 
++	struct MR_HOST_DEVICE_LIST *host_device_list_buf;
++	dma_addr_t host_device_list_buf_h;
++
+ 	struct MR_SNAPDUMP_PROPERTIES *snapdump_prop;
+ 	dma_addr_t snapdump_prop_h;
+ 
+@@ -2337,6 +2377,7 @@ struct megasas_instance {
+ 	u8 task_abort_tmo;
+ 	u8 max_reset_tmo;
+ 	u8 snapdump_wait_time;
++	u8 enable_fw_dev_list;
+ };
+ struct MR_LD_VF_MAP {
+ 	u32 size;
+diff --git a/drivers/scsi/megaraid/megaraid_sas_base.c b/drivers/scsi/megaraid/megaraid_sas_base.c
+index e6dd1aab9931..37e811d9c4c4 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -4640,6 +4640,123 @@ megasas_ld_list_query(struct megasas_instance *instance, u8 query_type)
+ 	return ret;
+ }
+ 
++/**
++ * dcmd.opcode            - MR_DCMD_CTRL_DEVICE_LIST_GET
++ * dcmd.mbox              - reserved
++ * dcmd.sge IN            - ptr to return MR_HOST_DEVICE_LIST structure
++ * Desc:    This DCMD will return the combined device list
++ * Status:  MFI_STAT_OK - List returned successfully
++ *          MFI_STAT_INVALID_CMD - Firmware support for the feature has been
++ *                                 disabled
++ * @instance:			Adapter soft state
++ * @is_probe:			Driver probe check
++ * Return:			0 if DCMD succeeded
++ *				 non-zero if failed
++ */
++int
++megasas_host_device_list_query(struct megasas_instance *instance,
++			       bool is_probe)
++{
++	int ret, i, target_id;
++	struct megasas_cmd *cmd;
++	struct megasas_dcmd_frame *dcmd;
++	struct MR_HOST_DEVICE_LIST *ci;
++	u32 count;
++	dma_addr_t ci_h;
++
++	ci = instance->host_device_list_buf;
++	ci_h = instance->host_device_list_buf_h;
++
++	cmd = megasas_get_cmd(instance);
++
++	if (!cmd) {
++		dev_warn(&instance->pdev->dev,
++			 "%s: failed to get cmd\n",
++			 __func__);
++		return -ENOMEM;
++	}
++
++	dcmd = &cmd->frame->dcmd;
++
++	memset(ci, 0, sizeof(*ci));
++	memset(dcmd->mbox.b, 0, MFI_MBOX_SIZE);
++
++	dcmd->mbox.b[0] = is_probe ? 0 : 1;
++	dcmd->cmd = MFI_CMD_DCMD;
++	dcmd->cmd_status = MFI_STAT_INVALID_STATUS;
++	dcmd->sge_count = 1;
++	dcmd->flags = MFI_FRAME_DIR_READ;
++	dcmd->timeout = 0;
++	dcmd->pad_0 = 0;
++	dcmd->data_xfer_len = cpu_to_le32(HOST_DEVICE_LIST_SZ);
++	dcmd->opcode = cpu_to_le32(MR_DCMD_CTRL_DEVICE_LIST_GET);
++
++	megasas_set_dma_settings(instance, dcmd, ci_h, HOST_DEVICE_LIST_SZ);
++
++	if (!instance->mask_interrupts) {
++		ret = megasas_issue_blocked_cmd(instance, cmd,
++						MFI_IO_TIMEOUT_SECS);
++	} else {
++		ret = megasas_issue_polled(instance, cmd);
++		cmd->flags |= DRV_DCMD_SKIP_REFIRE;
++	}
++
++	switch (ret) {
++	case DCMD_SUCCESS:
++		/* Fill the internal pd_list and ld_ids array based on
++		 * targetIds returned by FW
++		 */
++		count = le32_to_cpu(ci->count);
++
++		memset(instance->local_pd_list, 0,
++		       MEGASAS_MAX_PD * sizeof(struct megasas_pd_list));
++		memset(instance->ld_ids, 0xff, MAX_LOGICAL_DRIVES_EXT);
++		for (i = 0; i < count; i++) {
++			target_id = le16_to_cpu(ci->host_device_list[i].target_id);
++			if (ci->host_device_list[i].flags.u.bits.is_sys_pd) {
++				instance->local_pd_list[target_id].tid = target_id;
++				instance->local_pd_list[target_id].driveType =
++						ci->host_device_list[i].scsi_type;
++				instance->local_pd_list[target_id].driveState =
++						MR_PD_STATE_SYSTEM;
++			} else {
++				instance->ld_ids[target_id] = target_id;
++			}
++		}
++
++		memcpy(instance->pd_list, instance->local_pd_list,
++		       sizeof(instance->pd_list));
++		break;
++
++	case DCMD_TIMEOUT:
++		switch (dcmd_timeout_ocr_possible(instance)) {
++		case INITIATE_OCR:
++			cmd->flags |= DRV_DCMD_SKIP_REFIRE;
++			megasas_reset_fusion(instance->host,
++				MFI_IO_TIMEOUT_OCR);
++			break;
++		case KILL_ADAPTER:
++			megaraid_sas_kill_hba(instance);
++			break;
++		case IGNORE_TIMEOUT:
++			dev_info(&instance->pdev->dev, "Ignore DCMD timeout: %s %d\n",
++				 __func__, __LINE__);
++			break;
++		}
++		break;
++	case DCMD_FAILED:
++		dev_err(&instance->pdev->dev,
++			"%s: MR_DCMD_CTRL_DEVICE_LIST_GET failed\n",
++			__func__);
++		break;
++	}
++
++	if (ret != DCMD_TIMEOUT)
++		megasas_return_cmd(instance, cmd);
++
++	return ret;
++}
++
+ /*
+  * megasas_update_ext_vd_details : Update details w.r.t Extended VD
+  * instance			 : Controller's instance
+@@ -4867,6 +4984,9 @@ megasas_get_ctrl_info(struct megasas_instance *instance)
+ 			(ci->properties.on_off_properties2.enable_snap_dump ?
+ 			 MEGASAS_DEFAULT_SNAP_DUMP_WAIT_TIME : 0);
+ 
++		instance->enable_fw_dev_list =
++			ci->properties.on_off_properties2.enable_fw_dev_list;
++
+ 		dev_info(&instance->pdev->dev,
+ 			"controller type\t: %s(%dMB)\n",
+ 			instance->is_imr ? "iMR" : "MR",
+@@ -5331,6 +5451,8 @@ static void megasas_setup_reply_map(struct megasas_instance *instance)
+  * @return:			Success or failure
+  *
+  * Issue DCMDs to Firmware to get the PD and LD list.
++ * Based on the FW support, driver sends the HOST_DEVICE_LIST or combination
++ * of PD_LIST/LD_LIST_QUERY DCMDs to get the device list.
+  */
+ static
+ int megasas_get_device_list(struct megasas_instance *instance)
+@@ -5339,15 +5461,20 @@ int megasas_get_device_list(struct megasas_instance *instance)
+ 	       (MEGASAS_MAX_PD * sizeof(struct megasas_pd_list)));
+ 	memset(instance->ld_ids, 0xff, MEGASAS_MAX_LD_IDS);
+ 
+-	if (megasas_get_pd_list(instance) < 0) {
+-		dev_err(&instance->pdev->dev, "failed to get PD list\n");
+-		return FAILED;
+-	}
++	if (instance->enable_fw_dev_list) {
++		if (megasas_host_device_list_query(instance, true))
++			return FAILED;
++	} else {
++		if (megasas_get_pd_list(instance) < 0) {
++			dev_err(&instance->pdev->dev, "failed to get PD list\n");
++			return FAILED;
++		}
+ 
+-	if (megasas_ld_list_query(instance,
+-				  MR_LD_QUERY_TYPE_EXPOSED_TO_HOST)) {
+-		dev_err(&instance->pdev->dev, "failed to get LD list\n");
+-		return FAILED;
++		if (megasas_ld_list_query(instance,
++					  MR_LD_QUERY_TYPE_EXPOSED_TO_HOST)) {
++			dev_err(&instance->pdev->dev, "failed to get LD list\n");
++			return FAILED;
++		}
+ 	}
+ 
+ 	return SUCCESS;
+@@ -6449,6 +6576,18 @@ int megasas_alloc_ctrl_dma_buffers(struct megasas_instance *instance)
+ 		if (!instance->snapdump_prop)
+ 			dev_err(&pdev->dev,
+ 				"Failed to allocate snapdump properties buffer\n");
++
++		instance->host_device_list_buf = dma_alloc_coherent(&pdev->dev,
++							HOST_DEVICE_LIST_SZ,
++							&instance->host_device_list_buf_h,
++							GFP_KERNEL);
++
++		if (!instance->host_device_list_buf) {
++			dev_err(&pdev->dev,
++				"Failed to allocate targetid list buffer\n");
++			return -ENOMEM;
++		}
++
+ 	}
+ 
+ 	instance->pd_list_buf =
+@@ -6598,6 +6737,13 @@ void megasas_free_ctrl_dma_buffers(struct megasas_instance *instance)
+ 				  sizeof(struct MR_SNAPDUMP_PROPERTIES),
+ 				  instance->snapdump_prop,
+ 				  instance->snapdump_prop_h);
++
++	if (instance->host_device_list_buf)
++		dma_free_coherent(&pdev->dev,
++				  HOST_DEVICE_LIST_SZ,
++				  instance->host_device_list_buf,
++				  instance->host_device_list_buf_h);
++
+ }
+ 
+ /*
+@@ -6771,7 +6917,9 @@ static int megasas_probe_one(struct pci_dev *pdev,
+ 	/*
+ 	 * Trigger SCSI to scan our drives
+ 	 */
+-	scsi_scan_host(host);
++	if (!instance->enable_fw_dev_list ||
++	    (instance->host_device_list_buf->count > 0))
++		scsi_scan_host(host);
+ 
+ 	/*
+ 	 * Initiate AEN (Asynchronous Event Notification)
+@@ -7900,6 +8048,8 @@ static inline void megasas_remove_scsi_device(struct scsi_device *sdev)
+  * @return:			Success or failure
+  *
+  * Issue DCMDs to Firmware to update the internal device list in driver.
++ * Based on the FW support, driver sends the HOST_DEVICE_LIST or combination
++ * of PD_LIST/LD_LIST_QUERY DCMDs to get the device list.
+  */
+ static
+ int megasas_update_device_list(struct megasas_instance *instance,
+@@ -7907,22 +8057,28 @@ int megasas_update_device_list(struct megasas_instance *instance,
+ {
+ 	int dcmd_ret = DCMD_SUCCESS;
+ 
+-	if (event_type & SCAN_PD_CHANNEL) {
+-		dcmd_ret = megasas_get_pd_list(instance);
+-
++	if (instance->enable_fw_dev_list) {
++		dcmd_ret = megasas_host_device_list_query(instance, false);
+ 		if (dcmd_ret != DCMD_SUCCESS)
+ 			goto out;
+-	}
++	} else {
++		if (event_type & SCAN_PD_CHANNEL) {
++			dcmd_ret = megasas_get_pd_list(instance);
+ 
+-	if (event_type & SCAN_VD_CHANNEL) {
+-		if (!instance->requestorId ||
+-		    (instance->requestorId &&
+-		     megasas_get_ld_vf_affiliation(instance, 0))) {
+-			dcmd_ret = megasas_ld_list_query(instance,
+-					MR_LD_QUERY_TYPE_EXPOSED_TO_HOST);
+ 			if (dcmd_ret != DCMD_SUCCESS)
+ 				goto out;
+ 		}
++
++		if (event_type & SCAN_VD_CHANNEL) {
++			if (!instance->requestorId ||
++			    (instance->requestorId &&
++			     megasas_get_ld_vf_affiliation(instance, 0))) {
++				dcmd_ret = megasas_ld_list_query(instance,
++						MR_LD_QUERY_TYPE_EXPOSED_TO_HOST);
++				if (dcmd_ret != DCMD_SUCCESS)
++					goto out;
++			}
++		}
+ 	}
+ 
+ out:
+@@ -7943,11 +8099,39 @@ void megasas_add_remove_devices(struct megasas_instance *instance,
+ 	int i, j;
+ 	u16 pd_index = 0;
+ 	u16 ld_index = 0;
++	u16 channel = 0, id = 0;
+ 	struct Scsi_Host *host;
+ 	struct scsi_device *sdev1;
++	struct MR_HOST_DEVICE_LIST *targetid_list = NULL;
++	struct MR_HOST_DEVICE_LIST_ENTRY *targetid_entry = NULL;
+ 
+ 	host = instance->host;
+ 
++	if (instance->enable_fw_dev_list) {
++		targetid_list = instance->host_device_list_buf;
++		for (i = 0; i < targetid_list->count; i++) {
++			targetid_entry = &targetid_list->host_device_list[i];
++			if (targetid_entry->flags.u.bits.is_sys_pd) {
++				channel = le16_to_cpu(targetid_entry->target_id) /
++						MEGASAS_MAX_DEV_PER_CHANNEL;
++				id = le16_to_cpu(targetid_entry->target_id) %
++						MEGASAS_MAX_DEV_PER_CHANNEL;
++			} else {
++				channel = MEGASAS_MAX_PD_CHANNELS +
++					  (le16_to_cpu(targetid_entry->target_id) /
++					   MEGASAS_MAX_DEV_PER_CHANNEL);
++				id = le16_to_cpu(targetid_entry->target_id) %
++						MEGASAS_MAX_DEV_PER_CHANNEL;
++			}
++			sdev1 = scsi_device_lookup(host, channel, id, 0);
++			if (!sdev1) {
++				scsi_add_device(host, channel, id, 0);
++			} else {
++				scsi_device_put(sdev1);
++			}
++		}
++	}
++
+ 	if (scan_type & SCAN_PD_CHANNEL) {
+ 		for (i = 0; i < MEGASAS_MAX_PD_CHANNELS; i++) {
+ 			for (j = 0; j < MEGASAS_MAX_DEV_PER_CHANNEL; j++) {
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 3cecee38b192..4e912e01bb89 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -1074,6 +1074,7 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
+ 	drv_ops->mfi_capabilities.support_qd_throttling = 1;
+ 	drv_ops->mfi_capabilities.support_pd_map_target_id = 1;
+ 	drv_ops->mfi_capabilities.support_nvme_passthru = 1;
++	drv_ops->mfi_capabilities.support_fw_exposed_dev_list = 1;
+ 
+ 	if (instance->consistent_mask_64bit)
+ 		drv_ops->mfi_capabilities.support_64bit_mode = 1;
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.h b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+index ca73c50fe723..1481bf029490 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.h
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+@@ -724,6 +724,7 @@ struct MPI2_IOC_INIT_REQUEST {
+ #define MR_DCMD_LD_VF_MAP_GET_ALL_LDS_111   0x03200200
+ #define MR_DCMD_LD_VF_MAP_GET_ALL_LDS       0x03150200
+ #define MR_DCMD_CTRL_SNAPDUMP_GET_PROPERTIES	0x01200100
++#define MR_DCMD_CTRL_DEVICE_LIST_GET		0x01190600
+ 
+ struct MR_DEV_HANDLE_INFO {
+ 	__le16	curDevHdl;
+-- 
+2.16.4
+
