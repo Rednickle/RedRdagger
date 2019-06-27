@@ -1,0 +1,223 @@
+From 83417206427bdf0fef9fa69957807194f25923c3 Mon Sep 17 00:00:00 2001
+From: Jason Gerecke <killertofu@gmail.com>
+Date: Fri, 10 Nov 2017 11:50:01 -0800
+Subject: [PATCH] HID: wacom: Queue events with missing type/serial data for later processing
+Git-commit: 83417206427bdf0fef9fa69957807194f25923c3
+Patch-mainline: v4.16-rc1
+References: bsc#1051510
+
+Userspace expects to receive tool type and serial number information
+for the active pen in the very first kernel report, if such data is
+supported by the hardware. While this expectation is not an issue for
+EMR devices, AES sensors will often send several packets worth of in-
+range data before relaying type/serial data to the kernel. Sending this
+data "late" can result in proximity-tracking issues by xf86-input-wacom,
+or an inability to distinguish different pens by input-wacom.
+
+Options for dealing with this situation include ignoring reports from
+the tablet until we get the necessary data, or using the information
+from the last-seen pen instead of the (eventual) real data. Neither
+option is particularly attractive: the former results in truncated
+strokes and the latter causes issues with switching between pens.
+
+This commit instead opts to queue up events with missing information
+until we receive a report which contains it. At that point, we can
+update the driver's state variables (id[0] and serial[0]) and replay
+the queued events.
+
+Signed-off-by: Jason Gerecke <jason.gerecke@wacom.com>
+Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/hid/wacom_sys.c | 110 ++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/hid/wacom_wac.c |   1 +
+ drivers/hid/wacom_wac.h |   3 ++
+ 3 files changed, 114 insertions(+)
+
+diff --git a/drivers/hid/wacom_sys.c b/drivers/hid/wacom_sys.c
+index ee71ad9b6cc1..c9eadf632564 100644
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@ -56,6 +56,107 @@ static int wacom_set_report(struct hid_device *hdev, u8 type, u8 *buf,
+ 	return retval;
+ }
+ 
++static void wacom_wac_queue_insert(struct hid_device *hdev,
++				   struct kfifo_rec_ptr_2 *fifo,
++				   u8 *raw_data, int size)
++{
++	bool warned = false;
++
++	while (kfifo_avail(fifo) < size) {
++		if (!warned)
++			hid_warn(hdev, "%s: kfifo has filled, starting to drop events\n", __func__);
++		warned = true;
++
++		kfifo_skip(fifo);
++	}
++
++	kfifo_in(fifo, raw_data, size);
++}
++
++static void wacom_wac_queue_flush(struct hid_device *hdev,
++				  struct kfifo_rec_ptr_2 *fifo)
++{
++	while (!kfifo_is_empty(fifo)) {
++		u8 buf[WACOM_PKGLEN_MAX];
++		int size;
++		int err;
++
++		size = kfifo_out(fifo, buf, sizeof(buf));
++		err = hid_report_raw_event(hdev, HID_INPUT_REPORT, buf, size, false);
++		if (err) {
++			hid_warn(hdev, "%s: unable to flush event due to error %d\n",
++				 __func__, err);
++		}
++	}
++}
++
++static int wacom_wac_pen_serial_enforce(struct hid_device *hdev,
++		struct hid_report *report, u8 *raw_data, int size)
++{
++	struct wacom *wacom = hid_get_drvdata(hdev);
++	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++	struct wacom_features *features = &wacom_wac->features;
++	bool flush = false;
++	bool insert = false;
++	int i, j;
++
++	if (wacom_wac->serial[0] || !(features->quirks & WACOM_QUIRK_TOOLSERIAL))
++		return 0;
++
++	/* Queue events which have invalid tool type or serial number */
++	for (i = 0; i < report->maxfield; i++) {
++		for (j = 0; j < report->field[i]->maxusage; j++) {
++			struct hid_field *field = report->field[i];
++			struct hid_usage *usage = &field->usage[j];
++			unsigned int equivalent_usage = wacom_equivalent_usage(usage->hid);
++			unsigned int offset;
++			unsigned int size;
++			unsigned int value;
++
++			if (equivalent_usage != HID_DG_INRANGE &&
++			    equivalent_usage != HID_DG_TOOLSERIALNUMBER &&
++			    equivalent_usage != WACOM_HID_WD_SERIALHI &&
++			    equivalent_usage != WACOM_HID_WD_TOOLTYPE)
++				continue;
++
++			offset = field->report_offset;
++			size = field->report_size;
++			value = hid_field_extract(hdev, raw_data+1, offset + j * size, size);
++
++			/* If we go out of range, we need to flush the queue ASAP */
++			if (equivalent_usage == HID_DG_INRANGE)
++				value = !value;
++
++			if (value) {
++				flush = true;
++				switch (equivalent_usage) {
++				case HID_DG_TOOLSERIALNUMBER:
++					wacom_wac->serial[0] = value;
++					break;
++
++				case WACOM_HID_WD_SERIALHI:
++					wacom_wac->serial[0] |= ((__u64)value) << 32;
++					break;
++
++				case WACOM_HID_WD_TOOLTYPE:
++					wacom_wac->id[0] = value;
++					break;
++				}
++			}
++			else {
++				insert = true;
++			}
++		}
++	}
++
++	if (flush)
++		wacom_wac_queue_flush(hdev, &wacom_wac->pen_fifo);
++	else if (insert)
++		wacom_wac_queue_insert(hdev, &wacom_wac->pen_fifo, raw_data, size);
++
++	return insert && !flush;
++}
++
+ static int wacom_raw_event(struct hid_device *hdev, struct hid_report *report,
+ 		u8 *raw_data, int size)
+ {
+@@ -64,6 +165,9 @@ static int wacom_raw_event(struct hid_device *hdev, struct hid_report *report,
+ 	if (size > WACOM_PKGLEN_MAX)
+ 		return 1;
+ 
++	if (wacom_wac_pen_serial_enforce(hdev, report, raw_data, size))
++		return -1;
++
+ 	memcpy(wacom->wacom_wac.data, raw_data, size);
+ 
+ 	wacom_wac_irq(&wacom->wacom_wac, size);
+@@ -2580,6 +2684,10 @@ static int wacom_probe(struct hid_device *hdev,
+ 		goto fail;
+ 	}
+ 
++	error = kfifo_alloc(&wacom_wac->pen_fifo, WACOM_PKGLEN_MAX, GFP_KERNEL);
++	if (error)
++		goto fail;
++
+ 	wacom_wac->hid_data.inputmode = -1;
+ 	wacom_wac->mode_report = -1;
+ 
+@@ -2643,6 +2751,8 @@ static void wacom_remove(struct hid_device *hdev)
+ 	if (wacom->wacom_wac.features.type != REMOTE)
+ 		wacom_release_resources(wacom);
+ 
++	kfifo_free(&wacom_wac->pen_fifo);
++
+ 	hid_set_drvdata(hdev, NULL);
+ }
+ 
+diff --git a/drivers/hid/wacom_wac.c b/drivers/hid/wacom_wac.c
+index ff679ee3b358..7fa373225d8a 100644
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@ -2085,6 +2085,7 @@ static void wacom_wac_pen_usage_mapping(struct hid_device *hdev,
+ 		wacom_map_usage(input, usage, field, EV_KEY, BTN_STYLUS2, 0);
+ 		break;
+ 	case HID_DG_TOOLSERIALNUMBER:
++		features->quirks |= WACOM_QUIRK_TOOLSERIAL;
+ 		wacom_map_usage(input, usage, field, EV_MSC, MSC_SERIAL, 0);
+ 
+ 		/* Adjust AES usages to match modern convention */
+diff --git a/drivers/hid/wacom_wac.h b/drivers/hid/wacom_wac.h
+index 6fe6d60f9ab5..15d9c14fbdf7 100644
+--- a/drivers/hid/wacom_wac.h
++++ b/drivers/hid/wacom_wac.h
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/hid.h>
++#include <linux/kfifo.h>
+ 
+ /* maximum packet length for USB/BT devices */
+ #define WACOM_PKGLEN_MAX	361
+@@ -88,6 +89,7 @@
+ #define WACOM_QUIRK_SENSE		0x0002
+ #define WACOM_QUIRK_AESPEN		0x0004
+ #define WACOM_QUIRK_BATTERY		0x0008
++#define WACOM_QUIRK_TOOLSERIAL		0x0010
+ 
+ /* device types */
+ #define WACOM_DEVICETYPE_NONE           0x0000
+@@ -339,6 +341,7 @@ struct wacom_wac {
+ 	struct input_dev *pen_input;
+ 	struct input_dev *touch_input;
+ 	struct input_dev *pad_input;
++	struct kfifo_rec_ptr_2 pen_fifo;
+ 	int pid;
+ 	int num_contacts_left;
+ 	u8 bt_features;
+-- 
+2.16.4
+
