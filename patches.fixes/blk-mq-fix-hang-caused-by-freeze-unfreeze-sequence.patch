@@ -1,0 +1,149 @@
+From: Bob Liu <bob.liu@oracle.com>
+Date: Tue, 21 May 2019 11:25:55 +0800
+Subject: [PATCH] blk-mq: fix hang caused by freeze/unfreeze sequence
+Git-commit: 7996a8b5511a72465b0b286763c2d8f412b8874a
+Patch-Mainline: v5.2-rc1
+References: bsc#1128432
+
+The following is a description of a hang in blk_mq_freeze_queue_wait().
+The hang happens on attempt to freeze a queue while another task does
+queue unfreeze.
+
+The root cause is an incorrect sequence of percpu_ref_resurrect() and
+percpu_ref_kill() and as a result those two can be swapped:
+
+ CPU#0                         CPU#1
+ ----------------              -----------------
+ q1 = blk_mq_init_queue(shared_tags)
+
+                                q2 = blk_mq_init_queue(shared_tags):
+                                  blk_mq_add_queue_tag_set(shared_tags):
+                                    blk_mq_update_tag_set_depth(shared_tags):
+				     list_for_each_entry()
+                                      blk_mq_freeze_queue(q1)
+                                       > percpu_ref_kill()
+                                       > blk_mq_freeze_queue_wait()
+
+ blk_cleanup_queue(q1)
+  blk_mq_freeze_queue(q1)
+   > percpu_ref_kill()
+                 ^^^^^^ freeze_depth can't guarantee the order
+
+                                      blk_mq_unfreeze_queue()
+                                        > percpu_ref_resurrect()
+
+   > blk_mq_freeze_queue_wait()
+                 ^^^^^^ Hang here!!!!
+
+This wrong sequence raises kernel warning:
+percpu_ref_kill_and_confirm called more than once on blk_queue_usage_counter_release!
+WARNING: CPU: 0 PID: 11854 at lib/percpu-refcount.c:336 percpu_ref_kill_and_confirm+0x99/0xb0
+
+But the most unpleasant effect is a hang of a blk_mq_freeze_queue_wait(),
+which waits for a zero of a q_usage_counter, which never happens
+because percpu-ref was reinited (instead of being killed) and stays in
+PERCPU state forever.
+
+How to reproduce:
+ - "insmod null_blk.ko shared_tags=1 nr_devices=0 queue_mode=2"
+ - cpu0: python Script.py 0; taskset the corresponding process running on cpu0
+ - cpu1: python Script.py 1; taskset the corresponding process running on cpu1
+
+ Script.py:
+ ------
+ #!/usr/bin/python3
+
+import os
+import sys
+
+while True:
+    on = "echo 1 > /sys/kernel/config/nullb/%s/power" % sys.argv[1]
+    off = "echo 0 > /sys/kernel/config/nullb/%s/power" % sys.argv[1]
+    os.system(on)
+    os.system(off)
+------
+
+This bug was first reported and fixed by Roman, previous discussion:
+[1] Message id: 1443287365-4244-7-git-send-email-akinobu.mita@gmail.com
+[2] Message id: 1443563240-29306-6-git-send-email-tj@kernel.org
+[3] https://patchwork.kernel.org/patch/9268199/
+
+[hare: ported to SLE15]
+
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Roman Pen <roman.penyaev@profitbricks.com>
+Signed-off-by: Bob Liu <bob.liu@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/blk-core.c       | 1 +
+ block/blk-mq.c         | 6 ++++++
+ include/linux/blkdev.h | 3 +++
+ 3 files changed, 10 insertions(+)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index e555f960eac9..52ba6e23147f 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -933,6 +933,7 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ 	__set_bit(QUEUE_FLAG_BYPASS, &q->queue_flags);
+ 
+ 	init_waitqueue_head(&q->mq_freeze_wq);
++	mutex_init(&q->mq_freeze_lock);
+ 
+ 	/*
+ 	 * Init percpu_ref in atomic mode so that it's faster to shutdown.
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index a618fca98116..6f79ba87108f 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -138,11 +138,15 @@ void blk_freeze_queue_start(struct request_queue *q)
+ {
+ 	int freeze_depth;
+ 
++	mutex_lock(&q->mq_freeze_lock);
+ 	freeze_depth = atomic_inc_return(&q->mq_freeze_depth);
+ 	if (freeze_depth == 1) {
+ 		percpu_ref_kill(&q->q_usage_counter);
++		mutex_unlock(&q->mq_freeze_lock);
+ 		if (q->mq_ops)
+ 			blk_mq_run_hw_queues(q, false);
++	} else {
++		mutex_unlock(&q->mq_freeze_lock);
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(blk_freeze_queue_start);
+@@ -195,12 +199,14 @@ void blk_mq_unfreeze_queue(struct request_queue *q)
+ {
+ 	int freeze_depth;
+ 
++	mutex_lock(&q->mq_freeze_lock);
+ 	freeze_depth = atomic_dec_return(&q->mq_freeze_depth);
+ 	WARN_ON_ONCE(freeze_depth < 0);
+ 	if (!freeze_depth) {
+ 		percpu_ref_reinit(&q->q_usage_counter);
+ 		wake_up_all(&q->mq_freeze_wq);
+ 	}
++	mutex_unlock(&q->mq_freeze_lock);
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_unfreeze_queue);
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index bd8e0a5208c4..52ae47904496 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -617,6 +617,9 @@ struct request_queue {
+ 
+ #define BLK_MAX_WRITE_HINTS	5
+ 	u64			write_hints[BLK_MAX_WRITE_HINTS];
++#ifndef __GENKSYMS__
++	struct mutex		mq_freeze_lock;
++#endif
+ };
+ 
+ #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
+-- 
+2.16.4
+
