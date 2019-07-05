@@ -1,0 +1,194 @@
+From 6bc9b56433b76e40d11099338d27fbc5cd2935ca Mon Sep 17 00:00:00 2001
+From: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Date: Thu, 23 Aug 2018 17:00:38 -0700
+Subject: [PATCH] mm: fix race on soft-offlining free huge pages
+Patch-mainline: v4.19-rc1
+Git-commit: 6bc9b56433b76e40d11099338d27fbc5cd2935ca
+References: bsc#1139712
+
+Patch series "mm: soft-offline: fix race against page allocation".
+
+Xishi recently reported the issue about race on reusing the target pages
+of soft offlining.  Discussion and analysis showed that we need make
+sure that setting PG_hwpoison should be done in the right place under
+zone->lock for soft offline.  1/2 handles free hugepage's case, and 2/2
+hanldes free buddy page's case.
+
+This patch (of 2):
+
+There's a race condition between soft offline and hugetlb_fault which
+causes unexpected process killing and/or hugetlb allocation failure.
+
+The process killing is caused by the following flow:
+
+  CPU 0               CPU 1              CPU 2
+
+  soft offline
+    get_any_page
+    // find the hugetlb is free
+                      mmap a hugetlb file
+                      page fault
+                        ...
+                          hugetlb_fault
+                            hugetlb_no_page
+                              alloc_huge_page
+                              // succeed
+      soft_offline_free_page
+      // set hwpoison flag
+                                         mmap the hugetlb file
+                                         page fault
+                                           ...
+                                             hugetlb_fault
+                                               hugetlb_no_page
+                                                 find_lock_page
+                                                   return VM_FAULT_HWPOISON
+                                           mm_fault_error
+                                             do_sigbus
+                                             // kill the process
+
+The hugetlb allocation failure comes from the following flow:
+
+  CPU 0                          CPU 1
+
+                                 mmap a hugetlb file
+                                 // reserve all free page but don't fault-in
+  soft offline
+    get_any_page
+    // find the hugetlb is free
+      soft_offline_free_page
+      // set hwpoison flag
+        dissolve_free_huge_page
+        // fail because all free hugepages are reserved
+                                 page fault
+                                   ...
+                                     hugetlb_fault
+                                       hugetlb_no_page
+                                         alloc_huge_page
+                                           ...
+                                             dequeue_huge_page_node_exact
+                                             // ignore hwpoisoned hugepage
+                                             // and finally fail due to no-mem
+
+The root cause of this is that current soft-offline code is written based
+on an assumption that PageHWPoison flag should be set at first to avoid
+accessing the corrupted data.  This makes sense for memory_failure() or
+hard offline, but does not for soft offline because soft offline is about
+corrected (not uncorrected) error and is safe from data lost.  This patch
+changes soft offline semantics where it sets PageHWPoison flag only after
+containment of the error page completes successfully.
+
+Link: http://lkml.kernel.org/r/1531452366-11661-2-git-send-email-n-horiguchi@ah.jp.nec.com
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Reported-by: Xishi Qiu <xishi.qiuxishi@alibaba-inc.com>
+Suggested-by: Xishi Qiu <xishi.qiuxishi@alibaba-inc.com>
+Tested-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: <zy.zhengyi@alibaba-inc.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+---
+ mm/hugetlb.c        | 11 +++++------
+ mm/memory-failure.c | 22 ++++++++++++++++------
+ mm/migrate.c        |  2 --
+ 3 files changed, 21 insertions(+), 14 deletions(-)
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 47566bb0b4b1..9f1c853f67b5 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1479,22 +1479,20 @@ static int free_pool_huge_page(struct hstate *h, nodemask_t *nodes_allowed,
+ /*
+  * Dissolve a given free hugepage into free buddy pages. This function does
+  * nothing for in-use (including surplus) hugepages. Returns -EBUSY if the
+- * number of free hugepages would be reduced below the number of reserved
+- * hugepages.
++ * dissolution fails because a give page is not a free hugepage, or because
++ * free hugepages are fully reserved.
+  */
+ int dissolve_free_huge_page(struct page *page)
+ {
+-	int rc = 0;
++	int rc = -EBUSY;
+ 
+ 	spin_lock(&hugetlb_lock);
+ 	if (PageHuge(page) && !page_count(page)) {
+ 		struct page *head = compound_head(page);
+ 		struct hstate *h = page_hstate(head);
+ 		int nid = page_to_nid(head);
+-		if (h->free_huge_pages - h->resv_huge_pages == 0) {
+-			rc = -EBUSY;
++		if (h->free_huge_pages - h->resv_huge_pages == 0)
+ 			goto out;
+-		}
+ 		/*
+ 		 * Move PageHWPoison flag from head page to the raw error page,
+ 		 * which makes any subpages rather than the error page reusable.
+@@ -1508,6 +1506,7 @@ int dissolve_free_huge_page(struct page *page)
+ 		h->free_huge_pages_node[nid]--;
+ 		h->max_huge_pages--;
+ 		update_and_free_page(h, head);
++		rc = 0;
+ 	}
+ out:
+ 	spin_unlock(&hugetlb_lock);
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index c83a1746812f..49dc32c61137 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1598,8 +1598,18 @@ static int soft_offline_huge_page(struct page *page, int flags)
+ 		if (ret > 0)
+ 			ret = -EIO;
+ 	} else {
+-		if (PageHuge(page))
+-			dissolve_free_huge_page(page);
++		/*
++		 * We set PG_hwpoison only when the migration source hugepage
++		 * was successfully dissolved, because otherwise hwpoisoned
++		 * hugepage remains on free hugepage list, then userspace will
++		 * find it as SIGBUS by allocation failure. That's not expected
++		 * in soft-offlining.
++		 */
++		ret = dissolve_free_huge_page(page);
++		if (!ret) {
++			if (set_hwpoison_free_buddy_page(page))
++				num_poisoned_pages_inc();
++		}
+ 	}
+ 	return ret;
+ }
+@@ -1715,13 +1725,13 @@ static int soft_offline_in_use_page(struct page *page, int flags)
+ 
+ static void soft_offline_free_page(struct page *page)
+ {
++	int rc = 0;
+ 	struct page *head = compound_head(page);
+ 
+-	if (!TestSetPageHWPoison(head)) {
++	if (PageHuge(head))
++		rc = dissolve_free_huge_page(page);
++	if (!rc && !TestSetPageHWPoison(page))
+ 		num_poisoned_pages_inc();
+-		if (PageHuge(head))
+-			dissolve_free_huge_page(page);
+-	}
+ }
+ 
+ /**
+diff --git a/mm/migrate.c b/mm/migrate.c
+index c27e97b5b69d..91a99457127c 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1331,8 +1331,6 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ out:
+ 	if (rc != -EAGAIN)
+ 		putback_active_hugepage(hpage);
+-	if (reason == MR_MEMORY_FAILURE && !test_set_page_hwpoison(hpage))
+-		num_poisoned_pages_inc();
+ 
+ 	/*
+ 	 * If migration was not successful and there's a freeing callback, use
+-- 
+2.12.3
+
