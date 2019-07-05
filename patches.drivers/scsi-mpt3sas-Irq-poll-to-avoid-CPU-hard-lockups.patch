@@ -1,0 +1,287 @@
+From: Suganath Prabu <suganath-prabu.subramani@broadcom.com>
+Date: Fri, 15 Feb 2019 02:40:27 -0500
+Subject: [PATCH] scsi: mpt3sas: Irq poll to avoid CPU hard lockups
+References: bsc#1125703,jsc#SLE-4717
+Git-commit: 320e77acb32774b6addfe38d562956fad70c5f0d
+Patch-mainline: v5.2-rc1
+
+Issue Description:
+We have seen cpu lock up issue from fields if system has greater (more than
+96) logical cpu count.  SAS3.0 controller (Invader series) supports at max
+96 msix vector and SAS3.5 product (Ventura) supports at max 128 msix
+vectors.
+
+This may be a generic issue (if PCI device supports completion on multiple
+reply queues).  Let me explain it w.r.t to mpt3sas supported h/w just to
+simplify the problem and possible changes to handle such issues. IT HBA
+(mpt3sas) supports multiple reply queues in completion path. Driver creates
+MSI-x vectors for controller as "min of (FW supported Reply queue, Logical
+CPUs)". If submitter is not interrupted via completion on same CPU, there
+is a loop in the IO path. This behavior can cause hard/soft CPU lockups, IO
+timeout, system sluggish etc.
+
+Example - one CPU (e.g. CPU A) is busy submitting the IOs and another CPU
+(e.g. CPU B) is busy with processing the corresponding IO's reply
+descriptors from reply descriptor queue upon receiving the interrupts from
+HBA.  If the CPU A is continuously pumping the IOs then always CPU B (which
+is executing the ISR) will see the valid reply descriptors in the reply
+descriptor queue and it will be continuously processing those reply
+descriptor in a loop without quitting the ISR handler.
+
+Mpt3sas driver will exit ISR handler if it finds unused reply descriptor in
+the reply descriptor queue. Since CPU A will be continuously sending the
+IOs, CPU B may always see a valid reply descriptor (posted by HBA Firmware
+after processing the IO) in the reply descriptor queue. In worst case,
+driver will not quit from this loop in the ISR handler. Eventually, CPU
+lockup will be detected by watchdog.
+
+Above mentioned behavior is not common if "rq_affinity" set to 2 or
+affinity_hint is honored by irqbalance as "exact". If rq_affinity is set
+to 2, submitter will be always interrupted via completion on same CPU.  If
+irqbalance is using "exact" policy, interrupt will be delivered to
+submitter CPU.
+
+If CPU counts to MSI-X vectors (reply descriptor Queues) count ratio is not
+1:1, we still have exposure of issue explained above and for that we don't
+have any solution.
+
+Exposure of soft/hard lockup if CPU count is more than MSI-x supported by
+device.
+
+If CPUs count to MSI-x vectors count ratio is not 1:1, (Other way, if CPU
+counts to MSI-x vector count ratio is something like X:1, where X > 1) then
+'exact' irqbalance policy OR rq_affinity = 2 won't help to avoid CPU
+hard/soft lockups. There won't be any one to one mapping between CPU to
+MSI-x vector instead one MSI-x interrupt (or reply descriptor queue) is
+shared with group/set of CPUs and there is a possibility of having a loop
+in the IO path within that CPU group and may observe lockups.
+
+For example: Consider a system having two NUMA nodes and each node having
+four logical CPUs and also consider that number of MSI-x vectors enabled on
+the HBA is two, then CPUs count to MSI-x vector count ratio as 4:1.  e.g.
+MSIx vector 0 is affinity to CPU 0, CPU 1, CPU 2 & CPU 3 of NUMA node 0 and
+MSI-x vector 1 is affinity to CPU 4, CPU 5, CPU 6 & CPU 7 of NUMA node 1.
+
+numactl --hardware
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3                 --> MSI-x 0
+node 0 size: 65536 MB
+node 0 free: 63176 MB
+node 1 cpus: 4 5 6 7                 -->MSI-x 1
+node 1 size: 65536 MB
+node 1 free: 63176 MB
+
+Assume that user started an application which uses all the CPUs of NUMA
+node 0 for issuing the IOs.  Only one CPU from affinity list (it can be any
+cpu since this behavior depends upon irqbalance) CPU0 will receive the
+interrupts from MSIx vector 0 for all the IOs. Eventually, CPU 0 IO
+submission percentage will be decreasing and ISR processing percentage will
+be increasing as it is more busy with processing the interrupts.  Gradually
+IO submission percentage on CPU 0 will be zero and it's ISR processing
+percentage will be 100 percentage as IO loop has already formed within the
+NUMA node 0, i.e. CPU 1, CPU 2 & CPU 3 will be continuously busy with
+submitting the heavy IOs and only CPU 0 is busy in the ISR path as it
+always find the valid reply descriptor in the reply descriptor
+queue. Eventually, we will observe the hard lockup here.
+
+Chances of occurring of hard/soft lockups are directly proportional to
+value of X. If value of X is high, then chances of observing CPU lockups is
+high.
+
+Solution: Use IRQ poll interface defined in " irq_poll.c".  mpt3sas driver
+will execute ISR routine in Softirq context and it will always quit the
+loop based on budget provided in IRQ poll interface.
+
+In these scenarios (i.e. where CPUs count to MSI-X vectors count ratio is
+X:1 (where X > 1)), IRQ poll interface will avoid CPU hard lockups due to
+voluntary exit from the reply queue processing based on budget.  Note -
+Only one MSI-x vector is busy doing processing.
+
+Irqstat output:
+
+IRQs / 1 second(s)
+IRQ#  TOTAL  NODE0   NODE1   NODE2   NODE3  NAME
+  44    122871   122871   0       0       0  IR-PCI-MSI-edge mpt3sas0-msix0
+  45        0              0           0       0       0  IR-PCI-MSI-edge mpt3sas0-msix1
+
+We use this approach only if cpu count is more than FW supported MSI-x
+vector
+
+Signed-off-by: Suganath Prabu <suganath-prabu.subramani@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/mpt3sas/Kconfig        |  1 +
+ drivers/scsi/mpt3sas/mpt3sas_base.c | 78 ++++++++++++++++++++++++++++++++++++-
+ drivers/scsi/mpt3sas/mpt3sas_base.h |  8 ++++
+ 3 files changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/mpt3sas/Kconfig b/drivers/scsi/mpt3sas/Kconfig
+index b736dbc80485..a072187875df 100644
+--- a/drivers/scsi/mpt3sas/Kconfig
++++ b/drivers/scsi/mpt3sas/Kconfig
+@@ -45,6 +45,7 @@ config SCSI_MPT3SAS
+ 	depends on PCI && SCSI
+ 	select SCSI_SAS_ATTRS
+ 	select RAID_ATTRS
++	select IRQ_POLL
+ 	---help---
+ 	This driver supports PCI-Express SAS 12Gb/s Host Adapters.
+ 
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.c b/drivers/scsi/mpt3sas/mpt3sas_base.c
+index 8e37053717e9..81edce642bfa 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -1504,7 +1504,12 @@ _base_process_reply_queue(struct adapter_reply_queue *reply_q)
+ 						 MPI2_RPHI_MSIX_INDEX_SHIFT),
+ 						&ioc->chip->ReplyPostHostIndex);
+ 			}
+-			completed_cmds = 1;
++			if (!reply_q->irq_poll_scheduled) {
++				reply_q->irq_poll_scheduled = true;
++				irq_poll_sched(&reply_q->irqpoll);
++			}
++				atomic_dec(&reply_q->busy);
++				return completed_cmds;
+ 		}
+ 		if (request_descript_type == MPI2_RPY_DESCRIPT_FLAGS_UNUSED)
+ 			goto out;
+@@ -1570,11 +1575,66 @@ _base_interrupt(int irq, void *bus_id)
+ 
+ 	if (ioc->mask_interrupts)
+ 		return IRQ_NONE;
+-
++	if (reply_q->irq_poll_scheduled)
++		return IRQ_HANDLED;
+ 	return ((_base_process_reply_queue(reply_q) > 0) ?
+ 			IRQ_HANDLED : IRQ_NONE);
+ }
+ 
++/**
++ * _base_irqpoll - IRQ poll callback handler
++ * @irqpoll - irq_poll object
++ * @budget - irq poll weight
++ *
++ * returns number of reply descriptors processed
++ */
++static int
++_base_irqpoll(struct irq_poll *irqpoll, int budget)
++{
++	struct adapter_reply_queue *reply_q;
++	int num_entries = 0;
++
++	reply_q = container_of(irqpoll, struct adapter_reply_queue,
++			irqpoll);
++	if (reply_q->irq_line_enable) {
++		disable_irq(reply_q->os_irq);
++		reply_q->irq_line_enable = false;
++	}
++	num_entries = _base_process_reply_queue(reply_q);
++	if (num_entries < budget) {
++		irq_poll_complete(irqpoll);
++		reply_q->irq_poll_scheduled = false;
++		reply_q->irq_line_enable = true;
++		enable_irq(reply_q->os_irq);
++	}
++
++	return num_entries;
++}
++
++/**
++ * _base_init_irqpolls - initliaze IRQ polls
++ * @ioc: per adapter object
++ *
++ * returns nothing
++ */
++static void
++_base_init_irqpolls(struct MPT3SAS_ADAPTER *ioc)
++{
++	struct adapter_reply_queue *reply_q, *next;
++
++	if (list_empty(&ioc->reply_queue_list))
++		return;
++
++	list_for_each_entry_safe(reply_q, next, &ioc->reply_queue_list, list) {
++		irq_poll_init(&reply_q->irqpoll,
++			ioc->hba_queue_depth/4, _base_irqpoll);
++		reply_q->irq_poll_scheduled = false;
++		reply_q->irq_line_enable = true;
++		reply_q->os_irq = pci_irq_vector(ioc->pdev,
++		    reply_q->msix_index);
++	}
++}
++
+ /**
+  * _base_is_controller_msix_enabled - is controller support muli-reply queues
+  * @ioc: per adapter object
+@@ -1613,6 +1673,17 @@ mpt3sas_base_sync_reply_irqs(struct MPT3SAS_ADAPTER *ioc)
+ 		/* TMs are on msix_index == 0 */
+ 		if (reply_q->msix_index == 0)
+ 			continue;
++		if (reply_q->irq_poll_scheduled) {
++			/* Calling irq_poll_disable will wait for any pending
++			 * callbacks to have completed.
++			 */
++			irq_poll_disable(&reply_q->irqpoll);
++			irq_poll_enable(&reply_q->irqpoll);
++			reply_q->irq_poll_scheduled = false;
++			reply_q->irq_line_enable = true;
++			enable_irq(reply_q->os_irq);
++			continue;
++		}
+ 		synchronize_irq(pci_irq_vector(ioc->pdev, reply_q->msix_index));
+ 	}
+ }
+@@ -3032,6 +3103,8 @@ mpt3sas_base_map_resources(struct MPT3SAS_ADAPTER *ioc)
+ 	if (r)
+ 		goto out_fail;
+ 
++	if (!ioc->is_driver_loading)
++		_base_init_irqpolls(ioc);
+ 	/* Use the Combined reply queue feature only for SAS3 C0 & higher
+ 	 * revision HBAs and also only when reply queue count is greater than 8
+ 	 */
+@@ -6518,6 +6591,7 @@ mpt3sas_base_attach(struct MPT3SAS_ADAPTER *ioc)
+ 	if (r)
+ 		goto out_free_resources;
+ 
++	_base_init_irqpolls(ioc);
+ 	init_waitqueue_head(&ioc->reset_wq);
+ 
+ 	/* allocate memory pd handle bitmask list */
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_base.h b/drivers/scsi/mpt3sas/mpt3sas_base.h
+index 19158cb59101..fb572cdb751e 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -67,6 +67,7 @@
+ #include <scsi/scsi_eh.h>
+ #include <linux/pci.h>
+ #include <linux/poll.h>
++#include <linux/irq_poll.h>
+ 
+ #include "mpt3sas_debug.h"
+ #include "mpt3sas_trigger_diag.h"
+@@ -882,6 +883,9 @@ struct _event_ack_list {
+  * @reply_post_free: reply post base virt address
+  * @name: the name registered to request_irq()
+  * @busy: isr is actively processing replies on another cpu
++ * @os_irq: irq number
++ * @irqpoll: irq_poll object
++ * @irq_poll_scheduled: Tells whether irq poll is scheduled or not
+  * @list: this list
+ */
+ struct adapter_reply_queue {
+@@ -891,6 +895,10 @@ struct adapter_reply_queue {
+ 	Mpi2ReplyDescriptorsUnion_t *reply_post_free;
+ 	char			name[MPT_NAME_LENGTH];
+ 	atomic_t		busy;
++	u32			os_irq;
++	struct irq_poll         irqpoll;
++	bool			irq_poll_scheduled;
++	bool			irq_line_enable;
+ 	struct list_head	list;
+ };
+ 
+-- 
+2.16.4
+
