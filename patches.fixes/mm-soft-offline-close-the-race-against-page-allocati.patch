@@ -1,0 +1,203 @@
+From d4ae9916ea2947341180d2b538f48875ff393a86 Mon Sep 17 00:00:00 2001
+From: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Date: Thu, 23 Aug 2018 17:00:42 -0700
+Subject: [PATCH] mm: soft-offline: close the race against page allocation
+Patch-mainline: v4.19-rc1
+Git-commit: d4ae9916ea2947341180d2b538f48875ff393a86
+References: bsc#1139712
+
+A process can be killed with SIGBUS(BUS_MCEERR_AR) when it tries to
+allocate a page that was just freed on the way of soft-offline.  This is
+undesirable because soft-offline (which is about corrected error) is
+less aggressive than hard-offline (which is about uncorrected error),
+and we can make soft-offline fail and keep using the page for good
+reason like "system is busy."
+
+Two main changes of this patch are:
+
+- setting migrate type of the target page to MIGRATE_ISOLATE. As done
+  in free_unref_page_commit(), this makes kernel bypass pcplist when
+  freeing the page. So we can assume that the page is in freelist just
+  after put_page() returns,
+
+- setting PG_hwpoison on free page under zone->lock which protects
+  freelists, so this allows us to avoid setting PG_hwpoison on a page
+  that is decided to be allocated soon.
+
+[akpm@linux-foundation.org: tweak set_hwpoison_free_buddy_page() comment]
+Link: http://lkml.kernel.org/r/1531452366-11661-3-git-send-email-n-horiguchi@ah.jp.nec.com
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Reported-by: Xishi Qiu <xishi.qiuxishi@alibaba-inc.com>
+Tested-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: <zy.zhengyi@alibaba-inc.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+---
+ include/linux/page-flags.h |    5 +++++
+ include/linux/swapops.h    |   10 ----------
+ mm/memory-failure.c        |   26 +++++++++++++++++++++-----
+ mm/migrate.c               |    2 +-
+ mm/page_alloc.c            |   30 ++++++++++++++++++++++++++++++
+ 5 files changed, 57 insertions(+), 16 deletions(-)
+
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -358,8 +358,13 @@ PAGEFLAG_FALSE(Uncached)
+ PAGEFLAG(HWPoison, hwpoison, PF_ANY)
+ TESTSCFLAG(HWPoison, hwpoison, PF_ANY)
+ #define __PG_HWPOISON (1UL << PG_hwpoison)
++extern bool set_hwpoison_free_buddy_page(struct page *page);
+ #else
+ PAGEFLAG_FALSE(HWPoison)
++static inline bool set_hwpoison_free_buddy_page(struct page *page)
++{
++	return 0;
++}
+ #define __PG_HWPOISON 0
+ #endif
+ 
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@ -249,11 +249,6 @@ static inline int is_hwpoison_entry(swp_
+ 	return swp_type(entry) == SWP_HWPOISON;
+ }
+ 
+-static inline bool test_set_page_hwpoison(struct page *page)
+-{
+-	return TestSetPageHWPoison(page);
+-}
+-
+ static inline void num_poisoned_pages_inc(void)
+ {
+ 	atomic_long_inc(&num_poisoned_pages);
+@@ -276,11 +271,6 @@ static inline int is_hwpoison_entry(swp_
+ 	return 0;
+ }
+ 
+-static inline bool test_set_page_hwpoison(struct page *page)
+-{
+-	return false;
+-}
+-
+ static inline void num_poisoned_pages_inc(void)
+ {
+ }
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -57,6 +57,7 @@
+ #include <linux/mm_inline.h>
+ #include <linux/kfifo.h>
+ #include <linux/ratelimit.h>
++#include <linux/page-isolation.h>
+ #include "internal.h"
+ #include "ras/ras_event.h"
+ 
+@@ -1694,6 +1695,7 @@ static int __soft_offline_page(struct pa
+ static int soft_offline_in_use_page(struct page *page, int flags)
+ {
+ 	int ret;
++	int mt;
+ 	struct page *hpage = compound_head(page);
+ 
+ 	if (!PageHuge(page) && PageTransHuge(hpage)) {
+@@ -1712,23 +1714,37 @@ static int soft_offline_in_use_page(stru
+ 		put_hwpoison_page(hpage);
+ 	}
+ 
++	/*
++	 * Setting MIGRATE_ISOLATE here ensures that the page will be linked
++	 * to free list immediately (not via pcplist) when released after
++	 * successful page migration. Otherwise we can't guarantee that the
++	 * page is really free after put_page() returns, so
++	 * set_hwpoison_free_buddy_page() highly likely fails.
++	 */
++	mt = get_pageblock_migratetype(page);
++	set_pageblock_migratetype(page, MIGRATE_ISOLATE);
+ 	if (PageHuge(page))
+ 		ret = soft_offline_huge_page(page, flags);
+ 	else
+ 		ret = __soft_offline_page(page, flags);
+-
++	set_pageblock_migratetype(page, mt);
+ 	return ret;
+ }
+ 
+-static void soft_offline_free_page(struct page *page)
++static int soft_offline_free_page(struct page *page)
+ {
+ 	int rc = 0;
+ 	struct page *head = compound_head(page);
+ 
+ 	if (PageHuge(head))
+ 		rc = dissolve_free_huge_page(page);
+-	if (!rc && !TestSetPageHWPoison(page))
+-		num_poisoned_pages_inc();
++	if (!rc) {
++		if (set_hwpoison_free_buddy_page(page))
++			num_poisoned_pages_inc();
++		else
++			rc = -EBUSY;
++	}
++	return rc;
+ }
+ 
+ /**
+@@ -1772,7 +1788,7 @@ int soft_offline_page(struct page *page,
+ 	if (ret > 0)
+ 		ret = soft_offline_in_use_page(page, flags);
+ 	else if (ret == 0)
+-		soft_offline_free_page(page);
++		ret = soft_offline_free_page(page);
+ 
+ 	return ret;
+ }
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1173,7 +1173,7 @@ out:
+ 			 * intentionally. Although it's rather weird,
+ 			 * it's how HWPoison flag works at the moment.
+ 			 */
+-			if (!test_set_page_hwpoison(page))
++			if (set_hwpoison_free_buddy_page(page))
+ 				num_poisoned_pages_inc();
+ 		}
+ 	} else {
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7877,3 +7877,33 @@ bool is_free_buddy_page(struct page *pag
+ 
+ 	return order < MAX_ORDER;
+ }
++
++#ifdef CONFIG_MEMORY_FAILURE
++/*
++ * Set PG_hwpoison flag if a given page is confirmed to be a free page.  This
++ * test is performed under the zone lock to prevent a race against page
++ * allocation.
++ */
++bool set_hwpoison_free_buddy_page(struct page *page)
++{
++	struct zone *zone = page_zone(page);
++	unsigned long pfn = page_to_pfn(page);
++	unsigned long flags;
++	unsigned int order;
++	bool hwpoisoned = false;
++
++	spin_lock_irqsave(&zone->lock, flags);
++	for (order = 0; order < MAX_ORDER; order++) {
++		struct page *page_head = page - (pfn & ((1 << order) - 1));
++
++		if (PageBuddy(page_head) && page_order(page_head) >= order) {
++			if (!TestSetPageHWPoison(page))
++				hwpoisoned = true;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&zone->lock, flags);
++
++	return hwpoisoned;
++}
++#endif
