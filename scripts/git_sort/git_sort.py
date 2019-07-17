@@ -230,6 +230,7 @@ remotes = (
     Head(RepoURL("nvdimm/nvdimm.git"), "libnvdimm-fixes"),
     Head(RepoURL("djbw/nvdimm.git"), "libnvdimm-pending"),
     Head(RepoURL("herbert/crypto-2.6.git"), "master"),
+    Head(RepoURL("git://git.cmpxchg.org/linux-mmots.git"), "master"),
 )
 
 
