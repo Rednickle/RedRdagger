@@ -1,0 +1,153 @@
+From: James Smart <jsmart2021@gmail.com>
+Date: Tue, 12 Mar 2019 16:30:14 -0700
+Subject: [PATCH] scsi: lpfc: Coordinate adapter error handling with offline
+ handling
+References: bsc#1136217,jsc#SLE-4722
+Git-commit: 4645f7b56a9fc3fb16605a1bfa10d884fcd5226c
+Patch-mainline: v5.2-rc1
+
+The driver periodically checks for adapter error in a background thread. If
+the thread detects an error, the adapter will be reset including the
+deletion and reallocation of workqueues on the adapter.  Simultaneously,
+there may be a user-space request to offline the adapter which may try to
+do many of the same steps, in parallel, on a different thread. As memory
+was deallocated while unexpected, the parallel offline request hit a bad
+pointer.
+
+Add coordination between the two threads.  The error recovery thread has
+precedence. So, when an error is detected, a flag is set on the adapter to
+indicate the error thread is terminating the adapter. But, before doing
+that work, it will look for a flag that is set by the offline flow, and if
+set, will wait for it to complete before then processing the error handling
+path.  Similarly, in the offline thread, it first checks for whether the
+error thread is resetting the adapter, and if so, will then wait for the
+error thread to finish. Only after it has finished, will it set its flag
+and offline the adapter.
+
+Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+Signed-off-by: James Smart <jsmart2021@gmail.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/lpfc/lpfc_attr.c | 19 +++++++++++++++++++
+ drivers/scsi/lpfc/lpfc_init.c | 19 +++++++++++++++++++
+ drivers/scsi/lpfc/lpfc_sli.c  |  6 +++---
+ drivers/scsi/lpfc/lpfc_sli.h  |  4 ++++
+ 4 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index 1762135dc5e3..3878e43632e7 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -1204,6 +1204,20 @@ lpfc_do_offline(struct lpfc_hba *phba, uint32_t type)
+ 
+ 	psli = &phba->sli;
+ 
++	/*
++	 * If freeing the queues have already started, don't access them.
++	 * Otherwise set FREE_WAIT to indicate that queues are being used
++	 * to hold the freeing process until we finish.
++	 */
++	spin_lock_irq(&phba->hbalock);
++	if (!(psli->sli_flag & LPFC_QUEUE_FREE_INIT)) {
++		psli->sli_flag |= LPFC_QUEUE_FREE_WAIT;
++	} else {
++		spin_unlock_irq(&phba->hbalock);
++		goto skip_wait;
++	}
++	spin_unlock_irq(&phba->hbalock);
++
+ 	/* Wait a little for things to settle down, but not
+ 	 * long enough for dev loss timeout to expire.
+ 	 */
+@@ -1225,6 +1239,11 @@ lpfc_do_offline(struct lpfc_hba *phba, uint32_t type)
+ 		}
+ 	}
+ out:
++	spin_lock_irq(&phba->hbalock);
++	psli->sli_flag &= ~LPFC_QUEUE_FREE_WAIT;
++	spin_unlock_irq(&phba->hbalock);
++
++skip_wait:
+ 	init_completion(&online_compl);
+ 	rc = lpfc_workq_post_event(phba, &status, &online_compl, type);
+ 	if (rc == 0)
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index 03119543804a..e69bbfb06a65 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -9141,6 +9141,20 @@ lpfc_sli4_release_hdwq(struct lpfc_hba *phba)
+ void
+ lpfc_sli4_queue_destroy(struct lpfc_hba *phba)
+ {
++	/*
++	 * Set FREE_INIT before beginning to free the queues.
++	 * Wait until the users of queues to acknowledge to
++	 * release queues by clearing FREE_WAIT.
++	 */
++	spin_lock_irq(&phba->hbalock);
++	phba->sli.sli_flag |= LPFC_QUEUE_FREE_INIT;
++	while (phba->sli.sli_flag & LPFC_QUEUE_FREE_WAIT) {
++		spin_unlock_irq(&phba->hbalock);
++		msleep(20);
++		spin_lock_irq(&phba->hbalock);
++	}
++	spin_unlock_irq(&phba->hbalock);
++
+ 	/* Release HBA eqs */
+ 	if (phba->sli4_hba.hdwq)
+ 		lpfc_sli4_release_hdwq(phba);
+@@ -9179,6 +9193,11 @@ lpfc_sli4_queue_destroy(struct lpfc_hba *phba)
+ 
+ 	/* Everything on this list has been freed */
+ 	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_wq_list);
++
++	/* Done with freeing the queues */
++	spin_lock_irq(&phba->hbalock);
++	phba->sli.sli_flag &= ~LPFC_QUEUE_FREE_INIT;
++	spin_unlock_irq(&phba->hbalock);
+ }
+ 
+ int
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 0e899f0b9eea..5b0ded23bfbf 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -14424,6 +14424,9 @@ lpfc_sli4_queue_free(struct lpfc_queue *queue)
+ 	if (!queue)
+ 		return;
+ 
++	if (!list_empty(&queue->wq_list))
++		list_del(&queue->wq_list);
++
+ 	while (!list_empty(&queue->page_list)) {
+ 		list_remove_head(&queue->page_list, dmabuf, struct lpfc_dmabuf,
+ 				 list);
+@@ -14439,9 +14442,6 @@ lpfc_sli4_queue_free(struct lpfc_queue *queue)
+ 	if (!list_empty(&queue->cpu_list))
+ 		list_del(&queue->cpu_list);
+ 
+-	if (!list_empty(&queue->wq_list))
+-		list_del(&queue->wq_list);
+-
+ 	kfree(queue);
+ 	return;
+ }
+diff --git a/drivers/scsi/lpfc/lpfc_sli.h b/drivers/scsi/lpfc/lpfc_sli.h
+index 0168b8239dc3..2442a22b187e 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.h
++++ b/drivers/scsi/lpfc/lpfc_sli.h
+@@ -327,6 +327,10 @@ struct lpfc_sli {
+ #define LPFC_SLI_ASYNC_MBX_BLK    0x2000 /* Async mailbox is blocked */
+ #define LPFC_SLI_SUPPRESS_RSP     0x4000 /* Suppress RSP feature is supported */
+ #define LPFC_SLI_USE_EQDR         0x8000 /* EQ Delay Register is supported */
++#define LPFC_QUEUE_FREE_INIT	  0x10000 /* Queue freeing is in progress */
++#define LPFC_QUEUE_FREE_WAIT	  0x20000 /* Hold Queue free as it is being
++					   * used outside worker thread
++					   */
+ 
+ 	struct lpfc_sli_ring *sli3_ring;
+ 
+-- 
+2.16.4
+
