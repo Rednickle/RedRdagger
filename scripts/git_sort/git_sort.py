@@ -236,6 +236,7 @@ remotes = (
     Head(RepoURL("will/linux.git"), "for-joerg/arm-smmu/updates"),
     Head(RepoURL("herbert/crypto-2.6.git"), "master"),
     Head(RepoURL("rafael/linux-pm.git")),
+    Head(RepoURL("git://git.cmpxchg.org/linux-mmots.git"), "master"),
 )
 
 
