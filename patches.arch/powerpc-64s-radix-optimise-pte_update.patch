@@ -1,0 +1,131 @@
+From 85bcfaf69cbd610fdfac3351cf385809a2f4a93b Mon Sep 17 00:00:00 2001
+From: Nicholas Piggin <npiggin@gmail.com>
+Date: Fri, 1 Jun 2018 20:01:20 +1000
+Subject: [PATCH] powerpc/64s/radix: optimise pte_update
+
+References: bsc#1055117
+Patch-mainline: v4.18-rc1
+Git-commit: 85bcfaf69cbd610fdfac3351cf385809a2f4a93b
+
+Implementing pte_update with pte_xchg (which uses cmpxchg) is
+inefficient. A single larx/stcx. works fine, no need for the less
+efficient cmpxchg sequence.
+
+Then remove the memory barriers from the operation. There is a
+requirement for TLB flushing to load mm_cpumask after the store
+that reduces pte permissions, which is moved into the TLB flush
+code.
+
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Acked-by: Michal Suchanek <msuchanek@suse.de>
+---
+ arch/powerpc/include/asm/book3s/64/radix.h | 25 +++++++++++-----------
+ arch/powerpc/mm/mmu_context.c              |  6 ++++--
+ arch/powerpc/mm/tlb-radix.c                | 11 +++++++++-
+ 3 files changed, 27 insertions(+), 15 deletions(-)
+
+--- a/arch/powerpc/include/asm/book3s/64/radix.h
++++ b/arch/powerpc/include/asm/book3s/64/radix.h
+@@ -129,20 +129,21 @@ extern void radix__ptep_set_access_flags
+ static inline unsigned long __radix_pte_update(pte_t *ptep, unsigned long clr,
+ 					       unsigned long set)
+ {
+-	pte_t pte;
+-	unsigned long old_pte, new_pte;
++	__be64 old_be, tmp_be;
+ 
+-	do {
+-		pte = READ_ONCE(*ptep);
+-		old_pte = pte_val(pte);
+-		new_pte = (old_pte | set) & ~clr;
++	__asm__ __volatile__(
++	"1:	ldarx	%0,0,%3		# pte_update\n"
++	"	andc	%1,%0,%5	\n"
++	"	or	%1,%1,%4	\n"
++	"	stdcx.	%1,0,%3		\n"
++	"	bne-	1b"
++	: "=&r" (old_be), "=&r" (tmp_be), "=m" (*ptep)
++	: "r" (ptep), "r" (cpu_to_be64(set)), "r" (cpu_to_be64(clr))
++	: "cc" );
+ 
+-	} while (!pte_xchg(ptep, __pte(old_pte), __pte(new_pte)));
+-
+-	return old_pte;
++	return be64_to_cpu(old_be);
+ }
+ 
+-
+ static inline unsigned long radix__pte_update(struct mm_struct *mm,
+ 					unsigned long addr,
+ 					pte_t *ptep, unsigned long clr,
+--- a/arch/powerpc/mm/mmu_context.c
++++ b/arch/powerpc/mm/mmu_context.c
+@@ -56,8 +56,10 @@ void switch_mm_irqs_off(struct mm_struct
+ 		 * in switch_slb(), and/or the store of paca->mm_ctx_id in
+ 		 * copy_mm_to_paca().
+ 		 *
+-		 * On the read side the barrier is in pte_xchg(), which orders
+-		 * the store to the PTE vs the load of mm_cpumask.
++		 * On the other side, the barrier is in mm/tlb-radix.c for
++		 * radix which orders earlier stores to clear the PTEs vs
++		 * the load of mm_cpumask. And pte_xchg which does the same
++		 * thing for hash.
+ 		 */
+ 		smp_mb();
+ 
+--- a/arch/powerpc/mm/tlb-radix.c
++++ b/arch/powerpc/mm/tlb-radix.c
+@@ -360,6 +360,11 @@ void radix__flush_tlb_mm(struct mm_struc
+ 		return;
+ 
+ 	preempt_disable();
++	/*
++	 * Order loads of mm_cpumask vs previous stores to clear ptes before
++	 * the invalidate. See barrier in switch_mm_irqs_off
++	 */
++	smp_mb();
+ 	if (!mm_is_thread_local(mm)) {
+ 		if (mm_needs_flush_escalation(mm))
+ 			_tlbie_pid(pid, RIC_FLUSH_ALL);
+@@ -380,6 +385,7 @@ void radix__flush_all_mm(struct mm_struc
+ 		return;
+ 
+ 	preempt_disable();
++	smp_mb(); /* see radix__flush_tlb_mm */
+ 	if (!mm_is_thread_local(mm))
+ 		_tlbie_pid(pid, RIC_FLUSH_ALL);
+ 	else
+@@ -404,6 +410,7 @@ void radix__flush_tlb_page_psize(struct
+ 		return;
+ 
+ 	preempt_disable();
++	smp_mb(); /* see radix__flush_tlb_mm */
+ 	if (!mm_is_thread_local(mm))
+ 		_tlbie_va(vmaddr, pid, psize, RIC_FLUSH_TLB);
+ 	else
+@@ -466,6 +473,7 @@ void radix__flush_tlb_range(struct vm_ar
+ 		return;
+ 
+ 	preempt_disable();
++	smp_mb(); /* see radix__flush_tlb_mm */
+ 	if (mm_is_thread_local(mm)) {
+ 		local = true;
+ 		full = (end == TLB_FLUSH_ALL ||
+@@ -584,6 +592,7 @@ static inline void __radix__flush_tlb_ra
+ 		return;
+ 
+ 	preempt_disable();
++	smp_mb(); /* see radix__flush_tlb_mm */
+ 	if (mm_is_thread_local(mm)) {
+ 		local = true;
+ 		full = (end == TLB_FLUSH_ALL ||
+@@ -642,7 +651,7 @@ void radix__flush_tlb_collapsed_pmd(stru
+ 
+ 	/* Otherwise first do the PWC, then iterate the pages. */
+ 	preempt_disable();
+-
++	smp_mb(); /* see radix__flush_tlb_mm */
+ 	if (mm_is_thread_local(mm)) {
+ 		_tlbiel_va_range(addr, end, pid, PAGE_SIZE, mmu_virtual_psize, true);
+ 	} else {
