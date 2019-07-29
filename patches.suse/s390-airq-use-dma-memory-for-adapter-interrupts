@@ -1,0 +1,168 @@
+From: Halil Pasic <pasic@linux.ibm.com>
+Date: Thu, 13 Sep 2018 18:57:16 +0200
+Subject: s390/airq: use DMA memory for adapter interrupts
+Git-commit: b50623e5db802e41736f3305cb54c03bc7f0e30a
+Patch-mainline: v5.2-rc1
+References: jsc#SLE-6197 FATE#327012 bsc#1140559 LTC#173150
+
+Protected virtualization guests have to use shared pages for airq
+notifier bit vectors, because the hypervisor needs to write these bits.
+
+Let us make sure we allocate DMA memory for the notifier bit vectors by
+replacing the kmem_cache with a dma_cache and kalloc() with
+cio_dma_zalloc().
+
+Signed-off-by: Halil Pasic <pasic@linux.ibm.com>
+Reviewed-by: Sebastian Ott <sebott@linux.ibm.com>
+Reviewed-by: Michael Mueller <mimu@linux.ibm.com>
+Tested-by: Michael Mueller <mimu@linux.ibm.com>
+Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Acked-by: Petr Tesarik <ptesarik@suse.com>
+---
+ arch/s390/include/asm/airq.h |    2 ++
+ drivers/s390/cio/airq.c      |   37 +++++++++++++++++++++++--------------
+ drivers/s390/cio/cio.h       |    2 ++
+ drivers/s390/cio/css.c       |    1 +
+ 4 files changed, 28 insertions(+), 14 deletions(-)
+
+--- a/arch/s390/include/asm/airq.h
++++ b/arch/s390/include/asm/airq.h
+@@ -10,6 +10,7 @@
+ #define _ASM_S390_AIRQ_H
+ 
+ #include <linux/bit_spinlock.h>
++#include <linux/dma-mapping.h>
+ 
+ struct airq_struct {
+ 	struct hlist_node list;		/* Handler queueing. */
+@@ -28,6 +29,7 @@ void unregister_adapter_interrupt(struct
+ /* Adapter interrupt bit vector */
+ struct airq_iv {
+ 	unsigned long *vector;	/* Adapter interrupt bit vector */
++	dma_addr_t vector_dma; /* Adapter interrupt bit vector dma */
+ 	unsigned long *avail;	/* Allocation bit mask for the bit vector */
+ 	unsigned long *bitlock;	/* Lock bit mask for the bit vector */
+ 	unsigned long *ptr;	/* Pointer associated with each bit */
+--- a/drivers/s390/cio/airq.c
++++ b/drivers/s390/cio/airq.c
+@@ -15,9 +15,11 @@
+ #include <linux/mutex.h>
+ #include <linux/rculist.h>
+ #include <linux/slab.h>
++#include <linux/dmapool.h>
+ 
+ #include <asm/airq.h>
+ #include <asm/isc.h>
++#include <asm/cio.h>
+ 
+ #include "cio.h"
+ #include "cio_debug.h"
+@@ -26,7 +28,7 @@
+ static DEFINE_SPINLOCK(airq_lists_lock);
+ static struct hlist_head airq_lists[MAX_ISC+1];
+ 
+-static struct kmem_cache *airq_iv_cache;
++static struct dma_pool *airq_iv_cache;
+ 
+ /**
+  * register_adapter_interrupt() - register adapter interrupt handler
+@@ -114,6 +116,11 @@ void __init init_airq_interrupts(void)
+ 	setup_irq(THIN_INTERRUPT, &airq_interrupt);
+ }
+ 
++static inline unsigned long iv_size(unsigned long bits)
++{
++	return BITS_TO_LONGS(bits) * sizeof(unsigned long);
++}
++
+ /**
+  * airq_iv_create - create an interrupt vector
+  * @bits: number of bits in the interrupt vector
+@@ -131,17 +138,19 @@ struct airq_iv *airq_iv_create(unsigned
+ 		goto out;
+ 	iv->bits = bits;
+ 	iv->flags = flags;
+-	size = BITS_TO_LONGS(bits) * sizeof(unsigned long);
++	size = iv_size(bits);
+ 
+ 	if (flags & AIRQ_IV_CACHELINE) {
+-		if ((cache_line_size() * BITS_PER_BYTE) < bits)
++		if ((cache_line_size() * BITS_PER_BYTE) < bits
++				|| !airq_iv_cache)
+ 			goto out_free;
+ 
+-		iv->vector = kmem_cache_zalloc(airq_iv_cache, GFP_KERNEL);
++		iv->vector = dma_pool_zalloc(airq_iv_cache, GFP_KERNEL,
++					     &iv->vector_dma);
+ 		if (!iv->vector)
+ 			goto out_free;
+ 	} else {
+-		iv->vector = kzalloc(size, GFP_KERNEL);
++		iv->vector = cio_dma_zalloc(size);
+ 		if (!iv->vector)
+ 			goto out_free;
+ 	}
+@@ -177,10 +186,10 @@ out_free:
+ 	kfree(iv->ptr);
+ 	kfree(iv->bitlock);
+ 	kfree(iv->avail);
+-	if (iv->flags & AIRQ_IV_CACHELINE)
+-		kmem_cache_free(airq_iv_cache, iv->vector);
++	if (iv->flags & AIRQ_IV_CACHELINE && iv->vector)
++		dma_pool_free(airq_iv_cache, iv->vector, iv->vector_dma);
+ 	else
+-		kfree(iv->vector);
++		cio_dma_free(iv->vector, size);
+ 	kfree(iv);
+ out:
+ 	return NULL;
+@@ -197,9 +206,9 @@ void airq_iv_release(struct airq_iv *iv)
+ 	kfree(iv->ptr);
+ 	kfree(iv->bitlock);
+ 	if (iv->flags & AIRQ_IV_CACHELINE)
+-		kmem_cache_free(airq_iv_cache, iv->vector);
++		dma_pool_free(airq_iv_cache, iv->vector, iv->vector_dma);
+ 	else
+-		kfree(iv->vector);
++		cio_dma_free(iv->vector, iv_size(iv->bits));
+ 	kfree(iv->avail);
+ 	kfree(iv);
+ }
+@@ -294,12 +303,12 @@ unsigned long airq_iv_scan(struct airq_i
+ }
+ EXPORT_SYMBOL(airq_iv_scan);
+ 
+-static int __init airq_init(void)
++int __init airq_init(void)
+ {
+-	airq_iv_cache = kmem_cache_create("airq_iv_cache", cache_line_size(),
+-					  cache_line_size(), 0, NULL);
++	airq_iv_cache = dma_pool_create("airq_iv_cache", cio_get_dma_css_dev(),
++					cache_line_size(),
++					cache_line_size(), PAGE_SIZE);
+ 	if (!airq_iv_cache)
+ 		return -ENOMEM;
+ 	return 0;
+ }
+-subsys_initcall(airq_init);
+--- a/drivers/s390/cio/cio.h
++++ b/drivers/s390/cio/cio.h
+@@ -135,6 +135,8 @@ extern int cio_commit_config(struct subc
+ int cio_tm_start_key(struct subchannel *sch, struct tcw *tcw, u8 lpm, u8 key);
+ int cio_tm_intrg(struct subchannel *sch);
+ 
++extern int __init airq_init(void);
++
+ /* Use with care. */
+ #ifdef CONFIG_CCW_CONSOLE
+ extern struct subchannel *cio_probe_console(void);
+--- a/drivers/s390/cio/css.c
++++ b/drivers/s390/cio/css.c
+@@ -1101,6 +1101,7 @@ static int __init css_bus_init(void)
+ 	ret = cio_dma_pool_init();
+ 	if (ret)
+ 		goto out_unregister_pmn;
++	airq_init();
+ 	css_init_done = 1;
+ 
+ 	/* Enable default isc for I/O subchannels. */
