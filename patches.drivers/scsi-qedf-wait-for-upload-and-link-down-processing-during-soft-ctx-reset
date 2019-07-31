@@ -1,0 +1,170 @@
+From: Chad Dupuis <cdupuis@marvell.com>
+Date: Tue, 26 Mar 2019 00:38:47 -0700
+Subject: scsi: qedf: Wait for upload and link down processing during soft ctx
+ reset
+Git-commit: a66c6cd2a8ade6150364687f5872934a7e623fb2
+Patch-mainline: v5.2-rc1
+References: bsc#1136467 jsc#SLE-4694
+
+ - Wait for all the connections to get uploaded.
+
+Signed-off-by: Chad Dupuis <cdupuis@marvell.com>
+Signed-off-by: Saurav Kashyap <skashyap@marvell.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/qedf/qedf.h      |    6 ++--
+ drivers/scsi/qedf/qedf_fip.c  |    4 --
+ drivers/scsi/qedf/qedf_main.c |   60 +++++++++++++++++++++++++++++++++++++-----
+ 3 files changed, 58 insertions(+), 12 deletions(-)
+
+--- a/drivers/scsi/qedf/qedf.h
++++ b/drivers/scsi/qedf/qedf.h
+@@ -506,7 +506,7 @@ extern void qedf_set_vlan_id(struct qedf
+ extern void qedf_create_sysfs_ctx_attr(struct qedf_ctx *qedf);
+ extern void qedf_remove_sysfs_ctx_attr(struct qedf_ctx *qedf);
+ extern void qedf_capture_grc_dump(struct qedf_ctx *qedf);
+-extern void qedf_wait_for_upload(struct qedf_ctx *qedf);
++bool qedf_wait_for_upload(struct qedf_ctx *qedf);
+ extern void qedf_process_unsol_compl(struct qedf_ctx *qedf, uint16_t que_idx,
+ 	struct fcoe_cqe *cqe);
+ extern void qedf_restart_rport(struct qedf_rport *fcport);
+@@ -518,8 +518,10 @@ extern void qedf_process_seq_cleanup_com
+ extern int qedf_send_flogi(struct qedf_ctx *qedf);
+ extern void qedf_get_protocol_tlv_data(void *dev, void *data);
+ extern void qedf_fp_io_handler(struct work_struct *work);
+-extern void qedf_wq_grcdump(struct work_struct *work);
+ extern void qedf_get_generic_tlv_data(void *dev, struct qed_generic_tlvs *data);
++extern void qedf_wq_grcdump(struct work_struct *work);
++void qedf_stag_change_work(struct work_struct *work);
++void qedf_ctx_soft_reset(struct fc_lport *lport);
+ 
+ #define FCOE_WORD_TO_BYTE  4
+ #define QEDF_MAX_TASK_NUM	0xFFFF
+--- a/drivers/scsi/qedf/qedf_fip.c
++++ b/drivers/scsi/qedf/qedf_fip.c
+@@ -230,9 +230,7 @@ void qedf_fip_recv(struct qedf_ctx *qedf
+ 		QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_LL2,
+ 		    "do_reset=%d.\n", do_reset);
+ 		if (do_reset) {
+-			fcoe_ctlr_link_down(&qedf->ctlr);
+-			qedf_wait_for_upload(qedf);
+-			fcoe_ctlr_link_up(&qedf->ctlr);
++			qedf_ctx_soft_reset(qedf->lport);
+ 		}
+ 		kfree_skb(skb);
+ 	} else {
+--- a/drivers/scsi/qedf/qedf_main.c
++++ b/drivers/scsi/qedf/qedf_main.c
+@@ -153,7 +153,8 @@ static void qedf_handle_link_update(stru
+ 	    container_of(work, struct qedf_ctx, link_update.work);
+ 	int rc;
+ 
+-	QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC, "Entered.\n");
++	QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC, "Entered. link_state=%d.\n",
++		  atomic_read(&qedf->link_state));
+ 
+ 	if (atomic_read(&qedf->link_state) == QEDF_LINK_UP) {
+ 		rc = qedf_initiate_fipvlan_req(qedf);
+@@ -185,7 +186,9 @@ static void qedf_handle_link_update(stru
+ 		QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC,
+ 		    "Calling fcoe_ctlr_link_down().\n");
+ 		fcoe_ctlr_link_down(&qedf->ctlr);
+-		qedf_wait_for_upload(qedf);
++		if (qedf_wait_for_upload(qedf) == false)
++			QEDF_ERR(&qedf->dbg_ctx,
++				 "Could not upload all sessions.\n");
+ 		/* Reset the number of FIP VLAN retries */
+ 		qedf->fipvlan_retries = qedf_fipvlan_retries;
+ 	}
+@@ -771,22 +774,42 @@ static int qedf_eh_device_reset(struct s
+ 	return qedf_initiate_tmf(sc_cmd, FCP_TMF_LUN_RESET);
+ }
+ 
+-void qedf_wait_for_upload(struct qedf_ctx *qedf)
++bool qedf_wait_for_upload(struct qedf_ctx *qedf)
+ {
++	struct qedf_rport *fcport = NULL;
++
+ 	while (1) {
+ 		if (atomic_read(&qedf->num_offloads))
+ 			QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC,
+ 			    "Waiting for all uploads to complete.\n");
+ 		else
+-			break;
++			return true;
+ 		msleep(500);
+ 	}
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(fcport, &qedf->fcports, peers) {
++		if (fcport && test_bit(QEDF_RPORT_SESSION_READY,
++				       &fcport->flags)) {
++			if (fcport->rdata)
++				QEDF_ERR(&qedf->dbg_ctx,
++					 "Waiting for fcport %p portid=%06x.\n",
++					 fcport, fcport->rdata->ids.port_id);
++			} else {
++				QEDF_ERR(&qedf->dbg_ctx,
++					 "Waiting for fcport %p.\n", fcport);
++			}
++	}
++	rcu_read_unlock();
++	return false;
++
+ }
+ 
+ /* Performs soft reset of qedf_ctx by simulating a link down/up */
+-static void qedf_ctx_soft_reset(struct fc_lport *lport)
++void qedf_ctx_soft_reset(struct fc_lport *lport)
+ {
+ 	struct qedf_ctx *qedf;
++	struct qed_link_output if_link;
+ 
+ 	if (lport->vport) {
+ 		QEDF_ERR(NULL, "Cannot issue host reset on NPIV port.\n");
+@@ -797,11 +820,32 @@ static void qedf_ctx_soft_reset(struct f
+ 
+ 	/* For host reset, essentially do a soft link up/down */
+ 	atomic_set(&qedf->link_state, QEDF_LINK_DOWN);
++	QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
++		  "Queuing link down work.\n");
+ 	queue_delayed_work(qedf->link_update_wq, &qedf->link_update,
+ 	    0);
+-	qedf_wait_for_upload(qedf);
++
++	if (qedf_wait_for_upload(qedf) == false) {
++		QEDF_ERR(&qedf->dbg_ctx, "Could not upload all sessions.\n");
++		WARN_ON(atomic_read(&qedf->num_offloads));
++	}
++
++	/* Before setting link up query physical link state */
++	qed_ops->common->get_link(qedf->cdev, &if_link);
++	/* Bail if the physical link is not up */
++	if (!if_link.link_up) {
++		QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
++			  "Physical link is not up.\n");
++		return;
++	}
++	/* Flush and wait to make sure link down is processed */
++	flush_delayed_work(&qedf->link_update);
++	msleep(500);
++
+ 	atomic_set(&qedf->link_state, QEDF_LINK_UP);
+ 	qedf->vlan_id  = 0;
++	QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
++		  "Queue link up work.\n");
+ 	queue_delayed_work(qedf->link_update_wq, &qedf->link_update,
+ 	    0);
+ }
+@@ -3437,7 +3481,9 @@ static void __qedf_remove(struct pci_dev
+ 		fcoe_ctlr_link_down(&qedf->ctlr);
+ 	else
+ 		fc_fabric_logoff(qedf->lport);
+-	qedf_wait_for_upload(qedf);
++
++	if (qedf_wait_for_upload(qedf) == false)
++		QEDF_ERR(&qedf->dbg_ctx, "Could not upload all sessions.\n");
+ 
+ #ifdef CONFIG_DEBUG_FS
+ 	qedf_dbg_host_exit(&(qedf->dbg_ctx));
