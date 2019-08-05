@@ -1,0 +1,675 @@
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Mon, 15 Oct 2018 17:38:23 +0200
+Subject: libceph: preallocate message data items
+Git-commit: 0d9c1ab3be4c0187663096a6a084421d0a1e45c6
+Patch-mainline: v4.20-rc1
+References: bsc#1135897
+
+Currently message data items are allocated with ceph_msg_data_create()
+in setup_request_data() inside send_request().  send_request() has never
+been allowed to fail, so each allocation is followed by a BUG_ON:
+
+  data = ceph_msg_data_create(...);
+  BUG_ON(!data);
+
+It's been this way since support for multiple message data items was
+added in commit 6644ed7b7e04 ("libceph: make message data be a pointer")
+in 3.10.
+
+There is no reason to delay the allocation of message data items until
+the last possible moment and we certainly don't need a linked list of
+them as they are only ever appended to the end and never erased.  Make
+ceph_msg_new2() take max_data_items and adapt the rest of the code.
+
+Reported-by: Jerry Lee <leisurelysw24@gmail.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ fs/ceph/mds_client.c           |   4 +-
+ include/linux/ceph/messenger.h |  24 ++--------
+ include/linux/ceph/msgpool.h   |  11 +++--
+ net/ceph/messenger.c           | 106 +++++++++++++++--------------------------
+ net/ceph/msgpool.c             |  25 ++++++----
+ net/ceph/osd_client.c          | 102 +++++++++++++++++++++++++++++++++------
+ 6 files changed, 157 insertions(+), 115 deletions(-)
+
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 97de674ea377..67a9aeb2f4ec 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -2071,7 +2071,7 @@ static struct ceph_msg *create_request_message(struct ceph_mds_client *mdsc,
+ 	if (req->r_old_dentry_drop)
+ 		len += req->r_old_dentry->d_name.len;
+ 
+-	msg = ceph_msg_new(CEPH_MSG_CLIENT_REQUEST, len, GFP_NOFS, false);
++	msg = ceph_msg_new2(CEPH_MSG_CLIENT_REQUEST, len, 1, GFP_NOFS, false);
+ 	if (!msg) {
+ 		msg = ERR_PTR(-ENOMEM);
+ 		goto out_free2;
+@@ -3129,7 +3129,7 @@ static void send_mds_reconnect(struct ceph_mds_client *mdsc,
+ 	if (!pagelist)
+ 		goto fail_nopagelist;
+ 
+-	reply = ceph_msg_new(CEPH_MSG_CLIENT_RECONNECT, 0, GFP_NOFS, false);
++	reply = ceph_msg_new2(CEPH_MSG_CLIENT_RECONNECT, 0, 1, GFP_NOFS, false);
+ 	if (!reply)
+ 		goto fail_nomsg;
+ 
+diff --git a/include/linux/ceph/messenger.h b/include/linux/ceph/messenger.h
+index fc2b4491ee0a..800a2128d411 100644
+--- a/include/linux/ceph/messenger.h
++++ b/include/linux/ceph/messenger.h
+@@ -82,22 +82,6 @@ enum ceph_msg_data_type {
+ 	CEPH_MSG_DATA_BVECS,	/* data source/destination is a bio_vec array */
+ };
+ 
+-static __inline__ bool ceph_msg_data_type_valid(enum ceph_msg_data_type type)
+-{
+-	switch (type) {
+-	case CEPH_MSG_DATA_NONE:
+-	case CEPH_MSG_DATA_PAGES:
+-	case CEPH_MSG_DATA_PAGELIST:
+-#ifdef CONFIG_BLOCK
+-	case CEPH_MSG_DATA_BIO:
+-#endif /* CONFIG_BLOCK */
+-	case CEPH_MSG_DATA_BVECS:
+-		return true;
+-	default:
+-		return false;
+-	}
+-}
+-
+ #ifdef CONFIG_BLOCK
+ 
+ struct ceph_bio_iter {
+@@ -181,7 +165,6 @@ struct ceph_bvec_iter {
+ } while (0)
+ 
+ struct ceph_msg_data {
+-	struct list_head		links;	/* ceph_msg->data */
+ 	enum ceph_msg_data_type		type;
+ 	union {
+ #ifdef CONFIG_BLOCK
+@@ -202,7 +185,6 @@ struct ceph_msg_data {
+ 
+ struct ceph_msg_data_cursor {
+ 	size_t			total_resid;	/* across all data items */
+-	struct list_head	*data_head;	/* = &ceph_msg->data */
+ 
+ 	struct ceph_msg_data	*data;		/* current data item */
+ 	size_t			resid;		/* bytes not yet consumed */
+@@ -240,7 +222,9 @@ struct ceph_msg {
+ 	struct ceph_buffer *middle;
+ 
+ 	size_t				data_length;
+-	struct list_head		data;
++	struct ceph_msg_data		*data;
++	int				num_data_items;
++	int				max_data_items;
+ 	struct ceph_msg_data_cursor	cursor;
+ 
+ 	struct ceph_connection *con;
+@@ -381,6 +365,8 @@ void ceph_msg_data_add_bio(struct ceph_msg *msg, struct ceph_bio_iter *bio_pos,
+ void ceph_msg_data_add_bvecs(struct ceph_msg *msg,
+ 			     struct ceph_bvec_iter *bvec_pos);
+ 
++struct ceph_msg *ceph_msg_new2(int type, int front_len, int max_data_items,
++			       gfp_t flags, bool can_fail);
+ extern struct ceph_msg *ceph_msg_new(int type, int front_len, gfp_t flags,
+ 				     bool can_fail);
+ 
+diff --git a/include/linux/ceph/msgpool.h b/include/linux/ceph/msgpool.h
+index 76c98a512758..729cdf700eae 100644
+--- a/include/linux/ceph/msgpool.h
++++ b/include/linux/ceph/msgpool.h
+@@ -13,14 +13,15 @@ struct ceph_msgpool {
+ 	mempool_t *pool;
+ 	int type;               /* preallocated message type */
+ 	int front_len;          /* preallocated payload size */
++	int max_data_items;
+ };
+ 
+-extern int ceph_msgpool_init(struct ceph_msgpool *pool, int type,
+-			     int front_len, int size, bool blocking,
+-			     const char *name);
++int ceph_msgpool_init(struct ceph_msgpool *pool, int type,
++		      int front_len, int max_data_items, int size,
++		      const char *name);
+ extern void ceph_msgpool_destroy(struct ceph_msgpool *pool);
+-extern struct ceph_msg *ceph_msgpool_get(struct ceph_msgpool *,
+-					 int front_len);
++struct ceph_msg *ceph_msgpool_get(struct ceph_msgpool *pool, int front_len,
++				  int max_data_items);
+ extern void ceph_msgpool_put(struct ceph_msgpool *, struct ceph_msg *);
+ 
+ #endif
+diff --git a/net/ceph/messenger.c b/net/ceph/messenger.c
+index 76684edc43ef..88e35830198c 100644
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@ -156,7 +156,6 @@ static bool con_flag_test_and_set(struct ceph_connection *con,
+ /* Slab caches for frequently-allocated structures */
+ 
+ static struct kmem_cache	*ceph_msg_cache;
+-static struct kmem_cache	*ceph_msg_data_cache;
+ 
+ /* static tag bytes (protocol control messages) */
+ static char tag_msg = CEPH_MSGR_TAG_MSG;
+@@ -235,23 +234,11 @@ static int ceph_msgr_slab_init(void)
+ 	if (!ceph_msg_cache)
+ 		return -ENOMEM;
+ 
+-	BUG_ON(ceph_msg_data_cache);
+-	ceph_msg_data_cache = KMEM_CACHE(ceph_msg_data, 0);
+-	if (ceph_msg_data_cache)
+-		return 0;
+-
+-	kmem_cache_destroy(ceph_msg_cache);
+-	ceph_msg_cache = NULL;
+-
+-	return -ENOMEM;
++	return 0;
+ }
+ 
+ static void ceph_msgr_slab_exit(void)
+ {
+-	BUG_ON(!ceph_msg_data_cache);
+-	kmem_cache_destroy(ceph_msg_data_cache);
+-	ceph_msg_data_cache = NULL;
+-
+ 	BUG_ON(!ceph_msg_cache);
+ 	kmem_cache_destroy(ceph_msg_cache);
+ 	ceph_msg_cache = NULL;
+@@ -1141,16 +1128,13 @@ static void __ceph_msg_data_cursor_init(struct ceph_msg_data_cursor *cursor)
+ static void ceph_msg_data_cursor_init(struct ceph_msg *msg, size_t length)
+ {
+ 	struct ceph_msg_data_cursor *cursor = &msg->cursor;
+-	struct ceph_msg_data *data;
+ 
+ 	BUG_ON(!length);
+ 	BUG_ON(length > msg->data_length);
+-	BUG_ON(list_empty(&msg->data));
++	BUG_ON(!msg->num_data_items);
+ 
+-	cursor->data_head = &msg->data;
+ 	cursor->total_resid = length;
+-	data = list_first_entry(&msg->data, struct ceph_msg_data, links);
+-	cursor->data = data;
++	cursor->data = msg->data;
+ 
+ 	__ceph_msg_data_cursor_init(cursor);
+ }
+@@ -1231,8 +1215,7 @@ static void ceph_msg_data_advance(struct ceph_msg_data_cursor *cursor,
+ 
+ 	if (!cursor->resid && cursor->total_resid) {
+ 		WARN_ON(!cursor->last_piece);
+-		BUG_ON(list_is_last(&cursor->data->links, cursor->data_head));
+-		cursor->data = list_next_entry(cursor->data, links);
++		cursor->data++;
+ 		__ceph_msg_data_cursor_init(cursor);
+ 		new_piece = true;
+ 	}
+@@ -1248,9 +1231,6 @@ static size_t sizeof_footer(struct ceph_connection *con)
+ 
+ static void prepare_message_data(struct ceph_msg *msg, u32 data_len)
+ {
+-	BUG_ON(!msg);
+-	BUG_ON(!data_len);
+-
+ 	/* Initialize data cursor */
+ 
+ 	ceph_msg_data_cursor_init(msg, (size_t)data_len);
+@@ -1590,7 +1570,7 @@ static int write_partial_message_data(struct ceph_connection *con)
+ 
+ 	dout("%s %p msg %p\n", __func__, con, msg);
+ 
+-	if (list_empty(&msg->data))
++	if (!msg->num_data_items)
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -2347,8 +2327,7 @@ static int read_partial_msg_data(struct ceph_connection *con)
+ 	u32 crc = 0;
+ 	int ret;
+ 
+-	BUG_ON(!msg);
+-	if (list_empty(&msg->data))
++	if (!msg->num_data_items)
+ 		return -EIO;
+ 
+ 	if (do_datacrc)
+@@ -3256,32 +3235,16 @@ bool ceph_con_keepalive_expired(struct ceph_connection *con,
+ 	return false;
+ }
+ 
+-static struct ceph_msg_data *ceph_msg_data_create(enum ceph_msg_data_type type)
++static struct ceph_msg_data *ceph_msg_data_add(struct ceph_msg *msg)
+ {
+-	struct ceph_msg_data *data;
+-
+-	if (WARN_ON(!ceph_msg_data_type_valid(type)))
+-		return NULL;
+-
+-	data = kmem_cache_zalloc(ceph_msg_data_cache, GFP_NOFS);
+-	if (!data)
+-		return NULL;
+-
+-	data->type = type;
+-	INIT_LIST_HEAD(&data->links);
+-
+-	return data;
++	BUG_ON(msg->num_data_items >= msg->max_data_items);
++	return &msg->data[msg->num_data_items++];
+ }
+ 
+ static void ceph_msg_data_destroy(struct ceph_msg_data *data)
+ {
+-	if (!data)
+-		return;
+-
+-	WARN_ON(!list_empty(&data->links));
+ 	if (data->type == CEPH_MSG_DATA_PAGELIST)
+ 		ceph_pagelist_release(data->pagelist);
+-	kmem_cache_free(ceph_msg_data_cache, data);
+ }
+ 
+ void ceph_msg_data_add_pages(struct ceph_msg *msg, struct page **pages,
+@@ -3292,13 +3255,12 @@ void ceph_msg_data_add_pages(struct ceph_msg *msg, struct page **pages,
+ 	BUG_ON(!pages);
+ 	BUG_ON(!length);
+ 
+-	data = ceph_msg_data_create(CEPH_MSG_DATA_PAGES);
+-	BUG_ON(!data);
++	data = ceph_msg_data_add(msg);
++	data->type = CEPH_MSG_DATA_PAGES;
+ 	data->pages = pages;
+ 	data->length = length;
+ 	data->alignment = alignment & ~PAGE_MASK;
+ 
+-	list_add_tail(&data->links, &msg->data);
+ 	msg->data_length += length;
+ }
+ EXPORT_SYMBOL(ceph_msg_data_add_pages);
+@@ -3311,12 +3273,11 @@ void ceph_msg_data_add_pagelist(struct ceph_msg *msg,
+ 	BUG_ON(!pagelist);
+ 	BUG_ON(!pagelist->length);
+ 
+-	data = ceph_msg_data_create(CEPH_MSG_DATA_PAGELIST);
+-	BUG_ON(!data);
++	data = ceph_msg_data_add(msg);
++	data->type = CEPH_MSG_DATA_PAGELIST;
+ 	refcount_inc(&pagelist->refcnt);
+ 	data->pagelist = pagelist;
+ 
+-	list_add_tail(&data->links, &msg->data);
+ 	msg->data_length += pagelist->length;
+ }
+ EXPORT_SYMBOL(ceph_msg_data_add_pagelist);
+@@ -3327,12 +3288,11 @@ void ceph_msg_data_add_bio(struct ceph_msg *msg, struct ceph_bio_iter *bio_pos,
+ {
+ 	struct ceph_msg_data *data;
+ 
+-	data = ceph_msg_data_create(CEPH_MSG_DATA_BIO);
+-	BUG_ON(!data);
++	data = ceph_msg_data_add(msg);
++	data->type = CEPH_MSG_DATA_BIO;
+ 	data->bio_pos = *bio_pos;
+ 	data->bio_length = length;
+ 
+-	list_add_tail(&data->links, &msg->data);
+ 	msg->data_length += length;
+ }
+ EXPORT_SYMBOL(ceph_msg_data_add_bio);
+@@ -3343,11 +3303,10 @@ void ceph_msg_data_add_bvecs(struct ceph_msg *msg,
+ {
+ 	struct ceph_msg_data *data;
+ 
+-	data = ceph_msg_data_create(CEPH_MSG_DATA_BVECS);
+-	BUG_ON(!data);
++	data = ceph_msg_data_add(msg);
++	data->type = CEPH_MSG_DATA_BVECS;
+ 	data->bvec_pos = *bvec_pos;
+ 
+-	list_add_tail(&data->links, &msg->data);
+ 	msg->data_length += bvec_pos->iter.bi_size;
+ }
+ EXPORT_SYMBOL(ceph_msg_data_add_bvecs);
+@@ -3356,8 +3315,8 @@ EXPORT_SYMBOL(ceph_msg_data_add_bvecs);
+  * construct a new message with given type, size
+  * the new msg has a ref count of 1.
+  */
+-struct ceph_msg *ceph_msg_new(int type, int front_len, gfp_t flags,
+-			      bool can_fail)
++struct ceph_msg *ceph_msg_new2(int type, int front_len, int max_data_items,
++			       gfp_t flags, bool can_fail)
+ {
+ 	struct ceph_msg *m;
+ 
+@@ -3371,7 +3330,6 @@ struct ceph_msg *ceph_msg_new(int type, int front_len, gfp_t flags,
+ 
+ 	INIT_LIST_HEAD(&m->list_head);
+ 	kref_init(&m->kref);
+-	INIT_LIST_HEAD(&m->data);
+ 
+ 	/* front */
+ 	if (front_len) {
+@@ -3386,6 +3344,15 @@ struct ceph_msg *ceph_msg_new(int type, int front_len, gfp_t flags,
+ 	}
+ 	m->front_alloc_len = m->front.iov_len = front_len;
+ 
++	if (max_data_items) {
++		m->data = kmalloc_array(max_data_items, sizeof(*m->data),
++					flags);
++		if (!m->data)
++			goto out2;
++
++		m->max_data_items = max_data_items;
++	}
++
+ 	dout("ceph_msg_new %p front %d\n", m, front_len);
+ 	return m;
+ 
+@@ -3402,6 +3369,13 @@ struct ceph_msg *ceph_msg_new(int type, int front_len, gfp_t flags,
+ 	}
+ 	return NULL;
+ }
++EXPORT_SYMBOL(ceph_msg_new2);
++
++struct ceph_msg *ceph_msg_new(int type, int front_len, gfp_t flags,
++			      bool can_fail)
++{
++	return ceph_msg_new2(type, front_len, 0, flags, can_fail);
++}
+ EXPORT_SYMBOL(ceph_msg_new);
+ 
+ /*
+@@ -3497,13 +3471,14 @@ static void ceph_msg_free(struct ceph_msg *m)
+ {
+ 	dout("%s %p\n", __func__, m);
+ 	kvfree(m->front.iov_base);
++	kfree(m->data);
+ 	kmem_cache_free(ceph_msg_cache, m);
+ }
+ 
+ static void ceph_msg_release(struct kref *kref)
+ {
+ 	struct ceph_msg *m = container_of(kref, struct ceph_msg, kref);
+-	struct ceph_msg_data *data, *next;
++	int i;
+ 
+ 	dout("%s %p\n", __func__, m);
+ 	WARN_ON(!list_empty(&m->list_head));
+@@ -3516,11 +3491,8 @@ static void ceph_msg_release(struct kref *kref)
+ 		m->middle = NULL;
+ 	}
+ 
+-	list_for_each_entry_safe(data, next, &m->data, links) {
+-		list_del_init(&data->links);
+-		ceph_msg_data_destroy(data);
+-	}
+-	m->data_length = 0;
++	for (i = 0; i < m->num_data_items; i++)
++		ceph_msg_data_destroy(&m->data[i]);
+ 
+ 	if (m->pool)
+ 		ceph_msgpool_put(m->pool, m);
+diff --git a/net/ceph/msgpool.c b/net/ceph/msgpool.c
+index 3dddc074f0d7..e3ecb80cd182 100644
+--- a/net/ceph/msgpool.c
++++ b/net/ceph/msgpool.c
+@@ -14,7 +14,8 @@ static void *msgpool_alloc(gfp_t gfp_mask, void *arg)
+ 	struct ceph_msgpool *pool = arg;
+ 	struct ceph_msg *msg;
+ 
+-	msg = ceph_msg_new(pool->type, pool->front_len, gfp_mask, true);
++	msg = ceph_msg_new2(pool->type, pool->front_len, pool->max_data_items,
++			    gfp_mask, true);
+ 	if (!msg) {
+ 		dout("msgpool_alloc %s failed\n", pool->name);
+ 	} else {
+@@ -35,11 +36,13 @@ static void msgpool_free(void *element, void *arg)
+ }
+ 
+ int ceph_msgpool_init(struct ceph_msgpool *pool, int type,
+-		      int front_len, int size, bool blocking, const char *name)
++		      int front_len, int max_data_items, int size,
++		      const char *name)
+ {
+ 	dout("msgpool %s init\n", name);
+ 	pool->type = type;
+ 	pool->front_len = front_len;
++	pool->max_data_items = max_data_items;
+ 	pool->pool = mempool_create(size, msgpool_alloc, msgpool_free, pool);
+ 	if (!pool->pool)
+ 		return -ENOMEM;
+@@ -53,18 +56,21 @@ void ceph_msgpool_destroy(struct ceph_msgpool *pool)
+ 	mempool_destroy(pool->pool);
+ }
+ 
+-struct ceph_msg *ceph_msgpool_get(struct ceph_msgpool *pool,
+-				  int front_len)
++struct ceph_msg *ceph_msgpool_get(struct ceph_msgpool *pool, int front_len,
++				  int max_data_items)
+ {
+ 	struct ceph_msg *msg;
+ 
+-	if (front_len > pool->front_len) {
+-		dout("msgpool_get %s need front %d, pool size is %d\n",
+-		       pool->name, front_len, pool->front_len);
++	if (front_len > pool->front_len ||
++	    max_data_items > pool->max_data_items) {
++		pr_warn_ratelimited("%s need %d/%d, pool %s has %d/%d\n",
++		    __func__, front_len, max_data_items, pool->name,
++		    pool->front_len, pool->max_data_items);
+ 		WARN_ON_ONCE(1);
+ 
+ 		/* try to alloc a fresh message */
+-		return ceph_msg_new(pool->type, front_len, GFP_NOFS, false);
++		return ceph_msg_new2(pool->type, front_len, max_data_items,
++				     GFP_NOFS, false);
+ 	}
+ 
+ 	msg = mempool_alloc(pool->pool, GFP_NOFS);
+@@ -80,6 +86,9 @@ void ceph_msgpool_put(struct ceph_msgpool *pool, struct ceph_msg *msg)
+ 	msg->front.iov_len = pool->front_len;
+ 	msg->hdr.front_len = cpu_to_le32(pool->front_len);
+ 
++	msg->data_length = 0;
++	msg->num_data_items = 0;
++
+ 	kref_init(&msg->kref);  /* retake single ref */
+ 	mempool_free(msg, pool->pool);
+ }
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index 7ac7f21ff317..cf0bd2cce848 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -614,12 +614,15 @@ static int ceph_oloc_encoding_size(const struct ceph_object_locator *oloc)
+ 	return 8 + 4 + 4 + 4 + (oloc->pool_ns ? oloc->pool_ns->len : 0);
+ }
+ 
+-int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
++static int __ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp,
++				      int num_request_data_items,
++				      int num_reply_data_items)
+ {
+ 	struct ceph_osd_client *osdc = req->r_osdc;
+ 	struct ceph_msg *msg;
+ 	int msg_size;
+ 
++	WARN_ON(req->r_request || req->r_reply);
+ 	WARN_ON(ceph_oid_empty(&req->r_base_oid));
+ 	WARN_ON(ceph_oloc_empty(&req->r_base_oloc));
+ 
+@@ -641,9 +644,11 @@ int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
+ 	msg_size += 4 + 8; /* retry_attempt, features */
+ 
+ 	if (req->r_mempool)
+-		msg = ceph_msgpool_get(&osdc->msgpool_op, msg_size);
++		msg = ceph_msgpool_get(&osdc->msgpool_op, msg_size,
++				       num_request_data_items);
+ 	else
+-		msg = ceph_msg_new(CEPH_MSG_OSD_OP, msg_size, gfp, true);
++		msg = ceph_msg_new2(CEPH_MSG_OSD_OP, msg_size,
++				    num_request_data_items, gfp, true);
+ 	if (!msg)
+ 		return -ENOMEM;
+ 
+@@ -656,9 +661,11 @@ int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
+ 	msg_size += req->r_num_ops * sizeof(struct ceph_osd_op);
+ 
+ 	if (req->r_mempool)
+-		msg = ceph_msgpool_get(&osdc->msgpool_op_reply, msg_size);
++		msg = ceph_msgpool_get(&osdc->msgpool_op_reply, msg_size,
++				       num_reply_data_items);
+ 	else
+-		msg = ceph_msg_new(CEPH_MSG_OSD_OPREPLY, msg_size, gfp, true);
++		msg = ceph_msg_new2(CEPH_MSG_OSD_OPREPLY, msg_size,
++				    num_reply_data_items, gfp, true);
+ 	if (!msg)
+ 		return -ENOMEM;
+ 
+@@ -666,7 +673,6 @@ int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(ceph_osdc_alloc_messages);
+ 
+ static bool osd_req_opcode_valid(u16 opcode)
+ {
+@@ -679,6 +685,64 @@ __CEPH_FORALL_OSD_OPS(GENERATE_CASE)
+ 	}
+ }
+ 
++static void get_num_data_items(struct ceph_osd_request *req,
++			       int *num_request_data_items,
++			       int *num_reply_data_items)
++{
++	struct ceph_osd_req_op *op;
++
++	*num_request_data_items = 0;
++	*num_reply_data_items = 0;
++
++	for (op = req->r_ops; op != &req->r_ops[req->r_num_ops]; op++) {
++		switch (op->op) {
++		/* request */
++		case CEPH_OSD_OP_WRITE:
++		case CEPH_OSD_OP_WRITEFULL:
++		case CEPH_OSD_OP_SETXATTR:
++		case CEPH_OSD_OP_CMPXATTR:
++		case CEPH_OSD_OP_NOTIFY_ACK:
++			*num_request_data_items += 1;
++			break;
++
++		/* reply */
++		case CEPH_OSD_OP_STAT:
++		case CEPH_OSD_OP_READ:
++		case CEPH_OSD_OP_LIST_WATCHERS:
++			*num_reply_data_items += 1;
++			break;
++
++		/* both */
++		case CEPH_OSD_OP_NOTIFY:
++			*num_request_data_items += 1;
++			*num_reply_data_items += 1;
++			break;
++		case CEPH_OSD_OP_CALL:
++			*num_request_data_items += 2;
++			*num_reply_data_items += 1;
++			break;
++
++		default:
++			WARN_ON(!osd_req_opcode_valid(op->op));
++			break;
++		}
++	}
++}
++
++/*
++ * oid, oloc and OSD op opcode(s) must be filled in before this function
++ * is called.
++ */
++int ceph_osdc_alloc_messages(struct ceph_osd_request *req, gfp_t gfp)
++{
++	int num_request_data_items, num_reply_data_items;
++
++	get_num_data_items(req, &num_request_data_items, &num_reply_data_items);
++	return __ceph_osdc_alloc_messages(req, gfp, num_request_data_items,
++					  num_reply_data_items);
++}
++EXPORT_SYMBOL(ceph_osdc_alloc_messages);
++
+ /*
+  * This is an osd op init function for opcodes that have no data or
+  * other information associated with them.  It also serves as a
+@@ -1035,7 +1099,15 @@ struct ceph_osd_request *ceph_osdc_new_request(struct ceph_osd_client *osdc,
+ 	if (flags & CEPH_OSD_FLAG_WRITE)
+ 		req->r_data_offset = off;
+ 
+-	r = ceph_osdc_alloc_messages(req, GFP_NOFS);
++	if (num_ops > 1)
++		/*
++		 * This is a special case for ceph_writepages_start(), but it
++		 * also covers ceph_uninline_data().  If more multi-op request
++		 * use cases emerge, we will need a separate helper.
++		 */
++		r = __ceph_osdc_alloc_messages(req, GFP_NOFS, num_ops, 0);
++	else
++		r = ceph_osdc_alloc_messages(req, GFP_NOFS);
+ 	if (r)
+ 		goto fail;
+ 
+@@ -1842,13 +1914,16 @@ static bool should_plug_request(struct ceph_osd_request *req)
+ 	return true;
+ }
+ 
++/*
++ * Keep get_num_data_items() in sync with this function.
++ */
+ static void setup_request_data(struct ceph_osd_request *req,
+ 			       struct ceph_msg *msg)
+ {
+ 	u32 data_len = 0;
+ 	int i;
+ 
+-	if (!list_empty(&msg->data))
++	if (msg->num_data_items)
+ 		return;
+ 
+ 	WARN_ON(msg->data_length);
+@@ -4325,9 +4400,7 @@ static void handle_watch_notify(struct ceph_osd_client *osdc,
+ 			     lreq->notify_id, notify_id);
+ 		} else if (!completion_done(&lreq->notify_finish_wait)) {
+ 			struct ceph_msg_data *data =
+-			    list_first_entry_or_null(&msg->data,
+-						     struct ceph_msg_data,
+-						     links);
++			    msg->num_data_items ? &msg->data[0] : NULL;
+ 
+ 			if (data) {
+ 				if (lreq->preply_pages) {
+@@ -5036,11 +5109,12 @@ int ceph_osdc_init(struct ceph_osd_client *osdc, struct ceph_client *client)
+ 		goto out_map;
+ 
+ 	err = ceph_msgpool_init(&osdc->msgpool_op, CEPH_MSG_OSD_OP,
+-				PAGE_SIZE, 10, true, "osd_op");
++				PAGE_SIZE, CEPH_OSD_SLAB_OPS, 10, "osd_op");
+ 	if (err < 0)
+ 		goto out_mempool;
+ 	err = ceph_msgpool_init(&osdc->msgpool_op_reply, CEPH_MSG_OSD_OPREPLY,
+-				PAGE_SIZE, 10, true, "osd_op_reply");
++				PAGE_SIZE, CEPH_OSD_SLAB_OPS, 10,
++				"osd_op_reply");
+ 	if (err < 0)
+ 		goto out_msgpool;
+ 
+@@ -5310,7 +5384,7 @@ static struct ceph_msg *alloc_msg_with_page_vector(struct ceph_msg_header *hdr)
+ 	u32 front_len = le32_to_cpu(hdr->front_len);
+ 	u32 data_len = le32_to_cpu(hdr->data_len);
+ 
+-	m = ceph_msg_new(type, front_len, GFP_NOIO, false);
++	m = ceph_msg_new2(type, front_len, 1, GFP_NOIO, false);
+ 	if (!m)
+ 		return NULL;
+ 
+
