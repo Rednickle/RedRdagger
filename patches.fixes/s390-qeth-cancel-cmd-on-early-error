@@ -1,0 +1,135 @@
+From: Julian Wiedmann <jwi@linux.ibm.com>
+Date: Tue, 12 Feb 2019 18:33:22 +0100
+Subject: s390/qeth: cancel cmd on early error
+Git-commit: 54daaca7024d5419dad64db8a3e65f6b38f24b7f
+Patch-mainline: v5.1-rc1
+References: bsc#1142109 LTC#179339
+
+When sending cmds via qeth_send_control_data(), qeth puts the request
+on the IO channel and then blocks on the reply object until the response
+has been received.
+
+If the IO completes with error, there will never be a response and we
+block until the reply-wait hits its timeout. For this case, connect the
+request buffer to its reply object, so that we can immediately cancel
+the wait.
+
+Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[ ptesarik: Use __qeth_check_irb_error instead of qeth_check_irb_error.
+  Renamed by 8d908eb045bb1ad8a842910360938a204a203617. ]
+Signed-off-by: Petr Tesarik <ptesarik@suse.com>
+---
+ drivers/s390/net/qeth_core.h      |    1 +
+ drivers/s390/net/qeth_core_main.c |   34 +++++++++++++++++++++++++++-------
+ 2 files changed, 28 insertions(+), 7 deletions(-)
+
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -602,6 +602,7 @@ struct qeth_channel;
+ struct qeth_cmd_buffer {
+ 	enum qeth_cmd_buffer_state state;
+ 	struct qeth_channel *channel;
++	struct qeth_reply *reply;
+ 	unsigned char *data;
+ 	int rc;
+ 	void (*callback) (struct qeth_channel *, struct qeth_cmd_buffer *);
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -810,12 +810,27 @@ void qeth_release_buffer(struct qeth_cha
+ 	memset(iob->data, 0, QETH_BUFSIZE);
+ 	iob->state = BUF_STATE_FREE;
+ 	iob->callback = qeth_send_control_data_cb;
++	if (iob->reply) {
++		qeth_put_reply(iob->reply);
++		iob->reply = NULL;
++	}
+ 	iob->rc = 0;
+ 	spin_unlock_irqrestore(&channel->iob_lock, flags);
+ 	wake_up(&channel->wait_q);
+ }
+ EXPORT_SYMBOL_GPL(qeth_release_buffer);
+ 
++static void qeth_cancel_cmd(struct qeth_cmd_buffer *iob, int rc)
++{
++	struct qeth_reply *reply = iob->reply;
++
++	if (reply) {
++		reply->rc = rc;
++		qeth_notify_reply(reply);
++	}
++	qeth_release_buffer(iob->channel, iob);
++}
++
+ static struct qeth_cmd_buffer *qeth_get_buffer(struct qeth_channel *channel)
+ {
+ 	struct qeth_cmd_buffer *buffer = NULL;
+@@ -1076,7 +1091,7 @@ static int qeth_get_problem(struct ccw_d
+ 	return 0;
+ }
+ 
+-static long __qeth_check_irb_error(struct ccw_device *cdev,
++static int __qeth_check_irb_error(struct ccw_device *cdev,
+ 		unsigned long intparm, struct irb *irb)
+ {
+ 	struct qeth_card *card;
+@@ -1092,7 +1107,7 @@ static long __qeth_check_irb_error(struc
+ 				 CCW_DEVID(cdev));
+ 		QETH_CARD_TEXT(card, 2, "ckirberr");
+ 		QETH_CARD_TEXT_(card, 2, "  rc%d", -EIO);
+-		break;
++		return -EIO;
+ 	case -ETIMEDOUT:
+ 		dev_warn(&cdev->dev, "A hardware operation timed out"
+ 			" on the device\n");
+@@ -1104,14 +1119,14 @@ static long __qeth_check_irb_error(struc
+ 				wake_up(&card->wait_q);
+ 			}
+ 		}
+-		break;
++		return -ETIMEDOUT;
+ 	default:
+ 		QETH_DBF_MESSAGE(2, "unknown error %ld on channel %x\n",
+ 				 PTR_ERR(irb), CCW_DEVID(cdev));
+ 		QETH_CARD_TEXT(card, 2, "ckirberr");
+ 		QETH_CARD_TEXT(card, 2, "  rc???");
++		return PTR_ERR(irb);
+ 	}
+-	return PTR_ERR(irb);
+ }
+ 
+ static void qeth_irq(struct ccw_device *cdev, unsigned long intparm,
+@@ -1143,10 +1158,11 @@ static void qeth_irq(struct ccw_device *
+ 	if (qeth_intparm_is_iob(intparm))
+ 		iob = (struct qeth_cmd_buffer *) __va((addr_t)intparm);
+ 
+-	if (__qeth_check_irb_error(cdev, intparm, irb)) {
++	rc = __qeth_check_irb_error(cdev, intparm, irb);
++	if (rc) {
+ 		/* IO was terminated, free its resources. */
+ 		if (iob)
+-			qeth_release_buffer(iob->channel, iob);
++			qeth_cancel_cmd(iob, rc);
+ 		atomic_set(&channel->irq_pending, 0);
+ 		wake_up(&card->wait_q);
+ 		return;
+@@ -1202,7 +1218,7 @@ static void qeth_irq(struct ccw_device *
+ 		if (rc) {
+ 			card->read_or_write_problem = 1;
+ 			if (iob)
+-				qeth_release_buffer(iob->channel, iob);
++				qeth_cancel_cmd(iob, rc);
+ 			qeth_clear_ipacmd_list(card);
+ 			qeth_schedule_recovery(card);
+ 			goto out;
+@@ -2119,6 +2135,10 @@ int qeth_send_control_data(struct qeth_c
+ 	reply->callback = reply_cb;
+ 	reply->param = reply_param;
+ 
++	/* pairs with qeth_release_buffer(): */
++	qeth_get_reply(reply);
++	iob->reply = reply;
++
+ 	while (atomic_cmpxchg(&card->write.irq_pending, 0, 1)) ;
+ 
+ 	if (IS_IPA(iob->data)) {
