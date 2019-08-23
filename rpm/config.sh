@@ -4,6 +4,8 @@ SRCVERSION=5.3-rc5
 VARIANT=
 # enable kernel module compression
 COMPRESS_MODULES="xz"
+# Use new style livepatch package names
+LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Leap:15.2:Update
 # Bugzilla info
