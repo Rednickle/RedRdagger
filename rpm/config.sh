@@ -5,9 +5,9 @@ VARIANT=
 # enable kernel module compression
 COMPRESS_MODULES="xz"
 # buildservice projects to build the kernel against
-OBS_PROJECT=openSUSE:Leap:15.1:Update
+OBS_PROJECT=openSUSE:Leap:15.2:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15 SP2"
+BUGZILLA_PRODUCT="openSUSE Distribution"
 # Check the sorted patches section of series.conf
 SORT_SERIES=yes
