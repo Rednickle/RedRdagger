@@ -1,0 +1,769 @@
+From: Giridhar Malavali <gmalavali@marvell.com>
+Date: Fri, 21 Dec 2018 09:33:45 -0800
+Subject: scsi: qla2xxx: Fix DMA error when the DIF sg buffer crosses 4GB
+ boundary
+Patch-mainline: v5.1-rc1
+Git-commit: 50b812755e9766fa0a1a28533f4d11a34a5b813e
+References: bsc#1123034 bsc#1131304 bsc#1127988
+
+When SGE buffer containing DIF information crosses 4G boundary, it results
+in DMA error. This patch fixes this issue by calculating SGE buffer size
+and if it crosses 4G boundary, driver will split it into multiple SGE
+buffers to avoid DMA error.
+
+Signed-off-by: Giridhar Malavali <gmalavali@marvell.com>
+Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Acked-by: Daniel Wagner <dwagner@suse.de>
+---
+ drivers/scsi/qla2xxx/qla_attr.c   |   21 ++
+ drivers/scsi/qla2xxx/qla_def.h    |   28 +++
+ drivers/scsi/qla2xxx/qla_gbl.h    |    3 
+ drivers/scsi/qla2xxx/qla_iocb.c   |  331 +++++++++++++++++++++++++++++++-------
+ drivers/scsi/qla2xxx/qla_isr.c    |   11 +
+ drivers/scsi/qla2xxx/qla_os.c     |  169 +++++++++++++++++++
+ drivers/scsi/qla2xxx/qla_target.c |    2 
+ drivers/scsi/qla2xxx/qla_target.h |    2 
+ 8 files changed, 501 insertions(+), 66 deletions(-)
+
+--- a/drivers/scsi/qla2xxx/qla_attr.c
++++ b/drivers/scsi/qla2xxx/qla_attr.c
+@@ -1002,7 +1002,7 @@ qla2x00_free_sysfs_attr(scsi_qla_host_t
+ /* Scsi_Host attributes. */
+ 
+ static ssize_t
+-qla2x00_drvr_version_show(struct device *dev,
++qla2x00_driver_version_show(struct device *dev,
+ 			  struct device_attribute *attr, char *buf)
+ {
+ 	return scnprintf(buf, PAGE_SIZE, "%s\n", qla2x00_version_str);
+@@ -2059,7 +2059,21 @@ ql2xiniexchg_store(struct device *dev, s
+ 	return strlen(buf);
+ }
+ 
+-static DEVICE_ATTR(driver_version, S_IRUGO, qla2x00_drvr_version_show, NULL);
++static ssize_t
++qla2x00_dif_bundle_statistics_show(struct device *dev,
++    struct device_attribute *attr, char *buf)
++{
++	scsi_qla_host_t *vha = shost_priv(class_to_shost(dev));
++	struct qla_hw_data *ha = vha->hw;
++
++	return scnprintf(buf, PAGE_SIZE,
++	    "cross=%llu read=%llu write=%llu kalloc=%llu dma_alloc=%llu unusable=%u\n",
++	    ha->dif_bundle_crossed_pages, ha->dif_bundle_reads,
++	    ha->dif_bundle_writes, ha->dif_bundle_kallocs,
++	    ha->dif_bundle_dma_allocs, ha->pool.unusable.count);
++}
++
++static DEVICE_ATTR(driver_version, S_IRUGO, qla2x00_driver_version_show, NULL);
+ static DEVICE_ATTR(fw_version, S_IRUGO, qla2x00_fw_version_show, NULL);
+ static DEVICE_ATTR(serial_num, S_IRUGO, qla2x00_serial_num_show, NULL);
+ static DEVICE_ATTR(isp_name, S_IRUGO, qla2x00_isp_name_show, NULL);
+@@ -2112,6 +2126,8 @@ static DEVICE_ATTR(zio_threshold, 0644,
+ static DEVICE_ATTR_RW(qlini_mode);
+ static DEVICE_ATTR_RW(ql2xexchoffld);
+ static DEVICE_ATTR_RW(ql2xiniexchg);
++static DEVICE_ATTR(dif_bundle_statistics, 0444,
++    qla2x00_dif_bundle_statistics_show, NULL);
+ 
+ 
+ struct device_attribute *qla2x00_host_attrs[] = {
+@@ -2150,6 +2166,7 @@ struct device_attribute *qla2x00_host_at
+ 	&dev_attr_min_link_speed,
+ 	&dev_attr_max_speed_sup,
+ 	&dev_attr_zio_threshold,
++	&dev_attr_dif_bundle_statistics,
+ 	NULL, /* reserve for qlini_mode */
+ 	NULL, /* reserve for ql2xiniexchg */
+ 	NULL, /* reserve for ql2xexchoffld */
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -314,6 +314,7 @@ struct srb_cmd {
+ #define SRB_CRC_PROT_DMA_VALID		BIT_4	/* DIF: prot DMA valid */
+ #define SRB_CRC_CTX_DSD_VALID		BIT_5	/* DIF: dsd_list valid */
+ #define SRB_WAKEUP_ON_COMP		BIT_6
++#define SRB_DIF_BUNDL_DMA_VALID		BIT_7   /* DIF: DMA list valid */
+ 
+ /* To identify if a srb is of T10-CRC type. @sp => srb_t pointer */
+ #define IS_PROT_IO(sp)	(sp->flags & SRB_CRC_CTX_DSD_VALID)
+@@ -1892,6 +1893,13 @@ struct crc_context {
+ 	/* List of DMA context transfers */
+ 	struct list_head dsd_list;
+ 
++	/* List of DIF Bundling context DMA address */
++	struct list_head ldif_dsd_list;
++	u8 no_ldif_dsd;
++
++	struct list_head ldif_dma_hndl_list;
++	u32 dif_bundl_len;
++	u8 no_dif_bundl;
+ 	/* This structure should not exceed 512 bytes */
+ };
+ 
+@@ -4184,6 +4192,26 @@ struct qla_hw_data {
+ 	uint16_t min_link_speed;
+ 	uint16_t max_speed_sup;
+ 
++	/* DMA pool for the DIF bundling buffers */
++	struct dma_pool *dif_bundl_pool;
++	#define DIF_BUNDLING_DMA_POOL_SIZE  1024
++	struct {
++		struct {
++			struct list_head head;
++			uint count;
++		} good;
++		struct {
++			struct list_head head;
++			uint count;
++		} unusable;
++	} pool;
++
++	unsigned long long dif_bundle_crossed_pages;
++	unsigned long long dif_bundle_reads;
++	unsigned long long dif_bundle_writes;
++	unsigned long long dif_bundle_kallocs;
++	unsigned long long dif_bundle_dma_allocs;
++
+ 	atomic_t        nvme_active_aen_cnt;
+ 	uint16_t        nvme_last_rptd_aen;             /* Last recorded aen count */
+ 
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -160,6 +160,7 @@ extern int ql2xautodetectsfp;
+ extern int ql2xenablemsix;
+ extern int qla2xuseresexchforels;
+ extern int ql2xexlogins;
++extern int ql2xdifbundlinginternalbuffers;
+ 
+ extern int qla2x00_loop_reset(scsi_qla_host_t *);
+ extern void qla2x00_abort_all_cmds(scsi_qla_host_t *, int);
+@@ -285,7 +286,7 @@ extern int qla24xx_walk_and_build_sglist
+ extern int qla24xx_walk_and_build_sglist(struct qla_hw_data *, srb_t *,
+ 	uint32_t *, uint16_t, struct qla_tc_param *);
+ extern int qla24xx_walk_and_build_prot_sglist(struct qla_hw_data *, srb_t *,
+-	uint32_t *, uint16_t, struct qla_tc_param *);
++	uint32_t *, uint16_t, struct qla_tgt_cmd *);
+ extern int qla24xx_get_one_block_sg(uint32_t, struct qla2_sgx *, uint32_t *);
+ extern int qla24xx_configure_prot_mode(srb_t *, uint16_t *);
+ extern int qla24xx_build_scsi_crc_2_iocbs(srb_t *,
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@ -1098,88 +1098,300 @@ qla24xx_walk_and_build_sglist(struct qla
+ 
+ int
+ qla24xx_walk_and_build_prot_sglist(struct qla_hw_data *ha, srb_t *sp,
+-	uint32_t *dsd, uint16_t tot_dsds, struct qla_tc_param *tc)
++    uint32_t *cur_dsd, uint16_t tot_dsds, struct qla_tgt_cmd *tc)
+ {
+-	void *next_dsd;
+-	uint8_t avail_dsds = 0;
+-	uint32_t dsd_list_len;
+-	struct dsd_dma *dsd_ptr;
++	struct dsd_dma *dsd_ptr = NULL, *dif_dsd, *nxt_dsd;
+ 	struct scatterlist *sg, *sgl;
+-	int	i;
+-	struct scsi_cmnd *cmd;
+-	uint32_t *cur_dsd = dsd;
+-	uint16_t used_dsds = tot_dsds;
++	struct crc_context *difctx = NULL;
+ 	struct scsi_qla_host *vha;
++	uint dsd_list_len;
++	uint avail_dsds = 0;
++	uint used_dsds = tot_dsds;
++	bool dif_local_dma_alloc = false;
++	bool direction_to_device = false;
++	int i;
+ 
+ 	if (sp) {
+-		cmd = GET_CMD_SP(sp);
++		struct scsi_cmnd *cmd = GET_CMD_SP(sp);
+ 		sgl = scsi_prot_sglist(cmd);
+ 		vha = sp->vha;
++		difctx = sp->u.scmd.ctx;
++		direction_to_device = cmd->sc_data_direction == DMA_TO_DEVICE;
++		ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe021,
++		  "%s: scsi_cmnd: %p, crc_ctx: %p, sp: %p\n",
++			__func__, cmd, difctx, sp);
+ 	} else if (tc) {
+ 		vha = tc->vha;
+ 		sgl = tc->prot_sg;
++		difctx = tc->ctx;
++		direction_to_device = tc->dma_data_direction == DMA_TO_DEVICE;
+ 	} else {
+ 		BUG();
+ 		return 1;
+ 	}
+ 
+-	ql_dbg(ql_dbg_tgt, vha, 0xe021,
+-		"%s: enter\n", __func__);
++	ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe021,
++	    "%s: enter (write=%u)\n", __func__, direction_to_device);
+ 
+-	for_each_sg(sgl, sg, tot_dsds, i) {
+-		dma_addr_t	sle_dma;
+-
+-		/* Allocate additional continuation packets? */
+-		if (avail_dsds == 0) {
+-			avail_dsds = (used_dsds > QLA_DSDS_PER_IOCB) ?
+-						QLA_DSDS_PER_IOCB : used_dsds;
+-			dsd_list_len = (avail_dsds + 1) * 12;
+-			used_dsds -= avail_dsds;
+-
+-			/* allocate tracking DS */
+-			dsd_ptr = kzalloc(sizeof(struct dsd_dma), GFP_ATOMIC);
+-			if (!dsd_ptr)
+-				return 1;
+-
+-			/* allocate new list */
+-			dsd_ptr->dsd_addr = next_dsd =
+-			    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC,
+-				&dsd_ptr->dsd_list_dma);
+-
+-			if (!next_dsd) {
+-				/*
+-				 * Need to cleanup only this dsd_ptr, rest
+-				 * will be done by sp_free_dma()
+-				 */
+-				kfree(dsd_ptr);
+-				return 1;
++	/* if initiator doing write or target doing read */
++	if (direction_to_device) {
++		for_each_sg(sgl, sg, tot_dsds, i) {
++			dma_addr_t sle_phys = sg_phys(sg);
++
++			/* If SGE addr + len flips bits in upper 32-bits */
++			if (MSD(sle_phys + sg->length) ^ MSD(sle_phys)) {
++				ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe022,
++				    "%s: page boundary crossing (phys=%llx len=%x)\n",
++				    __func__, sle_phys, sg->length);
++
++				if (difctx) {
++					ha->dif_bundle_crossed_pages++;
++					dif_local_dma_alloc = true;
++				} else {
++					ql_dbg(ql_dbg_tgt + ql_dbg_verbose,
++					    vha, 0xe022,
++					    "%s: difctx pointer is NULL\n",
++					    __func__);
++				}
++				break;
+ 			}
++		}
++		ha->dif_bundle_writes++;
++	} else {
++		ha->dif_bundle_reads++;
++	}
++
++	if (ql2xdifbundlinginternalbuffers)
++		dif_local_dma_alloc = direction_to_device;
+ 
+-			if (sp) {
+-				list_add_tail(&dsd_ptr->list,
+-				    &((struct crc_context *)
+-					    sp->u.scmd.ctx)->dsd_list);
+-
+-				sp->flags |= SRB_CRC_CTX_DSD_VALID;
+-			} else {
+-				list_add_tail(&dsd_ptr->list,
+-				    &(tc->ctx->dsd_list));
+-				*tc->ctx_dsd_alloced = 1;
++	if (dif_local_dma_alloc) {
++		u32 track_difbundl_buf = 0;
++		u32 ldma_sg_len = 0;
++		u8 ldma_needed = 1;
++
++		difctx->no_dif_bundl = 0;
++		difctx->dif_bundl_len = 0;
++
++		/* Track DSD buffers */
++		INIT_LIST_HEAD(&difctx->ldif_dsd_list);
++		/* Track local DMA buffers */
++		INIT_LIST_HEAD(&difctx->ldif_dma_hndl_list);
++
++		for_each_sg(sgl, sg, tot_dsds, i) {
++			u32 sglen = sg_dma_len(sg);
++
++			ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe023,
++			    "%s: sg[%x] (phys=%llx sglen=%x) ldma_sg_len: %x dif_bundl_len: %x ldma_needed: %x\n",
++			    __func__, i, sg_phys(sg), sglen, ldma_sg_len,
++			    difctx->dif_bundl_len, ldma_needed);
++
++			while (sglen) {
++				u32 xfrlen = 0;
++
++				if (ldma_needed) {
++					/*
++					 * Allocate list item to store
++					 * the DMA buffers
++					 */
++					dsd_ptr = kzalloc(sizeof(*dsd_ptr),
++					    GFP_ATOMIC);
++					if (!dsd_ptr) {
++						ql_dbg(ql_dbg_tgt, vha, 0xe024,
++						    "%s: failed alloc dsd_ptr\n",
++						    __func__);
++						return 1;
++					}
++					ha->dif_bundle_kallocs++;
++
++					/* allocate dma buffer */
++					dsd_ptr->dsd_addr = dma_pool_alloc
++						(ha->dif_bundl_pool, GFP_ATOMIC,
++						 &dsd_ptr->dsd_list_dma);
++					if (!dsd_ptr->dsd_addr) {
++						ql_dbg(ql_dbg_tgt, vha, 0xe024,
++						    "%s: failed alloc ->dsd_ptr\n",
++						    __func__);
++						/*
++						 * need to cleanup only this
++						 * dsd_ptr rest will be done
++						 * by sp_free_dma()
++						 */
++						kfree(dsd_ptr);
++						ha->dif_bundle_kallocs--;
++						return 1;
++					}
++					ha->dif_bundle_dma_allocs++;
++					ldma_needed = 0;
++					difctx->no_dif_bundl++;
++					list_add_tail(&dsd_ptr->list,
++					    &difctx->ldif_dma_hndl_list);
++				}
++
++				/* xfrlen is min of dma pool size and sglen */
++				xfrlen = (sglen >
++				   (DIF_BUNDLING_DMA_POOL_SIZE - ldma_sg_len)) ?
++				    DIF_BUNDLING_DMA_POOL_SIZE - ldma_sg_len :
++				    sglen;
++
++				/* replace with local allocated dma buffer */
++				sg_pcopy_to_buffer(sgl, sg_nents(sgl),
++				    dsd_ptr->dsd_addr + ldma_sg_len, xfrlen,
++				    difctx->dif_bundl_len);
++				difctx->dif_bundl_len += xfrlen;
++				sglen -= xfrlen;
++				ldma_sg_len += xfrlen;
++				if (ldma_sg_len == DIF_BUNDLING_DMA_POOL_SIZE ||
++				    sg_is_last(sg)) {
++					ldma_needed = 1;
++					ldma_sg_len = 0;
++				}
+ 			}
++		}
+ 
+-			/* add new list to cmd iocb or last list */
+-			*cur_dsd++ = cpu_to_le32(LSD(dsd_ptr->dsd_list_dma));
+-			*cur_dsd++ = cpu_to_le32(MSD(dsd_ptr->dsd_list_dma));
+-			*cur_dsd++ = dsd_list_len;
+-			cur_dsd = (uint32_t *)next_dsd;
++		track_difbundl_buf = used_dsds = difctx->no_dif_bundl;
++		ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe025,
++		    "dif_bundl_len=%x, no_dif_bundl=%x track_difbundl_buf: %x\n",
++		    difctx->dif_bundl_len, difctx->no_dif_bundl,
++		    track_difbundl_buf);
++
++		if (sp)
++			sp->flags |= SRB_DIF_BUNDL_DMA_VALID;
++		else
++			tc->prot_flags = DIF_BUNDL_DMA_VALID;
++
++		list_for_each_entry_safe(dif_dsd, nxt_dsd,
++		    &difctx->ldif_dma_hndl_list, list) {
++			u32 sglen = (difctx->dif_bundl_len >
++			    DIF_BUNDLING_DMA_POOL_SIZE) ?
++			    DIF_BUNDLING_DMA_POOL_SIZE : difctx->dif_bundl_len;
++
++			BUG_ON(track_difbundl_buf == 0);
++
++			/* Allocate additional continuation packets? */
++			if (avail_dsds == 0) {
++				ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha,
++				    0xe024,
++				    "%s: adding continuation iocb's\n",
++				    __func__);
++				avail_dsds = (used_dsds > QLA_DSDS_PER_IOCB) ?
++				    QLA_DSDS_PER_IOCB : used_dsds;
++				dsd_list_len = (avail_dsds + 1) * 12;
++				used_dsds -= avail_dsds;
++
++				/* allocate tracking DS */
++				dsd_ptr = kzalloc(sizeof(*dsd_ptr), GFP_ATOMIC);
++				if (!dsd_ptr) {
++					ql_dbg(ql_dbg_tgt, vha, 0xe026,
++					    "%s: failed alloc dsd_ptr\n",
++					    __func__);
++					return 1;
++				}
++				ha->dif_bundle_kallocs++;
++
++				difctx->no_ldif_dsd++;
++				/* allocate new list */
++				dsd_ptr->dsd_addr =
++				    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC,
++					&dsd_ptr->dsd_list_dma);
++				if (!dsd_ptr->dsd_addr) {
++					ql_dbg(ql_dbg_tgt, vha, 0xe026,
++					    "%s: failed alloc ->dsd_addr\n",
++					    __func__);
++					/*
++					 * need to cleanup only this dsd_ptr
++					 *  rest will be done by sp_free_dma()
++					 */
++					kfree(dsd_ptr);
++					ha->dif_bundle_kallocs--;
++					return 1;
++				}
++				ha->dif_bundle_dma_allocs++;
++
++				if (sp) {
++					list_add_tail(&dsd_ptr->list,
++					    &difctx->ldif_dsd_list);
++					sp->flags |= SRB_CRC_CTX_DSD_VALID;
++				} else {
++					list_add_tail(&dsd_ptr->list,
++					    &difctx->ldif_dsd_list);
++					tc->ctx_dsd_alloced = 1;
++				}
++
++				/* add new list to cmd iocb or last list */
++				*cur_dsd++ =
++				    cpu_to_le32(LSD(dsd_ptr->dsd_list_dma));
++				*cur_dsd++ =
++				    cpu_to_le32(MSD(dsd_ptr->dsd_list_dma));
++				*cur_dsd++ = dsd_list_len;
++				cur_dsd = dsd_ptr->dsd_addr;
++			}
++			*cur_dsd++ = cpu_to_le32(LSD(dif_dsd->dsd_list_dma));
++			*cur_dsd++ = cpu_to_le32(MSD(dif_dsd->dsd_list_dma));
++			*cur_dsd++ = cpu_to_le32(sglen);
++			avail_dsds--;
++			difctx->dif_bundl_len -= sglen;
++			track_difbundl_buf--;
+ 		}
+-		sle_dma = sg_dma_address(sg);
+ 
+-		*cur_dsd++ = cpu_to_le32(LSD(sle_dma));
+-		*cur_dsd++ = cpu_to_le32(MSD(sle_dma));
+-		*cur_dsd++ = cpu_to_le32(sg_dma_len(sg));
++		ql_dbg(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe026,
++		    "%s: no_ldif_dsd:%x, no_dif_bundl:%x\n", __func__,
++			difctx->no_ldif_dsd, difctx->no_dif_bundl);
++	} else {
++		for_each_sg(sgl, sg, tot_dsds, i) {
++			dma_addr_t sle_dma;
+ 
+-		avail_dsds--;
++			/* Allocate additional continuation packets? */
++			if (avail_dsds == 0) {
++				avail_dsds = (used_dsds > QLA_DSDS_PER_IOCB) ?
++				    QLA_DSDS_PER_IOCB : used_dsds;
++				dsd_list_len = (avail_dsds + 1) * 12;
++				used_dsds -= avail_dsds;
++
++				/* allocate tracking DS */
++				dsd_ptr = kzalloc(sizeof(*dsd_ptr), GFP_ATOMIC);
++				if (!dsd_ptr) {
++					ql_dbg(ql_dbg_tgt + ql_dbg_verbose,
++					    vha, 0xe027,
++					    "%s: failed alloc dsd_dma...\n",
++					    __func__);
++					return 1;
++				}
++
++				/* allocate new list */
++				dsd_ptr->dsd_addr =
++				    dma_pool_alloc(ha->dl_dma_pool, GFP_ATOMIC,
++					&dsd_ptr->dsd_list_dma);
++				if (!dsd_ptr->dsd_addr) {
++					/* need to cleanup only this dsd_ptr */
++					/* rest will be done by sp_free_dma() */
++					kfree(dsd_ptr);
++					return 1;
++				}
++
++				if (sp) {
++					list_add_tail(&dsd_ptr->list,
++					    &difctx->dsd_list);
++					sp->flags |= SRB_CRC_CTX_DSD_VALID;
++				} else {
++					list_add_tail(&dsd_ptr->list,
++					    &difctx->dsd_list);
++					tc->ctx_dsd_alloced = 1;
++				}
++
++				/* add new list to cmd iocb or last list */
++				*cur_dsd++ =
++				    cpu_to_le32(LSD(dsd_ptr->dsd_list_dma));
++				*cur_dsd++ =
++				    cpu_to_le32(MSD(dsd_ptr->dsd_list_dma));
++				*cur_dsd++ = dsd_list_len;
++				cur_dsd = dsd_ptr->dsd_addr;
++			}
++			sle_dma = sg_dma_address(sg);
++			*cur_dsd++ = cpu_to_le32(LSD(sle_dma));
++			*cur_dsd++ = cpu_to_le32(MSD(sle_dma));
++			*cur_dsd++ = cpu_to_le32(sg_dma_len(sg));
++			avail_dsds--;
++		}
+ 	}
+ 	/* Null termination */
+ 	*cur_dsd++ = 0;
+@@ -1187,7 +1399,6 @@ qla24xx_walk_and_build_prot_sglist(struc
+ 	*cur_dsd++ = 0;
+ 	return 0;
+ }
+-
+ /**
+  * qla24xx_build_scsi_crc_2_iocbs() - Build IOCB command utilizing Command
+  *							Type 6 IOCB types.
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -2725,6 +2725,17 @@ check_scsi_status:
+ 			    cp->device->vendor);
+ 		break;
+ 
++	case CS_DMA:
++		ql_log(ql_log_info, fcport->vha, 0x3022,
++		    "CS_DMA error: 0x%x-0x%x (0x%x) nexus=%ld:%d:%llu portid=%06x oxid=0x%x cdb=%10phN len=0x%x rsp_info=0x%x resid=0x%x fw_resid=0x%x sp=%p cp=%p.\n",
++		    comp_status, scsi_status, res, vha->host_no,
++		    cp->device->id, cp->device->lun, fcport->d_id.b24,
++		    ox_id, cp->cmnd, scsi_bufflen(cp), rsp_info_len,
++		    resid_len, fw_resid_len, sp, cp);
++		ql_dump_buffer(ql_dbg_tgt + ql_dbg_verbose, vha, 0xe0ee,
++		    pkt, sizeof(*sts24));
++		res = DID_ERROR << 16;
++		break;
+ 	default:
+ 		res = DID_ERROR << 16;
+ 		break;
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -299,6 +299,13 @@ MODULE_PARM_DESC(ql2xprotguard, "Overrid
+ 		 "  1 -- Force T10 CRC\n"
+ 		 "  2 -- Force IP checksum\n");
+ 
++int ql2xdifbundlinginternalbuffers;
++module_param(ql2xdifbundlinginternalbuffers, int, 0644);
++MODULE_PARM_DESC(ql2xdifbundlinginternalbuffers,
++    "Force using internal buffers for DIF information\n"
++    "0 (Default). Based on check.\n"
++    "1 Force using internal buffers\n");
++
+ /*
+  * SCSI host template entry points
+  */
+@@ -821,7 +828,44 @@ qla2xxx_qpair_sp_free_dma(void *ptr)
+ 		ha->gbl_dsd_inuse -= ctx1->dsd_use_cnt;
+ 		ha->gbl_dsd_avail += ctx1->dsd_use_cnt;
+ 		mempool_free(ctx1, ha->ctx_mempool);
++		sp->flags &= ~SRB_FCP_CMND_DMA_VALID;
++	}
++	if (sp->flags & SRB_DIF_BUNDL_DMA_VALID) {
++		struct crc_context *difctx = sp->u.scmd.ctx;
++		struct dsd_dma *dif_dsd, *nxt_dsd;
++
++		list_for_each_entry_safe(dif_dsd, nxt_dsd,
++		    &difctx->ldif_dma_hndl_list, list) {
++			list_del(&dif_dsd->list);
++			dma_pool_free(ha->dif_bundl_pool, dif_dsd->dsd_addr,
++			    dif_dsd->dsd_list_dma);
++			kfree(dif_dsd);
++			difctx->no_dif_bundl--;
++		}
++
++		list_for_each_entry_safe(dif_dsd, nxt_dsd,
++		    &difctx->ldif_dsd_list, list) {
++			list_del(&dif_dsd->list);
++			dma_pool_free(ha->dl_dma_pool, dif_dsd->dsd_addr,
++			    dif_dsd->dsd_list_dma);
++			kfree(dif_dsd);
++			difctx->no_ldif_dsd--;
++		}
++
++		if (difctx->no_ldif_dsd) {
++			ql_dbg(ql_dbg_tgt+ql_dbg_verbose, sp->vha, 0xe022,
++			    "%s: difctx->no_ldif_dsd=%x\n",
++			    __func__, difctx->no_ldif_dsd);
++		}
++
++		if (difctx->no_dif_bundl) {
++			ql_dbg(ql_dbg_tgt+ql_dbg_verbose, sp->vha, 0xe022,
++			    "%s: difctx->no_dif_bundl=%x\n",
++			    __func__, difctx->no_dif_bundl);
++		}
++		sp->flags &= ~SRB_DIF_BUNDL_DMA_VALID;
+ 	}
++
+ end:
+ 	CMD_SP(cmd) = NULL;
+ 	qla2xxx_rel_qpair_sp(sp->qpair, sp);
+@@ -4025,9 +4069,86 @@ qla2x00_mem_alloc(struct qla_hw_data *ha
+ 			    "Failed to allocate memory for fcp_cmnd_dma_pool.\n");
+ 			goto fail_dl_dma_pool;
+ 		}
++
++		if (ql2xenabledif) {
++			u64 bufsize = DIF_BUNDLING_DMA_POOL_SIZE;
++			struct dsd_dma *dsd, *nxt;
++			uint i;
++			/* Creata a DMA pool of buffers for DIF bundling */
++			ha->dif_bundl_pool = dma_pool_create(name,
++			    &ha->pdev->dev, DIF_BUNDLING_DMA_POOL_SIZE, 8, 0);
++			if (!ha->dif_bundl_pool) {
++				ql_dbg_pci(ql_dbg_init, ha->pdev, 0x0024,
++				    "%s: failed create dif_bundl_pool\n",
++				    __func__);
++				goto fail_dif_bundl_dma_pool;
++			}
++
++			INIT_LIST_HEAD(&ha->pool.good.head);
++			INIT_LIST_HEAD(&ha->pool.unusable.head);
++			ha->pool.good.count = 0;
++			ha->pool.unusable.count = 0;
++			for (i = 0; i < 128; i++) {
++				dsd = kzalloc(sizeof(*dsd), GFP_ATOMIC);
++				if (!dsd) {
++					ql_dbg_pci(ql_dbg_init, ha->pdev,
++					    0xe0ee, "%s: failed alloc dsd\n",
++					    __func__);
++					return 1;
++				}
++				ha->dif_bundle_kallocs++;
++
++				dsd->dsd_addr = dma_pool_alloc(
++				    ha->dif_bundl_pool, GFP_ATOMIC,
++				    &dsd->dsd_list_dma);
++				if (!dsd->dsd_addr) {
++					ql_dbg_pci(ql_dbg_init, ha->pdev,
++					    0xe0ee,
++					    "%s: failed alloc ->dsd_addr\n",
++					    __func__);
++					kfree(dsd);
++					ha->dif_bundle_kallocs--;
++					continue;
++				}
++				ha->dif_bundle_dma_allocs++;
++
++				/*
++				 * if DMA buffer crosses 4G boundary,
++				 * put it on bad list
++				 */
++				if (MSD(dsd->dsd_list_dma) ^
++				    MSD(dsd->dsd_list_dma + bufsize)) {
++					list_add_tail(&dsd->list,
++					    &ha->pool.unusable.head);
++					ha->pool.unusable.count++;
++				} else {
++					list_add_tail(&dsd->list,
++					    &ha->pool.good.head);
++					ha->pool.good.count++;
++				}
++			}
++
++			/* return the good ones back to the pool */
++			list_for_each_entry_safe(dsd, nxt,
++			    &ha->pool.good.head, list) {
++				list_del(&dsd->list);
++				dma_pool_free(ha->dif_bundl_pool,
++				    dsd->dsd_addr, dsd->dsd_list_dma);
++				ha->dif_bundle_dma_allocs--;
++				kfree(dsd);
++				ha->dif_bundle_kallocs--;
++			}
++
++			ql_dbg_pci(ql_dbg_init, ha->pdev, 0x0024,
++			    "%s: dif dma pool (good=%u unusable=%u)\n",
++			    __func__, ha->pool.good.count,
++			    ha->pool.unusable.count);
++		}
++
+ 		ql_dbg_pci(ql_dbg_init, ha->pdev, 0x0025,
+-		    "dl_dma_pool=%p fcp_cmnd_dma_pool=%p.\n",
+-		    ha->dl_dma_pool, ha->fcp_cmnd_dma_pool);
++		    "dl_dma_pool=%p fcp_cmnd_dma_pool=%p dif_bundl_pool=%p.\n",
++		    ha->dl_dma_pool, ha->fcp_cmnd_dma_pool,
++		    ha->dif_bundl_pool);
+ 	}
+ 
+ 	/* Allocate memory for SNS commands */
+@@ -4190,6 +4311,24 @@ fail_free_ms_iocb:
+ 		dma_free_coherent(&ha->pdev->dev, sizeof(struct sns_cmd_pkt),
+ 		    ha->sns_cmd, ha->sns_cmd_dma);
+ fail_dma_pool:
++	if (ql2xenabledif) {
++		struct dsd_dma *dsd, *nxt;
++
++		list_for_each_entry_safe(dsd, nxt, &ha->pool.unusable.head,
++		    list) {
++			list_del(&dsd->list);
++			dma_pool_free(ha->dif_bundl_pool, dsd->dsd_addr,
++			    dsd->dsd_list_dma);
++			ha->dif_bundle_dma_allocs--;
++			kfree(dsd);
++			ha->dif_bundle_kallocs--;
++			ha->pool.unusable.count--;
++		}
++		dma_pool_destroy(ha->dif_bundl_pool);
++		ha->dif_bundl_pool = NULL;
++	}
++
++fail_dif_bundl_dma_pool:
+ 	if (IS_QLA82XX(ha) || ql2xenabledif) {
+ 		dma_pool_destroy(ha->fcp_cmnd_dma_pool);
+ 		ha->fcp_cmnd_dma_pool = NULL;
+@@ -4570,6 +4709,32 @@ qla2x00_mem_free(struct qla_hw_data *ha)
+ 
+ 	mempool_destroy(ha->ctx_mempool);
+ 
++	if (ql2xenabledif) {
++		struct dsd_dma *dsd, *nxt;
++
++		list_for_each_entry_safe(dsd, nxt, &ha->pool.unusable.head,
++					 list) {
++			list_del(&dsd->list);
++			dma_pool_free(ha->dif_bundl_pool, dsd->dsd_addr,
++				      dsd->dsd_list_dma);
++			ha->dif_bundle_dma_allocs--;
++			kfree(dsd);
++			ha->dif_bundle_kallocs--;
++			ha->pool.unusable.count--;
++		}
++		list_for_each_entry_safe(dsd, nxt, &ha->pool.good.head, list) {
++			list_del(&dsd->list);
++			dma_pool_free(ha->dif_bundl_pool, dsd->dsd_addr,
++				      dsd->dsd_list_dma);
++			ha->dif_bundle_dma_allocs--;
++			kfree(dsd);
++			ha->dif_bundle_kallocs--;
++		}
++	}
++
++	if (ha->dif_bundl_pool)
++		dma_pool_destroy(ha->dif_bundl_pool);
++
+ 	qlt_mem_free(ha);
+ 
+ 	if (ha->init_cb)
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -3235,7 +3235,7 @@ qlt_build_ctio_crc2_pkt(struct qla_qpair
+ 
+ 		cur_dsd = (uint32_t *) &crc_ctx_pkt->u.bundling.dif_address;
+ 		if (qla24xx_walk_and_build_prot_sglist(ha, NULL, cur_dsd,
+-			prm->prot_seg_cnt, &tc))
++			prm->prot_seg_cnt, cmd))
+ 			goto crc_queuing_error;
+ 	}
+ 	return QLA_SUCCESS;
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -928,6 +928,8 @@ struct qla_tgt_cmd {
+ 	uint64_t	lba;
+ 	uint16_t	a_guard, e_guard, a_app_tag, e_app_tag;
+ 	uint32_t	a_ref_tag, e_ref_tag;
++#define DIF_BUNDL_DMA_VALID 1
++	uint16_t prot_flags;
+ 
+ 	uint64_t jiffies_at_alloc;
+ 	uint64_t jiffies_at_free;
