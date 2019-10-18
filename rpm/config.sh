@@ -6,6 +6,8 @@ VARIANT=
 COMPRESS_MODULES="xz"
 # Use new style livepatch package names
 LIVEPATCH=livepatch
+# Compile binary devicetrees on master and stable branches.
+BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Leap:15.2:Update
 # Bugzilla info
