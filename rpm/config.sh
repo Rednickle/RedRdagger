@@ -2,6 +2,8 @@
 SRCVERSION=4.12
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
+# Use new style livepatch package names
+LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Leap:15.1:Update
 # Bugzilla info
