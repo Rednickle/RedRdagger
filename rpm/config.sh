@@ -2,6 +2,8 @@
 SRCVERSION=4.12
 # variant of the kernel-source package, either empty or "-rt" or "-azure"
 VARIANT=-azure
+# Use new style livepatch package names
+LIVEPATCH=livepatch
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLE-15-SP1:Update
 IBS_PROJECT=SUSE:SLE-15-SP1:Update
