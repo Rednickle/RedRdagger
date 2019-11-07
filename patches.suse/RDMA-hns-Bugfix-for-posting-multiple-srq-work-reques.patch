@@ -1,0 +1,141 @@
+From: Lijun Ou <oulijun@huawei.com>
+Date: Thu, 30 May 2019 23:55:53 +0800
+Subject: RDMA/hns: Bugfix for posting multiple srq work request
+Patch-mainline: v5.3-rc1
+Git-commit: 97545b10221ad14b046dba135a37f4e98a560697
+References: bsc#1104427 FATE#326416 bsc#1137236
+
+When the user submits more than 32 work request to a srq queue
+at a time, it needs to find the corresponding number of entries
+in the bitmap in the idx queue. However, the original lookup
+function named ffs only processes 32 bits of the array element,
+When the number of srq wqe issued exceeds 32, the ffs will only
+process the lower 32 bits of the elements, it will not be able
+to get the correct wqe index for srq wqe.
+
+Signed-off-by: Xi Wang <wangxi11@huawei.com>
+Signed-off-by: Lijun Ou <oulijun@huawei.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/hw/hns/hns_roce_device.h |    2 -
+ drivers/infiniband/hw/hns/hns_roce_hw_v2.c  |   34 ++++++++++++++--------------
+ drivers/infiniband/hw/hns/hns_roce_srq.c    |   15 ++----------
+ 3 files changed, 22 insertions(+), 29 deletions(-)
+
+--- a/drivers/infiniband/hw/hns/hns_roce_device.h
++++ b/drivers/infiniband/hw/hns/hns_roce_device.h
+@@ -489,7 +489,7 @@ struct hns_roce_idx_que {
+ 	u32				buf_size;
+ 	struct ib_umem			*umem;
+ 	struct hns_roce_mtt		mtt;
+-	u64				*bitmap;
++	unsigned long			*bitmap;
+ };
+ 
+ struct hns_roce_srq {
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -2343,15 +2343,10 @@ static void *get_srq_wqe(struct hns_roce
+ 
+ static void hns_roce_free_srq_wqe(struct hns_roce_srq *srq, int wqe_index)
+ {
+-	u32 bitmap_num;
+-	int bit_num;
+-
+ 	/* always called with interrupts disabled. */
+ 	spin_lock(&srq->lock);
+ 
+-	bitmap_num = wqe_index / (sizeof(u64) * 8);
+-	bit_num = wqe_index % (sizeof(u64) * 8);
+-	srq->idx_que.bitmap[bitmap_num] |= (1ULL << bit_num);
++	bitmap_clear(srq->idx_que.bitmap, wqe_index, 1);
+ 	srq->tail++;
+ 
+ 	spin_unlock(&srq->lock);
+@@ -5976,18 +5971,19 @@ out:
+ 	return ret;
+ }
+ 
+-static int find_empty_entry(struct hns_roce_idx_que *idx_que)
++static int find_empty_entry(struct hns_roce_idx_que *idx_que,
++			    unsigned long size)
+ {
+-	int bit_num;
+-	int i;
++	int wqe_idx;
+ 
+-	/* bitmap[i] is set zero if all bits are allocated */
+-	for (i = 0; idx_que->bitmap[i] == 0; ++i)
+-		;
+-	bit_num = ffs(idx_que->bitmap[i]);
+-	idx_que->bitmap[i] &= ~(1ULL << (bit_num - 1));
++	if (unlikely(bitmap_full(idx_que->bitmap, size)))
++		return -ENOSPC;
++
++	wqe_idx = find_first_zero_bit(idx_que->bitmap, size);
++
++	bitmap_set(idx_que->bitmap, wqe_idx, 1);
+ 
+-	return i * BITS_PER_LONG_LONG + (bit_num - 1);
++	return wqe_idx;
+ }
+ 
+ static void fill_idx_queue(struct hns_roce_idx_que *idx_que,
+@@ -6033,7 +6029,13 @@ static int hns_roce_v2_post_srq_recv(str
+ 			break;
+ 		}
+ 
+-		wqe_idx = find_empty_entry(&srq->idx_que);
++		wqe_idx = find_empty_entry(&srq->idx_que, srq->max);
++		if (wqe_idx < 0) {
++			ret = -ENOMEM;
++			*bad_wr = wr;
++			break;
++		}
++
+ 		fill_idx_queue(&srq->idx_que, ind, wqe_idx);
+ 		wqe = get_srq_wqe(srq, wqe_idx);
+ 		dseg = (struct hns_roce_v2_wqe_data_seg *)wqe;
+--- a/drivers/infiniband/hw/hns/hns_roce_srq.c
++++ b/drivers/infiniband/hw/hns/hns_roce_srq.c
+@@ -188,28 +188,19 @@ static int hns_roce_create_idx_que(struc
+ {
+ 	struct hns_roce_dev *hr_dev = to_hr_dev(pd->device);
+ 	struct hns_roce_idx_que *idx_que = &srq->idx_que;
+-	u32 bitmap_num;
+-	int i;
+ 
+-	bitmap_num = HNS_ROCE_ALOGN_UP(srq->max, 8 * sizeof(u64));
+-
+-	idx_que->bitmap = kcalloc(1, bitmap_num / 8, GFP_KERNEL);
++	idx_que->bitmap = bitmap_zalloc(srq->max, GFP_KERNEL);
+ 	if (!idx_que->bitmap)
+ 		return -ENOMEM;
+ 
+-	bitmap_num = bitmap_num / (8 * sizeof(u64));
+-
+ 	idx_que->buf_size = srq->idx_que.buf_size;
+ 
+ 	if (hns_roce_buf_alloc(hr_dev, idx_que->buf_size, (1 << page_shift) * 2,
+ 			       &idx_que->idx_buf, page_shift)) {
+-		kfree(idx_que->bitmap);
++		bitmap_free(idx_que->bitmap);
+ 		return -ENOMEM;
+ 	}
+ 
+-	for (i = 0; i < bitmap_num; i++)
+-		idx_que->bitmap[i] = ~(0UL);
+-
+ 	return 0;
+ }
+ 
+@@ -415,7 +406,7 @@ err_idx_mtt:
+ err_create_idx:
+ 	hns_roce_buf_free(hr_dev, srq->idx_que.buf_size,
+ 			  &srq->idx_que.idx_buf);
+-	kfree(srq->idx_que.bitmap);
++	bitmap_free(srq->idx_que.bitmap);
+ 
+ err_srq_mtt:
+ 	hns_roce_mtt_cleanup(hr_dev, &srq->mtt);
