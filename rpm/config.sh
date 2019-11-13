@@ -4,6 +4,8 @@ SRCVERSION=4.12
 VARIANT=
 # Use new style livepatch package names
 LIVEPATCH=livepatch
+# Compile binary devicetrees on Leap
+BUILD_DTBS="Yes"
 # buildservice projects to build the kernel against
 OBS_PROJECT=openSUSE:Leap:15.1:Update
 # Bugzilla info
