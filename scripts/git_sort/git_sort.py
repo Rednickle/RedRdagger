@@ -248,6 +248,8 @@ remotes = (
     Head(RepoURL("git://github.com/cminyard/linux-ipmi.git"), "for-next"),
     Head(RepoURL("ras/ras.git"), "edac-for-next"),
     Head(RepoURL("linusw/linux-pinctrl.git"), "for-next"),
+    Head(RepoURL("efi/efi.git"), "next"),
+    Head(RepoURL("ulfh/mmc.git"), "next"),
 )
 
 
