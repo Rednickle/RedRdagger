@@ -1,0 +1,177 @@
+From: Nicolai Stange <nstange@suse.de>
+Patch-mainline: Never, kABI
+Subject: kABI: restore ->d_fsdata semantics for debugfs_real_fops()
+References: bsc#1159198 bsc#1109911
+
+Upstream commit 7c8d469877b1 ("debugfs: add support for more elaborate
+->d_fsdata"), imported as
+patches.suse/debugfs-add-support-for-more-elaborate-d_fsdata.patch,
+changed the semantics of S_IFREG debugfs files' ->d_fsdata, which breaks
+kABI. Before that change, ->d_fsdata used to store a pointer to the
+original, user provided file_operations and the public, inline
+debugfs_real_fops() would merely retrieve this pointer value.
+
+After the aforementioned patch, ->d_fsdata was made to point to an
+intermediate struct debugfs_fsdata instance, which contains, among others,
+a member for referring to said file_operations. (Actully, with later
+upstream commit 7d39bc50c47b ("debugfs: defer debugfs_fsdata allocation to
+first usage"), things became a bit more complicated: ->d_fsdata would
+either point to the file_operations directly or to such a struct
+debugfs_fsdata instance wrapping it. The two cases are disambiguated by
+by testing ->d_fsdata lsb).
+
+To retain kABI, restore the old semantics of ->d_fsdata and make
+__debugfs_create_file() initialize it with a pointer to the user provided
+file_operations again.
+
+The implication is that some other means of associating a pointers of the
+the new semantics with S_IFREG debugfs files is needed. Abuse the
+associated struct inode's ->i_link member for that. This works, because
+- with debugfs, the association dentry <-> inode is always 1:1,
+- for debugfs S_IFREG files, ->i_link as well as the other members from
+  the enclosing union are unused and
+- the inode_operations installed for S_IFREG files,
+  debugfs_file_inode_operations, has its ->get_link() unset and thus, the
+  VFS layer won't ever look at the inode's ->i_link.
+
+Introduce helper macros kabi_debugfs_d_fsdata(dentry) and
+__kabi_debugfs_d_fsdata(inode) which both provide access to the associated 
+inode's ->i_link rather than the dentry's ->d_fsdata. Replace all direct
+accesses to ->d_fsdata from the debugfs core by invocations of these as
+appropriate.
+
+Finally move the cleanup of the debugfs_fsdata instance, if any, from
+debugfs_release_dentry() to debugfs_free_inode(): when the VFS invokes
+the former, the dentry isn't linked to the inode anymore.
+
+Signed-off-by: Nicolai Stange <nstange@suse.de>
+
+---
+ fs/debugfs/file.c     |   10 +++++-----
+ fs/debugfs/inode.c    |   25 ++++++++++++++++++-------
+ fs/debugfs/internal.h |   19 +++++++++++++++++++
+ 3 files changed, 42 insertions(+), 12 deletions(-)
+
+--- a/fs/debugfs/file.c
++++ b/fs/debugfs/file.c
+@@ -51,7 +51,7 @@ const struct file_operations debugfs_noo
+ 
+ const struct file_operations *debugfs_real_fops(const struct file *filp)
+ {
+-	struct debugfs_fsdata *fsd = F_DENTRY(filp)->d_fsdata;
++	struct debugfs_fsdata *fsd = kabi_debugfs_d_fsdata(F_DENTRY(filp));
+ 
+ 	if ((unsigned long)fsd & DEBUGFS_FSDATA_IS_REAL_FOPS_BIT) {
+ 		/*
+@@ -86,7 +86,7 @@ int debugfs_file_get(struct dentry *dent
+ 	struct debugfs_fsdata *fsd;
+ 	void *d_fsd;
+ 
+-	d_fsd = READ_ONCE(dentry->d_fsdata);
++	d_fsd = READ_ONCE(kabi_debugfs_d_fsdata(dentry));
+ 	if (!((unsigned long)d_fsd & DEBUGFS_FSDATA_IS_REAL_FOPS_BIT)) {
+ 		fsd = d_fsd;
+ 	} else {
+@@ -98,9 +98,9 @@ int debugfs_file_get(struct dentry *dent
+ 					~DEBUGFS_FSDATA_IS_REAL_FOPS_BIT);
+ 		refcount_set(&fsd->active_users, 1);
+ 		init_completion(&fsd->active_users_drained);
+-		if (cmpxchg(&dentry->d_fsdata, d_fsd, fsd) != d_fsd) {
++		if (cmpxchg(&kabi_debugfs_d_fsdata(dentry), d_fsd, fsd) != d_fsd) {
+ 			kfree(fsd);
+-			fsd = READ_ONCE(dentry->d_fsdata);
++			fsd = READ_ONCE(kabi_debugfs_d_fsdata(dentry));
+ 		}
+ 	}
+ 
+@@ -133,7 +133,7 @@ EXPORT_SYMBOL_GPL(debugfs_file_get);
+  */
+ void debugfs_file_put(struct dentry *dentry)
+ {
+-	struct debugfs_fsdata *fsd = READ_ONCE(dentry->d_fsdata);
++	struct debugfs_fsdata *fsd = READ_ONCE(kabi_debugfs_d_fsdata(dentry));
+ 
+ 	if (refcount_dec_and_test(&fsd->active_users))
+ 		complete(&fsd->active_users_drained);
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@ -170,8 +170,17 @@ static int debugfs_show_options(struct s
+ static void debugfs_i_callback(struct rcu_head *head)
+ {
+ 	struct inode *inode = container_of(head, struct inode, i_rcu);
+-	if (S_ISLNK(inode->i_mode))
++	if (S_ISLNK(inode->i_mode)) {
+ 		kfree(inode->i_link);
++	} else if (S_ISREG(inode->i_mode)) {
++		/*
++		 * kABI workaround uses ->i_link in place of ->d->fs_data
++		 * for regular files.
++		 */
++		void *fsd = __kabi_debugfs_d_fsdata(inode);
++		if (!((unsigned long)fsd & DEBUGFS_FSDATA_IS_REAL_FOPS_BIT))
++			kfree(fsd);
++	}
+ 	free_inode_nonrcu(inode);
+ }
+ 
+@@ -189,10 +198,11 @@ static const struct super_operations deb
+ 
+ static void debugfs_release_dentry(struct dentry *dentry)
+ {
+-	void *fsd = dentry->d_fsdata;
+-
+-	if (!((unsigned long)fsd & DEBUGFS_FSDATA_IS_REAL_FOPS_BIT))
+-		kfree(dentry->d_fsdata);
++	/*
++	 * Upstream does a kfree() on ->d_fsdata here. However,
++	 * for working around kABI, ->i_link is used instead.
++	 * The corresponding cleanup is found in debugfs_i_callback().
++	 */
+ }
+ 
+ static struct vfsmount *debugfs_automount(struct path *path)
+@@ -370,7 +380,8 @@ static struct dentry *__debugfs_create_f
+ 	inode->i_private = data;
+ 
+ 	inode->i_fop = proxy_fops;
+-	dentry->d_fsdata = (void *)((unsigned long)real_fops |
++	dentry->d_fsdata = (void *)real_fops; /* Needed for kABI */
++	__kabi_debugfs_d_fsdata(inode) = (void *)((unsigned long)real_fops |
+ 				DEBUGFS_FSDATA_IS_REAL_FOPS_BIT);
+ 
+ 	d_instantiate(dentry, inode);
+@@ -639,7 +650,7 @@ static void __debugfs_file_removed(struc
+ 	 * debugfs_fsdata instance at ->d_fsdata here (or both).
+ 	 */
+ 	smp_mb();
+-	fsd = READ_ONCE(dentry->d_fsdata);
++	fsd = READ_ONCE(kabi_debugfs_d_fsdata(dentry));
+ 	if ((unsigned long)fsd & DEBUGFS_FSDATA_IS_REAL_FOPS_BIT)
+ 		return;
+ 	if (!refcount_dec_and_test(&fsd->active_users))
+--- a/fs/debugfs/internal.h
++++ b/fs/debugfs/internal.h
+@@ -33,4 +33,23 @@ struct debugfs_fsdata {
+  */
+ #define DEBUGFS_FSDATA_IS_REAL_FOPS_BIT BIT(0)
+ 
++/*
++ * The file removal protection series, upstream commit
++ * 7c8d469877b1 ("debugfs: add support for more elaborate ->d_fsdata")
++ * in particular, changed the semantics of S_IFREG files' dentry->d_fsdata.
++ * Before that change, the original, a pointer to the user-provided
++ * file_operations had been stored there and external modules might depend on
++ * this. Especially as debugfs_real_fops() used to be defined as an inline
++ * function in public include/linux/debugfs.h.
++ *
++ * Work around this by abusing the associated inode's ->i_link instead, which
++ * is unused for regular debugfs files. The dereference + cast dance below
++ * is to make the result an lvalue of type void *.
++ */
++#define __kabi_debugfs_d_fsdata(inode)			\
++	(*(void **)&(inode)->i_link)
++
++#define kabi_debugfs_d_fsdata(dentry)			\
++	__kabi_debugfs_d_fsdata(d_inode(dentry))
++
+ #endif /* _DEBUGFS_INTERNAL_H_ */
