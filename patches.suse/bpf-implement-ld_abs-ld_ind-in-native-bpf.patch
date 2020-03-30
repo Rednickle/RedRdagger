@@ -1,0 +1,650 @@
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Fri, 4 May 2018 01:08:14 +0200
+Subject: bpf: implement ld_abs/ld_ind in native bpf
+Patch-mainline: v4.18-rc1
+Git-commit: e0cea7ce988cf48cc4052235d2ad2550b3bc4fa0
+References: bsc#1154385
+
+The main part of this work is to finally allow removal of LD_ABS
+and LD_IND from the BPF core by reimplementing them through native
+eBPF instead. Both LD_ABS/LD_IND were carried over from cBPF and
+keeping them around in native eBPF caused way more trouble than
+actually worth it. To just list some of the security issues in
+the past:
+
+  * fdfaf64e7539 ("x86: bpf_jit: support negative offsets")
+  * 35607b02dbef ("sparc: bpf_jit: fix loads from negative offsets")
+  * e0ee9c12157d ("x86: bpf_jit: fix two bugs in eBPF JIT compiler")
+  * 07aee9439454 ("bpf, sparc: fix usage of wrong reg for load_skb_regs after call")
+  * 6d59b7dbf72e ("bpf, s390x: do not reload skb pointers in non-skb context")
+  * 87338c8e2cbb ("bpf, ppc64: do not reload skb pointers in non-skb context")
+
+For programs in native eBPF, LD_ABS/LD_IND are pretty much legacy
+these days due to their limitations and more efficient/flexible
+alternatives that have been developed over time such as direct
+packet access. LD_ABS/LD_IND only cover 1/2/4 byte loads into a
+register, the load happens in host endianness and its exception
+handling can yield unexpected behavior. The latter is explained
+in depth in f6b1b3bf0d5f ("bpf: fix subprog verifier bypass by
+div/mod by 0 exception") with similar cases of exceptions we had.
+In native eBPF more recent program types will disable LD_ABS/LD_IND
+altogether through may_access_skb() in verifier, and given the
+limitations in terms of exception handling, it's also disabled
+in programs that use BPF to BPF calls.
+
+In terms of cBPF, the LD_ABS/LD_IND is used in networking programs
+to access packet data. It is not used in seccomp-BPF but programs
+that use it for socket filtering or reuseport for demuxing with
+cBPF. This is mostly relevant for applications that have not yet
+migrated to native eBPF.
+
+The main complexity and source of bugs in LD_ABS/LD_IND is coming
+from their implementation in the various JITs. Most of them keep
+the model around from cBPF times by implementing a fastpath written
+in asm. They use typically two from the BPF program hidden CPU
+registers for caching the skb's headlen (skb->len - skb->data_len)
+and skb->data. Throughout the JIT phase this requires to keep track
+whether LD_ABS/LD_IND are used and if so, the two registers need
+to be recached each time a BPF helper would change the underlying
+packet data in native eBPF case. At least in eBPF case, available
+CPU registers are rare and the additional exit path out of the
+asm written JIT helper makes it also inflexible since not all
+parts of the JITer are in control from plain C. A LD_ABS/LD_IND
+implementation in eBPF therefore allows to significantly reduce
+the complexity in JITs with comparable performance results for
+them, e.g.:
+
+test_bpf             tcpdump port 22             tcpdump complex
+x64      - before    15 21 10                    14 19  18
+         - after      7 10 10                     7 10  15
+arm64    - before    40 91 92                    40 91 151
+         - after     51 64 73                    51 62 113
+
+For cBPF we now track any usage of LD_ABS/LD_IND in bpf_convert_filter()
+and cache the skb's headlen and data in the cBPF prologue. The
+BPF_REG_TMP gets remapped from R8 to R2 since it's mainly just
+used as a local temporary variable. This allows to shrink the
+image on x86_64 also for seccomp programs slightly since mapping
+to %rsi is not an ereg. In callee-saved R8 and R9 we now track
+skb data and headlen, respectively. For normal prologue emission
+in the JITs this does not add any extra instructions since R8, R9
+are pushed to stack in any case from eBPF side. cBPF uses the
+convert_bpf_ld_abs() emitter which probes the fast path inline
+already and falls back to bpf_skb_load_helper_{8,16,32}() helper
+relying on the cached skb data and headlen as well. R8 and R9
+never need to be reloaded due to bpf_helper_changes_pkt_data()
+since all skb access in cBPF is read-only. Then, for the case
+of native eBPF, we use the bpf_gen_ld_abs() emitter, which calls
+the bpf_skb_load_helper_{8,16,32}_no_cache() helper unconditionally,
+does neither cache skb data and headlen nor has an inlined fast
+path. The reason for the latter is that native eBPF does not have
+any extra registers available anyway, but even if there were, it
+avoids any reload of skb data and headlen in the first place.
+Additionally, for the negative offsets, we provide an alternative
+bpf_skb_load_bytes_relative() helper in eBPF which operates
+similarly as bpf_skb_load_bytes() and allows for more flexibility.
+Tested myself on x64, arm64, s390x, from Sandipan on ppc64.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Gary Lin <glin@suse.com>
+---
+ include/linux/bpf.h    |    2 
+ include/linux/filter.h |    4 
+ kernel/bpf/core.c      |   96 +------------------
+ kernel/bpf/verifier.c  |   24 ++++
+ net/core/filter.c      |  236 ++++++++++++++++++++++++++++++++++++++++++++++---
+ 5 files changed, 262 insertions(+), 100 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -172,6 +172,8 @@ struct bpf_verifier_ops {
+ 				struct bpf_insn_access_aux *info);
+ 	int (*gen_prologue)(struct bpf_insn *insn, bool direct_write,
+ 			    const struct bpf_prog *prog);
++	int (*gen_ld_abs)(const struct bpf_insn *orig,
++			  struct bpf_insn *insn_buf);
+ 	u32 (*convert_ctx_access)(enum bpf_access_type type,
+ 				  const struct bpf_insn *src,
+ 				  struct bpf_insn *dst,
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -46,7 +46,9 @@ struct bpf_prog_aux;
+ /* Additional register mappings for converted user programs. */
+ #define BPF_REG_A	BPF_REG_0
+ #define BPF_REG_X	BPF_REG_7
+-#define BPF_REG_TMP	BPF_REG_8
++#define BPF_REG_TMP	BPF_REG_2	/* scratch reg */
++#define BPF_REG_D	BPF_REG_8	/* data, callee-saved */
++#define BPF_REG_H	BPF_REG_9	/* hlen, callee-saved */
+ 
+ /* Kernel hidden auxiliary/helper register for hardening step.
+  * Only used by eBPF JITs. It's nothing more than a temporary
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -612,23 +612,6 @@ static int bpf_jit_blind_insn(const stru
+ 		*to++ = BPF_JMP_REG(from->code, from->dst_reg, BPF_REG_AX, off);
+ 		break;
+ 
+-	case BPF_LD | BPF_ABS | BPF_W:
+-	case BPF_LD | BPF_ABS | BPF_H:
+-	case BPF_LD | BPF_ABS | BPF_B:
+-		*to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm);
+-		*to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
+-		*to++ = BPF_LD_IND(from->code, BPF_REG_AX, 0);
+-		break;
+-
+-	case BPF_LD | BPF_IND | BPF_W:
+-	case BPF_LD | BPF_IND | BPF_H:
+-	case BPF_LD | BPF_IND | BPF_B:
+-		*to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ from->imm);
+-		*to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
+-		*to++ = BPF_ALU32_REG(BPF_ADD, BPF_REG_AX, from->src_reg);
+-		*to++ = BPF_LD_IND(from->code, BPF_REG_AX, 0);
+-		break;
+-
+ 	case BPF_LD | BPF_IMM | BPF_DW:
+ 		*to++ = BPF_ALU64_IMM(BPF_MOV, BPF_REG_AX, imm_rnd ^ aux[1].imm);
+ 		*to++ = BPF_ALU64_IMM(BPF_XOR, BPF_REG_AX, imm_rnd);
+@@ -868,14 +851,7 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
+ 	INSN_3(LDX, MEM, W),			\
+ 	INSN_3(LDX, MEM, DW),			\
+ 	/*   Immediate based. */		\
+-	INSN_3(LD, IMM, DW),			\
+-	/*   Misc (old cBPF carry-over). */	\
+-	INSN_3(LD, ABS, B),			\
+-	INSN_3(LD, ABS, H),			\
+-	INSN_3(LD, ABS, W),			\
+-	INSN_3(LD, IND, B),			\
+-	INSN_3(LD, IND, H),			\
+-	INSN_3(LD, IND, W)
++	INSN_3(LD, IMM, DW)
+ 
+ bool bpf_opcode_in_insntable(u8 code)
+ {
+@@ -885,6 +861,13 @@ bool bpf_opcode_in_insntable(u8 code)
+ 		[0 ... 255] = false,
+ 		/* Now overwrite non-defaults ... */
+ 		BPF_INSN_MAP(BPF_INSN_2_TBL, BPF_INSN_3_TBL),
++		/* UAPI exposed, but rewritten opcodes. cBPF carry-over. */
++		[BPF_LD | BPF_ABS | BPF_B] = true,
++		[BPF_LD | BPF_ABS | BPF_H] = true,
++		[BPF_LD | BPF_ABS | BPF_W] = true,
++		[BPF_LD | BPF_IND | BPF_B] = true,
++		[BPF_LD | BPF_IND | BPF_H] = true,
++		[BPF_LD | BPF_IND | BPF_W] = true,
+ 	};
+ #undef BPF_INSN_3_TBL
+ #undef BPF_INSN_2_TBL
+@@ -915,8 +898,6 @@ static unsigned int ___bpf_prog_run(u64
+ #undef BPF_INSN_3_LBL
+ #undef BPF_INSN_2_LBL
+ 	u32 tail_call_cnt = 0;
+-	void *ptr;
+-	int off;
+ 
+ #define CONT	 ({ insn++; goto select_insn; })
+ #define CONT_JMP ({ insn++; goto select_insn; })
+@@ -1244,67 +1225,6 @@ out:
+ 		atomic64_add((u64) SRC, (atomic64_t *)(unsigned long)
+ 			     (DST + insn->off));
+ 		CONT;
+-	LD_ABS_W: /* BPF_R0 = ntohl(*(u32 *) (skb->data + imm32)) */
+-		off = IMM;
+-load_word:
+-		/* BPF_LD + BPD_ABS and BPF_LD + BPF_IND insns are only
+-		 * appearing in the programs where ctx == skb
+-		 * (see may_access_skb() in the verifier). All programs
+-		 * keep 'ctx' in regs[BPF_REG_CTX] == BPF_R6,
+-		 * bpf_convert_filter() saves it in BPF_R6, internal BPF
+-		 * verifier will check that BPF_R6 == ctx.
+-		 *
+-		 * BPF_ABS and BPF_IND are wrappers of function calls,
+-		 * so they scratch BPF_R1-BPF_R5 registers, preserve
+-		 * BPF_R6-BPF_R9, and store return value into BPF_R0.
+-		 *
+-		 * Implicit input:
+-		 *   ctx == skb == BPF_R6 == CTX
+-		 *
+-		 * Explicit input:
+-		 *   SRC == any register
+-		 *   IMM == 32-bit immediate
+-		 *
+-		 * Output:
+-		 *   BPF_R0 - 8/16/32-bit skb data converted to cpu endianness
+-		 */
+-
+-		ptr = bpf_load_pointer((struct sk_buff *) (unsigned long) CTX, off, 4, &tmp);
+-		if (likely(ptr != NULL)) {
+-			BPF_R0 = get_unaligned_be32(ptr);
+-			CONT;
+-		}
+-
+-		return 0;
+-	LD_ABS_H: /* BPF_R0 = ntohs(*(u16 *) (skb->data + imm32)) */
+-		off = IMM;
+-load_half:
+-		ptr = bpf_load_pointer((struct sk_buff *) (unsigned long) CTX, off, 2, &tmp);
+-		if (likely(ptr != NULL)) {
+-			BPF_R0 = get_unaligned_be16(ptr);
+-			CONT;
+-		}
+-
+-		return 0;
+-	LD_ABS_B: /* BPF_R0 = *(u8 *) (skb->data + imm32) */
+-		off = IMM;
+-load_byte:
+-		ptr = bpf_load_pointer((struct sk_buff *) (unsigned long) CTX, off, 1, &tmp);
+-		if (likely(ptr != NULL)) {
+-			BPF_R0 = *(u8 *)ptr;
+-			CONT;
+-		}
+-
+-		return 0;
+-	LD_IND_W: /* BPF_R0 = ntohl(*(u32 *) (skb->data + src_reg + imm32)) */
+-		off = IMM + SRC;
+-		goto load_word;
+-	LD_IND_H: /* BPF_R0 = ntohs(*(u16 *) (skb->data + src_reg + imm32)) */
+-		off = IMM + SRC;
+-		goto load_half;
+-	LD_IND_B: /* BPF_R0 = *(u8 *) (skb->data + src_reg + imm32) */
+-		off = IMM + SRC;
+-		goto load_byte;
+ 
+ 	default_label:
+ 		/* If we ever reach this, we have a bug somewhere. Die hard here
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3111,6 +3111,11 @@ static int check_ld_abs(struct bpf_verif
+ 		return -EINVAL;
+ 	}
+ 
++	if (!env->ops->gen_ld_abs) {
++		verbose(env, "bpf verifier is misconfigured\n");
++		return -EINVAL;
++	}
++
+ 	if (insn->dst_reg != BPF_REG_0 || insn->off != 0 ||
+ 	    BPF_SIZE(insn->code) == BPF_DW ||
+ 	    (mode == BPF_ABS && insn->src_reg != BPF_REG_0)) {
+@@ -4420,6 +4425,25 @@ static int fixup_bpf_calls(struct bpf_ve
+ 			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+ 			if (!new_prog)
+ 				return -ENOMEM;
++
++			delta    += cnt - 1;
++			env->prog = prog = new_prog;
++			insn      = new_prog->insnsi + i + delta;
++			continue;
++		}
++
++		if (BPF_CLASS(insn->code) == BPF_LD &&
++		    (BPF_MODE(insn->code) == BPF_ABS ||
++		     BPF_MODE(insn->code) == BPF_IND)) {
++			cnt = env->ops->gen_ld_abs(insn, insn_buf);
++			if (cnt == 0 || cnt >= ARRAY_SIZE(insn_buf)) {
++				verbose(env, "bpf verifier is misconfigured\n");
++				return -EINVAL;
++			}
++
++			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
++			if (!new_prog)
++				return -ENOMEM;
+ 
+ 			delta    += cnt - 1;
+ 			env->prog = prog = new_prog;
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -157,6 +157,87 @@ BPF_CALL_3(bpf_skb_get_nlattr_nest, stru
+ 	return 0;
+ }
+ 
++BPF_CALL_4(bpf_skb_load_helper_8, const struct sk_buff *, skb, const void *,
++	   data, int, headlen, int, offset)
++{
++	u8 tmp, *ptr;
++	const int len = sizeof(tmp);
++
++	if (offset >= 0) {
++		if (headlen - offset >= len)
++			return *(u8 *)(data + offset);
++		if (!skb_copy_bits(skb, offset, &tmp, sizeof(tmp)))
++			return tmp;
++	} else {
++		ptr = bpf_internal_load_pointer_neg_helper(skb, offset, len);
++		if (likely(ptr))
++			return *(u8 *)ptr;
++	}
++
++	return -EFAULT;
++}
++
++BPF_CALL_2(bpf_skb_load_helper_8_no_cache, const struct sk_buff *, skb,
++	   int, offset)
++{
++	return ____bpf_skb_load_helper_8(skb, skb->data, skb->len - skb->data_len,
++					 offset);
++}
++
++BPF_CALL_4(bpf_skb_load_helper_16, const struct sk_buff *, skb, const void *,
++	   data, int, headlen, int, offset)
++{
++	u16 tmp, *ptr;
++	const int len = sizeof(tmp);
++
++	if (offset >= 0) {
++		if (headlen - offset >= len)
++			return get_unaligned_be16(data + offset);
++		if (!skb_copy_bits(skb, offset, &tmp, sizeof(tmp)))
++			return be16_to_cpu(tmp);
++	} else {
++		ptr = bpf_internal_load_pointer_neg_helper(skb, offset, len);
++		if (likely(ptr))
++			return get_unaligned_be16(ptr);
++	}
++
++	return -EFAULT;
++}
++
++BPF_CALL_2(bpf_skb_load_helper_16_no_cache, const struct sk_buff *, skb,
++	   int, offset)
++{
++	return ____bpf_skb_load_helper_16(skb, skb->data, skb->len - skb->data_len,
++					  offset);
++}
++
++BPF_CALL_4(bpf_skb_load_helper_32, const struct sk_buff *, skb, const void *,
++	   data, int, headlen, int, offset)
++{
++	u32 tmp, *ptr;
++	const int len = sizeof(tmp);
++
++	if (likely(offset >= 0)) {
++		if (headlen - offset >= len)
++			return get_unaligned_be32(data + offset);
++		if (!skb_copy_bits(skb, offset, &tmp, sizeof(tmp)))
++			return be32_to_cpu(tmp);
++	} else {
++		ptr = bpf_internal_load_pointer_neg_helper(skb, offset, len);
++		if (likely(ptr))
++			return get_unaligned_be32(ptr);
++	}
++
++	return -EFAULT;
++}
++
++BPF_CALL_2(bpf_skb_load_helper_32_no_cache, const struct sk_buff *, skb,
++	   int, offset)
++{
++	return ____bpf_skb_load_helper_32(skb, skb->data, skb->len - skb->data_len,
++					  offset);
++}
++
+ BPF_CALL_0(bpf_get_raw_cpu_id)
+ {
+ 	return raw_smp_processor_id();
+@@ -349,26 +430,87 @@ static bool convert_bpf_extensions(struc
+ 	return true;
+ }
+ 
++static bool convert_bpf_ld_abs(struct sock_filter *fp, struct bpf_insn **insnp)
++{
++	const bool unaligned_ok = IS_BUILTIN(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS);
++	int size = bpf_size_to_bytes(BPF_SIZE(fp->code));
++	bool endian = BPF_SIZE(fp->code) == BPF_H ||
++		      BPF_SIZE(fp->code) == BPF_W;
++	bool indirect = BPF_MODE(fp->code) == BPF_IND;
++	const int ip_align = NET_IP_ALIGN;
++	struct bpf_insn *insn = *insnp;
++	int offset = fp->k;
++
++	if (!indirect &&
++	    ((unaligned_ok && offset >= 0) ||
++	     (!unaligned_ok && offset >= 0 &&
++	      offset + ip_align >= 0 &&
++	      offset + ip_align % size == 0))) {
++		*insn++ = BPF_MOV64_REG(BPF_REG_TMP, BPF_REG_H);
++		*insn++ = BPF_ALU64_IMM(BPF_SUB, BPF_REG_TMP, offset);
++		*insn++ = BPF_JMP_IMM(BPF_JSLT, BPF_REG_TMP, size, 2 + endian);
++		*insn++ = BPF_LDX_MEM(BPF_SIZE(fp->code), BPF_REG_A, BPF_REG_D,
++				      offset);
++		if (endian)
++			*insn++ = BPF_ENDIAN(BPF_FROM_BE, BPF_REG_A, size * 8);
++		*insn++ = BPF_JMP_A(8);
++	}
++
++	*insn++ = BPF_MOV64_REG(BPF_REG_ARG1, BPF_REG_CTX);
++	*insn++ = BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_D);
++	*insn++ = BPF_MOV64_REG(BPF_REG_ARG3, BPF_REG_H);
++	if (!indirect) {
++		*insn++ = BPF_MOV64_IMM(BPF_REG_ARG4, offset);
++	} else {
++		*insn++ = BPF_MOV64_REG(BPF_REG_ARG4, BPF_REG_X);
++		if (fp->k)
++			*insn++ = BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG4, offset);
++	}
++
++	switch (BPF_SIZE(fp->code)) {
++	case BPF_B:
++		*insn++ = BPF_EMIT_CALL(bpf_skb_load_helper_8);
++		break;
++	case BPF_H:
++		*insn++ = BPF_EMIT_CALL(bpf_skb_load_helper_16);
++		break;
++	case BPF_W:
++		*insn++ = BPF_EMIT_CALL(bpf_skb_load_helper_32);
++		break;
++	default:
++		return false;
++	}
++
++	*insn++ = BPF_JMP_IMM(BPF_JSGE, BPF_REG_A, 0, 2);
++	*insn++ = BPF_ALU32_REG(BPF_XOR, BPF_REG_A, BPF_REG_A);
++	*insn   = BPF_EXIT_INSN();
++
++	*insnp = insn;
++	return true;
++}
++
+ /**
+  *	bpf_convert_filter - convert filter program
+  *	@prog: the user passed filter program
+  *	@len: the length of the user passed filter program
+  *	@new_prog: allocated 'struct bpf_prog' or NULL
+  *	@new_len: pointer to store length of converted program
++ *	@seen_ld_abs: bool whether we've seen ld_abs/ind
+  *
+  * Remap 'sock_filter' style classic BPF (cBPF) instruction set to 'bpf_insn'
+  * style extended BPF (eBPF).
+  * Conversion workflow:
+  *
+  * 1) First pass for calculating the new program length:
+- *   bpf_convert_filter(old_prog, old_len, NULL, &new_len)
++ *   bpf_convert_filter(old_prog, old_len, NULL, &new_len, &seen_ld_abs)
+  *
+  * 2) 2nd pass to remap in two passes: 1st pass finds new
+  *    jump offsets, 2nd pass remapping:
+- *   bpf_convert_filter(old_prog, old_len, new_prog, &new_len);
++ *   bpf_convert_filter(old_prog, old_len, new_prog, &new_len, &seen_ld_abs)
+  */
+ static int bpf_convert_filter(struct sock_filter *prog, int len,
+-			      struct bpf_prog *new_prog, int *new_len)
++			      struct bpf_prog *new_prog, int *new_len,
++			      bool *seen_ld_abs)
+ {
+ 	int new_flen = 0, pass = 0, target, i, stack_off;
+ 	struct bpf_insn *new_insn, *first_insn = NULL;
+@@ -407,12 +549,27 @@ do_pass:
+ 		 * do this ourself. Initial CTX is present in BPF_REG_ARG1.
+ 		 */
+ 		*new_insn++ = BPF_MOV64_REG(BPF_REG_CTX, BPF_REG_ARG1);
++		if (*seen_ld_abs) {
++			/* For packet access in classic BPF, cache skb->data
++			 * in callee-saved BPF R8 and skb->len - skb->data_len
++			 * (headlen) in BPF R9. Since classic BPF is read-only
++			 * on CTX, we only need to cache it once.
++			 */
++			*new_insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, data),
++						  BPF_REG_D, BPF_REG_CTX,
++						  offsetof(struct sk_buff, data));
++			*new_insn++ = BPF_LDX_MEM(BPF_W, BPF_REG_H, BPF_REG_CTX,
++						  offsetof(struct sk_buff, len));
++			*new_insn++ = BPF_LDX_MEM(BPF_W, BPF_REG_TMP, BPF_REG_CTX,
++						  offsetof(struct sk_buff, data_len));
++			*new_insn++ = BPF_ALU32_REG(BPF_SUB, BPF_REG_H, BPF_REG_TMP);
++		}
+ 	} else {
+ 		new_insn += 3;
+ 	}
+ 
+ 	for (i = 0; i < len; fp++, i++) {
+-		struct bpf_insn tmp_insns[6] = { };
++		struct bpf_insn tmp_insns[32] = { };
+ 		struct bpf_insn *insn = tmp_insns;
+ 
+ 		if (addrs)
+@@ -455,6 +612,11 @@ do_pass:
+ 			    BPF_MODE(fp->code) == BPF_ABS &&
+ 			    convert_bpf_extensions(fp, &insn))
+ 				break;
++			if (BPF_CLASS(fp->code) == BPF_LD &&
++			    convert_bpf_ld_abs(fp, &insn)) {
++				*seen_ld_abs = true;
++				break;
++			}
+ 
+ 			if (fp->code == (BPF_ALU | BPF_DIV | BPF_X) ||
+ 			    fp->code == (BPF_ALU | BPF_MOD | BPF_X))
+@@ -550,21 +712,31 @@ jmp_rest:
+ 			break;
+ 
+ 		/* ldxb 4 * ([14] & 0xf) is remaped into 6 insns. */
+-		case BPF_LDX | BPF_MSH | BPF_B:
+-			/* tmp = A */
+-			*insn++ = BPF_MOV64_REG(BPF_REG_TMP, BPF_REG_A);
++		case BPF_LDX | BPF_MSH | BPF_B: {
++			struct sock_filter tmp = {
++				.code	= BPF_LD | BPF_ABS | BPF_B,
++				.k	= fp->k,
++			};
++
++			*seen_ld_abs = true;
++
++			/* X = A */
++			*insn++ = BPF_MOV64_REG(BPF_REG_X, BPF_REG_A);
+ 			/* A = BPF_R0 = *(u8 *) (skb->data + K) */
+-			*insn++ = BPF_LD_ABS(BPF_B, fp->k);
++			convert_bpf_ld_abs(&tmp, &insn);
++			insn++;
+ 			/* A &= 0xf */
+ 			*insn++ = BPF_ALU32_IMM(BPF_AND, BPF_REG_A, 0xf);
+ 			/* A <<= 2 */
+ 			*insn++ = BPF_ALU32_IMM(BPF_LSH, BPF_REG_A, 2);
++			/* tmp = X */
++			*insn++ = BPF_MOV64_REG(BPF_REG_TMP, BPF_REG_X);
+ 			/* X = A */
+ 			*insn++ = BPF_MOV64_REG(BPF_REG_X, BPF_REG_A);
+ 			/* A = tmp */
+ 			*insn = BPF_MOV64_REG(BPF_REG_A, BPF_REG_TMP);
+ 			break;
+-
++		}
+ 		/* RET_K is remaped into 2 insns. RET_A case doesn't need an
+ 		 * extra mov as BPF_REG_0 is already mapped into BPF_REG_A.
+ 		 */
+@@ -646,6 +818,8 @@ jmp_rest:
+ 	if (!new_prog) {
+ 		/* Only calculating new length. */
+ 		*new_len = new_insn - first_insn;
++		if (*seen_ld_abs)
++			*new_len += 4; /* Prologue bits. */
+ 		return 0;
+ 	}
+ 
+@@ -1007,6 +1181,7 @@ static struct bpf_prog *bpf_migrate_filt
+ 	struct sock_filter *old_prog;
+ 	struct bpf_prog *old_fp;
+ 	int err, new_len, old_len = fp->len;
++	bool seen_ld_abs = false;
+ 
+ 	/* We are free to overwrite insns et al right here as it
+ 	 * won't be used at this point in time anymore internally
+@@ -1028,7 +1203,8 @@ static struct bpf_prog *bpf_migrate_filt
+ 	}
+ 
+ 	/* 1st pass: calculate the new program length. */
+-	err = bpf_convert_filter(old_prog, old_len, NULL, &new_len);
++	err = bpf_convert_filter(old_prog, old_len, NULL, &new_len,
++				 &seen_ld_abs);
+ 	if (err)
+ 		goto out_err_free;
+ 
+@@ -1047,7 +1223,8 @@ static struct bpf_prog *bpf_migrate_filt
+ 	fp->len = new_len;
+ 
+ 	/* 2nd pass: remap sock_filter insns into bpf_insn insns. */
+-	err = bpf_convert_filter(old_prog, old_len, fp, &new_len);
++	err = bpf_convert_filter(old_prog, old_len, fp, &new_len,
++				 &seen_ld_abs);
+ 	if (err)
+ 		/* 2nd bpf_convert_filter() can fail only if it fails
+ 		 * to allocate memory, remapping must succeed. Note,
+@@ -3020,6 +3197,41 @@ static bool sock_filter_is_valid_access(
+ 	return true;
+ }
+ 
++static int bpf_gen_ld_abs(const struct bpf_insn *orig,
++			  struct bpf_insn *insn_buf)
++{
++	bool indirect = BPF_MODE(orig->code) == BPF_IND;
++	struct bpf_insn *insn = insn_buf;
++
++	/* We're guaranteed here that CTX is in R6. */
++	*insn++ = BPF_MOV64_REG(BPF_REG_1, BPF_REG_CTX);
++	if (!indirect) {
++		*insn++ = BPF_MOV64_IMM(BPF_REG_2, orig->imm);
++	} else {
++		*insn++ = BPF_MOV64_REG(BPF_REG_2, orig->src_reg);
++		if (orig->imm)
++			*insn++ = BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, orig->imm);
++	}
++
++	switch (BPF_SIZE(orig->code)) {
++	case BPF_B:
++		*insn++ = BPF_EMIT_CALL(bpf_skb_load_helper_8_no_cache);
++		break;
++	case BPF_H:
++		*insn++ = BPF_EMIT_CALL(bpf_skb_load_helper_16_no_cache);
++		break;
++	case BPF_W:
++		*insn++ = BPF_EMIT_CALL(bpf_skb_load_helper_32_no_cache);
++		break;
++	}
++
++	*insn++ = BPF_JMP_IMM(BPF_JSGE, BPF_REG_0, 0, 2);
++	*insn++ = BPF_ALU32_REG(BPF_XOR, BPF_REG_0, BPF_REG_0);
++	*insn++ = BPF_EXIT_INSN();
++
++	return insn - insn_buf;
++}
++
+ static int tc_cls_act_prologue(struct bpf_insn *insn_buf, bool direct_write,
+ 			       const struct bpf_prog *prog)
+ {
+@@ -3444,6 +3656,7 @@ const struct bpf_verifier_ops sk_filter_
+ 	.get_func_proto		= sk_filter_func_proto,
+ 	.is_valid_access	= sk_filter_is_valid_access,
+ 	.convert_ctx_access	= bpf_convert_ctx_access,
++	.gen_ld_abs		= bpf_gen_ld_abs,
+ };
+ 
+ const struct bpf_prog_ops sk_filter_prog_ops = {
+@@ -3454,6 +3667,7 @@ const struct bpf_verifier_ops tc_cls_act
+ 	.is_valid_access	= tc_cls_act_is_valid_access,
+ 	.convert_ctx_access	= tc_cls_act_convert_ctx_access,
+ 	.gen_prologue		= tc_cls_act_prologue,
++	.gen_ld_abs		= bpf_gen_ld_abs,
+ };
+ 
+ const struct bpf_verifier_ops tc_cls_act_analyzer_ops = {
